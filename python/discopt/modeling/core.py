@@ -1789,6 +1789,7 @@ class Model:
         lazy_constraints: Optional[Callable] = None,
         incumbent_callback: Optional[Callable] = None,
         node_callback: Optional[Callable] = None,
+        solver: Optional[str] = None,
         **kwargs,
     ) -> Union[SolveResult, Iterator["SolveUpdate"]]:
         """
@@ -1892,6 +1893,9 @@ class Model:
             )
 
         from discopt.solver import solve_model
+
+        if solver is not None:
+            kwargs["solver"] = solver
 
         result = solve_model(
             self,
