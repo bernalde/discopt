@@ -21,6 +21,7 @@ Soundness guarantee: LB_k ≤ global_opt ≤ UB_k at every iteration k.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from typing import Callable, Optional
@@ -28,7 +29,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from discopt._jax.model_utils import flat_variable_bounds
-from discopt.modeling.core import Model, SolveResult, VarType
+from discopt.modeling.core import Model, ObjectiveSense, SolveResult, VarType
 
 logger = logging.getLogger(__name__)
 _DEFAULT_MAX_OA_CUTS = 128
@@ -108,16 +109,146 @@ def _check_integer_feasible(
     return True
 
 
-def _round_integers(x: np.ndarray, model: Model) -> np.ndarray:
-    """Round integer/binary variables to nearest integer in-place (copy)."""
-    x = x.copy()
+def _integer_rounding_candidates(
+    x: np.ndarray,
+    model: Model,
+    max_candidates: int = 64,
+) -> list[np.ndarray]:
+    """Generate nearest-first integer rounding candidates within variable bounds."""
+    base = np.asarray(x, dtype=np.float64).copy()
+    integer_entries: list[tuple[int, list[int]]] = []
+
     offset = 0
     for v in model._variables:
         if v.var_type in (VarType.BINARY, VarType.INTEGER):
+            v_lb = np.asarray(v.lb, dtype=np.float64).ravel()
+            v_ub = np.asarray(v.ub, dtype=np.float64).ravel()
             for i in range(v.size):
-                x[offset + i] = round(float(x[offset + i]))
+                idx = offset + i
+                lb_i = float(v_lb[i])
+                ub_i = float(v_ub[i])
+                clipped = float(np.clip(base[idx], lb_i, ub_i))
+                lo_i = int(np.ceil(lb_i - 1e-9))
+                hi_i = int(np.floor(ub_i + 1e-9))
+
+                options: list[int] = []
+                for raw in (
+                    int(round(clipped)),
+                    int(np.floor(clipped)),
+                    int(np.ceil(clipped)),
+                ):
+                    if lo_i <= hi_i:
+                        cand = min(max(raw, lo_i), hi_i)
+                    else:
+                        cand = int(round(clipped))
+                    if cand not in options:
+                        options.append(cand)
+
+                integer_entries.append((idx, options))
         offset += v.size
-    return x
+
+    if not integer_entries:
+        return [base]
+
+    total_candidates = 1
+    for _, options in integer_entries:
+        total_candidates *= max(1, len(options))
+
+    candidates: list[np.ndarray] = []
+    if total_candidates <= max_candidates:
+        option_lists = [options for _, options in integer_entries]
+        for values in itertools.product(*option_lists):
+            cand = base.copy()
+            for (idx, _), value in zip(integer_entries, values):
+                cand[idx] = float(value)
+            candidates.append(cand)
+    else:
+        nearest = base.copy()
+        for idx, options in integer_entries:
+            nearest[idx] = float(options[0])
+        candidates.append(nearest)
+        for idx, options in integer_entries:
+            for value in options[1:]:
+                cand = nearest.copy()
+                cand[idx] = float(value)
+                candidates.append(cand)
+
+    deduped: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for cand in candidates:
+        key = tuple(float(v) for v in cand)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(cand)
+    return deduped
+
+
+def _round_integers(x: np.ndarray, model: Model) -> np.ndarray:
+    """Round integer/binary variables to the nearest candidate."""
+    return _integer_rounding_candidates(x, model)[0]
+
+
+def _build_fixed_integer_bounds(
+    x: np.ndarray,
+    model: Model,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fix integer and binary variables to the provided candidate values."""
+    nlp_lb = flat_lb.copy()
+    nlp_ub = flat_ub.copy()
+
+    offset = 0
+    for v in model._variables:
+        if v.var_type in (VarType.BINARY, VarType.INTEGER):
+            v_lb = np.asarray(v.lb, dtype=np.float64).ravel()
+            v_ub = np.asarray(v.ub, dtype=np.float64).ravel()
+            for k in range(v.size):
+                idx = offset + k
+                val = float(np.clip(x[idx], v_lb[k], v_ub[k]))
+                rounded = round(val)
+                nlp_lb[idx] = rounded
+                nlp_ub[idx] = rounded
+        offset += v.size
+
+    return nlp_lb, nlp_ub
+
+
+def _solve_milp_with_oa_recovery(
+    model: Model,
+    terms,
+    disc_state,
+    incumbent: Optional[np.ndarray],
+    oa_cuts: Optional[list],
+    time_limit: Optional[float],
+    gap_tolerance: float,
+):
+    """Retry MILP solves after dropping the oldest half of OA cuts on infeasibility."""
+    from discopt._jax.milp_relaxation import build_milp_relaxation
+
+    active_oa_cuts = list(oa_cuts or [])
+    while True:
+        milp_model, varmap = build_milp_relaxation(
+            model,
+            terms,
+            disc_state,
+            incumbent,
+            oa_cuts=active_oa_cuts,
+        )
+        milp_result = milp_model.solve(
+            time_limit=time_limit,
+            gap_tolerance=gap_tolerance,
+        )
+        if milp_result.status != "infeasible" or not active_oa_cuts:
+            return milp_result, varmap, active_oa_cuts
+
+        drop_count = max(1, len(active_oa_cuts) // 2)
+        logger.info(
+            "AMP: MILP infeasible with %d OA cuts; dropping %d oldest cuts and retrying",
+            len(active_oa_cuts),
+            drop_count,
+        )
+        active_oa_cuts = active_oa_cuts[drop_count:]
 
 
 def _check_constraints(x: np.ndarray, model: Model, tol: float = 1e-4) -> bool:
@@ -242,10 +373,18 @@ def solve_amp(
         initialize_partitions,
     )
     from discopt._jax.nlp_evaluator import NLPEvaluator
-    from discopt._jax.milp_relaxation import build_milp_relaxation
     from discopt._jax.partition_selection import pick_partition_vars
     from discopt._jax.term_classifier import classify_nonlinear_terms
     from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
+
+    assert model._objective is not None
+    maximize = model._objective.sense == ObjectiveSense.MAXIMIZE
+
+    def _to_minimization_space(value: float) -> float:
+        return -float(value) if maximize else float(value)
+
+    def _from_minimization_space(value: float) -> float:
+        return -float(value) if maximize else float(value)
 
     n_orig = sum(v.size for v in model._variables)
     flat_lb, flat_ub = flat_variable_bounds(model)
@@ -309,12 +448,16 @@ def solve_amp(
         _milp_gap_tol = milp_gap_tolerance if milp_gap_tolerance is not None else min(rel_gap / 2, 1e-3)
 
         try:
-            milp_model, varmap = build_milp_relaxation(
-                model, terms, disc_state, incumbent, oa_cuts=oa_cuts
+            milp_result, varmap, active_oa_cuts = _solve_milp_with_oa_recovery(
+                model=model,
+                terms=terms,
+                disc_state=disc_state,
+                incumbent=incumbent,
+                oa_cuts=oa_cuts,
+                time_limit=milp_tl,
+                gap_tolerance=_milp_gap_tol,
             )
-            milp_result = milp_model.solve(
-                time_limit=milp_tl, gap_tolerance=_milp_gap_tol
-            )
+            oa_cuts = active_oa_cuts
         except Exception as e:
             logger.warning("AMP: MILP build/solve failed at iteration %d: %s", iteration, e)
             break
@@ -342,43 +485,44 @@ def solve_amp(
         else:
             x0 = 0.5 * (flat_lb + flat_ub)
 
-        # Round integer/binary vars to nearest integer for NLP subproblem
-        x0_nlp = _round_integers(x0, model)
-
-        # Build fixed-integer bounds for NLP
-        nlp_lb = flat_lb.copy()
-        nlp_ub = flat_ub.copy()
-        offset = 0
-        for v in model._variables:
-            if v.var_type in (VarType.BINARY, VarType.INTEGER):
-                for k in range(v.size):
-                    val = float(x0_nlp[offset + k])
-                    val = np.clip(val, float(flat_lb[offset + k]), float(flat_ub[offset + k]))
-                    rounded = round(val)
-                    nlp_lb[offset + k] = rounded
-                    nlp_ub[offset + k] = rounded
-            offset += v.size
-
-        x_nlp, obj_nlp = _solve_nlp_subproblem(
-            evaluator,
-            x0_nlp,
-            nlp_lb,
-            nlp_ub,
-            nlp_solver,
-        )
-
-        if x_nlp is not None and obj_nlp is not None:
-            # Verify feasibility and update UB
-            feasible = _check_constraints_with_evaluator(
+        x_nlp = None
+        obj_nlp = None
+        obj_nlp_min = None
+        for x0_nlp in _integer_rounding_candidates(x0, model):
+            nlp_lb, nlp_ub = _build_fixed_integer_bounds(
+                x0_nlp, model, flat_lb, flat_ub
+            )
+            cand_x, cand_obj = _solve_nlp_subproblem(
                 evaluator,
-                x_nlp,
+                x0_nlp,
+                nlp_lb,
+                nlp_ub,
+                nlp_solver,
+            )
+            if cand_x is None or cand_obj is None:
+                continue
+            if not _check_constraints_with_evaluator(
+                evaluator,
+                cand_x,
                 constraint_lb,
                 constraint_ub,
-            )
-            if feasible and obj_nlp < UB:
-                UB = obj_nlp
+            ):
+                continue
+            x_nlp = cand_x
+            obj_nlp = cand_obj
+            obj_nlp_min = float(cand_obj)
+            break
+
+        if x_nlp is not None and obj_nlp is not None and obj_nlp_min is not None:
+            # Verify feasibility and update UB in the canonical minimization space.
+            if obj_nlp_min < UB:
+                UB = obj_nlp_min
                 incumbent = x_nlp.copy()
-                logger.debug("AMP iter %d: new UB=%.6g", iteration, UB)
+                logger.debug(
+                    "AMP iter %d: new incumbent objective=%.6g",
+                    iteration,
+                    _from_minimization_space(UB),
+                )
 
                 # Accumulate OA tangent cuts at this NLP solution to tighten
                 # the next MILP relaxation.  Uses existing OA infrastructure
@@ -416,27 +560,43 @@ def solve_amp(
 
         # ── Step 3: Gap check ────────────────────────────────────────────────
         if iteration_callback is not None:
+            if maximize:
+                callback_lb = _from_minimization_space(UB) if UB < np.inf else -np.inf
+                callback_ub = _from_minimization_space(LB) if LB > -np.inf else np.inf
+            else:
+                callback_lb = LB
+                callback_ub = UB
             iteration_callback(
-                {"iteration": iteration, "lower_bound": LB, "upper_bound": UB}
+                {
+                    "iteration": iteration,
+                    "lower_bound": callback_lb,
+                    "upper_bound": callback_ub,
+                }
             )
 
         if UB < np.inf and LB > -np.inf:
             abs_gap = UB - LB
             rel_g = _compute_relative_gap(abs_gap, UB)
+            if maximize:
+                display_lb = _from_minimization_space(UB)
+                display_ub = _from_minimization_space(LB)
+            else:
+                display_lb = LB
+                display_ub = UB
             if rel_g is None:
                 logger.info(
                     "AMP iter %d: LB=%.6g, UB=%.6g, abs_gap=%.6g (relative gap undefined)",
                     iteration,
-                    LB,
-                    UB,
+                    display_lb,
+                    display_ub,
                     abs_gap,
                 )
             else:
                 logger.info(
                     "AMP iter %d: LB=%.6g, UB=%.6g, gap=%.4g%%",
                     iteration,
-                    LB,
-                    UB,
+                    display_lb,
+                    display_ub,
                     100 * rel_g,
                 )
             if abs_gap <= abs_tol or (rel_g is not None and rel_g <= rel_gap):
@@ -498,8 +658,8 @@ def solve_amp(
 
         return SolveResult(
             status=status,
-            objective=float(UB),
-            bound=float(LB) if LB > -np.inf else None,
+            objective=_from_minimization_space(UB),
+            bound=_from_minimization_space(LB) if LB > -np.inf else None,
             gap=float(rel_gap_final) if rel_gap_final is not None else None,
             x=_build_x_dict(incumbent, model),
             wall_time=elapsed,
@@ -515,7 +675,7 @@ def solve_amp(
     return SolveResult(
         status=status,
         objective=None,
-        bound=float(LB) if LB > -np.inf else None,
+        bound=_from_minimization_space(LB) if LB > -np.inf else None,
         gap=None,
         x=None,
         wall_time=elapsed,

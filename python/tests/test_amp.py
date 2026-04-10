@@ -666,8 +666,8 @@ class TestMilpRelaxation:
         lb_arr = []
         ub_arr = []
         for v in model._variables:
-            lb_arr.extend(v.lb.tolist() if hasattr(v.lb, "tolist") else [float(v.lb)])
-            ub_arr.extend(v.ub.tolist() if hasattr(v.ub, "tolist") else [float(v.ub)])
+            lb_arr.extend(np.asarray(v.lb, dtype=np.float64).ravel().tolist())
+            ub_arr.extend(np.asarray(v.ub, dtype=np.float64).ravel().tolist())
         state = self.init_partitions(
             terms.partition_candidates,
             lb=[lb_arr[i] for i in terms.partition_candidates],
@@ -759,6 +759,37 @@ class TestMilpRelaxation:
                     matched = True
                     break
             assert matched, f"missing interval-specific upper row for [{a_k}, {b_k}]"
+
+    def test_milp_respects_original_variable_integrality(self):
+        """Original integer variables must stay integral in the MILP relaxation."""
+        m = Model("orig_integrality")
+        x = m.continuous("x", lb=0, ub=1)
+        y = m.integer("y", lb=0, ub=3)
+        m.subject_to(x * y >= 1.8)
+        m.minimize(y)
+
+        result = self._build_and_solve(m)
+
+        assert result.status == "optimal"
+        assert result.objective is not None
+        assert result.objective >= 2.0 - 1e-8
+        assert result.x is not None
+        assert abs(float(result.x[1]) - round(float(result.x[1]))) <= 1e-8
+
+
+class TestAmpPhase1Helpers:
+    """Fast regression tests for Phase 1 helper behavior."""
+
+    def test_piecewise_big_m_scales_with_large_coefficients(self):
+        """Big-M must scale with coefficient magnitude instead of adding a flat 1.0."""
+        from discopt._jax.milp_relaxation import _compute_piecewise_big_m
+
+        corners = [-25000.0, 10000.0, 5000.0, 30000.0]
+        big_m = _compute_piecewise_big_m(corners)
+        expected = 30000.0 * (1.0 + 1e-4) + 1e-2
+
+        assert big_m == pytest.approx(expected)
+        assert big_m > 30000.0
 
 
 # ===========================================================================
@@ -863,6 +894,22 @@ class TestAmpEndToEnd:
         assert result.objective is not None
         assert abs(result.objective) <= 1e-6
         assert result.gap is None
+
+    def test_bilinear_maximize_global_optimum(self):
+        """AMP must handle maximize objectives with certified bounds."""
+        m = Model("max_bilinear")
+        x = m.continuous("x", lb=0, ub=2, shape=(2,))
+        m.subject_to(x[0] + x[1] <= 2)
+        m.maximize(x[0] * x[1])
+
+        result = m.solve(solver="amp", rel_gap=1e-3, time_limit=60)
+
+        assert result.status == "optimal"
+        assert result.gap_certified is True
+        assert result.objective is not None
+        assert abs(result.objective - 1.0) <= 1e-3
+        assert result.bound is not None
+        assert result.bound >= result.objective - 1e-6
 
 
 # ===========================================================================
@@ -993,6 +1040,7 @@ class TestCurrentCodeWeaknesses:
         class BrokenEvaluator:
             def __init__(self, model):
                 self.n_constraints = 1
+                self.constraint_bounds = (np.array([0.0]), np.array([1.0]))
 
             def evaluate_constraints(self, x):
                 raise RuntimeError("boom")
@@ -1013,6 +1061,64 @@ class TestCurrentCodeWeaknesses:
         from discopt.solver import solve_model
 
         assert "solver" in inspect.signature(solve_model).parameters
+
+    def test_integer_rounding_candidates_include_floor_and_ceil(self):
+        """Nearest-integer rounding fallback must try floor and ceil alternatives."""
+        from discopt.solvers import amp as amp_mod
+
+        m = Model("rounding")
+        y = m.integer("y", lb=0, ub=3, shape=(2,))
+        x0 = np.array([1.49, 1.51], dtype=np.float64)
+
+        candidates = amp_mod._integer_rounding_candidates(x0, m)
+        rounded = {tuple(float(v) for v in cand) for cand in candidates}
+
+        assert (1.0, 2.0) in rounded  # nearest
+        assert (1.0, 1.0) in rounded  # floor on the second variable
+        assert (2.0, 2.0) in rounded  # ceil on the first variable
+
+    def test_oa_cut_recovery_drops_oldest_half(self, monkeypatch):
+        """OA recovery should retry with the oldest half of cuts removed."""
+        from discopt._jax.milp_relaxation import MilpRelaxationResult
+        from discopt.solvers import amp as amp_mod
+
+        call_sizes = []
+
+        class FakeMilpModel:
+            def __init__(self, status):
+                self.status = status
+
+            def solve(self, time_limit=None, gap_tolerance=None):
+                return MilpRelaxationResult(
+                    status=self.status,
+                    objective=0.0,
+                    x=np.zeros(1, dtype=np.float64),
+                )
+
+        def fake_build(model, terms, disc_state, incumbent, oa_cuts=None):
+            size = len(oa_cuts or [])
+            call_sizes.append(size)
+            status = "infeasible" if size >= 4 else "optimal"
+            return FakeMilpModel(status), {"dummy": True}
+
+        monkeypatch.setattr(
+            "discopt._jax.milp_relaxation.build_milp_relaxation",
+            fake_build,
+        )
+
+        result, _, kept_cuts = amp_mod._solve_milp_with_oa_recovery(
+            model=None,
+            terms=None,
+            disc_state=None,
+            incumbent=None,
+            oa_cuts=[("c1", 1), ("c2", 2), ("c3", 3), ("c4", 4)],
+            time_limit=1.0,
+            gap_tolerance=1e-4,
+        )
+
+        assert call_sizes == [4, 2]
+        assert kept_cuts == [("c3", 3), ("c4", 4)]
+        assert result.status == "optimal"
 
     def test_spatial_bnb_bilinear_global_correctness(self):
         """Existing spatial B&B should solve nlp1 to global optimum.

@@ -45,6 +45,7 @@ from discopt.modeling.core import (
     SumExpression,
     SumOverExpression,
     UnaryOp,
+    VarType,
     Variable,
 )
 
@@ -137,6 +138,12 @@ def _piecewise_product_bounds(
     """Return interval corner products and their min/max values."""
     corners = [a_k * y_lb, a_k * y_ub, b_k * y_lb, b_k * y_ub]
     return corners, min(corners), max(corners)
+
+
+def _compute_piecewise_big_m(corners: list[float]) -> float:
+    """Scale Big-M with the interval magnitude instead of adding a flat constant."""
+    max_corner = max(abs(float(c)) for c in corners)
+    return max_corner * (1.0 + 1e-4) + 1e-2
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +384,10 @@ def build_milp_relaxation(
     all_bounds: list[tuple[float, float]] = list(
         zip(flat_lb.tolist(), flat_ub.tolist())
     )
-    integrality_flags: list[int] = [0] * n_orig
+    integrality_flags: list[int] = []
+    for v in model._variables:
+        flag = 1 if v.var_type in (VarType.BINARY, VarType.INTEGER) else 0
+        integrality_flags.extend([flag] * v.size)
 
     # Pre-compute bilinear auxiliary variable slots
     for i, j in terms.bilinear:
@@ -528,7 +538,7 @@ def build_milp_relaxation(
                     yj_lb,
                     yj_ub,
                 )
-                M_k = max(abs(corner) for corner in corners) + 1.0
+                M_k = _compute_piecewise_big_m(corners)
 
                 # x̄_k ≥ a_k * δ_k  (x̄_k is in [a_k, b_k] when δ_k=1)
                 row = np.zeros(n_total)
