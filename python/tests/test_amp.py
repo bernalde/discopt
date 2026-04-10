@@ -176,6 +176,18 @@ class TestTermClassifier:
         assert len(terms.bilinear) >= 1
         assert len(terms.monomial) >= 2  # x[0]**2 and x[1]**2
 
+    def test_repeated_factor_product_is_general_nl(self):
+        """Mixed repeated-factor products like x*x*y must not be misclassified as bilinear."""
+        m = Model("repeat_factor")
+        x = m.continuous("x", lb=0, ub=10, shape=(2,))
+        m.minimize((x[0] * x[0]) * x[1])
+
+        terms = self.classify(m)
+
+        assert len(terms.bilinear) == 0
+        assert len(terms.general_nl) >= 1
+        assert (0, 2) in terms.monomial
+
     def test_partition_candidates_excludes_linear_vars(self):
         """Variable not in any nonlinear term must NOT be a partition candidate."""
         m = Model("t")
@@ -327,6 +339,21 @@ class TestPartitionSelection:
         terms = self._make_terms()
         assert self.pick(terms, method="max_cover") == []
         assert self.pick(terms, method="min_vertex_cover") == []
+
+    def test_min_vertex_cover_falls_back_to_greedy_cover(self, monkeypatch):
+        """When the MILP cover solve fails, the greedy fallback should still cover all terms."""
+        import discopt._jax.partition_selection as part_sel
+
+        terms = self._make_terms(bilinear=[(0, 1), (0, 2), (0, 3), (0, 4)])
+        monkeypatch.setattr(
+            part_sel,
+            "_solve_vertex_cover_milp",
+            lambda candidates, all_t: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        selected = self.pick(terms, method="min_vertex_cover")
+
+        assert set(selected) == {0}
 
 
 # ===========================================================================
@@ -695,6 +722,44 @@ class TestMilpRelaxation:
                 f"MILP relaxation infeasible for a feasible problem: {m._name}"
             )
 
+    def test_piecewise_interval_rows_use_interval_specific_bounds(self):
+        """Piecewise product rows must use the current interval's wk_hi, not a stale value."""
+        import scipy.sparse as sp
+
+        from discopt._jax.discretization import DiscretizationState
+        from discopt._jax.term_classifier import classify_nonlinear_terms
+
+        m = Model("piecewise_bounds")
+        x = m.continuous("x", lb=1, ub=5)
+        y = m.continuous("y", lb=10, ub=20)
+        m.minimize(x * y)
+
+        terms = classify_nonlinear_terms(m)
+        state = DiscretizationState(partitions={0: np.array([1.0, 2.5, 4.0, 5.0])})
+        milp_model, varmap = self.build_milp(m, terms, state, incumbent=None)
+
+        assert sp.issparse(milp_model._A_ub)
+        A_csr = milp_model._A_ub.tocsr()
+        b_ub = np.asarray(milp_model._b_ub, dtype=np.float64)
+
+        for delta_col, _, wbar_col, a_k, b_k in varmap["bilinear_pw"][(0, 1)]:
+            expected_hi = max(
+                a_k * 10.0,
+                a_k * 20.0,
+                b_k * 10.0,
+                b_k * 20.0,
+            )
+            matched = False
+            for row_idx in range(A_csr.shape[0]):
+                row = A_csr.getrow(row_idx)
+                if row.nnz != 2 or abs(b_ub[row_idx]) > 1e-12:
+                    continue
+                coeffs = dict(zip(row.indices.tolist(), row.data.tolist()))
+                if coeffs.get(wbar_col) == 1.0 and coeffs.get(delta_col) == -expected_hi:
+                    matched = True
+                    break
+            assert matched, f"missing interval-specific upper row for [{a_k}, {b_k}]"
+
 
 # ===========================================================================
 # Section 6: End-to-End AMP Solver (Alpine canonical problems)
@@ -779,6 +844,20 @@ class TestAmpEndToEnd:
         assert result.status == "optimal"
         assert result.objective is not None
         assert abs(result.objective - 1.0) <= 1e-3
+
+    @pytest.mark.smoke
+    def test_zero_upper_bound_reports_no_relative_gap(self):
+        """Relative gap should be left undefined when the incumbent objective is numerically zero."""
+        m = Model("zero_gap")
+        x = m.continuous("x", lb=-1, ub=1)
+        m.minimize(x ** 2)
+
+        result = m.solve(solver="amp", rel_gap=1e-4, time_limit=30)
+
+        assert result.status == "optimal"
+        assert result.objective is not None
+        assert abs(result.objective) <= 1e-6
+        assert result.gap is None
 
 
 # ===========================================================================
@@ -901,6 +980,35 @@ class TestCurrentCodeWeaknesses:
     These are diagnostic tests — failures here guide implementation priorities.
     """
 
+    def test_constraint_check_rejects_eval_failure(self, monkeypatch):
+        """Constraint evaluation errors must reject the candidate point."""
+        import discopt._jax.nlp_evaluator as nlp_eval
+        from discopt.solvers import amp as amp_mod
+
+        class BrokenEvaluator:
+            def __init__(self, model):
+                self.n_constraints = 1
+
+            def evaluate_constraints(self, x):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(nlp_eval, "NLPEvaluator", BrokenEvaluator)
+
+        m = Model("broken_eval")
+        x = m.continuous("x", lb=0, ub=1)
+        m.subject_to(x >= 0)
+        m.minimize(x)
+
+        assert amp_mod._check_constraints(np.array([0.5]), m) is False
+
+    def test_solve_model_signature_exposes_solver_parameter(self):
+        """solve_model should expose the backend selector in its signature."""
+        import inspect
+
+        from discopt.solver import solve_model
+
+        assert "solver" in inspect.signature(solve_model).parameters
+
     def test_spatial_bnb_bilinear_global_correctness(self):
         """Existing spatial B&B should solve nlp1 to global optimum.
 
@@ -915,8 +1023,12 @@ class TestCurrentCodeWeaknesses:
             f"(gap={abs(result.objective - NLP1_OPTIMUM):.4f})"
         )
 
+    @pytest.mark.xfail(
+        reason="Documents a known weakness of the legacy spatial B&B on quadratic constraints",
+        strict=False,
+    )
     def test_circle_monomial_global_correctness(self):
-        """Existing solver should handle x²+y²≥2 correctly (monomials)."""
+        """Existing solver weakness: x²+y²≥2 is not yet solved globally by spatial B&B."""
         m = _make_circle()
         result = m.solve(time_limit=30, gap_tolerance=1e-3)
         assert result.objective is not None

@@ -1010,6 +1010,7 @@ def solve_model(
     lazy_constraints=None,
     incumbent_callback=None,
     node_callback=None,
+    solver: Optional[str] = None,
     **kwargs,
 ) -> SolveResult:
     """
@@ -1098,7 +1099,7 @@ def solve_model(
         )
 
     # --- AMP (Adaptive Multivariate Partitioning) global solver ---
-    _solver = kwargs.pop("solver", None)
+    _solver = solver if solver is not None else kwargs.pop("solver", None)
     if _solver == "amp":
         from discopt.solvers.amp import solve_amp
 

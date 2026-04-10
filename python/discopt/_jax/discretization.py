@@ -36,8 +36,11 @@ class DiscretizationState:
         Finer partitions have more elements.
     scaling_factor : float
         Controls the width of new partitions added during adaptive refinement.
-        New breakpoints are placed at x* ± (partition_width / scaling_factor).
-        Default 10.0 (Alpine's default).
+        New breakpoints are placed symmetrically around the current solution
+        value x* at x* ± (partition_width / scaling_factor). This centered
+        refinement differs from Alpine.jl's edge-based update, which places
+        breakpoints near the active interval endpoints.
+        Default 10.0.
     abs_width_tol : float
         Convergence threshold.  When all partition widths are below this value,
         check_partition_convergence() returns True.
@@ -93,11 +96,11 @@ def add_adaptive_partition(
     1. Identify the active partition [p_lo, p_hi] containing solution[v].
     2. Compute width = p_hi - p_lo.
     3. Add new breakpoints at:
-         p_lo + width / scaling_factor
-         p_hi - width / scaling_factor
+         x* - width / scaling_factor
+         x* + width / scaling_factor
     4. Merge with existing breakpoints, sort, deduplicate.
 
-    This mirrors Alpine.jl's add_adaptive_partition() in bounding_model.jl.
+    This is a centered refinement rule, not Alpine.jl's edge-based placement.
 
     Parameters
     ----------
@@ -142,8 +145,7 @@ def add_adaptive_partition(
 
         delta = width / state.scaling_factor
 
-        # New breakpoints: two new points around the solution value
-        # (mirrors Alpine.jl add_adaptive_partition)
+        # New breakpoints: two new points around the current solution value.
         new1 = x_star - delta
         new2 = x_star + delta
 

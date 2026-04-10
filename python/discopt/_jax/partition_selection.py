@@ -63,8 +63,8 @@ def _min_vertex_cover(terms: NonlinearTerms) -> list[int]:
     try:
         return _solve_vertex_cover_milp(candidates, all_t)
     except Exception:
-        # Fallback: use max_cover if MILP fails
-        return candidates
+        greedy = _greedy_vertex_cover(candidates, all_t)
+        return greedy if greedy else candidates
 
 
 def _solve_vertex_cover_milp(
@@ -141,8 +141,8 @@ def _solve_vertex_cover_milp(
         return selected
 
     except ImportError:
-        # HiGHS not available; use greedy max-cover
-        return list(dict.fromkeys(candidates))
+        greedy = _greedy_vertex_cover(candidates, valid_terms)
+        return greedy if greedy else list(dict.fromkeys(candidates))
 
 
 def _greedy_vertex_cover(candidates: list[int], terms: list[tuple[int, ...]]) -> list[int]:

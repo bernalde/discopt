@@ -1894,9 +1894,6 @@ class Model:
 
         from discopt.solver import solve_model
 
-        if solver is not None:
-            kwargs["solver"] = solver
-
         result = solve_model(
             self,
             time_limit=time_limit,
@@ -1911,6 +1908,7 @@ class Model:
             lazy_constraints=lazy_constraints,
             incumbent_callback=incumbent_callback,
             node_callback=node_callback,
+            solver=solver,
             **kwargs,
         )
 
