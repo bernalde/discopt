@@ -180,7 +180,7 @@ def add_adaptive_partition(
 
 def add_uniform_partition(
     state: DiscretizationState,
-    solution: dict[int, float],
+    _solution: dict[int, float],
     var_indices: list[int],
     lb: list[float],
     ub: list[float],
@@ -190,8 +190,6 @@ def add_uniform_partition(
     Unlike adaptive refinement, this does not use the current solution value.
     Each interval is split at its midpoint, preserving all existing breakpoints.
     """
-    del solution  # uniform refinement is solution-agnostic
-
     new_partitions = {k: v.copy() for k, v in state.partitions.items()}
 
     for k, v_idx in enumerate(var_indices):
