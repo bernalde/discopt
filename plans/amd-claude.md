@@ -2,9 +2,9 @@
 
 ## Context
 
-PR https://github.com/bernalde/discopt/pull/1 (branch `amp-global-solver`) has a partially working AMP (Adaptive Multivariate Partitioning) global MINLP solver. It currently solves simple bilinear problems (nlp1: obj=58.38, certified; circle: obj=1.414, certified) but has significant gaps vs the reference Alpine.jl implementation at `/home/bernalde/repos/Alpine.jl`. This plan covers completing all missing features and validating against MINLPTests.jl (92 test problems, infrastructure on branch `feature/minlptests/phase-A-infra`).
+The AMP base from PR https://github.com/bernalde/discopt/pull/1 is merged, and the remaining work now lives in the stacked draft PRs on top of `upstream-main-sync`. The current implementation solves simple bilinear problems (nlp1: obj=58.38, certified; circle: obj=1.414, certified) but still has significant gaps vs the reference Alpine.jl implementation at `/home/bernalde/repos/Alpine.jl`. This plan covers the remaining feature work and validation against the upstream MINLPTests integration.
 
-**What already works** (52/53 tests in `python/tests/test_amp.py` pass):
+**What already works**:
 - `term_classifier.py` -- bilinear, monomial(n=2), trilinear detection
 - `partition_selection.py` -- max_cover, min_vertex_cover (HiGHS MILP)
 - `discretization.py` -- DiscretizationState, init, adaptive refinement
@@ -205,17 +205,17 @@ Constraints:
 
 **Goal**: Validate AMP against 92 standardized test problems.
 
-- **Infrastructure**: branch `feature/minlptests/phase-A-infra`
-  - [test_minlptests.py](python/tests/test_minlptests.py) (1,680 lines, 4 test classes, 87 problems)
+- **Infrastructure**: upstream MINLPTests files now present in this repository
+  - [test_minlptests.py](python/tests/test_minlptests.py)
   - [known_failures.toml](python/tests/data/known_failures.toml)
   - [minlptests_problems.py](discopt_benchmarks/benchmarks/problems/minlptests_problems.py) (11 benchmark instances)
 
 ### Steps:
-1. Merge `feature/minlptests/phase-A-infra` into `amp-global-solver`
-2. Create `TestMINLPTestsAMP` test class for AMP on all non-convex instances
-3. Register AMP as solver in MINLPTests infrastructure
+1. Benchmark AMP against the upstream MINLPTests suite on the non-convex instances
+2. Create `TestMINLPTestsAMP` coverage where AMP-specific assertions belong in-tree
+3. Register or refine AMP hooks in the MINLPTests infrastructure as needed
 4. Track failures in `known_failures.toml`
-5. Cross-validate: run Alpine.jl on same problems, compare iteration counts and bounds
+5. Cross-validate: run Alpine.jl on the same problems, compare iteration counts and bounds
 
 ### Phased rollout:
 - **9A**: Run AMP on 18 nonconvex NLP instances (`nlp-*`)
@@ -311,8 +311,8 @@ Alpine partitions only ONE variable per bilinear term (the one in `disc_vars`). 
 ### R4: OA cut validity is more nuanced than Phase 1C suggests
 OA cuts at feasible points are valid cutting planes even for non-convex constraints -- they cut off the linearization point from the feasible side. The issue is that for non-convex constraints, the OA cut may also cut off the global optimum. However, since AMP adds OA cuts only at NLP-feasible points (which are in the original feasible region), the cuts are valid as supporting hyperplanes. The real risk is MILP infeasibility from accumulated cuts. **Consider: keep all OA cuts but add a feasibility recovery mechanism (drop oldest cuts if MILP becomes infeasible) rather than skipping non-convex OA entirely.**
 
-### R5: MINLPTests branch merge
-`feature/minlptests/phase-A-infra` and `amp-global-solver` may have conflicting changes in `solver.py` and `test_amp.py`. Phase 9 must handle merge conflicts carefully. **Strategy: rebase minlptests onto amp-global-solver after Phases 1-6 are done.**
+### R5: MINLPTests benchmark drift
+The upstream MINLPTests files can change independently of the AMP stack. Phase 9 should benchmark against the upstream suite snapshot we intend to merge against and keep `known_failures.toml` aligned with that exact revision.
 
 ### R6: `_check_constraints` returns True on evaluation failure
 [amp.py:146](python/discopt/solvers/amp.py#L146): `except Exception: return True` -- if constraint evaluation fails (e.g., NaN), the point is accepted as feasible. This can produce incorrect upper bounds. **Should return False on evaluation failure.**

@@ -2,7 +2,7 @@
 
 This directory turns the AMP completion plan into a manageable draft-PR queue.
 
-Base branch for this stack: `amp-global-solver`
+Base branch for this stack: `upstream-main-sync`
 
 Draft PR order:
 1. `feature/amp-completion/roadmap`
