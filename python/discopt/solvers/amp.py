@@ -387,6 +387,17 @@ def _normalize_partition_method(
     )
 
 
+def _default_obbt_time_limit_per_lp(
+    remaining: float,
+    n_orig: int,
+) -> float:
+    """Allocate a bounded per-LP budget for OBBT presolve."""
+    if not np.isfinite(remaining) or remaining <= 0.0:
+        return 0.0
+    obbt_budget = min(10.0, 0.1 * remaining)
+    return max(0.05, obbt_budget / max(1, 2 * n_orig))
+
+
 def _compute_relative_gap(
     abs_gap: Optional[float],
     upper_bound: float,
@@ -529,23 +540,30 @@ def solve_amp(
 
     # Tighten the initial McCormick domain before selecting partition bounds.
     if presolve_bt:
-        try:
-            from discopt._jax.obbt import run_obbt
-
-            obbt_result = run_obbt(
-                model,
-                lb=flat_lb.copy(),
-                ub=flat_ub.copy(),
-            )
-            if obbt_result.n_tightened > 0:
-                flat_lb = obbt_result.tightened_lb
-                flat_ub = obbt_result.tightened_ub
-                logger.info(
-                    "AMP: OBBT tightened %d bounds before partitioning",
-                    obbt_result.n_tightened,
+        remaining = max(0.0, time_limit - (time.perf_counter() - t_start))
+        obbt_time_limit = _default_obbt_time_limit_per_lp(remaining, n_orig)
+        if obbt_time_limit > 0.0:
+            try:
+                from discopt._jax.obbt import run_obbt
+            except ImportError as err:
+                logger.warning("AMP: OBBT presolve unavailable; continuing without it: %s", err)
+            else:
+                obbt_result = run_obbt(
+                    model,
+                    lb=flat_lb.copy(),
+                    ub=flat_ub.copy(),
+                    time_limit_per_lp=obbt_time_limit,
                 )
-        except Exception as err:
-            logger.warning("AMP: OBBT presolve failed; continuing without it: %s", err)
+                if obbt_result.n_tightened > 0:
+                    flat_lb = obbt_result.tightened_lb
+                    flat_ub = obbt_result.tightened_ub
+                    logger.info(
+                        "AMP: OBBT tightened %d bounds in %.3fs before partitioning",
+                        obbt_result.n_tightened,
+                        obbt_result.total_lp_time,
+                    )
+        else:
+            logger.info("AMP: skipping OBBT presolve because no wall-clock budget remains")
 
     # ── Select partition variables ───────────────────────────────────────────
     if apply_partitioning:
