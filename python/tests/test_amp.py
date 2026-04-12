@@ -1471,10 +1471,10 @@ class TestCurrentCodeWeaknesses:
                 total_lp_time=0.0,
             )
 
-        def spy_initialize(part_vars, lb, ub, n_init):
+        def spy_initialize(part_vars, lb, ub, n_init, **kwargs):
             captured["lb"] = list(lb)
             captured["ub"] = list(ub)
-            return orig_initialize(part_vars, lb=lb, ub=ub, n_init=n_init)
+            return orig_initialize(part_vars, lb=lb, ub=ub, n_init=n_init, **kwargs)
 
         def stop_after_init(*args, **kwargs):
             raise RuntimeError("stop after initialization")
