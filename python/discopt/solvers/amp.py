@@ -387,6 +387,17 @@ def _normalize_partition_method(
     )
 
 
+def _default_obbt_time_limit_per_lp(
+    remaining: float,
+    n_orig: int,
+) -> float:
+    """Allocate a bounded per-LP budget for OBBT presolve."""
+    if not np.isfinite(remaining) or remaining <= 0.0:
+        return 0.0
+    obbt_budget = min(10.0, 0.1 * remaining)
+    return max(0.05, obbt_budget / max(1, 2 * n_orig))
+
+
 def _compute_relative_gap(
     abs_gap: Optional[float],
     upper_bound: float,
@@ -427,6 +438,7 @@ def solve_amp(
     disc_add_partition_method: str = "adaptive",
     disc_abs_width_tol: float = 1e-3,
     convhull_formulation: str = "disaggregated",
+    presolve_bt: bool = True,
 ) -> SolveResult:
     """Solve MINLP globally using Adaptive Multivariate Partitioning (AMP).
 
@@ -471,6 +483,8 @@ def solve_amp(
     convhull_formulation : str
         Piecewise bilinear formulation: ``"disaggregated"``, ``"sos2"``,
         ``"facet"``, or ``"lambda"`` (alias for ``"sos2"``).
+    presolve_bt : bool
+        Run LP-based OBBT before the AMP loop to tighten variable bounds.
 
     Returns
     -------
@@ -523,6 +537,33 @@ def solve_amp(
         len(terms.monomial),
         len(terms.general_nl),
     )
+
+    # Tighten the initial McCormick domain before selecting partition bounds.
+    if presolve_bt:
+        remaining = max(0.0, time_limit - (time.perf_counter() - t_start))
+        obbt_time_limit = _default_obbt_time_limit_per_lp(remaining, n_orig)
+        if obbt_time_limit > 0.0:
+            try:
+                from discopt._jax.obbt import run_obbt
+            except ImportError as err:
+                logger.warning("AMP: OBBT presolve unavailable; continuing without it: %s", err)
+            else:
+                obbt_result = run_obbt(
+                    model,
+                    lb=flat_lb.copy(),
+                    ub=flat_ub.copy(),
+                    time_limit_per_lp=obbt_time_limit,
+                )
+                if obbt_result.n_tightened > 0:
+                    flat_lb = obbt_result.tightened_lb
+                    flat_ub = obbt_result.tightened_ub
+                    logger.info(
+                        "AMP: OBBT tightened %d bounds in %.3fs before partitioning",
+                        obbt_result.n_tightened,
+                        obbt_result.total_lp_time,
+                    )
+        else:
+            logger.info("AMP: skipping OBBT presolve because no wall-clock budget remains")
 
     # ── Select partition variables ───────────────────────────────────────────
     if apply_partitioning:
@@ -581,10 +622,9 @@ def solve_amp(
 
         # ── Step 1: Solve MILP relaxation → lower bound ──────────────────────
         # MILP gap tolerance: no tighter than needed for overall convergence.
-        if milp_gap_tolerance is not None:
-            _milp_gap_tol = milp_gap_tolerance
-        else:
-            _milp_gap_tol = min(rel_gap / 2, 1e-3)
+        _milp_gap_tol = (
+            milp_gap_tolerance if milp_gap_tolerance is not None else min(rel_gap / 2, 1e-3)
+        )
 
         try:
             milp_result, varmap, active_oa_cuts = _solve_milp_with_oa_recovery(

@@ -1110,6 +1110,7 @@ def solve_model(
             "max_iter",
             "n_init_partitions",
             "partition_method",
+            "presolve_bt",
             "iteration_callback",
             "milp_time_limit",
             "milp_gap_tolerance",

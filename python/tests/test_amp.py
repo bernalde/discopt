@@ -99,6 +99,28 @@ def _build_nlp3() -> Model:
     return m
 
 
+def _make_obbt_demo() -> Model:
+    """Small bilinear model where linear constraints sharply tighten the box."""
+    m = Model("obbt_demo")
+    x = m.continuous("x", lb=0, ub=10)
+    y = m.continuous("y", lb=0, ub=10)
+    m.subject_to(x + y == 1)
+    m.maximize(x * y)
+    return m
+
+
+def _make_obbt_ineq_demo() -> Model:
+    """Small bilinear model that exercises OBBT's inequality extraction path."""
+    m = Model("obbt_ineq_demo")
+    x = m.continuous("x", lb=0, ub=10)
+    y = m.continuous("y", lb=0, ub=10)
+    m.subject_to(x <= 1)
+    m.subject_to(y <= 1)
+    m.subject_to(x + y >= 0.5)
+    m.maximize(x * y)
+    return m
+
+
 # ===========================================================================
 # Section 1: Nonlinear Term Classifier
 #
@@ -1233,6 +1255,36 @@ class TestCurrentCodeWeaknesses:
         assert (1.0, 1.0) in rounded  # floor on the second variable
         assert (2.0, 2.0) in rounded  # ceil on the first variable
 
+    def test_solve_model_forwards_amp_presolve_bt_option(self, monkeypatch):
+        """solve_model should pass the OBBT toggle through to solve_amp."""
+        from discopt.solver import solve_model
+        from discopt.solvers import amp as amp_mod
+
+        captured = {}
+
+        def fake_solve_amp(model, **kwargs):
+            captured.update(kwargs)
+            return SolveResult(status="optimal")
+
+        monkeypatch.setattr(amp_mod, "solve_amp", fake_solve_amp)
+
+        m = Model("forward_obbt")
+        x = m.continuous("x", lb=0, ub=1)
+        m.minimize(x)
+
+        solve_model(m, solver="amp", presolve_bt=False, time_limit=1.0)
+
+        assert captured["presolve_bt"] is False
+
+    def test_default_obbt_time_limit_per_lp_is_bounded(self):
+        """OBBT per-LP budgets should stay bounded and respect missing time."""
+        from discopt.solvers import amp as amp_mod
+
+        assert amp_mod._default_obbt_time_limit_per_lp(0.0, 2) == pytest.approx(0.0)
+        assert amp_mod._default_obbt_time_limit_per_lp(np.inf, 2) == pytest.approx(0.0)
+        assert amp_mod._default_obbt_time_limit_per_lp(100.0, 2) == pytest.approx(2.5)
+        assert amp_mod._default_obbt_time_limit_per_lp(1.0, 100) == pytest.approx(0.05)
+
     def test_best_nlp_candidate_chooses_lowest_feasible_objective(self, monkeypatch):
         """Integer rounding fallback should keep the best feasible NLP candidate."""
         from discopt.solvers import amp as amp_mod
@@ -1377,6 +1429,104 @@ class TestCurrentCodeWeaknesses:
         assert call_sizes == [4, 2]
         assert kept_cuts == [("c3", 3), ("c4", 4)]
         assert result.status == "optimal"
+
+    def test_obbt_presolve_tightens_bilinear_demo_bounds(self):
+        """OBBT should shrink the initial [0, 10]^2 box to the linear hull x + y = 1."""
+        from discopt._jax.obbt import run_obbt
+
+        result = run_obbt(_make_obbt_demo())
+
+        np.testing.assert_allclose(result.tightened_lb, np.array([0.0, 0.0]))
+        np.testing.assert_allclose(result.tightened_ub, np.array([1.0, 1.0]))
+        assert result.n_tightened >= 2
+
+    def test_obbt_presolve_tightens_inequality_demo_bounds(self):
+        """OBBT should also tighten bounds through the A_ub / b_ub extraction path."""
+        from discopt._jax.obbt import run_obbt
+
+        result = run_obbt(_make_obbt_ineq_demo())
+
+        np.testing.assert_allclose(result.tightened_lb, np.array([0.0, 0.0]))
+        np.testing.assert_allclose(result.tightened_ub, np.array([1.0, 1.0]))
+        assert result.n_tightened >= 2
+
+    def test_amp_presolve_bt_uses_tightened_partition_bounds(self, monkeypatch):
+        """AMP should initialize partitions from the OBBT-tightened bounds."""
+        import discopt._jax.discretization as disc_mod
+        from discopt._jax.obbt import ObbtResult
+        from discopt.solvers import amp as amp_mod
+
+        captured = {}
+        orig_initialize = disc_mod.initialize_partitions
+
+        def fake_run_obbt(model, lb=None, ub=None, **kwargs):
+            assert lb is not None
+            assert ub is not None
+            assert kwargs["time_limit_per_lp"] > 0.0
+            return ObbtResult(
+                tightened_lb=np.array([0.0, 0.0], dtype=np.float64),
+                tightened_ub=np.array([1.0, 1.0], dtype=np.float64),
+                n_lp_solves=4,
+                n_tightened=2,
+                total_lp_time=0.0,
+            )
+
+        def spy_initialize(part_vars, lb, ub, n_init, **kwargs):
+            captured["lb"] = list(lb)
+            captured["ub"] = list(ub)
+            return orig_initialize(part_vars, lb=lb, ub=ub, n_init=n_init, **kwargs)
+
+        def stop_after_init(*args, **kwargs):
+            raise RuntimeError("stop after initialization")
+
+        monkeypatch.setattr("discopt._jax.obbt.run_obbt", fake_run_obbt)
+        monkeypatch.setattr(disc_mod, "initialize_partitions", spy_initialize)
+        monkeypatch.setattr(amp_mod, "_solve_milp_with_oa_recovery", stop_after_init)
+
+        result = amp_mod.solve_amp(
+            _make_obbt_demo(),
+            presolve_bt=True,
+            max_iter=1,
+            time_limit=1.0,
+        )
+
+        assert result.status == "infeasible"
+        assert captured["lb"] == [0.0, 0.0]
+        assert captured["ub"] == [1.0, 1.0]
+
+    def test_amp_presolve_bt_can_reduce_iterations(self):
+        """OBBT should reduce AMP iterations on a model with loose linear bounds."""
+        m = _make_obbt_demo()
+
+        iters_without = []
+        result_without = m.solve(
+            solver="amp",
+            presolve_bt=False,
+            rel_gap=0.55,
+            max_iter=20,
+            time_limit=20,
+            iteration_callback=lambda info: iters_without.append(info["iteration"]),
+        )
+
+        iters_with = []
+        result_with = m.solve(
+            solver="amp",
+            presolve_bt=True,
+            rel_gap=0.55,
+            max_iter=20,
+            time_limit=20,
+            iteration_callback=lambda info: iters_with.append(info["iteration"]),
+        )
+
+        assert result_without.status == "optimal"
+        assert result_with.status == "optimal"
+        assert result_without.objective is not None
+        assert result_with.objective is not None
+        assert abs(result_without.objective - 0.25) <= 1e-2
+        assert abs(result_with.objective - 0.25) <= 1e-2
+        # Bound tightening is validated directly above; this guards against OBBT
+        # making the AMP loop strictly worse while staying robust to solver noise.
+        assert len(iters_with) <= len(iters_without)
 
     def test_amp_max_iter_without_gap_certificate_returns_feasible(self):
         """An incumbent without a certified gap should not be labeled optimal."""
