@@ -427,6 +427,7 @@ def solve_amp(
     disc_add_partition_method: str = "adaptive",
     disc_abs_width_tol: float = 1e-3,
     convhull_formulation: str = "disaggregated",
+    presolve_bt: bool = True,
 ) -> SolveResult:
     """Solve MINLP globally using Adaptive Multivariate Partitioning (AMP).
 
@@ -471,6 +472,8 @@ def solve_amp(
     convhull_formulation : str
         Piecewise bilinear formulation: ``"disaggregated"``, ``"sos2"``,
         ``"facet"``, or ``"lambda"`` (alias for ``"sos2"``).
+    presolve_bt : bool
+        Run LP-based OBBT before the AMP loop to tighten variable bounds.
 
     Returns
     -------
@@ -523,6 +526,26 @@ def solve_amp(
         len(terms.monomial),
         len(terms.general_nl),
     )
+
+    # Tighten the initial McCormick domain before selecting partition bounds.
+    if presolve_bt:
+        try:
+            from discopt._jax.obbt import run_obbt
+
+            obbt_result = run_obbt(
+                model,
+                lb=flat_lb.copy(),
+                ub=flat_ub.copy(),
+            )
+            if obbt_result.n_tightened > 0:
+                flat_lb = obbt_result.tightened_lb
+                flat_ub = obbt_result.tightened_ub
+                logger.info(
+                    "AMP: OBBT tightened %d bounds before partitioning",
+                    obbt_result.n_tightened,
+                )
+        except Exception as err:
+            logger.warning("AMP: OBBT presolve failed; continuing without it: %s", err)
 
     # ── Select partition variables ───────────────────────────────────────────
     if apply_partitioning:
@@ -581,10 +604,9 @@ def solve_amp(
 
         # ── Step 1: Solve MILP relaxation → lower bound ──────────────────────
         # MILP gap tolerance: no tighter than needed for overall convergence.
-        if milp_gap_tolerance is not None:
-            _milp_gap_tol = milp_gap_tolerance
-        else:
-            _milp_gap_tol = min(rel_gap / 2, 1e-3)
+        _milp_gap_tol = (
+            milp_gap_tolerance if milp_gap_tolerance is not None else min(rel_gap / 2, 1e-3)
+        )
 
         try:
             milp_result, varmap, active_oa_cuts = _solve_milp_with_oa_recovery(
