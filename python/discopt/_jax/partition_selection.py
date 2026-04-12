@@ -67,9 +67,30 @@ def _min_vertex_cover(terms: NonlinearTerms) -> list[int]:
         return greedy if greedy else candidates
 
 
+def _weighted_min_vertex_cover(
+    terms: NonlinearTerms,
+    distance: dict[int, float],
+) -> list[int]:
+    """Weighted minimum vertex cover using Alpine-style incumbent distance scores."""
+    all_t = _all_terms(terms)
+    candidates = list(terms.partition_candidates)
+
+    if not candidates or not all_t:
+        return []
+    if len(candidates) <= 2:
+        return candidates
+
+    try:
+        return _solve_vertex_cover_milp(candidates, all_t, weights=distance)
+    except Exception:
+        greedy = _greedy_vertex_cover(candidates, all_t, weights=distance)
+        return greedy if greedy else candidates
+
+
 def _solve_vertex_cover_milp(
     candidates: list[int],
     terms: list[tuple[int, ...]],
+    weights: dict[int, float] | None = None,
 ) -> list[int]:
     """Solve the minimum vertex cover as a MILP using HiGHS.
 
@@ -96,12 +117,23 @@ def _solve_vertex_cover_milp(
             if v in var_to_col:
                 A[row_idx, var_to_col[v]] = 1.0
 
-    # Objective: minimize sum(y)
-    c = np.ones(n, dtype=np.float64)
-
-    # Bounds: y ∈ [0, 1]
-    lb = np.zeros(n, dtype=np.float64)
-    ub = np.ones(n, dtype=np.float64)
+    # Objective: minimize sum(y) or a weighted cover objective.
+    if weights is None:
+        c = np.ones(n, dtype=np.float64)
+    else:
+        positive = [
+            abs(float(weights.get(v, 0.0)))
+            for v in candidates
+            if abs(float(weights.get(v, 0.0))) > 0.0
+        ]
+        heavy = 1.0 if not positive else 1.0 / min(positive)
+        c = np.array(
+            [
+                (heavy if abs(float(weights.get(v, 0.0))) <= 1e-6 else 1.0 / abs(float(weights[v])))
+                for v in candidates
+            ],
+            dtype=np.float64,
+        )
 
     # Convert A >= 1 to standard form: -A @ y <= -1
     A_le = -A
@@ -122,9 +154,7 @@ def _solve_vertex_cover_milp(
             nonzero_cols = np.array(
                 [i for i in range(n) if A_le[row_idx, i] != 0.0], dtype=np.int32
             )
-            vals = np.array(
-                [A_le[row_idx, i] for i in nonzero_cols], dtype=np.float64
-            )
+            vals = np.array([A_le[row_idx, i] for i in nonzero_cols], dtype=np.float64)
             h.addRow(-np.inf, float(b_le[row_idx]), len(nonzero_cols), nonzero_cols, vals)
 
         h.run()
@@ -141,16 +171,19 @@ def _solve_vertex_cover_milp(
         return selected
 
     except ImportError:
-        greedy = _greedy_vertex_cover(candidates, valid_terms)
+        greedy = _greedy_vertex_cover(candidates, valid_terms, weights=weights)
         return greedy if greedy else list(dict.fromkeys(candidates))
 
 
-def _greedy_vertex_cover(candidates: list[int], terms: list[tuple[int, ...]]) -> list[int]:
+def _greedy_vertex_cover(
+    candidates: list[int],
+    terms: list[tuple[int, ...]],
+    weights: dict[int, float] | None = None,
+) -> list[int]:
     """Greedy vertex cover: repeatedly pick the variable covering the most uncovered terms.
 
     O(n * m) but good approximation for small instances.
     """
-    covered = set()
     selected = []
     term_set = [set(t) for t in terms]
     n_terms = len(term_set)
@@ -159,15 +192,25 @@ def _greedy_vertex_cover(candidates: list[int], terms: list[tuple[int, ...]]) ->
     while uncovered:
         # Find variable with most coverage
         best_var = None
-        best_count = -1
+        best_score = -1.0
         for v in candidates:
             if v in selected:
                 continue
             count = sum(1 for idx in uncovered if v in term_set[idx])
-            if count > best_count:
-                best_count = count
+            if count <= 0:
+                continue
+
+            if weights is None:
+                score = float(count)
+            else:
+                dist = abs(float(weights.get(v, 0.0)))
+                weight = max(dist, 1e-6)
+                score = float(count) * weight
+
+            if score > best_score:
+                best_score = score
                 best_var = v
-        if best_var is None or best_count == 0:
+        if best_var is None or best_score <= 0.0:
             break
         selected.append(best_var)
         newly_covered = {idx for idx in uncovered if best_var in term_set[idx]}
@@ -176,7 +219,11 @@ def _greedy_vertex_cover(candidates: list[int], terms: list[tuple[int, ...]]) ->
     return selected
 
 
-def pick_partition_vars(terms: NonlinearTerms, method: str = "auto") -> list[int]:
+def pick_partition_vars(
+    terms: NonlinearTerms,
+    method: str = "auto",
+    distance: dict[int, float] | None = None,
+) -> list[int]:
     """Select variables to partition for the AMP relaxation.
 
     Parameters
@@ -188,6 +235,8 @@ def pick_partition_vars(terms: NonlinearTerms, method: str = "auto") -> list[int
         - ``"max_cover"``: all variables appearing in any nonlinear term.
         - ``"min_vertex_cover"``: minimum set covering all terms (MILP-based).
         - ``"auto"``: max_cover if ≤15 candidates, else min_vertex_cover.
+        - ``"adaptive_vertex_cover"``: Alpine-style weighted cover using incumbent
+          distances when available, else falls back to ``"auto"``.
 
     Returns
     -------
@@ -207,8 +256,13 @@ def pick_partition_vars(terms: NonlinearTerms, method: str = "auto") -> list[int
             return _max_cover(terms)
         else:
             return _min_vertex_cover(terms)
+    elif method == "adaptive_vertex_cover":
+        if len(terms.partition_candidates) <= 15 or not distance:
+            return _max_cover(terms)
+        return _weighted_min_vertex_cover(terms, distance)
     else:
         raise ValueError(
             f"Unknown variable selection method: {method!r}. "
-            "Choose from 'max_cover', 'min_vertex_cover', 'auto'."
+            "Choose from 'max_cover', 'min_vertex_cover', 'auto', "
+            "'adaptive_vertex_cover'."
         )
