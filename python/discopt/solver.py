@@ -1120,6 +1120,8 @@ def solve_model(
             "disc_add_partition_method",
             "disc_abs_width_tol",
             "convhull_formulation",
+            "convhull_ebd",
+            "convhull_ebd_encoding",
         ):
             if key in kwargs:
                 amp_kwargs[key] = kwargs.pop(key)

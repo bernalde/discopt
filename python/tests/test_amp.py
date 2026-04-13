@@ -849,6 +849,73 @@ class TestMilpRelaxation:
         assert len(info["alpha_cols"]) == 2
         assert len(info["theta_cols"]) == 3
 
+    def test_sos2_embedding_uses_logarithmic_selector_count(self):
+        """Embedded SOS2 should replace interval binaries with O(log K) selectors."""
+        m = _make_nlp1()
+        terms = self.classify(m)
+        state = self.init_partitions([0], lb=[1.0], ub=[4.0], n_init=8)
+
+        _, plain_varmap = self.build_milp(
+            m,
+            terms,
+            state,
+            incumbent=None,
+            convhull_formulation="sos2",
+        )
+        _, embedded_varmap = self.build_milp(
+            m,
+            terms,
+            state,
+            incumbent=None,
+            convhull_formulation="sos2",
+            convhull_ebd=True,
+            convhull_ebd_encoding="gray",
+        )
+
+        plain_info = plain_varmap["bilinear_lambda"][(0, 1)]
+        embedded_info = embedded_varmap["bilinear_lambda"][(0, 1)]
+        assert len(plain_info["alpha_cols"]) == 8
+        assert len(embedded_info["alpha_cols"]) == 0
+        assert len(embedded_info["embedding_cols"]) == 3
+        assert embedded_varmap["convhull_ebd"] is True
+        assert embedded_varmap["convhull_ebd_encoding"] == "gray"
+
+    def test_sos2_embedding_matches_plain_sos2_relaxation_value(self):
+        """Embedded SOS2 should preserve the λ-relaxation bound on a simple model."""
+        m = Model("embedding_compare")
+        x = m.continuous("x", lb=0, ub=2, shape=(2,))
+        m.subject_to(x[0] * x[1] >= 1.0)
+        m.minimize(x[0] + x[1])
+
+        terms = self.classify(m)
+        state = self.init_partitions([0], lb=[0.0], ub=[2.0], n_init=4)
+
+        plain_model, _ = self.build_milp(
+            m,
+            terms,
+            state,
+            incumbent=None,
+            convhull_formulation="sos2",
+        )
+        embedded_model, _ = self.build_milp(
+            m,
+            terms,
+            state,
+            incumbent=None,
+            convhull_formulation="sos2",
+            convhull_ebd=True,
+            convhull_ebd_encoding="gray",
+        )
+
+        plain_result = plain_model.solve()
+        embedded_result = embedded_model.solve()
+
+        assert plain_result.status == "optimal"
+        assert embedded_result.status == "optimal"
+        assert plain_result.objective is not None
+        assert embedded_result.objective is not None
+        assert embedded_result.objective == pytest.approx(plain_result.objective, abs=1e-6)
+
     def test_sos2_and_facet_convhull_match_on_simple_bilinear_relaxation(self):
         """SOS2 and facet λ-linking should dominate the disaggregated relaxation."""
         m = Model("lambda_compare")
@@ -910,6 +977,29 @@ class TestMilpRelaxation:
                 state,
                 incumbent=None,
                 convhull_formulation="bogus",
+            )
+
+    def test_embedding_helper_rejects_non_sos2_compatible_encoding(self):
+        """Binary counting codes are invalid for SOS2 once adjacency breaks."""
+        from discopt._jax.embedding import build_embedding_map
+
+        with pytest.raises(ValueError, match="not SOS2-compatible"):
+            build_embedding_map(5, encoding="binary")
+
+    def test_embedding_requires_sos2_formulation(self):
+        """Embedded binaries should be rejected for non-SOS2 formulations."""
+        m = _make_nlp1()
+        terms = self.classify(m)
+        state = self.init_partitions([0], lb=[1.0], ub=[4.0], n_init=2)
+
+        with pytest.raises(ValueError, match="convhull_ebd is only supported"):
+            self.build_milp(
+                m,
+                terms,
+                state,
+                incumbent=None,
+                convhull_formulation="facet",
+                convhull_ebd=True,
             )
 
 
@@ -1318,6 +1408,8 @@ class TestCurrentCodeWeaknesses:
             disc_add_partition_method="uniform",
             disc_abs_width_tol=1e-2,
             convhull_formulation="sos2",
+            convhull_ebd=True,
+            convhull_ebd_encoding="gray",
         )
 
         assert captured["rel_gap"] == pytest.approx(1e-3)
@@ -1327,6 +1419,8 @@ class TestCurrentCodeWeaknesses:
         assert captured["disc_add_partition_method"] == "uniform"
         assert captured["disc_abs_width_tol"] == pytest.approx(1e-2)
         assert captured["convhull_formulation"] == "sos2"
+        assert captured["convhull_ebd"] is True
+        assert captured["convhull_ebd_encoding"] == "gray"
 
     def test_integer_rounding_candidates_include_floor_and_ceil(self):
         """Nearest-integer rounding fallback must try floor and ceil alternatives."""
@@ -1491,8 +1585,12 @@ class TestCurrentCodeWeaknesses:
             incumbent,
             oa_cuts=None,
             convhull_formulation="disaggregated",
+            convhull_ebd=False,
+            convhull_ebd_encoding="gray",
         ):
             assert convhull_formulation == "disaggregated"
+            assert convhull_ebd is False
+            assert convhull_ebd_encoding == "gray"
             size = len(oa_cuts or [])
             call_sizes.append(size)
             status = "infeasible" if size >= 4 else "optimal"
@@ -1512,6 +1610,8 @@ class TestCurrentCodeWeaknesses:
             time_limit=1.0,
             gap_tolerance=1e-4,
             convhull_formulation="disaggregated",
+            convhull_ebd=False,
+            convhull_ebd_encoding="gray",
         )
 
         assert call_sizes == [4, 2]

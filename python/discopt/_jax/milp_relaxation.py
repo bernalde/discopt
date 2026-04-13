@@ -28,6 +28,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from discopt._jax.discretization import DiscretizationState
+from discopt._jax.embedding import EmbeddingMap, build_embedding_map
 from discopt._jax.model_utils import flat_variable_bounds
 from discopt._jax.term_classifier import (
     NonlinearTerms,
@@ -446,6 +447,8 @@ def build_milp_relaxation(
     incumbent: Optional[np.ndarray] = None,
     oa_cuts: Optional[list] = None,
     convhull_formulation: str = "disaggregated",
+    convhull_ebd: bool = False,
+    convhull_ebd_encoding: str = "gray",
 ) -> tuple["MilpRelaxationModel", dict]:
     """Build a MILP relaxation with piecewise McCormick for bilinear/monomial terms.
 
@@ -476,6 +479,11 @@ def build_milp_relaxation(
         Piecewise bilinear formulation. ``"disaggregated"`` keeps the existing
         xbar/wbar construction; ``"sos2"`` and ``"facet"`` use a λ-based
         convex-hull reformulation similar to Alpine.jl.
+    convhull_ebd : bool, default False
+        Replace SOS2 interval binaries with a logarithmic embedded encoding.
+        Only supported with ``convhull_formulation="sos2"`` or ``"lambda"``.
+    convhull_ebd_encoding : str, default "gray"
+        Embedded encoding scheme. ``"gray"`` is the Alpine-style default.
 
     Returns
     -------
@@ -486,6 +494,10 @@ def build_milp_relaxation(
     flat_lb, flat_ub = flat_variable_bounds(model)
     n_orig = len(flat_lb)
     convhull_mode = _normalize_convhull_formulation(convhull_formulation)
+    if convhull_ebd and convhull_mode != "sos2":
+        raise ValueError(
+            "convhull_ebd is only supported with convhull_formulation='sos2' or its 'lambda' alias."
+        )
 
     # ── Assign MILP column indices ──────────────────────────────────────────
     # Original variables keep columns 0..n_orig-1. Additional columns are created
@@ -611,6 +623,8 @@ def build_milp_relaxation(
             lambda_cols: list[int] = []
             alpha_cols: list[int] = []
             theta_cols: list[int] = []
+            embedding_cols: list[int] = []
+            embedding_info: Optional[EmbeddingMap] = None
             theta_lb = min(0.0, float(other_lb), float(other_ub))
             theta_ub = max(0.0, float(other_lb), float(other_ub))
 
@@ -620,11 +634,22 @@ def build_milp_relaxation(
                 integrality_flags.append(0)
                 col_idx += 1
 
-            for _ in range(len(breakpoints) - 1):
-                alpha_cols.append(col_idx)
-                all_bounds.append((0.0, 1.0))
-                integrality_flags.append(1)
-                col_idx += 1
+            if convhull_mode == "sos2" and convhull_ebd and len(breakpoints) > 2:
+                embedding_info = build_embedding_map(
+                    len(breakpoints),
+                    encoding=convhull_ebd_encoding,
+                )
+                for _ in range(embedding_info["bit_count"]):
+                    embedding_cols.append(col_idx)
+                    all_bounds.append((0.0, 1.0))
+                    integrality_flags.append(1)
+                    col_idx += 1
+            else:
+                for _ in range(len(breakpoints) - 1):
+                    alpha_cols.append(col_idx)
+                    all_bounds.append((0.0, 1.0))
+                    integrality_flags.append(1)
+                    col_idx += 1
 
             for _ in breakpoints:
                 theta_cols.append(col_idx)
@@ -639,6 +664,8 @@ def build_milp_relaxation(
                 "lambda_cols": lambda_cols,
                 "alpha_cols": alpha_cols,
                 "theta_cols": theta_cols,
+                "embedding_cols": embedding_cols,
+                "embedding_info": embedding_info,
                 "mode": convhull_mode,
             }
 
@@ -673,6 +700,8 @@ def build_milp_relaxation(
             lambda_cols = list(lambda_info["lambda_cols"])
             alpha_cols = list(lambda_info["alpha_cols"])
             theta_cols = list(lambda_info["theta_cols"])
+            embedding_cols = list(lambda_info.get("embedding_cols", []))
+            embedding_info = lambda_info.get("embedding_info")
             mode = str(lambda_info["mode"])
             yj_lb, yj_ub = [float(v) for v in all_bounds[other_var]]
 
@@ -682,11 +711,12 @@ def build_milp_relaxation(
             _add_row(row_sum_lambda, -1.0)
             _add_row(-row_sum_lambda, 1.0)
 
-            row_sum_alpha = np.zeros(n_total)
-            for alpha_col in alpha_cols:
-                row_sum_alpha[alpha_col] = -1.0
-            _add_row(row_sum_alpha, -1.0)
-            _add_row(-row_sum_alpha, 1.0)
+            if alpha_cols:
+                row_sum_alpha = np.zeros(n_total)
+                for alpha_col in alpha_cols:
+                    row_sum_alpha[alpha_col] = -1.0
+                _add_row(row_sum_alpha, -1.0)
+                _add_row(-row_sum_alpha, 1.0)
 
             row_x = np.zeros(n_total)
             row_x[part_var] = 1.0
@@ -709,7 +739,24 @@ def build_milp_relaxation(
             _add_row(row_w, 0.0)
             _add_row(-row_w, 0.0)
 
-            if mode == "sos2":
+            if mode == "sos2" and embedding_info is not None:
+                for bit_col, positive_set, negative_set in zip(
+                    embedding_cols,
+                    embedding_info["positive_sets"],
+                    embedding_info["negative_sets"],
+                ):
+                    row = np.zeros(n_total)
+                    for lambda_idx in positive_set:
+                        row[lambda_cols[lambda_idx]] = 1.0
+                    row[bit_col] = -1.0
+                    _add_row(row, 0.0)
+
+                    row = np.zeros(n_total)
+                    for lambda_idx in negative_set:
+                        row[lambda_cols[lambda_idx]] = 1.0
+                    row[bit_col] = 1.0
+                    _add_row(row, 1.0)
+            elif mode == "sos2":
                 for idx, lambda_col in enumerate(lambda_cols):
                     row = np.zeros(n_total)
                     row[lambda_col] = 1.0
@@ -1046,6 +1093,8 @@ def build_milp_relaxation(
         "bilinear_pw": bilinear_pw_map,
         "bilinear_lambda": bilinear_lambda_map,
         "convhull_formulation": convhull_mode,
+        "convhull_ebd": convhull_ebd,
+        "convhull_ebd_encoding": convhull_ebd_encoding,
     }
 
     return milp_model, varmap

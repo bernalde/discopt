@@ -263,6 +263,8 @@ def _solve_milp_with_oa_recovery(
     time_limit: Optional[float],
     gap_tolerance: float,
     convhull_formulation: str,
+    convhull_ebd: bool,
+    convhull_ebd_encoding: str,
 ):
     """Retry MILP solves after dropping the oldest half of OA cuts on infeasibility."""
     from discopt._jax.milp_relaxation import build_milp_relaxation
@@ -280,6 +282,8 @@ def _solve_milp_with_oa_recovery(
             incumbent,
             oa_cuts=active_oa_cuts,
             convhull_formulation=convhull_formulation,
+            convhull_ebd=convhull_ebd,
+            convhull_ebd_encoding=convhull_ebd_encoding,
         )
         milp_result = milp_model.solve(
             time_limit=time_limit,
@@ -438,6 +442,8 @@ def solve_amp(
     disc_add_partition_method: str = "adaptive",
     disc_abs_width_tol: float = 1e-3,
     convhull_formulation: str = "disaggregated",
+    convhull_ebd: bool = False,
+    convhull_ebd_encoding: str = "gray",
     presolve_bt: bool = True,
 ) -> SolveResult:
     """Solve MINLP globally using Adaptive Multivariate Partitioning (AMP).
@@ -483,6 +489,10 @@ def solve_amp(
     convhull_formulation : str
         Piecewise bilinear formulation: ``"disaggregated"``, ``"sos2"``,
         ``"facet"``, or ``"lambda"`` (alias for ``"sos2"``).
+    convhull_ebd : bool
+        Replace SOS2 interval binaries with an embedded logarithmic encoding.
+    convhull_ebd_encoding : str
+        Embedded encoding scheme for the SOS2 formulation.
     presolve_bt : bool
         Run LP-based OBBT before the AMP loop to tighten variable bounds.
 
@@ -516,6 +526,8 @@ def solve_amp(
 
     partition_mode = _normalize_partition_method(partition_method, disc_var_pick)
     convhull_mode = _normalize_convhull_formulation(convhull_formulation)
+    if convhull_ebd and convhull_mode != "sos2":
+        raise ValueError("convhull_ebd requires convhull_formulation='sos2' or the 'lambda' alias.")
 
     def _to_minimization_space(value: float) -> float:
         return -float(value) if maximize else float(value)
@@ -636,6 +648,8 @@ def solve_amp(
                 time_limit=milp_tl,
                 gap_tolerance=_milp_gap_tol,
                 convhull_formulation=convhull_mode,
+                convhull_ebd=convhull_ebd,
+                convhull_ebd_encoding=convhull_ebd_encoding,
             )
             oa_cuts = active_oa_cuts
         except Exception as e:
