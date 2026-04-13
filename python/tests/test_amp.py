@@ -121,6 +121,24 @@ def _make_obbt_ineq_demo() -> Model:
     return m
 
 
+def _make_trilinear_cover() -> Model:
+    """Simple trilinear problem with a known AM-GM optimum of 3."""
+    m = Model("trilinear_cover")
+    x = m.continuous("x", lb=0, ub=2, shape=(3,))
+    m.subject_to(x[0] * x[1] * x[2] >= 1.0)
+    m.minimize(x[0] + x[1] + x[2])
+    return m
+
+
+def _make_quartic_objective_demo() -> Model:
+    """Univariate quartic objective whose MILP lower bound should tighten with refinement."""
+    m = Model("quartic_objective")
+    x = m.continuous("x", lb=0, ub=2)
+    m.subject_to(x >= 1.0)
+    m.minimize(x**4)
+    return m
+
+
 # ===========================================================================
 # Section 1: Nonlinear Term Classifier
 #
@@ -895,6 +913,66 @@ class TestMilpRelaxation:
             )
 
 
+class TestAmpPhase4Coverage:
+    """Regression coverage for trilinear and higher-order monomial relaxations."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from discopt._jax.discretization import initialize_partitions
+        from discopt._jax.milp_relaxation import (
+            _odd_mixed_tangent_is_valid,
+            build_milp_relaxation,
+        )
+        from discopt._jax.term_classifier import classify_nonlinear_terms
+
+        self.build_milp = build_milp_relaxation
+        self.classify = classify_nonlinear_terms
+        self.init_partitions = initialize_partitions
+        self.is_valid_odd_tangent = _odd_mixed_tangent_is_valid
+
+    def test_trilinear_milp_builds_nested_auxiliaries(self):
+        """Trilinear terms should be modeled through explicit lifted auxiliaries."""
+        m = _make_trilinear_cover()
+        terms = self.classify(m)
+        state = self.init_partitions([0, 1, 2], lb=[0.0, 0.0, 0.0], ub=[2.0, 2.0, 2.0], n_init=2)
+
+        milp_model, varmap = self.build_milp(m, terms, state, incumbent=None)
+        result = milp_model.solve()
+
+        assert (0, 1, 2) in varmap["trilinear"]
+        stage = varmap["trilinear_stages"][(0, 1, 2)]
+        assert stage["product_col"] == varmap["trilinear"][(0, 1, 2)]
+        assert result.status == "optimal"
+        assert result.objective is not None
+        assert 0.0 < result.objective <= 3.0 + 1e-6
+
+    def test_quartic_relaxation_tightens_with_finer_partitions(self):
+        """Breakpoint tangents should tighten n>2 monomial objectives as partitions refine."""
+        m = _make_quartic_objective_demo()
+        terms = self.classify(m)
+        lbs = []
+
+        for n_init in [1, 2, 4, 8]:
+            state = self.init_partitions([0], lb=[0.0], ub=[2.0], n_init=n_init)
+            milp_model, _ = self.build_milp(m, terms, state, incumbent=None)
+            result = milp_model.solve()
+            assert result.status == "optimal"
+            assert result.objective is not None
+            lbs.append(float(result.objective))
+
+        for i in range(len(lbs) - 1):
+            assert lbs[i] <= lbs[i + 1] + 1e-8
+        assert lbs[0] < 0.2
+        assert lbs[-1] >= 0.999
+
+    def test_mixed_sign_odd_tangent_filter_keeps_only_global_supporting_lines(self):
+        """Only tangents that stay valid on the full mixed-sign box should be used."""
+        assert self.is_valid_odd_tangent(0.5, -0.5, 0.5, 5, "under") is True
+        assert self.is_valid_odd_tangent(-0.5, -0.5, 0.5, 5, "over") is True
+        assert self.is_valid_odd_tangent(0.1, -1.0, 0.1, 5, "under") is False
+        assert self.is_valid_odd_tangent(-0.1, -0.1, 1.0, 5, "over") is False
+
+
 class TestAmpPhase1Helpers:
     """Fast regression tests for Phase 1 helper behavior."""
 
@@ -966,6 +1044,16 @@ class TestAmpEndToEnd:
         assert abs(result.objective - CIRCLE_OPTIMUM) <= 1e-3, (
             f"Objective {result.objective:.6f} too far from √2={CIRCLE_OPTIMUM}"
         )
+
+    @pytest.mark.smoke
+    def test_trilinear_global_optimum(self):
+        """A simple AM-GM trilinear instance should converge to the global optimum 3."""
+        m = _make_trilinear_cover()
+        result = m.solve(solver="amp", rel_gap=1e-3, time_limit=60)
+        assert result.status == "optimal"
+        assert result.gap_certified is True
+        assert result.objective is not None
+        assert abs(result.objective - 3.0) <= 1e-3
 
     @pytest.mark.slow
     @pytest.mark.timeout(300)
