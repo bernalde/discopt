@@ -4,12 +4,15 @@ Plan phases:
 - 9 MINLPTests integration
 - 10 Performance and polish
 
-Primary files:
-- `python/tests/test_minlptests.py`
-- `python/tests/data/known_failures.toml`
-- `discopt_benchmarks/benchmarks/problems/minlptests_problems.py`
-- `python/discopt/solvers/amp.py`
-- `docs/notebooks/amp_global_optimization.ipynb`
+Repository touchpoints for this phase:
+- `python/tests/test_minlptests.py` (existing)
+- `python/tests/data/known_failures.toml` (existing)
+- `discopt_benchmarks/benchmarks/problems/minlptests_problems.py` (existing)
+- `python/discopt/solvers/amp.py` (existing)
+- `docs/notebooks/amp_global_optimization.ipynb` (to be added)
+
+This planning PR only adds the scoped checklist. The files above are the
+expected implementation touchpoints on top of the current AMP line.
 
 Exit criteria:
 - AMP is registered in the MINLPTests infrastructure with tracked known failures.

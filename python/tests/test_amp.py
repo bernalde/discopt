@@ -1506,6 +1506,36 @@ class TestCurrentCodeWeaknesses:
         assert (1.0, 1.0) in rounded  # floor on the second variable
         assert (2.0, 2.0) in rounded  # ceil on the first variable
 
+    def test_integer_rounding_candidates_respect_max_candidates(self):
+        """The fallback candidate list should stay bounded by max_candidates."""
+        from discopt.solvers import amp as amp_mod
+
+        m = Model("rounding_cap")
+        m.binary("y", shape=(100,))
+        x0 = np.full(100, 0.49, dtype=np.float64)
+
+        candidates = amp_mod._integer_rounding_candidates(x0, m, max_candidates=64)
+
+        assert len(candidates) == 64
+        assert tuple(float(v) for v in candidates[0]) == tuple(0.0 for _ in range(100))
+
+    def test_build_fixed_integer_bounds_clamps_to_integer_domain(self):
+        """Rounded fixed bounds should stay within the realizable integer domain."""
+        from discopt.solvers import amp as amp_mod
+
+        m = Model("fixed_bounds_clamp")
+        m.integer("y", lb=0.2, ub=2.6)
+
+        nlp_lb, nlp_ub = amp_mod._build_fixed_integer_bounds(
+            np.array([2.6], dtype=np.float64),
+            m,
+            flat_lb=np.array([0.2], dtype=np.float64),
+            flat_ub=np.array([2.6], dtype=np.float64),
+        )
+
+        assert nlp_lb[0] == pytest.approx(2.0)
+        assert nlp_ub[0] == pytest.approx(2.0)
+
     def test_solve_model_forwards_amp_presolve_bt_option(self, monkeypatch):
         """solve_model should pass the OBBT toggle through to solve_amp."""
         from discopt.solver import solve_model

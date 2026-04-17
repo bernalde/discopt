@@ -177,7 +177,7 @@ def _integer_rounding_candidates(
         if key not in seen:
             seen.add(key)
             deduped.append(cand)
-    return deduped
+    return deduped[:max_candidates]
 
 
 def _round_integers(x: np.ndarray, model: Model) -> np.ndarray:
@@ -203,7 +203,11 @@ def _build_fixed_integer_bounds(
             for k in range(v.size):
                 idx = offset + k
                 val = float(np.clip(x[idx], v_lb[k], v_ub[k]))
-                rounded = round(val)
+                rounded = int(round(val))
+                lo_i = int(np.ceil(v_lb[k] - 1e-9))
+                hi_i = int(np.floor(v_ub[k] + 1e-9))
+                if lo_i <= hi_i:
+                    rounded = min(max(rounded, lo_i), hi_i)
                 nlp_lb[idx] = rounded
                 nlp_ub[idx] = rounded
         offset += v.size
@@ -530,9 +534,6 @@ def solve_amp(
     convhull_mode = _normalize_convhull_formulation(convhull_formulation)
     if convhull_ebd and convhull_mode != "sos2":
         raise ValueError("convhull_ebd requires convhull_formulation='sos2' or the 'lambda' alias.")
-
-    def _to_minimization_space(value: float) -> float:
-        return -float(value) if maximize else float(value)
 
     def _from_minimization_space(value: float) -> float:
         return -float(value) if maximize else float(value)
