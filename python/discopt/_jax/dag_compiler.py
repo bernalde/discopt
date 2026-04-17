@@ -3,6 +3,19 @@ DAG Compiler: Expression tree -> jax.numpy callable.
 
 Walks the Expression DAG defined in discopt.modeling.core and produces a pure
 jax.numpy function that is jax.jit and jax.grad compatible.
+
+Two entry-point families are provided:
+
+* ``compile_expression`` / ``compile_objective`` / ``compile_constraint`` return
+  ``fn(x_flat)``. Parameter values are snapshotted at compile time (legacy
+  behavior; kept for callers that do not rebuild between solves).
+
+* ``compile_expression_params`` / ``compile_objective_params`` /
+  ``compile_constraint_params`` return ``fn(x_flat, params)`` where ``params``
+  is a tuple of jax arrays aligned with ``model._parameters``. The JIT trace
+  depends only on shapes, so mutating ``Parameter.value`` between calls hits
+  the XLA cache instead of forcing a recompile. Use this for reusable
+  evaluators (e.g., NMPC closed-loop solves).
 """
 
 from __future__ import annotations
@@ -37,17 +50,17 @@ def _compute_var_offset(var: Variable, model: Model) -> int:
     return offset
 
 
-def _compile_node(expr: Expression, model: Model) -> Callable:
+def _compile_node(expr: Expression, model: Model, param_index: dict) -> Callable:
     """
-    Recursively compile an Expression node into a function f(x_flat) -> value.
+    Recursively compile an Expression node into a function f(x_flat, params) -> value.
 
-    Each returned function takes a single 1D jax array (the flat variable vector)
-    and returns a jax scalar or array.
+    ``params`` is a tuple of jax arrays aligned with ``model._parameters``;
+    ``param_index`` maps ``id(parameter)`` to its position in that tuple.
     """
     if isinstance(expr, Constant):
         val = jnp.array(expr.value)
 
-        def fn(x_flat):
+        def fn(x_flat, params):
             return val
 
         return fn
@@ -58,70 +71,70 @@ def _compile_node(expr: Expression, model: Model) -> Callable:
         shape = expr.shape
         if shape == () or (len(shape) == 1 and shape[0] == 1 and shape == ()):
             # Scalar variable: single slot
-            def fn(x_flat):
+            def fn(x_flat, params):
                 return x_flat[offset]
 
             return fn
         else:
             # Array variable: slice and reshape
-            def fn(x_flat, _offset=offset, _size=size, _shape=shape):
+            def fn(x_flat, params, _offset=offset, _size=size, _shape=shape):
                 return x_flat[_offset : _offset + _size].reshape(_shape)
 
             return fn
 
     if isinstance(expr, Parameter):
-        val = jnp.array(expr.value)
+        idx = param_index[id(expr)]
 
-        def fn(x_flat):
-            return val
+        def fn(x_flat, params, _i=idx):
+            return params[_i]
 
         return fn
 
     if isinstance(expr, BinaryOp):
-        left_fn = _compile_node(expr.left, model)
-        right_fn = _compile_node(expr.right, model)
+        left_fn = _compile_node(expr.left, model, param_index)
+        right_fn = _compile_node(expr.right, model, param_index)
         op = expr.op
         if op == "+":
 
-            def fn(x_flat):
-                return left_fn(x_flat) + right_fn(x_flat)
+            def fn(x_flat, params):
+                return left_fn(x_flat, params) + right_fn(x_flat, params)
         elif op == "-":
 
-            def fn(x_flat):
-                return left_fn(x_flat) - right_fn(x_flat)
+            def fn(x_flat, params):
+                return left_fn(x_flat, params) - right_fn(x_flat, params)
         elif op == "*":
 
-            def fn(x_flat):
-                return left_fn(x_flat) * right_fn(x_flat)
+            def fn(x_flat, params):
+                return left_fn(x_flat, params) * right_fn(x_flat, params)
         elif op == "/":
 
-            def fn(x_flat):
-                return left_fn(x_flat) / right_fn(x_flat)
+            def fn(x_flat, params):
+                return left_fn(x_flat, params) / right_fn(x_flat, params)
         elif op == "**":
 
-            def fn(x_flat):
-                return left_fn(x_flat) ** right_fn(x_flat)
+            def fn(x_flat, params):
+                return left_fn(x_flat, params) ** right_fn(x_flat, params)
         else:
             raise ValueError(f"Unknown binary operator: {op!r}")
         return fn
 
     if isinstance(expr, UnaryOp):
-        operand_fn = _compile_node(expr.operand, model)
+        operand_fn = _compile_node(expr.operand, model, param_index)
         op = expr.op
         if op == "neg":
 
-            def fn(x_flat):
-                return -operand_fn(x_flat)
+            def fn(x_flat, params):
+                return -operand_fn(x_flat, params)
         elif op == "abs":
 
-            def fn(x_flat):
-                return jnp.abs(operand_fn(x_flat))
+            def fn(x_flat, params):
+                return jnp.abs(operand_fn(x_flat, params))
         else:
             raise ValueError(f"Unknown unary operator: {op!r}")
         return fn
 
     if isinstance(expr, FunctionCall):
-        arg_fns = [_compile_node(a, model) for a in expr.args]
+        arg_fns = [_compile_node(a, model, param_index) for a in expr.args]
         name = expr.func_name
 
         # Single-argument functions
@@ -155,84 +168,133 @@ def _compile_node(expr: Expression, model: Model) -> Callable:
             jax_fn = _unary_funcs[name]
             a_fn = arg_fns[0]
 
-            def fn(x_flat, _jax_fn=jax_fn, _a_fn=a_fn):
-                return _jax_fn(_a_fn(x_flat))
+            def fn(x_flat, params, _jax_fn=jax_fn, _a_fn=a_fn):
+                return _jax_fn(_a_fn(x_flat, params))
 
             return fn
 
         if name == "min":
             a_fn, b_fn = arg_fns[0], arg_fns[1]
 
-            def fn(x_flat):
-                return jnp.minimum(a_fn(x_flat), b_fn(x_flat))
+            def fn(x_flat, params):
+                return jnp.minimum(a_fn(x_flat, params), b_fn(x_flat, params))
 
             return fn
 
         if name == "max":
             a_fn, b_fn = arg_fns[0], arg_fns[1]
 
-            def fn(x_flat):
-                return jnp.maximum(a_fn(x_flat), b_fn(x_flat))
+            def fn(x_flat, params):
+                return jnp.maximum(a_fn(x_flat, params), b_fn(x_flat, params))
 
             return fn
 
         if name == "prod":
             a_fn = arg_fns[0]
 
-            def fn(x_flat):
-                return jnp.prod(a_fn(x_flat))
+            def fn(x_flat, params):
+                return jnp.prod(a_fn(x_flat, params))
 
             return fn
 
         if name == "norm2":
             a_fn = arg_fns[0]
 
-            def fn(x_flat):
-                return jnp.linalg.norm(a_fn(x_flat), ord=2)
+            def fn(x_flat, params):
+                return jnp.linalg.norm(a_fn(x_flat, params), ord=2)
 
             return fn
 
         raise ValueError(f"Unknown function: {name!r}")
 
     if isinstance(expr, IndexExpression):
-        base_fn = _compile_node(expr.base, model)
+        base_fn = _compile_node(expr.base, model, param_index)
         idx = expr.index
 
-        def fn(x_flat, _idx=idx):
-            return base_fn(x_flat)[_idx]
+        def fn(x_flat, params, _idx=idx):
+            return base_fn(x_flat, params)[_idx]
 
         return fn
 
     if isinstance(expr, MatMulExpression):
-        left_fn = _compile_node(expr.left, model)
-        right_fn = _compile_node(expr.right, model)
+        left_fn = _compile_node(expr.left, model, param_index)
+        right_fn = _compile_node(expr.right, model, param_index)
 
-        def fn(x_flat):
-            return left_fn(x_flat) @ right_fn(x_flat)
+        def fn(x_flat, params):
+            return left_fn(x_flat, params) @ right_fn(x_flat, params)
 
         return fn
 
     if isinstance(expr, SumExpression):
-        operand_fn = _compile_node(expr.operand, model)
+        operand_fn = _compile_node(expr.operand, model, param_index)
         axis = expr.axis
 
-        def fn(x_flat, _axis=axis):
-            return jnp.sum(operand_fn(x_flat), axis=_axis)
+        def fn(x_flat, params, _axis=axis):
+            return jnp.sum(operand_fn(x_flat, params), axis=_axis)
 
         return fn
 
     if isinstance(expr, SumOverExpression):
-        term_fns = [_compile_node(t, model) for t in expr.terms]
+        term_fns = [_compile_node(t, model, param_index) for t in expr.terms]
 
-        def fn(x_flat):
-            result = term_fns[0](x_flat)
+        def fn(x_flat, params):
+            result = term_fns[0](x_flat, params)
             for t_fn in term_fns[1:]:
-                result = result + t_fn(x_flat)
+                result = result + t_fn(x_flat, params)
             return result
 
         return fn
 
     raise TypeError(f"Unhandled expression type: {type(expr).__name__}")
+
+
+def _build_param_index(model: Model) -> dict:
+    """Map ``id(Parameter)`` to its position in ``model._parameters``."""
+    return {id(p): i for i, p in enumerate(model._parameters)}
+
+
+def _snapshot_params(model: Model) -> tuple:
+    """Snapshot current parameter values as a tuple of jax arrays."""
+    return tuple(jnp.asarray(p.value) for p in model._parameters)
+
+
+# ---------------------------------------------------------------------------
+# Param-aware entry points: returned callables take (x_flat, params).
+# ---------------------------------------------------------------------------
+
+
+def compile_expression_params(
+    expr: Expression, model: Model, param_index: dict | None = None
+) -> Callable:
+    """Compile an Expression DAG into ``fn(x_flat, params)``.
+
+    ``params`` is a tuple of jax arrays aligned with ``model._parameters``.
+    The JIT trace is parameter-value-agnostic, so the XLA cache is hit across
+    repeated solves that only mutate ``Parameter.value``.
+    """
+    if param_index is None:
+        param_index = _build_param_index(model)
+    return _compile_node(expr, model, param_index)
+
+
+def compile_objective_params(model: Model, param_index: dict | None = None) -> Callable:
+    """Compile the model's objective into ``fn(x_flat, params) -> scalar``."""
+    if model._objective is None:
+        raise ValueError("Model has no objective set.")
+    return compile_expression_params(model._objective.expression, model, param_index)
+
+
+def compile_constraint_params(
+    constraint: Constraint, model: Model, param_index: dict | None = None
+) -> Callable:
+    """Compile a constraint body into ``fn(x_flat, params) -> scalar/array``."""
+    return compile_expression_params(constraint.body, model, param_index)
+
+
+# ---------------------------------------------------------------------------
+# Legacy entry points: returned callables take (x_flat) and snapshot parameter
+# values at compile time. Preserved for callers that rebuild per solve.
+# ---------------------------------------------------------------------------
 
 
 def compile_expression(expr: Expression, model: Model) -> Callable:
@@ -246,11 +308,19 @@ def compile_expression(expr: Expression, model: Model) -> Callable:
     Returns:
         A function f(x_flat) -> scalar/array where x_flat is a 1D jax array
         containing all variable values concatenated in model._variables order.
-        Parameters use their current .value during compilation.
+        Parameter values are snapshotted at compile time; mutate
+        ``Parameter.value`` and recompile to pick up changes, or use
+        :func:`compile_expression_params` to thread parameters at call time.
 
     The returned function is compatible with jax.jit, jax.grad, and jax.vmap.
     """
-    return _compile_node(expr, model)
+    inner = compile_expression_params(expr, model)
+    snapshot = _snapshot_params(model)
+
+    def fn(x_flat):
+        return inner(x_flat, snapshot)
+
+    return fn
 
 
 def compile_objective(model: Model) -> Callable:

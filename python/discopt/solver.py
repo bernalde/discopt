@@ -154,9 +154,40 @@ class _AugmentedEvaluator:
         return augmented_con
 
 
+def _evaluator_fingerprint(model: Model) -> tuple:
+    """Structural fingerprint of a model for evaluator-cache validity.
+
+    Captures identity of the objective, constraints, variables, and parameters.
+    Mutating ``Parameter.value`` does NOT change the fingerprint, so repeated
+    solves that only rebind parameter values reuse the same JITed callables
+    and hit the XLA cache.
+    """
+    return (
+        id(model._objective),
+        tuple(id(c) for c in model._constraints),
+        tuple(id(v) for v in model._variables),
+        tuple(id(p) for p in model._parameters),
+    )
+
+
 def _make_evaluator(model: Model):
-    """Create the appropriate evaluator for the model."""
-    return NLPEvaluator(model)
+    """Create or reuse a cached NLPEvaluator for the model.
+
+    The first call builds a fresh ``NLPEvaluator`` (which JITs obj/grad/hess/
+    cons/jac/lag_hess). Subsequent calls return the same evaluator as long as
+    the model's structural fingerprint is unchanged, so the underlying jit
+    objects (and their XLA caches) are preserved across solves. Parameter
+    value changes are threaded through at call time as a runtime pytree.
+    """
+    fingerprint = _evaluator_fingerprint(model)
+    cached = getattr(model, "_nlp_evaluator_cache", None)
+    if cached is not None:
+        ev, cached_fp = cached
+        if cached_fp == fingerprint:
+            return ev
+    ev = NLPEvaluator(model)
+    model._nlp_evaluator_cache = (ev, fingerprint)
+    return ev
 
 
 def _estimate_alpha_fd(evaluator, lb, ub, n_samples=30):
@@ -449,30 +480,42 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
     return lb, ub
 
 
-def _infer_constraint_bounds(model: Model):
+def _infer_constraint_bounds(model: Model, evaluator=None):
     """Infer (cl, cu) arrays from model constraint senses.
 
     The NLPEvaluator compiles constraints as `body - rhs`, so:
       - '<=' constraints: body - rhs <= 0 => cl = -inf, cu = 0
       - '==' constraints: body - rhs == 0 => cl = 0, cu = 0
       - '>=' constraints: body - rhs >= 0 => cl = 0, cu = inf
+
+    If an ``evaluator`` is passed, its per-constraint flat sizes are used
+    to expand each source Constraint's bounds to ``flat_size`` rows so
+    vector-valued bodies (e.g. DAEBuilder's vectorized collocation
+    residuals) line up with cyipopt's row count. Without an evaluator,
+    each source Constraint contributes one row (legacy scalar behavior).
     """
     cl_list = []
     cu_list = []
+    sizes = None
+    if evaluator is not None and hasattr(evaluator, "_constraint_flat_sizes"):
+        sizes = evaluator._constraint_flat_sizes
+
+    k = 0
     for c in model._constraints:
         if not isinstance(c, Constraint):
             continue
         if c.sense == "<=":
-            cl_list.append(-1e20)
-            cu_list.append(0.0)
+            lo, hi = -1e20, 0.0
         elif c.sense == "==":
-            cl_list.append(0.0)
-            cu_list.append(0.0)
+            lo, hi = 0.0, 0.0
         elif c.sense == ">=":
-            cl_list.append(0.0)
-            cu_list.append(1e20)
+            lo, hi = 0.0, 1e20
         else:
             raise ValueError(f"Unknown constraint sense: {c.sense}")
+        n = int(sizes[k]) if sizes is not None else 1
+        cl_list.extend([lo] * n)
+        cu_list.extend([hi] * n)
+        k += 1
 
     return cl_list, cu_list
 
@@ -554,7 +597,12 @@ def _solve_root_node_multistart_ipm(
     """
     import jax.numpy as jnp
 
-    from discopt._jax.ipm import IPMOptions, solve_nlp_batch
+    from discopt._jax.ipm import (
+        IPMOptions,
+        _jax_feasibility_restoration,
+        ipm_solve,
+        solve_nlp_batch,
+    )
     from discopt.solvers import NLPResult
 
     starting_points = _generate_starting_points(node_lb, node_ub, n_random=n_random)
@@ -591,8 +639,11 @@ def _solve_root_node_multistart_ipm(
     x_vals = np.asarray(state.x)  # (n_starts, n_vars)
 
     # Mask: converged == 1 (optimal), 2 (acceptable), 3 (iter limit), or 4 (stalled).
-    # Code 5 (infeasible) is excluded.
-    feasible_mask = (converged == 1) | (converged == 2) | (converged == 3) | (converged == 4)
+    # Code 5 (infeasible) is excluded. NaN objectives are also excluded —
+    # they indicate IPM divergence (e.g. log of negative argument).
+    feasible_mask = (
+        (converged == 1) | (converged == 2) | (converged == 3) | (converged == 4)
+    ) & np.isfinite(obj_vals)
 
     if np.any(feasible_mask):
         # Among feasible, pick the one with lowest objective
@@ -604,7 +655,45 @@ def _solve_root_node_multistart_ipm(
             objective=float(obj_vals[best_idx]),
         )
     else:
-        # All failed
+        # All starts infeasible or NaN — attempt feasibility restoration.
+        if con_fn is not None and g_l_jax is not None:
+            xl_jax = jnp.array(node_lb, dtype=jnp.float64)
+            xu_jax = jnp.array(node_ub, dtype=jnp.float64)
+            for i in range(n_starts):
+                if converged[i] == 5:
+                    try:
+                        x_restored, rest_ok = _jax_feasibility_restoration(
+                            con_fn,
+                            jnp.asarray(x_vals[i]),
+                            xl_jax,
+                            xu_jax,
+                            g_l_jax,
+                            g_u_jax,
+                            ipm_opts,
+                        )
+                    except Exception:
+                        continue
+                    if rest_ok:
+                        try:
+                            state_i = ipm_solve(
+                                obj_fn,
+                                con_fn,
+                                x_restored,
+                                xl_jax,
+                                xu_jax,
+                                g_l_jax,
+                                g_u_jax,
+                                ipm_opts,
+                            )
+                        except Exception:
+                            continue
+                        conv_i = int(state_i.converged)
+                        if conv_i in (1, 2, 3, 4):
+                            return NLPResult(
+                                status=SolveStatus.OPTIMAL,
+                                x=np.asarray(state_i.x),
+                                objective=float(state_i.obj),
+                            )
         return NLPResult(
             status=SolveStatus.ERROR,
             x=x_vals[0],
@@ -631,7 +720,12 @@ def _solve_node_multistart_ipm(
     """
     import jax.numpy as jnp
 
-    from discopt._jax.ipm import IPMOptions, solve_nlp_batch
+    from discopt._jax.ipm import (
+        IPMOptions,
+        _jax_feasibility_restoration,
+        ipm_solve,
+        solve_nlp_batch,
+    )
     from discopt.solvers import NLPResult
 
     n_vars = len(node_lb)
@@ -675,7 +769,7 @@ def _solve_node_multistart_ipm(
     obj_vals = np.asarray(state.obj)
     x_vals = np.asarray(state.x)
 
-    feasible_mask = (converged == 1) | (converged == 2) | (converged == 3)
+    feasible_mask = ((converged == 1) | (converged == 2) | (converged == 3)) & np.isfinite(obj_vals)
 
     if np.any(feasible_mask):
         masked_obj = np.where(feasible_mask, obj_vals, np.inf)
@@ -686,6 +780,45 @@ def _solve_node_multistart_ipm(
             objective=float(obj_vals[best_idx]),
         )
     else:
+        # All starts infeasible — attempt feasibility restoration.
+        if con_fn is not None and g_l_jax is not None:
+            xl_jax = jnp.array(node_lb, dtype=jnp.float64)
+            xu_jax = jnp.array(node_ub, dtype=jnp.float64)
+            for i in range(n_starts):
+                if converged[i] == 5:
+                    try:
+                        x_restored, rest_ok = _jax_feasibility_restoration(
+                            con_fn,
+                            jnp.asarray(x_vals[i]),
+                            xl_jax,
+                            xu_jax,
+                            g_l_jax,
+                            g_u_jax,
+                            ipm_opts,
+                        )
+                    except Exception:
+                        continue
+                    if rest_ok:
+                        try:
+                            state_i = ipm_solve(
+                                obj_fn,
+                                con_fn,
+                                x_restored,
+                                xl_jax,
+                                xu_jax,
+                                g_l_jax,
+                                g_u_jax,
+                                ipm_opts,
+                            )
+                        except Exception:
+                            continue
+                        conv_i = int(state_i.converged)
+                        if conv_i in (1, 2, 3):
+                            return NLPResult(
+                                status=SolveStatus.OPTIMAL,
+                                x=np.asarray(state_i.x),
+                                objective=float(state_i.obj),
+                            )
         return NLPResult(
             status=SolveStatus.ERROR,
             x=x_vals[0],
@@ -1011,6 +1144,7 @@ def solve_model(
     incumbent_callback=None,
     node_callback=None,
     solver: Optional[str] = None,
+    use_highs_milp: bool = True,
     **kwargs,
 ) -> SolveResult:
     """
@@ -1259,6 +1393,10 @@ def solve_model(
         elif problem_class == ProblemClass.QP:
             return _solve_qp(model, t_start)
         elif problem_class == ProblemClass.MILP:
+            if use_highs_milp:
+                highs_result = _solve_milp_highs(model, t_start, time_limit, gap_tolerance)
+                if highs_result is not None:
+                    return highs_result
             return _solve_milp_bb(
                 model,
                 time_limit,
@@ -1369,7 +1507,7 @@ def solve_model(
     jax_time += time.perf_counter() - t_jax_start
 
     # --- Infer constraint bounds ---
-    cl_list, cu_list = _infer_constraint_bounds(model)
+    cl_list, cu_list = _infer_constraint_bounds(model, evaluator)
     constraint_bounds = list(zip(cl_list, cu_list)) if cl_list else None
 
     # Pre-compute constraint bounds as JAX arrays for batch IPM
@@ -1608,7 +1746,7 @@ def solve_model(
                 _active_gl,
                 _active_gu,
                 batch_psols=batch_psols,
-                multistart=not _model_is_convex,
+                multistart=True,  # IPM needs multistart even for convex models
             )
             # Constraint feasibility post-check for batch IPM results.
             # When the IPM solution violates constraints (e.g. due to hitting
@@ -1771,7 +1909,7 @@ def solve_model(
                         lb_clipped = np.clip(node_lb, -_SPC, _SPC)
                         ub_clipped = np.clip(node_ub, -_SPC, _SPC)
                         x0 = 0.5 * (lb_clipped + ub_clipped)
-                    if not _model_is_convex and _use_ipm_batch:
+                    if _use_ipm_batch:
                         nlp_result = _solve_node_multistart_ipm(
                             _active_evaluator,
                             x0,
@@ -1877,6 +2015,10 @@ def solve_model(
                             "Node %d: NLP solution violates constraints, marking infeasible",
                             int(batch_ids[i]),
                         )
+                    # Guard: NaN lower bounds corrupt the Rust B&B tree
+                    # (NaN comparisons always return False in IEEE 754).
+                    if not np.isfinite(nlp_lb):
+                        nlp_lb = _INFEASIBILITY_SENTINEL
                     result_lbs[i] = nlp_lb
                     result_sols[i] = nlp_result.x
                     result_feas[i] = False
@@ -2203,6 +2345,16 @@ def _solve_continuous(
     initial_point: Optional[np.ndarray] = None,
 ) -> SolveResult:
     """Solve a purely continuous model directly with NLP solver (no B&B)."""
+    # Single-NLP solves need reliable KKT convergence. The pure-JAX IPM's
+    # acceptable-tolerance check only covers bound complementarity, so on
+    # problems with unbounded variables and inequality constraints it can
+    # terminate at a non-KKT point and report OPTIMAL (false optimality).
+    # B&B subproblems tolerate this because the tree catches it, but single
+    # solves don't, so promote the default ipm -> ipopt here. Users who
+    # explicitly requested ipm/ripopt/sparse_ipm still get what they asked for.
+    if nlp_solver == "ipm":
+        nlp_solver = "ipopt"
+
     t_jax_start = time.perf_counter()
     evaluator = _make_evaluator(model)
     jax_time = time.perf_counter() - t_jax_start
@@ -2215,6 +2367,22 @@ def _solve_continuous(
         logger.info("Using warm-start point for continuous NLP")
     else:
         x0 = 0.5 * (lb_clipped + ub_clipped)
+        # Variables that are effectively unbounded on both sides collapse
+        # to midpoint 0 above. Zero is a stationary point of periodic
+        # functions (sin, cos) and other even functions, so single-start
+        # local NLP gets stuck at a local max (e.g. cos(0) = 1). Nudge
+        # unbounded coordinates to 0.5 so first-order methods can pick a
+        # descent direction and escape the pathological start.
+        fully_unbounded = (lb <= -_BOUND_WARN_THRESHOLD) & (ub >= _BOUND_WARN_THRESHOLD)
+        x0 = np.where(fully_unbounded, 0.5, x0)
+        # On problems with one-sided large bounds (e.g. x >= 1e-5 with no
+        # upper bound), the midpoint of the clipped [-_SPC, _SPC] range
+        # lands at ~50, which sends exp/log NLPs into overflow territory
+        # and crashes ipopt. Tighten the starting-point range to keep
+        # initial iterates in a numerically safe zone while still
+        # respecting actual bounds.
+        _X0_CLIP = 10.0
+        x0 = np.clip(x0, np.maximum(lb, -_X0_CLIP), np.minimum(ub, _X0_CLIP))
 
     opts = dict(ipopt_options) if ipopt_options else {}
     opts.setdefault("print_level", 0)
@@ -2371,7 +2539,7 @@ def _solve_nlp_bb(
     jax_time += time.perf_counter() - t_jax_start
 
     # --- Infer constraint bounds ---
-    cl_list, cu_list = _infer_constraint_bounds(model)
+    cl_list, cu_list = _infer_constraint_bounds(model, evaluator)
     constraint_bounds = list(zip(cl_list, cu_list)) if cl_list else None
 
     g_l_jax = None
@@ -2454,7 +2622,7 @@ def _solve_nlp_bb(
                 g_l_jax,
                 g_u_jax,
                 batch_psols=batch_psols,
-                multistart=not _model_is_convex,
+                multistart=True,  # IPM needs multistart even for convex models
             )
             # Constraint feasibility post-check
             if cl_list:
@@ -2552,6 +2720,9 @@ def _solve_nlp_bb(
                                 break
                         if not sol_is_int_feas:
                             nlp_lb = -np.inf
+                    # Guard: NaN lower bounds corrupt the Rust B&B tree.
+                    if not np.isfinite(nlp_lb):
+                        nlp_lb = _INFEASIBILITY_SENTINEL
                     result_lbs[i] = nlp_lb
                     result_sols[i] = nlp_result.x
                     result_feas[i] = False
@@ -2863,8 +3034,55 @@ def _solve_node_nlp_ipm(
         return NLPResult(status=SolveStatus.ERROR, x=x0, objective=_INFEASIBILITY_SENTINEL)
 
     conv = int(state.converged)
+
+    obj_val = float(state.obj)
+    x_sol = np.asarray(state.x)
+    needs_recovery = conv == 5 or not np.isfinite(obj_val) or np.any(~np.isfinite(x_sol))
+
+    # Feasibility restoration: when the IPM declares infeasible or diverges
+    # to NaN, try to find a feasible point via restoration, then re-solve.
+    if needs_recovery and con_fn is not None and g_l is not None and g_u is not None:
+        from discopt._jax.ipm import _jax_feasibility_restoration
+
+        x_rest_start = x0_jax if np.any(~np.isfinite(x_sol)) else state.x
+        for _rest_attempt in range(3):
+            try:
+                x_restored, rest_ok = _jax_feasibility_restoration(
+                    con_fn,
+                    x_rest_start,
+                    x_l,
+                    x_u,
+                    g_l,
+                    g_u,
+                    ipm_opts,
+                )
+            except Exception:
+                break
+            if not rest_ok:
+                break
+            try:
+                state = ipm_solve(
+                    obj_fn,
+                    con_fn,
+                    x_restored,
+                    x_l,
+                    x_u,
+                    g_l,
+                    g_u,
+                    ipm_opts,
+                )
+            except Exception:
+                break
+            conv = int(state.converged)
+            obj_val = float(state.obj)
+            x_sol = np.asarray(state.x)
+            if conv != 5 and np.isfinite(obj_val) and np.all(np.isfinite(x_sol)):
+                break
+            x_rest_start = x0_jax if np.any(~np.isfinite(x_sol)) else state.x
+
     # Check wall-time limit post-hoc (issue #5). The JIT-compiled
     # jax.lax.while_loop cannot check wall clock mid-iteration.
+    wall_time = time.perf_counter() - t0
     exceeded_time = max_wall_time is not None and wall_time > max_wall_time
     if conv in (1, 2) and not exceeded_time:
         status = SolveStatus.OPTIMAL
@@ -2875,10 +3093,18 @@ def _solve_node_nlp_ipm(
     else:
         status = SolveStatus.ERROR
 
+    # Final NaN guard — if restoration also failed, mark as error.
+    if not np.isfinite(obj_val) or np.any(~np.isfinite(x_sol)):
+        return NLPResult(
+            status=SolveStatus.ERROR,
+            x=x0,
+            objective=_INFEASIBILITY_SENTINEL,
+        )
+
     return NLPResult(
         status=status,
-        x=np.asarray(state.x),
-        objective=float(state.obj),
+        x=x_sol,
+        objective=obj_val,
     )
 
 
@@ -2903,7 +3129,12 @@ def _solve_batch_ipm(
     """
     import jax.numpy as jnp
 
-    from discopt._jax.ipm import IPMOptions, solve_nlp_batch
+    from discopt._jax.ipm import (
+        IPMOptions,
+        _jax_feasibility_restoration,
+        ipm_solve,
+        solve_nlp_batch,
+    )
 
     n_batch = len(batch_ids)
     obj_fn = evaluator._obj_fn
@@ -2997,11 +3228,51 @@ def _solve_batch_ipm(
         result_sols = result_x  # already writable np.array
     else:
         conv_mask = (converged == 1) | (converged == 2) | (converged == 3) | (converged == 4)
+        ok_mask = conv_mask & np.isfinite(obj_vals)
         result_lbs = np.asarray(
-            np.where(conv_mask & np.isfinite(obj_vals), obj_vals, _INFEASIBILITY_SENTINEL),
+            np.where(ok_mask, obj_vals, _INFEASIBILITY_SENTINEL),
             dtype=np.float64,
         )
         result_sols = np.array(x_vals, dtype=np.float64)  # writable copy
+
+        # Restoration: for failed nodes (NaN or code 5), try to recover
+        # a feasible point via restoration and re-solve individually.
+        failed_indices = np.where(~ok_mask)[0]
+        if len(failed_indices) > 0 and con_fn is not None and g_l_jax is not None:
+            for idx in failed_indices:
+                x_start = x0_batch[idx] if not np.all(np.isfinite(x_vals[idx])) else x_vals[idx]
+                try:
+                    x_restored, rest_ok = _jax_feasibility_restoration(
+                        con_fn,
+                        x_start,
+                        xl_batch[idx] if xl_batch.ndim == 2 else xl_batch,
+                        xu_batch[idx] if xu_batch.ndim == 2 else xu_batch,
+                        g_l_jax,
+                        g_u_jax,
+                        ipm_opts,
+                    )
+                except Exception:
+                    continue
+                if rest_ok:
+                    try:
+                        state_i = ipm_solve(
+                            obj_fn,
+                            con_fn,
+                            x_restored,
+                            xl_batch[idx] if xl_batch.ndim == 2 else xl_batch,
+                            xu_batch[idx] if xu_batch.ndim == 2 else xu_batch,
+                            g_l_jax,
+                            g_u_jax,
+                            ipm_opts,
+                        )
+                    except Exception:
+                        continue
+                    conv_i = int(state_i.converged)
+                    obj_i = float(state_i.obj)
+                    x_i = np.asarray(state_i.x)
+                    if conv_i in (1, 2, 3, 4) and np.isfinite(obj_i) and np.all(np.isfinite(x_i)):
+                        result_lbs[idx] = obj_i
+                        result_sols[idx] = x_i
 
     result_ids = np.array(batch_ids, dtype=np.int64)
     result_feas = np.zeros(n_batch, dtype=bool)  # Let Rust check integrality
@@ -3088,6 +3359,58 @@ def _solve_node_nlp_ipopt(
 # ---------------------------------------------------------------------------
 
 
+def _decompose_eq_slack_form(
+    A_eq_full: np.ndarray,
+    b_eq_full: np.ndarray,
+    n_orig: int,
+    n_slack: int,
+) -> tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
+    """Reconstruct (A_ub, b_ub, A_eq, b_eq) from an equality-plus-slack form.
+
+    `extract_lp_data` / `extract_qp_data` convert inequalities to equalities
+    with non-negative slacks. Rows whose slack column is nonzero are the
+    original inequalities; rows with no slack are true equalities. This
+    helper projects back to inequality/equality form over the original
+    variables so HiGHS LP/MILP/QP solvers can consume it.
+    """
+    if A_eq_full.shape[0] == 0:
+        return None, None, None, None
+
+    eq_rows: list[np.ndarray] = []
+    eq_rhs: list[float] = []
+    ub_rows: list[np.ndarray] = []
+    ub_rhs: list[float] = []
+
+    for i in range(A_eq_full.shape[0]):
+        slack_part = A_eq_full[i, n_orig:]
+        has_slack = n_slack > 0 and np.any(np.abs(slack_part) > 1e-15)
+        if has_slack:
+            slack_idx = np.argmax(np.abs(slack_part))
+            slack_coef = slack_part[slack_idx]
+            orig_row = A_eq_full[i, :n_orig]
+            rhs = b_eq_full[i]
+            if slack_coef > 0:
+                ub_rows.append(orig_row)
+                ub_rhs.append(rhs)
+            else:
+                ub_rows.append(-orig_row)
+                ub_rhs.append(-rhs)
+        else:
+            eq_rows.append(A_eq_full[i, :n_orig])
+            eq_rhs.append(b_eq_full[i])
+
+    A_ub = np.array(ub_rows, dtype=np.float64) if ub_rows else None
+    b_ub = np.array(ub_rhs, dtype=np.float64) if ub_rows else None
+    A_eq = np.array(eq_rows, dtype=np.float64) if eq_rows else None
+    b_eq = np.array(eq_rhs, dtype=np.float64) if eq_rows else None
+    return A_ub, b_ub, A_eq, b_eq
+
+
 def _solve_lp(model: Model, t_start: float) -> SolveResult:
     """Solve an LP using the pure-JAX LP IPM (no NLP evaluator needed)."""
     from discopt._jax.lp_ipm import lp_ipm_solve
@@ -3166,49 +3489,11 @@ def _solve_qp_highs(
         )
     )
 
-    # Extract constraint matrices from the equality-form representation.
-    # extract_qp_data converts inequalities to equalities with slacks,
-    # so we reconstruct inequality/equality constraints.
     n_total = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
     A_eq_full = np.asarray(qp_data.A_eq)
     b_eq_full = np.asarray(qp_data.b_eq)
-
-    A_ub = None
-    b_ub = None
-    A_eq = None
-    b_eq = None
-
-    if A_eq_full.shape[0] > 0:
-        eq_rows = []
-        eq_rhs = []
-        ub_rows = []
-        ub_rhs = []
-
-        for i in range(A_eq_full.shape[0]):
-            slack_part = A_eq_full[i, n_orig:]
-            has_slack = np.any(np.abs(slack_part) > 1e-15)
-            if has_slack and n_slack > 0:
-                slack_idx = np.argmax(np.abs(slack_part))
-                slack_coef = slack_part[slack_idx]
-                orig_row = A_eq_full[i, :n_orig]
-                rhs = b_eq_full[i]
-                if slack_coef > 0:
-                    ub_rows.append(orig_row)
-                    ub_rhs.append(rhs)
-                else:
-                    ub_rows.append(-orig_row)
-                    ub_rhs.append(-rhs)
-            else:
-                eq_rows.append(A_eq_full[i, :n_orig])
-                eq_rhs.append(b_eq_full[i])
-
-        if ub_rows:
-            A_ub = np.array(ub_rows, dtype=np.float64)
-            b_ub = np.array(ub_rhs, dtype=np.float64)
-        if eq_rows:
-            A_eq = np.array(eq_rows, dtype=np.float64)
-            b_eq = np.array(eq_rhs, dtype=np.float64)
+    A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
     # Build integrality array for MIQP
     integrality = None
@@ -3253,7 +3538,7 @@ def _solve_qp_highs(
         if model._objective.sense == ObjectiveSense.MAXIMIZE:
             obj_val = -obj_val
 
-        return SolveResult(
+        sr = SolveResult(
             status="optimal",
             objective=obj_val,
             bound=obj_val,
@@ -3265,10 +3550,103 @@ def _solve_qp_highs(
             jax_time=0.0,
             python_time=wall_time,
         )
+        # A detected QP with PSD Q is a convex problem solved directly without
+        # B&B -- semantically the same as the convex NLP fast path.
+        if integrality is None:
+            sr.convex_fast_path = True
+        return sr
     elif result.status == SolveStatus.INFEASIBLE:
         return SolveResult(status="infeasible", wall_time=wall_time)
     elif result.status == SolveStatus.TIME_LIMIT:
         return SolveResult(status="time_limit", wall_time=wall_time)
+
+    return None
+
+
+def _solve_milp_highs(
+    model: Model,
+    t_start: float,
+    time_limit: float | None = None,
+    gap_tolerance: float = 1e-4,
+) -> SolveResult | None:
+    """Solve a MILP using HiGHS MIP. Returns None if HiGHS is unavailable."""
+    try:
+        from discopt.solvers.milp_highs import solve_milp as _highs_solve_milp
+    except ImportError:
+        return None
+
+    from discopt._jax.problem_classifier import extract_lp_data
+    from discopt.modeling.core import ObjectiveSense
+    from discopt.solvers import SolveStatus
+
+    lp_data = extract_lp_data(model)
+    n_orig = sum(v.size for v in model._variables)
+
+    bounds = list(
+        zip(
+            np.asarray(lp_data.x_l[:n_orig]).tolist(),
+            np.asarray(lp_data.x_u[:n_orig]).tolist(),
+        )
+    )
+
+    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    n_slack = n_total - n_orig
+    A_eq_full = np.asarray(lp_data.A_eq)
+    b_eq_full = np.asarray(lp_data.b_eq)
+    A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
+
+    int_arr = np.zeros(n_orig, dtype=np.int32)
+    offset = 0
+    for v in model._variables:
+        if v.var_type in (VarType.BINARY, VarType.INTEGER):
+            int_arr[offset : offset + v.size] = 1
+        offset += v.size
+
+    c_orig = np.asarray(lp_data.c[:n_orig])
+
+    try:
+        result = _highs_solve_milp(
+            c=c_orig,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds,
+            integrality=int_arr,
+            time_limit=time_limit,
+            gap_tolerance=gap_tolerance,
+        )
+    except Exception as e:
+        logger.debug("HiGHS MILP solve failed: %s", e)
+        return None
+
+    wall_time = time.perf_counter() - t_start
+
+    assert model._objective is not None
+    sense = model._objective.sense
+
+    if result.status == SolveStatus.OPTIMAL:
+        assert result.x is not None and result.objective is not None
+        x_flat = result.x[:n_orig]
+        obj_val = result.objective + lp_data.obj_const
+        if sense == ObjectiveSense.MAXIMIZE:
+            obj_val = -obj_val
+        return SolveResult(
+            status="optimal",
+            objective=obj_val,
+            bound=obj_val,
+            gap=result.gap if result.gap is not None else 0.0,
+            x=_unpack_solution(model, x_flat),
+            wall_time=wall_time,
+            node_count=result.node_count,
+            rust_time=0.0,
+            jax_time=0.0,
+            python_time=wall_time,
+        )
+    elif result.status == SolveStatus.INFEASIBLE:
+        return SolveResult(status="infeasible", wall_time=wall_time, node_count=result.node_count)
+    elif result.status == SolveStatus.TIME_LIMIT:
+        return SolveResult(status="time_limit", wall_time=wall_time, node_count=result.node_count)
 
     return None
 
@@ -3310,7 +3688,7 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
     else:
         status = "error"
 
-    return SolveResult(
+    sr = SolveResult(
         status=status,
         objective=obj_val,
         bound=obj_val if status == "optimal" else None,
@@ -3322,6 +3700,9 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
         jax_time=jax_time,
         python_time=wall_time - jax_time,
     )
+    # QP dispatch only reaches this function for detected convex QPs.
+    sr.convex_fast_path = True
+    return sr
 
 
 def _solve_milp_bb(

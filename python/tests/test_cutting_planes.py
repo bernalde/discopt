@@ -159,46 +159,20 @@ class TestRLTCutsWithAuxiliary:
 
 
 class TestRLTCutsWithoutAuxiliary:
-    """Test RLT cuts expressed only in original variables (no w)."""
+    """RLT cuts need an auxiliary variable; without one, none are generated."""
 
-    def test_generates_four_cuts(self):
+    def test_no_cuts_without_w_index(self):
         bt = BilinearTerm(i=0, j=1)
         lb = np.array([1.0, 2.0])
         ub = np.array([3.0, 5.0])
-        cuts = generate_rlt_cuts(bt, lb, ub, n_vars=2)
-        assert len(cuts) == 4
+        assert generate_rlt_cuts(bt, lb, ub, n_vars=2) == []
 
-    def test_envelope_bounds_product(self):
-        """Without auxiliary, the cuts bound the bilinear product at any point."""
+    def test_separation_returns_empty_without_w_index(self):
         bt = BilinearTerm(i=0, j=1)
-        lb = np.array([1.0, 2.0])
-        ub = np.array([4.0, 6.0])
-        cuts = generate_rlt_cuts(bt, lb, ub, n_vars=2)
-
-        key = jax.random.PRNGKey(7)
-        k1, k2 = jax.random.split(key)
-        xi = np.asarray(1.0 + 3.0 * jax.random.uniform(k1, (N_POINTS,), dtype=jnp.float64))
-        xj = np.asarray(2.0 + 4.0 * jax.random.uniform(k2, (N_POINTS,), dtype=jnp.float64))
-        product = xi * xj
-
-        # Without auxiliary, the "<=" cuts give underestimators of the product
-        # and ">=" cuts give overestimators.
-        le_cuts = [c for c in cuts if c.sense == "<="]
-        ge_cuts = [c for c in cuts if c.sense == ">="]
-
-        for k in range(N_POINTS):
-            x = np.array([xi[k], xj[k]])
-            # Each underestimator: coeffs @ x <= rhs should mean
-            # the linear combination is an underestimator of the product
-            for cut in le_cuts:
-                linear_val = np.dot(cut.coeffs, x)
-                # linear_val <= product (underestimator form)
-                assert linear_val - cut.rhs <= product[k] + TOL
-
-            for cut in ge_cuts:
-                linear_val = np.dot(cut.coeffs, x)
-                # linear_val - rhs >= product (overestimator form)
-                assert linear_val - cut.rhs >= product[k] - TOL
+        lb = np.array([0.1, 0.1])
+        ub = np.array([5.0, 5.0])
+        x_sol = np.array([2.0, 1.0])
+        assert separate_rlt_cuts(bt, x_sol, lb, ub, n_vars=2) == []
 
 
 class TestRLTSeparation:

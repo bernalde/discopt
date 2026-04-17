@@ -25,7 +25,24 @@ solvers
     NLP solver backends: ripopt (Rust IPM), pure-JAX IPM (vmap batch), cyipopt (Ipopt).
 """
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
+
+# Enable JAX 64-bit mode before any downstream discopt import triggers a
+# jax import. IPOPT tolerances (default tol=1e-6, bound_relax_factor=1e-8)
+# are incompatible with float32 residuals — silent truncation to float32
+# causes NMPC failures and parameter-array warnings. Users who need float32
+# can opt out by setting ``JAX_ENABLE_X64=0`` in the environment before
+# importing discopt.
+import os as _os
+
+if _os.environ.get("JAX_ENABLE_X64", "1") != "0":
+    _os.environ.setdefault("JAX_ENABLE_X64", "1")
+    try:
+        import jax as _jax
+
+        _jax.config.update("jax_enable_x64", True)
+    except ImportError:
+        pass
 
 from discopt.callbacks import (
     CallbackContext as CallbackContext,

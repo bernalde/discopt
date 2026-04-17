@@ -55,25 +55,36 @@ def _make_sparse_nonlinear_model(n: int = 60):
 
 
 class TestNLPEvaluatorSmall:
-    """Small model: should use dense structure (below threshold)."""
+    """Small model: sparsity pattern is still reported even though the
+    problem is below the compressed-evaluation threshold. Values are
+    evaluated densely and projected onto the pattern."""
 
-    def test_has_sparse_structure_false(self):
+    def test_has_sparse_structure_true_when_pattern_exists(self):
+        """A nonempty model has a sparsity pattern available."""
         ev = NLPEvaluator(_make_small_model())
-        assert not ev.has_sparse_structure()
+        assert ev.has_sparse_structure()
 
-    def test_jacobian_structure_dense(self):
+    def test_small_model_does_not_use_compressed_eval(self):
+        """But the compressed-JVP evaluation path is not triggered for
+        small/moderately-dense problems — the density threshold gates it."""
+        ev = NLPEvaluator(_make_small_model())
+        assert not ev._use_compressed_eval()
+
+    def test_jacobian_structure_matches_pattern(self):
+        """Structure is the true nonzero pattern: 5 entries (not 6).
+        Constraints: x0+x1+x2<=10 (3 nnz), x0*x1<=5 (2 nnz, x2 absent)."""
         ev = NLPEvaluator(_make_small_model())
         rows, cols = ev.jacobian_structure()
-        n, m = ev.n_variables, ev.n_constraints
-        assert len(rows) == m * n
-        assert len(cols) == m * n
+        assert len(rows) == 5
+        assert len(cols) == 5
 
-    def test_hessian_structure_dense(self):
+    def test_hessian_structure_matches_pattern(self):
+        """Lower-triangle Hessian nonzeros for
+        obj=x0^2+x1^2+x2^2 with x0*x1 bilinear in a constraint:
+        diagonal (0,0),(1,1),(2,2) plus bilinear (1,0)."""
         ev = NLPEvaluator(_make_small_model())
         rows, cols = ev.hessian_structure()
-        n = ev.n_variables
-        expected_nnz = n * (n + 1) // 2
-        assert len(rows) == expected_nnz
+        assert len(rows) == 4
 
     def test_jacobian_values_match_dense(self):
         ev = NLPEvaluator(_make_small_model())

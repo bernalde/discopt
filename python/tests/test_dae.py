@@ -301,8 +301,14 @@ class TestCollocationODE:
         np.testing.assert_allclose(A_vals, A_exact, atol=1e-4)
 
     def test_constraint_count(self):
-        """Verify the number of collocation + continuity constraints."""
+        """Verify the number of collocation + continuity equations.
+
+        DAEBuilder emits one vector-valued Constraint per state/continuity
+        block, so we count the total number of flat scalar equations via the
+        NLPEvaluator (which is also what the NLP solver sees).
+        """
         import discopt.modeling as dm
+        from discopt._jax.nlp_evaluator import NLPEvaluator
         from discopt.dae import ContinuousSet, DAEBuilder
 
         m = dm.Model("count")
@@ -310,16 +316,15 @@ class TestCollocationODE:
         dae = DAEBuilder(m, cs)
         dae.add_state("x", initial=0.0)
         dae.set_ode(lambda t, s, a, c: {"x": 1.0})
-
-        n_before = len(m._constraints)
         dae.discretize()
-        n_after = len(m._constraints)
+        m.minimize(0 * dae.get_state("x")[0, 0])
 
+        evaluator = NLPEvaluator(m)
         n_collocation = 5 * 3 * 1  # nfe * ncp * n_states = 15
         n_continuity = (5 - 1) * 1  # (nfe - 1) * n_states = 4
         expected = n_collocation + n_continuity
-        assert n_after - n_before == expected, (
-            f"Expected {expected} constraints, got {n_after - n_before}"
+        assert evaluator.n_constraints == expected, (
+            f"Expected {expected} flat equations, got {evaluator.n_constraints}"
         )
 
     def test_convergence_order(self):

@@ -79,9 +79,10 @@ def generate_rlt_cuts(
       - Two underestimator inequalities (w >= ...)
       - Two overestimator inequalities (w <= ...)
 
-    If bilinear_term.w_index is None, the cuts are expressed in the
-    original variable space by separating the bilinear contribution
-    (suitable for use as violated-cut separation in the LP relaxation).
+    Requires an auxiliary variable (``bilinear_term.w_index``) representing
+    the product. Without one, there is no sound way to encode the envelopes
+    as linear constraints in the original variable space, so this function
+    returns an empty list.
 
     Args:
         bilinear_term: BilinearTerm describing which variables are multiplied.
@@ -90,7 +91,7 @@ def generate_rlt_cuts(
         n_vars: total number of variables (including any auxiliaries).
 
     Returns:
-        List of four LinearCut objects.
+        List of four LinearCut objects, or [] if ``w_index`` is None.
     """
     i = bilinear_term.i
     j = bilinear_term.j
@@ -135,34 +136,15 @@ def generate_rlt_cuts(
         coeffs[w_idx] = 1.0
         cuts.append(LinearCut(coeffs=coeffs, rhs=-xi_lb * xj_ub, sense="<="))
     else:
-        # Cuts without auxiliary: express as separation inequalities.
-        # For a point x*, the bilinear term x[i]*x[j] is linearized by
-        # replacing x[i]*x[j] with the McCormick envelopes. The four
-        # cuts bound the bilinear product using only x[i] and x[j].
-        #
-        # Underestimator 1: x[i]*x[j] >= xi_lb*x[j] + xj_lb*x[i] - xi_lb*xj_lb
-        coeffs = np.zeros(n_vars, dtype=np.float64)
-        coeffs[i] = xj_lb
-        coeffs[j] = xi_lb
-        cuts.append(LinearCut(coeffs=coeffs, rhs=xi_lb * xj_lb, sense="<="))
-
-        # Underestimator 2: x[i]*x[j] >= xi_ub*x[j] + xj_ub*x[i] - xi_ub*xj_ub
-        coeffs = np.zeros(n_vars, dtype=np.float64)
-        coeffs[i] = xj_ub
-        coeffs[j] = xi_ub
-        cuts.append(LinearCut(coeffs=coeffs, rhs=xi_ub * xj_ub, sense="<="))
-
-        # Overestimator 1: x[i]*x[j] <= xi_ub*x[j] + xj_lb*x[i] - xi_ub*xj_lb
-        coeffs = np.zeros(n_vars, dtype=np.float64)
-        coeffs[i] = xj_lb
-        coeffs[j] = xi_ub
-        cuts.append(LinearCut(coeffs=coeffs, rhs=xi_ub * xj_lb, sense=">="))
-
-        # Overestimator 2: x[i]*x[j] <= xi_lb*x[j] + xj_ub*x[i] - xi_lb*xj_ub
-        coeffs = np.zeros(n_vars, dtype=np.float64)
-        coeffs[i] = xj_ub
-        coeffs[j] = xi_lb
-        cuts.append(LinearCut(coeffs=coeffs, rhs=xi_lb * xj_ub, sense=">="))
+        # Without an auxiliary variable w = x[i]*x[j], the McCormick envelopes
+        # cannot be expressed as valid linear inequalities on (x[i], x[j]) alone
+        # — the bilinear product is intrinsic to each envelope. Any "cut"
+        # generated purely in the original variable space would be unsound
+        # (e.g. with x,y in [0.1,5], the underestimator rearranges to
+        # 0.1*x + 0.1*y <= 0.01, which excludes every feasible point). Callers
+        # that want bilinear relaxations must introduce an auxiliary variable
+        # and set ``w_index`` accordingly.
+        return []
 
     return cuts
 

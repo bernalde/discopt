@@ -1067,9 +1067,9 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "ripopt"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09db916a3dd0c64c14c2952b377296157b537f80da3753758e4a46a59f255b87"
+checksum = "525c58b66d2e05c6e99dc6b0598288b38d5f8cf295f5940e812a1cd5850d1c6c"
 dependencies = [
  "env_logger",
  "faer",
@@ -1081,11 +1081,12 @@ dependencies = [
 
 [[package]]
 name = "rmumps"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "514a798c9a81dec2c1394589d661e99dc5c95ae7813dbf89c8eaac0ffd8f76bc"
+checksum = "cf79c819201aea6aeed6acb8aa275f7c0bb822a7b22d1ba089921a61507e9cc5"
 dependencies = [
  "amd",
+ "faer",
  "rayon",
 ]
 

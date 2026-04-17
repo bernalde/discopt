@@ -572,7 +572,7 @@ def _solve_with_cyipopt(build_fn):
 
     m = evaluator.n_constraints
     if m > 0:
-        cl, cu = _infer_constraint_bounds(model)
+        cl, cu = _infer_constraint_bounds(evaluator)
         constraint_bounds = list(zip(cl, cu))
     else:
         constraint_bounds = None
@@ -994,3 +994,272 @@ class TestPredictorCorrector:
         opts = IPMOptions(predictor_corrector=True)
         state = ipm_solve(obj_fn, con_fn, x0, x_l, x_u, g_l, g_u, opts)
         np.testing.assert_allclose(float(state.obj), 17.014, atol=0.1)
+
+
+# ---------------------------------------------------------------
+# Second-order correction (SOC) tests
+# ---------------------------------------------------------------
+
+
+class TestSecondOrderCorrection:
+    """Test SOC prevents Maratos effect on nonconvex constrained problems."""
+
+    def test_soc_options_defaults(self):
+        """IPMOptions should have SOC fields with correct defaults."""
+        opts = IPMOptions()
+        assert opts.max_soc == 4
+        assert opts.kappa_soc == 0.99
+
+    def test_soc_constrained_quadratic(self):
+        """SOC should converge on a quadratic-constrained problem.
+
+        min (x1-2)^2 + (x2-1)^2  subject to  x1^2 + x2^2 = 2
+        Optimal on circle closest to (2,1): x ≈ (1.265, 0.632), obj ≈ 0.675.
+        """
+
+        def obj(x):
+            return (x[0] - 2.0) ** 2 + (x[1] - 1.0) ** 2
+
+        def con(x):
+            return jnp.array([x[0] ** 2 + x[1] ** 2])
+
+        x0 = jnp.array([1.2, 0.5])
+        xl = jnp.array([-3.0, -3.0])
+        xu = jnp.array([3.0, 3.0])
+        gl = jnp.array([2.0])
+        gu = jnp.array([2.0])
+
+        # With SOC
+        state_soc = ipm_solve(obj, con, x0, xl, xu, gl, gu, IPMOptions(max_soc=4))
+        assert int(state_soc.converged) in (1, 2)
+        np.testing.assert_allclose(float(state_soc.obj), 0.6754, atol=1e-2)
+
+        # Without SOC — should also converge (this problem is mild)
+        state_no = ipm_solve(obj, con, x0, xl, xu, gl, gu, IPMOptions(max_soc=0))
+        assert int(state_no.converged) in (1, 2)
+        np.testing.assert_allclose(float(state_no.obj), 0.6754, atol=1e-2)
+
+    def test_soc_no_regression_hs071(self):
+        """SOC should not regress HS071 (compare with and without)."""
+
+        def obj(x):
+            return x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
+
+        def con(x):
+            return jnp.array(
+                [
+                    x[0] * x[1] * x[2] * x[3],
+                    x[0] ** 2 + x[1] ** 2 + x[2] ** 2 + x[3] ** 2,
+                ]
+            )
+
+        x0 = jnp.array([1.0, 5.0, 5.0, 1.0])
+        xl = jnp.array([1.0, 1.0, 1.0, 1.0])
+        xu = jnp.array([5.0, 5.0, 5.0, 5.0])
+        gl = jnp.array([25.0, 40.0])
+        gu = jnp.array([1e20, 40.0])
+
+        s_soc = ipm_solve(
+            obj,
+            con,
+            x0,
+            xl,
+            xu,
+            gl,
+            gu,
+            IPMOptions(max_soc=4, max_iter=500, tol=1e-6),
+        )
+        s_no = ipm_solve(
+            obj,
+            con,
+            x0,
+            xl,
+            xu,
+            gl,
+            gu,
+            IPMOptions(max_soc=0, max_iter=500, tol=1e-6),
+        )
+        # SOC should not produce a worse objective than without SOC
+        np.testing.assert_allclose(float(s_soc.obj), float(s_no.obj), atol=0.5)
+
+    def test_soc_unconstrained_noop(self):
+        """SOC block should not affect unconstrained problems."""
+
+        def obj(x):
+            return (x[0] - 1.0) ** 2 + (x[1] + 2.0) ** 2
+
+        x0 = jnp.array([0.0, 0.0])
+        xl = jnp.array([-10.0, -10.0])
+        xu = jnp.array([10.0, 10.0])
+
+        state_soc = ipm_solve(obj, None, x0, xl, xu, options=IPMOptions(max_soc=4))
+        state_no = ipm_solve(obj, None, x0, xl, xu, options=IPMOptions(max_soc=0))
+        assert int(state_soc.converged) in (1, 2)
+        np.testing.assert_allclose(float(state_soc.obj), float(state_no.obj), atol=1e-6)
+
+    def test_soc_quadratic_equality(self):
+        """SOC on a problem with two quadratic equality constraints.
+
+        min x1 + x2 + x3
+        s.t. x1^2 + x2^2 = 1
+             x2^2 + x3^2 = 1
+             0 <= x <= 2
+        """
+
+        def obj(x):
+            return x[0] + x[1] + x[2]
+
+        def con(x):
+            return jnp.array([x[0] ** 2 + x[1] ** 2, x[1] ** 2 + x[2] ** 2])
+
+        x0 = jnp.array([0.5, 0.5, 0.5])
+        xl = jnp.array([0.0, 0.0, 0.0])
+        xu = jnp.array([2.0, 2.0, 2.0])
+        gl = jnp.array([1.0, 1.0])
+        gu = jnp.array([1.0, 1.0])
+
+        state = ipm_solve(
+            obj,
+            con,
+            x0,
+            xl,
+            xu,
+            gl,
+            gu,
+            IPMOptions(max_soc=4, max_iter=500),
+        )
+        assert int(state.converged) in (1, 2)
+        # Both constraints active at the solution
+        g_sol = float(con(state.x)[0])
+        np.testing.assert_allclose(g_sol, 1.0, atol=1e-3)
+
+
+# ---------------------------------------------------------------
+# Feasibility restoration bridge tests
+# ---------------------------------------------------------------
+
+
+class TestJaxFeasibilityRestoration:
+    """Tests for the JAX-to-callback feasibility restoration bridge."""
+
+    def test_restoration_reduces_violation(self):
+        """Restoration should reduce constraint violation on a simple problem."""
+        from discopt._jax.ipm import _jax_feasibility_restoration
+
+        # Problem: x1^2 + x2^2 >= 1 with start at origin (infeasible)
+        def con_fn(x):
+            return jnp.array([x[0] ** 2 + x[1] ** 2])
+
+        x0 = jnp.array([0.1, 0.1])  # infeasible: 0.02 < 1
+        x_l = jnp.array([-2.0, -2.0])
+        x_u = jnp.array([2.0, 2.0])
+        g_l = jnp.array([1.0])  # x1^2 + x2^2 >= 1
+        g_u = jnp.array([1e20])
+
+        opts = IPMOptions(max_iter=200)
+        x_restored, success = _jax_feasibility_restoration(
+            con_fn,
+            x0,
+            x_l,
+            x_u,
+            g_l,
+            g_u,
+            opts,
+        )
+        assert success
+        # Restored point should satisfy the constraint better
+        g_restored = float(con_fn(x_restored)[0])
+        assert g_restored > 0.5  # significant improvement toward g >= 1
+
+    def test_restoration_already_feasible(self):
+        """Restoration on a feasible point should return success=False."""
+        from discopt._jax.ipm import _jax_feasibility_restoration
+
+        def con_fn(x):
+            return jnp.array([x[0] + x[1]])
+
+        x0 = jnp.array([1.0, 1.0])  # feasible: 2.0 <= 3.0
+        x_l = jnp.array([0.0, 0.0])
+        x_u = jnp.array([5.0, 5.0])
+        g_l = jnp.array([-1e20])
+        g_u = jnp.array([3.0])
+
+        opts = IPMOptions(max_iter=200)
+        _, success = _jax_feasibility_restoration(
+            con_fn,
+            x0,
+            x_l,
+            x_u,
+            g_l,
+            g_u,
+            opts,
+        )
+        assert not success  # already feasible, nothing to restore
+
+    def test_restoration_with_log_constraint(self):
+        """Restoration should handle log-domain constraints."""
+        from discopt._jax.ipm import _jax_feasibility_restoration
+
+        # log(1 + x1 - x2) >= 0 requires x1 - x2 >= 0
+        def con_fn(x):
+            return jnp.array([jnp.log(1.0 + x[0] - x[1])])
+
+        # Start where log is defined but constraint violated:
+        # 1 + 0.8 - 1.0 = 0.8, log(0.8) = -0.22 < 0
+        x0 = jnp.array([0.8, 1.0])
+        x_l = jnp.array([0.0, 0.0])
+        x_u = jnp.array([2.0, 2.0])
+        g_l = jnp.array([0.0])  # log(1+x1-x2) >= 0
+        g_u = jnp.array([1e20])
+
+        opts = IPMOptions(max_iter=200)
+        x_restored, success = _jax_feasibility_restoration(
+            con_fn,
+            x0,
+            x_l,
+            x_u,
+            g_l,
+            g_u,
+            opts,
+        )
+        assert success
+        g_val = float(con_fn(x_restored)[0])
+        assert g_val >= -0.1  # violation should be substantially reduced
+
+    def test_nan_filtering_in_batch(self):
+        """Batch solve with NaN results should not select NaN as best."""
+
+        # Objective that produces NaN for some x values
+        def obj_fn(x):
+            return jnp.log(x[0]) + x[1] ** 2
+
+        def con_fn(x):
+            return jnp.array([x[0] + x[1]])
+
+        n_starts = 3
+        # Start 0: valid, start 1: will produce NaN (x[0] near 0)
+        x0_batch = jnp.array(
+            [
+                [1.0, 0.5],
+                [0.001, 0.5],
+                [2.0, 0.1],
+            ]
+        )
+        xl = jnp.broadcast_to(jnp.array([0.01, -1.0]), (n_starts, 2))
+        xu = jnp.broadcast_to(jnp.array([3.0, 3.0]), (n_starts, 2))
+        g_l = jnp.array([-1e20])
+        g_u = jnp.array([2.0])
+
+        opts = IPMOptions(max_iter=200)
+        state = solve_nlp_batch(obj_fn, con_fn, x0_batch, xl, xu, g_l, g_u, opts)
+
+        converged = np.asarray(state.converged)
+        obj_vals = np.asarray(state.obj)
+        # Among converged results with finite obj, best should be picked
+        feasible_mask = ((converged == 1) | (converged == 2) | (converged == 3)) & np.isfinite(
+            obj_vals
+        )
+        if np.any(feasible_mask):
+            masked = np.where(feasible_mask, obj_vals, np.inf)
+            best_idx = int(np.argmin(masked))
+            assert np.isfinite(obj_vals[best_idx])

@@ -30,8 +30,12 @@ build/
 .venv/
 
 # Coverage artifacts
+.coverage
 coverage.xml
 coverage.svg
+
+# Scratch / reference materials
+/ref/
 
 # Benchmark results and reports
 /results/
@@ -57,6 +61,8 @@ manuscript/*.out
 manuscript/*.run.xml
 manuscript/*.synctex.gz
 manuscript/*.toc
+# discopt.tex is generated from discopt.org via `scimax export discopt.org --format pdf`
+manuscript/discopt.tex
 
 # Claude Code
 .claude/

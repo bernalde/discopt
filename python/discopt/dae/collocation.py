@@ -19,6 +19,7 @@ from typing import Any, Callable
 import numpy as np
 
 from discopt.dae.polynomials import collocation_matrix
+from discopt.modeling.core import Constant, MatMulExpression
 
 
 @dataclass
@@ -416,8 +417,54 @@ class DAEBuilder:
 
         self._ode_rhs = combined_rhs
 
+    def _build_vec_dicts(self):
+        """Construct state/algebraic/control dicts with vector-shaped entries.
+
+        Scalar states (``n_components == 1``) become shape ``(nfe, ncp)``
+        IndexExpressions covering all finite elements and collocation points
+        at once. Scalar controls are reshaped to ``(nfe, 1)`` so element-wise
+        multiplication with ``(nfe, ncp)`` state/algebraic expressions
+        broadcasts correctly. Multi-component variables are represented as
+        Python lists of vector-shaped IndexExpressions, preserving the
+        per-component access pattern the scalar path used.
+        """
+        states_vec: dict[str, Any] = {}
+        for sv in self._states:
+            var = self._vars[sv.name]
+            if sv.n_components == 1:
+                states_vec[sv.name] = var[:, 1:]  # (nfe, ncp)
+            else:
+                states_vec[sv.name] = [var[:, 1:, c] for c in range(sv.n_components)]
+
+        alg_vec: dict[str, Any] = {}
+        for av in self._algebraics:
+            var = self._vars[av.name]
+            if av.n_components == 1:
+                alg_vec[av.name] = var[:, :]  # (nfe, ncp)
+            else:
+                alg_vec[av.name] = [var[:, :, c] for c in range(av.n_components)]
+
+        ctrl_vec: dict[str, Any] = {}
+        for cv in self._controls:
+            var = self._vars[cv.name]
+            if cv.n_components == 1:
+                ctrl_vec[cv.name] = var[:, None]  # (nfe, 1) broadcasts over ncp
+            else:
+                ctrl_vec[cv.name] = [var[:, c, None] for c in range(cv.n_components)]
+
+        return states_vec, alg_vec, ctrl_vec
+
     def _add_collocation_constraints(self):
-        """Add collocation equations for all finite elements and states."""
+        """Add collocation equations for all finite elements and states.
+
+        Emits one vector-valued constraint per (state, component) of shape
+        ``(nfe, ncp)``. The left-hand side ``sum_k A[j, k] * x[i, k]`` is
+        built as a single ``MatMulExpression`` (``x @ A.T``), and the RHS
+        ``h_i * f(...)`` is built by broadcasting ``Constant(h_vec)`` against
+        the vectorized derivative expression returned from ``rhs_fn``. The
+        ``rhs_fn`` callable is invoked exactly once with vector-shaped
+        state/algebraic/control dicts rather than per ``(i, j)``.
+        """
         m = self._model
         cs = self._cs
         A = self._A
@@ -429,76 +476,71 @@ class DAEBuilder:
         if rhs_fn is None:
             return
 
-        tp = self._element_points()  # (nfe, ncp+1) time values
+        tp = self._element_points()  # (nfe, ncp+1)
+        t_arg = Constant(np.asarray(tp[:, 1:], dtype=np.float64))  # (nfe, ncp)
+        h_col = Constant(np.asarray(self._h_vec, dtype=np.float64).reshape(-1, 1))  # (nfe, 1)
+        A_T = Constant(np.asarray(A, dtype=np.float64).T)  # (ncp+1, ncp)
+
+        states_vec, alg_vec, ctrl_vec = self._build_vec_dicts()
+        derivs = rhs_fn(t_arg, states_vec, alg_vec, ctrl_vec)
 
         constraints = []
-        for i in range(cs.nfe):
-            for j in range(cs.ncp):
-                t_val = tp[i, j + 1]  # time at collocation point j
-
-                # Build state/algebraic/control dicts at (i, j)
-                states_ij = self._state_dict_at(i, j + 1)
-                alg_ij = self._algebraic_dict_at(i, j)
-                ctrl_ij = self._control_dict_at(i)
-
-                derivs = rhs_fn(t_val, states_ij, alg_ij, ctrl_ij)
-
-                # Collocation: sum_k A[j,k] * x[i,k] == h_i * f(t_ij, x_ij)
-                h_i = float(self._h_vec[i])
-                for sv in self._states:
-                    if sv.name not in derivs:
-                        continue
-                    var = self._vars[sv.name]
-                    if sv.n_components == 1:
-                        lhs = sum(float(A[j, k]) * var[i, k] for k in range(cs.ncp + 1))
-                        constraints.append(lhs == h_i * derivs[sv.name])
-                    else:
-                        for c in range(sv.n_components):
-                            lhs = sum(float(A[j, k]) * var[i, k, c] for k in range(cs.ncp + 1))
-                            constraints.append(lhs == h_i * derivs[sv.name][c])
+        for sv in self._states:
+            if sv.name not in derivs:
+                continue
+            var = self._vars[sv.name]
+            if sv.n_components == 1:
+                # LHS shape (nfe, ncp) = var @ A.T
+                lhs = MatMulExpression(var, A_T)
+                rhs_expr = h_col * derivs[sv.name]  # (nfe, 1) * (nfe, ncp) → (nfe, ncp)
+                constraints.append(lhs == rhs_expr)
+            else:
+                for c in range(sv.n_components):
+                    lhs = MatMulExpression(var[:, :, c], A_T)
+                    rhs_expr = h_col * derivs[sv.name][c]
+                    constraints.append(lhs == rhs_expr)
 
         if constraints:
             m.subject_to(constraints, name=f"{cs.name}_collocation")
 
     def _add_algebraic_constraints(self):
-        """Add algebraic equations at all collocation points."""
+        """Add algebraic equations at all collocation points.
+
+        Emits one vector-valued constraint of shape ``(nfe, ncp)`` per
+        algebraic residual returned by the user-supplied callable.
+        """
         m = self._model
         cs = self._cs
         tp = self._element_points()
+        t_arg = Constant(np.asarray(tp[:, 1:], dtype=np.float64))
 
-        constraints = []
-        for i in range(cs.nfe):
-            for j in range(cs.ncp):
-                t_val = tp[i, j + 1]
-                states_ij = self._state_dict_at(i, j + 1)
-                alg_ij = self._algebraic_dict_at(i, j)
-                ctrl_ij = self._control_dict_at(i)
+        states_vec, alg_vec, ctrl_vec = self._build_vec_dicts()
+        residuals = self._alg_rhs(t_arg, states_vec, alg_vec, ctrl_vec)
 
-                residuals = self._alg_rhs(t_val, states_ij, alg_ij, ctrl_ij)
-                for name, expr in residuals.items():
-                    constraints.append(expr == 0)
-
+        constraints = [expr == 0 for expr in residuals.values()]
         if constraints:
             m.subject_to(constraints, name=f"{cs.name}_algebraic")
 
     def _add_continuity_constraints_radau(self):
         """Add inter-element continuity for Radau scheme.
 
-        For Radau, the last collocation point is at tau=1, so:
-        x[i+1, 0] = x[i, ncp]  (the last collocation point value).
+        For Radau, the last collocation point is at tau=1, so
+        ``x[i+1, 0] = x[i, ncp]``. Emitted as one vector constraint per
+        state (or per state-component for vector-valued states).
         """
         m = self._model
         cs = self._cs
+        if cs.nfe <= 1:
+            return
         constraints = []
 
         for sv in self._states:
             var = self._vars[sv.name]
-            for i in range(cs.nfe - 1):
-                if sv.n_components == 1:
-                    constraints.append(var[i + 1, 0] == var[i, cs.ncp])
-                else:
-                    for c in range(sv.n_components):
-                        constraints.append(var[i + 1, 0, c] == var[i, cs.ncp, c])
+            if sv.n_components == 1:
+                constraints.append(var[1:, 0] == var[:-1, cs.ncp])
+            else:
+                for c in range(sv.n_components):
+                    constraints.append(var[1:, 0, c] == var[:-1, cs.ncp, c])
 
         if constraints:
             m.subject_to(constraints, name=f"{cs.name}_continuity")
@@ -506,24 +548,29 @@ class DAEBuilder:
     def _add_continuity_constraints_legendre(self):
         """Add inter-element continuity for Legendre scheme.
 
-        Legendre points don't include tau=1, so we interpolate:
-        x[i+1, 0] = sum_k w[k] * x[i, k]
+        Legendre points don't include tau=1, so we interpolate
+        ``x[i+1, 0] = sum_k w[k] * x[i, k]``. Built as a single
+        ``MatMulExpression`` per (state, component) using ``var @ w``.
         """
         m = self._model
         cs = self._cs
-        w = self._w
+        if cs.nfe <= 1:
+            return
+        w = np.asarray(self._w, dtype=np.float64).reshape(-1, 1)  # (ncp+1, 1)
+        w_const = Constant(w)
         constraints = []
 
         for sv in self._states:
             var = self._vars[sv.name]
-            for i in range(cs.nfe - 1):
-                if sv.n_components == 1:
-                    interp = sum(float(w[k]) * var[i, k] for k in range(cs.ncp + 1))
-                    constraints.append(var[i + 1, 0] == interp)
-                else:
-                    for c in range(sv.n_components):
-                        interp = sum(float(w[k]) * var[i, k, c] for k in range(cs.ncp + 1))
-                        constraints.append(var[i + 1, 0, c] == interp)
+            if sv.n_components == 1:
+                # var[:-1, :] has shape (nfe-1, ncp+1); @ w → (nfe-1, 1)
+                interp = MatMulExpression(var[:-1, :], w_const)
+                # var[1:, 0:1] has shape (nfe-1, 1) to match
+                constraints.append(var[1:, 0:1] == interp)
+            else:
+                for c in range(sv.n_components):
+                    interp = MatMulExpression(var[:-1, :, c], w_const)
+                    constraints.append(var[1:, 0:1, c] == interp)
 
         if constraints:
             m.subject_to(constraints, name=f"{cs.name}_continuity")

@@ -250,7 +250,11 @@ impl TreeManager {
                 let node = self.pool.get(result.node_id);
                 let is_down = record.var_index < node.ub.len()
                     && node.ub[record.var_index]
-                        < self.global_ub.get(record.var_index).copied().unwrap_or(f64::INFINITY);
+                        < self
+                            .global_ub
+                            .get(record.var_index)
+                            .copied()
+                            .unwrap_or(f64::INFINITY);
                 self.pseudocosts.update(
                     record.var_index,
                     record.parent_lb,
@@ -406,10 +410,8 @@ impl TreeManager {
         for i in 0..self.pool.total_count() {
             let node = self.pool.get(NodeId(i));
             match node.status {
-                NodeStatus::Pending | NodeStatus::Evaluated => {
-                    if node.local_lower_bound < min_lb {
-                        min_lb = node.local_lower_bound;
-                    }
+                NodeStatus::Pending | NodeStatus::Evaluated if node.local_lower_bound < min_lb => {
+                    min_lb = node.local_lower_bound;
                 }
                 _ => {}
             }
@@ -487,10 +489,7 @@ impl TreeManager {
     ///
     /// This allows the Python orchestrator to identify unreliable candidates
     /// and perform strong branching before calling `process_evaluated`.
-    pub fn score_candidates(
-        &self,
-        solution: &[f64],
-    ) -> Vec<(usize, f64, u32, f64)> {
+    pub fn score_candidates(&self, solution: &[f64]) -> Vec<(usize, f64, u32, f64)> {
         let mut candidates = Vec::new();
         for var in &self.integer_vars {
             if !var.is_integer {
