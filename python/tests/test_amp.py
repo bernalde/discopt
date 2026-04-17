@@ -983,7 +983,7 @@ class TestMilpRelaxation:
         """Binary counting codes are invalid for SOS2 once adjacency breaks."""
         from discopt._jax.embedding import build_embedding_map
 
-        with pytest.raises(ValueError, match="not SOS2-compatible"):
+        with pytest.raises(ValueError, match="only works for exactly 2 partitions"):
             build_embedding_map(5, encoding="binary")
 
     def test_embedding_requires_sos2_formulation(self):
@@ -999,6 +999,36 @@ class TestMilpRelaxation:
                 state,
                 incumbent=None,
                 convhull_formulation="facet",
+                convhull_ebd=True,
+            )
+
+    def test_sos2_embedding_requires_selector_columns(self, monkeypatch):
+        """SOS2 linking must keep either alpha or embedded selector columns."""
+        m = _make_nlp1()
+        terms = self.classify(m)
+        state = self.init_partitions([0], lb=[1.0], ub=[4.0], n_init=4)
+
+        monkeypatch.setattr(
+            "discopt._jax.milp_relaxation.build_embedding_map",
+            lambda lambda_count, encoding="gray": {
+                "encoding": encoding,
+                "bit_count": 0,
+                "codes": tuple(),
+                "positive_sets": tuple(),
+                "negative_sets": tuple(),
+            },
+        )
+
+        with pytest.raises(
+            AssertionError,
+            match="Expected either alpha or embedding columns for SOS2 linking",
+        ):
+            self.build_milp(
+                m,
+                terms,
+                state,
+                incumbent=None,
+                convhull_formulation="sos2",
                 convhull_ebd=True,
             )
 
@@ -1133,6 +1163,45 @@ class TestAmpEndToEnd:
         assert result.objective is not None
         assert abs(result.objective - CIRCLE_OPTIMUM) <= 1e-3, (
             f"Objective {result.objective:.6f} too far from √2={CIRCLE_OPTIMUM}"
+        )
+
+    def test_amp_embedding_rebuilds_across_refinement_iterations(self, monkeypatch):
+        """Embedded SOS2 should stay consistent as AMP refines the partitions."""
+        import discopt._jax.milp_relaxation as milp_mod
+
+        orig_build = milp_mod.build_milp_relaxation
+        lambda_counts = []
+        bit_counts = []
+
+        def spy_build(*args, **kwargs):
+            milp_model, varmap = orig_build(*args, **kwargs)
+            info = next(iter(varmap["bilinear_lambda"].values()))
+            lambda_counts.append(len(info["lambda_cols"]))
+            bit_counts.append(len(info["embedding_cols"]))
+            return milp_model, varmap
+
+        monkeypatch.setattr(milp_mod, "build_milp_relaxation", spy_build)
+
+        m = _make_nlp1()
+        result = m.solve(
+            solver="amp",
+            convhull_formulation="sos2",
+            convhull_ebd=True,
+            rel_gap=1e-6,
+            max_iter=4,
+            time_limit=30,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        assert abs(result.objective - NLP1_OPTIMUM) <= 0.15
+        assert len(bit_counts) >= 2
+        assert bit_counts[0] == 1
+        assert bit_counts[0] < max(bit_counts)
+        assert lambda_counts[0] < max(lambda_counts)
+        assert all(
+            bit_count == max(1, int(np.ceil(np.log2(max(1, lambda_count - 1)))))
+            for bit_count, lambda_count in zip(bit_counts, lambda_counts)
         )
 
     @pytest.mark.smoke

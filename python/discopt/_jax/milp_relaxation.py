@@ -483,7 +483,9 @@ def build_milp_relaxation(
         Replace SOS2 interval binaries with a logarithmic embedded encoding.
         Only supported with ``convhull_formulation="sos2"`` or ``"lambda"``.
     convhull_ebd_encoding : str, default "gray"
-        Embedded encoding scheme. ``"gray"`` is the Alpine-style default.
+        Embedded encoding scheme. ``"gray"`` is the Alpine-style default and
+        the only option that remains SOS2-compatible for arbitrary partition
+        counts. ``"binary"`` is only valid for two partitions.
 
     Returns
     -------
@@ -738,6 +740,11 @@ def build_milp_relaxation(
                 row_w[theta_col] -= float(p_j)
             _add_row(row_w, 0.0)
             _add_row(-row_w, 0.0)
+
+            if mode == "sos2":
+                assert alpha_cols or embedding_cols, (
+                    "Expected either alpha or embedding columns for SOS2 linking"
+                )
 
             if mode == "sos2" and embedding_info is not None:
                 for bit_col, positive_set, negative_set in zip(

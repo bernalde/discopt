@@ -492,7 +492,9 @@ def solve_amp(
     convhull_ebd : bool
         Replace SOS2 interval binaries with an embedded logarithmic encoding.
     convhull_ebd_encoding : str
-        Embedded encoding scheme for the SOS2 formulation.
+        Embedded encoding scheme for the SOS2 formulation. ``"gray"`` is the
+        only option that stays SOS2-compatible for arbitrary partition counts;
+        ``"binary"`` is only valid for two partitions.
     presolve_bt : bool
         Run LP-based OBBT before the AMP loop to tighten variable bounds.
 

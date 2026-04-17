@@ -62,8 +62,10 @@ def build_embedding_map(
     lambda_count : int
         Number of lambda variables, equal to the number of breakpoints.
     encoding : str, default ``"gray"``
-        Interval encoding scheme. Only encodings whose adjacent intervals differ
-        in one bit are accepted.
+        Interval encoding scheme. ``"gray"`` is SOS2-compatible for arbitrary
+        partition counts. ``"binary"`` is only SOS2-compatible for exactly two
+        partitions (``lambda_count == 3``) and is mainly kept to exercise the
+        validation path.
     """
     if lambda_count < 2:
         raise ValueError("lambda_count must be at least 2")
@@ -81,6 +83,13 @@ def build_embedding_map(
         )
 
     if not _is_sos2_compatible(codes):
+        if encoding == "binary":
+            raise ValueError(
+                "Embedding encoding 'binary' is not SOS2-compatible for "
+                f"{partition_count} partitions; it only works for exactly 2 "
+                "partitions (lambda_count=3). Use 'gray' for larger partition "
+                "counts."
+            )
         raise ValueError(
             f"Embedding encoding {encoding!r} is not SOS2-compatible for "
             f"{partition_count} partitions."
