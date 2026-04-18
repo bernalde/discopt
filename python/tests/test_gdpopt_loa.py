@@ -156,3 +156,20 @@ class TestMILPHiGHS:
             integrality=np.array([1]),
         )
         assert result.status.value == "infeasible"
+
+    def test_model_error_returns_clean_error_result(self):
+        """HiGHS model errors should not leak garbage counters into the result."""
+        from discopt.solvers.milp_highs import solve_milp
+
+        result = solve_milp(
+            c=np.array([0.0]),
+            A_ub=np.array([[1e16]]),
+            b_ub=np.array([1.0]),
+            bounds=[(-1.0, 1.0)],
+        )
+
+        assert result.status.value == "error"
+        assert result.x is None
+        assert result.objective is None
+        assert result.node_count == 0
+        assert result.wall_time == pytest.approx(0.0, abs=1e-12)

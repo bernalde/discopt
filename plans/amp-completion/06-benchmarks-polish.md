@@ -105,3 +105,6 @@ optimization quality can be compared.
 | Benchmark runner support | `amp` is now wired into the nonconvex and global benchmark categories. | Add a dedicated CLI target or report artifact once the pass rate is high enough to compare runs over time. |
 | Alpine comparison | Reproducible on local `../Alpine.jl` and `../MINLPTests.jl` using Julia `+release`. | Decide whether unsupported operators stay in-scope or whether the comparison should publish a smaller overlapping subset. |
 | Notebook update | Not started in this phase. | Defer the notebook result table until there is a meaningful shared solved subset and the false-infeasible AMP gaps are reduced. |
+
+The instance-led remediation plan derived from these failures is tracked in
+`plans/amp-completion/07-minlptests-remediation.md`.
