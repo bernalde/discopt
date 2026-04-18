@@ -153,12 +153,17 @@ class CategoryBenchmarkRunner:
         try:
             model = problem.build_fn()
             start = time.monotonic()
-            result = model.solve(
-                nlp_solver=solver,
-                time_limit=self.time_limit,
-                gap_tolerance=1e-4,
-                max_nodes=100_000,
-            )
+            solve_kwargs = {
+                "time_limit": self.time_limit,
+                "gap_tolerance": 1e-4,
+                "max_nodes": 100_000,
+            }
+            if solver == "amp":
+                solve_kwargs["solver"] = "amp"
+                solve_kwargs["nlp_solver"] = "ipm"
+            else:
+                solve_kwargs["nlp_solver"] = solver
+            result = model.solve(**solve_kwargs)
             elapsed = time.monotonic() - start
 
             # Map status

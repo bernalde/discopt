@@ -17,11 +17,11 @@ _SOLVER_MAP: dict[str, list[str]] = {
     "qp": ["ipm", "ripopt", "ipopt"],
     "milp": ["ipm", "ripopt", "ipopt"],
     "miqp": ["ipm", "ripopt", "ipopt"],
-    "minlp": ["ipm", "ripopt", "ipopt"],
-    "global_opt": ["ipm", "ripopt", "ipopt"],
+    "minlp": ["ipm", "ripopt", "ipopt", "amp"],
+    "global_opt": ["ipm", "ripopt", "ipopt", "amp"],
     "nlp_convex": ["ipm", "ripopt", "ipopt"],
-    "nlp_nonconvex": ["ipm", "ripopt", "ipopt"],
-    "minlp_nonconvex": ["ipm", "ripopt", "ipopt"],
+    "nlp_nonconvex": ["ipm", "ripopt", "ipopt", "amp"],
+    "minlp_nonconvex": ["ipm", "ripopt", "ipopt", "amp"],
 }
 
 
