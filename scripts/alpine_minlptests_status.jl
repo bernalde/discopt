@@ -33,17 +33,19 @@ function write_record(io, record::Dict{String, Any})
     write(io, "{" * join(parts, ",") * "}\n")
 end
 
-function build_optimizer()
+function build_optimizer(per_instance_time_limit::Float64)
     ipopt = MOI.OptimizerWithAttributes(
         Ipopt.Optimizer,
         MOI.Silent() => true,
         "sb" => "yes",
         "max_iter" => 9999,
+        "max_wall_time" => per_instance_time_limit,
     )
     highs = MOI.OptimizerWithAttributes(
         HiGHS.Optimizer,
         "presolve" => "on",
         "log_to_console" => false,
+        "time_limit" => per_instance_time_limit,
     )
     juniper = MOI.OptimizerWithAttributes(
         Juniper.Optimizer,
@@ -56,6 +58,7 @@ function build_optimizer()
         "nlp_solver" => ipopt,
         "mip_solver" => highs,
         "minlp_solver" => juniper,
+        "time_limit" => per_instance_time_limit,
     )
 end
 
@@ -100,19 +103,20 @@ function run_case(optimizer, problem_id::AbstractString, symbol_name::AbstractSt
 end
 
 function main()
-    if length(ARGS) != 3
-        error("usage: alpine_minlptests_status.jl REQUEST.tsv OUTPUT.jsonl MINLPTESTS_PATH")
+    if length(ARGS) != 4
+        error("usage: alpine_minlptests_status.jl REQUEST.tsv OUTPUT.jsonl MINLPTESTS_PATH TIME_LIMIT_SEC")
     end
 
     request_path = ARGS[1]
     output_path = ARGS[2]
     minlptests_path = ARGS[3]
+    per_instance_time_limit = parse(Float64, ARGS[4])
 
     push!(LOAD_PATH, minlptests_path)
     Base.eval(Main, :(using MINLPTests))
     minlptests = Base.invokelatest(() -> getfield(Main, :MINLPTests))
 
-    optimizer = build_optimizer()
+    optimizer = build_optimizer(per_instance_time_limit)
 
     open(output_path, "w") do io
         for line in eachline(request_path)

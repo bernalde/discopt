@@ -71,6 +71,21 @@ UV_CACHE_DIR=/tmp/uv-cache-pr14 PYTHONPATH=python \
 | `alpine_only_pass` | 0 | Alpine does not currently solve any case in this translated slice. |
 | `both_fail` | 22 | AMP still misses the case and Alpine rejects it earlier. |
 
+## Focused Update: translated `nlp_mi`
+
+A focused rerun of the translated `nlp_mi` slice after the current AMP fixes
+uses the same benchmark-harness validation path as the Phase 6 report, but with
+a `20s` per-instance cap:
+
+| Solver | NLP-MI pass | NLP-MI fail | Notes |
+| --- | ---: | ---: | --- |
+| discopt AMP | 13 | 0 | `nlp_mi_001_010` through `nlp_mi_005_010` now pass; the `003_*` and `005_010` variants return `feasible` with the expected objective when proof budget expires. |
+| Alpine.jl | 0 | 13 | Still blocked by unsupported operators (`exp`, `sqrt`, `tan`, reciprocal terms) or by the finite-domain requirement on integer bridges. |
+
+This means the old mixed-integer row in the summary table above is stale. The
+headline Phase 6 comparison still needs a full 31-case rerun, but the mixed-
+integer sub-slice is no longer an AMP failure bucket.
+
 ## Alpine Failure Modes
 
 | Failure mode | Count | Affected problems |
@@ -93,7 +108,7 @@ optimization quality can be compared.
 | Gap | Evidence | Affected problems | What remains to be done |
 | --- | --- | --- | --- |
 | False infeasible on feasible NLP | AMP returns `infeasible` on more than half of the feasible nonconvex NLP slice. | `nlp_001_010`, `nlp_002_010`, `nlp_003_014`, `nlp_003_015`, `nlp_004_010`, `nlp_008_010`, `nlp_008_011`, `nlp_009_010` | Tighten the feasibility recovery path for transcendental continuous relaxations and stop pruning feasible incumbents as infeasible. |
-| False infeasible on feasible MINLP | AMP returns `infeasible` on every feasible translated `nlp_mi` case in the current slice. | `nlp_mi_001_010`, `nlp_mi_002_010`, `nlp_mi_003_010`, `nlp_mi_003_011`, `nlp_mi_003_012`, `nlp_mi_003_013`, `nlp_mi_003_014`, `nlp_mi_003_015`, `nlp_mi_003_016`, `nlp_mi_004_010`, `nlp_mi_004_011`, `nlp_mi_004_012`, `nlp_mi_005_010` | Debug the mixed-integer OA and incumbent-validation path on the translated MINLPTests models before expanding the benchmark table further. |
+| Residual mixed-integer infeasibility proof gap | The feasible translated `nlp_mi` slice now passes in the focused rerun, but the infeasible mixed-integer equality case still does not get certified. | `nlp_mi_007_010` | Finish the nonlinear domain-propagation and infeasibility-proof work so AMP can close the last mixed-integer benchmark gap without exhausting the wall clock. |
 | Incomplete infeasibility proof | AMP times out instead of proving one infeasible mixed-integer case. | `nlp_mi_007_010` | Strengthen infeasibility detection for the mixed-integer branch-and-bound path. |
 | No shared solved subset with Alpine | Alpine is still at `0/31` on this translated scope. | whole comparison slice | Either narrow the published comparison to Alpine-supported operators or keep the full table and present Alpine as a coverage baseline, not as a quality baseline. |
 

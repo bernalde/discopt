@@ -61,7 +61,12 @@ def unwrap_case(case):
     return case.values[0] if hasattr(case, "values") else case
 
 
-def case_catalog(mod, *, include_convex: bool) -> list[dict[str, Any]]:
+def case_catalog(
+    mod,
+    *,
+    include_convex: bool,
+    per_instance_time_limit: float,
+) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
 
     if include_convex:
@@ -73,7 +78,7 @@ def case_catalog(mod, *, include_convex: bool) -> list[dict[str, Any]]:
                     "directory": "nlp-cvx",
                     "symbol": inst.problem_id,
                     "instance": inst,
-                    "time_limit": 60.0,
+                    "time_limit": per_instance_time_limit,
                     "gap_tolerance": 1e-6,
                     "expected_status": "optimal",
                 }
@@ -82,45 +87,45 @@ def case_catalog(mod, *, include_convex: bool) -> list[dict[str, Any]]:
     for raw in mod.NLP_INSTANCES:
         inst = unwrap_case(raw)
         cases.append(
-            {
-                "category": "nlp",
-                "directory": "nlp",
-                "symbol": inst.problem_id,
-                "instance": inst,
-                "time_limit": 120.0,
-                "gap_tolerance": 1e-6,
-                "expected_status": "optimal",
-            }
-        )
+                {
+                    "category": "nlp",
+                    "directory": "nlp",
+                    "symbol": inst.problem_id,
+                    "instance": inst,
+                    "time_limit": per_instance_time_limit,
+                    "gap_tolerance": 1e-6,
+                    "expected_status": "optimal",
+                }
+            )
 
     for raw in mod.NLP_MI_INSTANCES:
         inst = unwrap_case(raw)
         cases.append(
-            {
-                "category": "nlp_mi",
-                "directory": "nlp-mi",
-                "symbol": inst.problem_id,
-                "instance": inst,
-                "time_limit": 120.0,
-                "gap_tolerance": 1e-6,
-                "expected_status": "optimal",
-            }
-        )
+                {
+                    "category": "nlp_mi",
+                    "directory": "nlp-mi",
+                    "symbol": inst.problem_id,
+                    "instance": inst,
+                    "time_limit": per_instance_time_limit,
+                    "gap_tolerance": 1e-6,
+                    "expected_status": "optimal",
+                }
+            )
 
     for raw in mod.INFEASIBLE_INSTANCES:
         inst = unwrap_case(raw)
         directory = "nlp-mi" if inst.problem_id.startswith("nlp_mi_") else "nlp"
         cases.append(
-            {
-                "category": "infeasible",
-                "directory": directory,
-                "symbol": inst.problem_id,
-                "instance": inst,
-                "time_limit": 30.0,
-                "gap_tolerance": None,
-                "expected_status": "infeasible",
-            }
-        )
+                {
+                    "category": "infeasible",
+                    "directory": directory,
+                    "symbol": inst.problem_id,
+                    "instance": inst,
+                    "time_limit": per_instance_time_limit,
+                    "gap_tolerance": None,
+                    "expected_status": "infeasible",
+                }
+            )
 
     return cases
 
@@ -193,6 +198,7 @@ def run_alpine_cases(
     minlptests_path: Path,
     julia_bin: str,
     julia_channel: str,
+    per_instance_time_limit: float,
 ) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="alpine-minlptests-") as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -208,7 +214,15 @@ def run_alpine_cases(
         if julia_channel:
             cmd.append(julia_channel)
         cmd.append(f"--project={alpine_project}")
-        cmd.extend([str(ALPINE_HELPER), str(request_path), str(output_path), str(minlptests_path)])
+        cmd.extend(
+            [
+                str(ALPINE_HELPER),
+                str(request_path),
+                str(output_path),
+                str(minlptests_path),
+                str(per_instance_time_limit),
+            ]
+        )
         subprocess.run(cmd, check=True, cwd=REPO_ROOT)
 
         records: list[dict[str, Any]] = []
@@ -376,6 +390,12 @@ def main() -> None:
         help="Include the convex nlp-cvx cases. By default the runner uses the nonconvex Phase 6 scope only.",
     )
     parser.add_argument(
+        "--per-instance-time-limit",
+        type=float,
+        default=300.0,
+        help="Wall-clock time limit in seconds for each discopt or Alpine case.",
+    )
+    parser.add_argument(
         "--discopt-mode",
         choices=("amp", "default"),
         default="amp",
@@ -402,7 +422,11 @@ def main() -> None:
     args = parser.parse_args()
 
     mod = load_test_module()
-    cases = case_catalog(mod, include_convex=args.include_convex)
+    cases = case_catalog(
+        mod,
+        include_convex=args.include_convex,
+        per_instance_time_limit=args.per_instance_time_limit,
+    )
     discopt_records = run_discopt_cases(mod, cases, solver_mode=args.discopt_mode)
     alpine_records: list[dict[str, Any]] = []
 
@@ -413,6 +437,7 @@ def main() -> None:
             args.minlptests_path.resolve(),
             args.julia_bin,
             args.julia_channel,
+            args.per_instance_time_limit,
         )
 
     payload = {
