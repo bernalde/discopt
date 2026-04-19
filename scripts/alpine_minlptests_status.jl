@@ -3,12 +3,18 @@
 using Test
 using JuMP
 using Alpine
-using HiGHS
 using Ipopt
 using Juniper
 using MathOptInterface
+import HiGHS
 
 const MOI = MathOptInterface
+const _HAS_GUROBI = try
+    @eval import Gurobi
+    true
+catch
+    false
+end
 
 function json_escape(s::AbstractString)
     escaped = replace(s, "\\" => "\\\\", "\"" => "\\\"", "\n" => "\\n", "\r" => "\\r", "\t" => "\\t")
@@ -33,7 +39,32 @@ function write_record(io, record::Dict{String, Any})
     write(io, "{" * join(parts, ",") * "}\n")
 end
 
-function build_optimizer(per_instance_time_limit::Float64)
+function build_mip_solver(per_instance_time_limit::Float64, mip_backend::AbstractString)
+    backend = lowercase(String(mip_backend))
+    if backend == "highs"
+        return MOI.OptimizerWithAttributes(
+            HiGHS.Optimizer,
+            "presolve" => "on",
+            "log_to_console" => false,
+            "time_limit" => per_instance_time_limit,
+        )
+    end
+
+    if backend == "gurobi"
+        _HAS_GUROBI || error("ALPINE_MIP_SOLVER=gurobi requires Gurobi.jl in the active Julia environment")
+        grb_env = Gurobi.Env()
+        return MOI.OptimizerWithAttributes(
+            () -> Gurobi.Optimizer(grb_env),
+            MOI.Silent() => true,
+            "Presolve" => 1,
+            "TimeLimit" => per_instance_time_limit,
+        )
+    end
+
+    error("unsupported ALPINE_MIP_SOLVER=$(mip_backend); expected 'highs' or 'gurobi'")
+end
+
+function build_optimizer(per_instance_time_limit::Float64, mip_backend::AbstractString)
     ipopt = MOI.OptimizerWithAttributes(
         Ipopt.Optimizer,
         MOI.Silent() => true,
@@ -41,22 +72,17 @@ function build_optimizer(per_instance_time_limit::Float64)
         "max_iter" => 9999,
         "max_wall_time" => per_instance_time_limit,
     )
-    highs = MOI.OptimizerWithAttributes(
-        HiGHS.Optimizer,
-        "presolve" => "on",
-        "log_to_console" => false,
-        "time_limit" => per_instance_time_limit,
-    )
+    mip_solver = build_mip_solver(per_instance_time_limit, mip_backend)
     juniper = MOI.OptimizerWithAttributes(
         Juniper.Optimizer,
         MOI.Silent() => true,
-        "mip_solver" => highs,
+        "mip_solver" => mip_solver,
         "nl_solver" => ipopt,
     )
     return JuMP.optimizer_with_attributes(
         Alpine.Optimizer,
         "nlp_solver" => ipopt,
-        "mip_solver" => highs,
+        "mip_solver" => mip_solver,
         "minlp_solver" => juniper,
         "time_limit" => per_instance_time_limit,
     )
@@ -150,12 +176,13 @@ function main()
     output_path = ARGS[2]
     minlptests_path = ARGS[3]
     per_instance_time_limit = parse(Float64, ARGS[4])
+    mip_backend = get(ENV, "ALPINE_MIP_SOLVER", "highs")
 
     push!(LOAD_PATH, minlptests_path)
     Base.eval(Main, :(using MINLPTests))
     minlptests = Base.invokelatest(() -> getfield(Main, :MINLPTests))
 
-    optimizer = build_optimizer(per_instance_time_limit)
+    optimizer = build_optimizer(per_instance_time_limit, mip_backend)
     cached_records = Dict{String, Dict{String, Any}}()
 
     open(output_path, "w") do io
@@ -183,6 +210,7 @@ function main()
             end
 
             record["category"] = category
+            record["mip_solver"] = mip_backend
             write_record(io, record)
         end
     end

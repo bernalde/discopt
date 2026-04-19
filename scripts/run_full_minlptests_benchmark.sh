@@ -15,6 +15,7 @@ FORCE_RERUN="${FORCE_RERUN:-0}"
 RUN_DISCOPT="${RUN_DISCOPT:-1}"
 RUN_ALPINE="${RUN_ALPINE:-1}"
 RUN_COMPARISON="${RUN_COMPARISON:-1}"
+ALPINE_MIP_SOLVER="${ALPINE_MIP_SOLVER:-highs}"
 JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
 JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 DISCOPT_INPUT_JSON="${DISCOPT_INPUT_JSON:-}"
@@ -74,6 +75,7 @@ log "Force rerun: ${FORCE_RERUN}"
 log "Run discopt: ${RUN_DISCOPT}"
 log "Run Alpine: ${RUN_ALPINE}"
 log "Run comparison: ${RUN_COMPARISON}"
+log "Alpine MIP solver: ${ALPINE_MIP_SOLVER}"
 echo
 
 resolve_python_runner
@@ -173,7 +175,7 @@ PY
     )
     (
       cd "${ALPINE_PROJECT}"
-      "${JULIA_CMD[@]}"
+      ALPINE_MIP_SOLVER="${ALPINE_MIP_SOLVER}" "${JULIA_CMD[@]}"
     )
     log "Alpine output:"
     log "  ${ALPINE_JSONL}"
