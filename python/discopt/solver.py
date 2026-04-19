@@ -18,6 +18,7 @@ from scipy.optimize import minimize as scipy_minimize
 
 from discopt._jax.alphabb import estimate_alpha as _estimate_alpha_jax
 from discopt._jax.nlp_evaluator import NLPEvaluator
+from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 from discopt._rust import PyTreeManager
 from discopt.constants import INFEASIBILITY_SENTINEL as _INFEASIBILITY_SENTINEL
 from discopt.constants import SENTINEL_THRESHOLD as _SENTINEL_THRESHOLD
@@ -377,11 +378,17 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
     lb, ub : np.ndarray
         Tightened variable bounds.
     """
-    if evaluator.n_constraints == 0 or not cl_list:
-        return node_lb.copy(), node_ub.copy()
-
     lb = node_lb.copy()
     ub = node_ub.copy()
+
+    try:
+        lb, ub, _ = tighten_nonlinear_bounds(evaluator._model, lb, ub)
+    except Exception:
+        pass
+
+    if evaluator.n_constraints == 0 or not cl_list:
+        return lb, ub
+
     n = len(lb)
     m = len(cl_list)
     cu = np.array(cu_list, dtype=np.float64)
@@ -406,6 +413,17 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
 
     for _ in range(max_rounds):
         changed = False
+
+        try:
+            tightened_lb, tightened_ub, nonlinear_stats = tighten_nonlinear_bounds(evaluator._model, lb, ub)
+        except Exception:
+            nonlinear_stats = None
+        else:
+            if nonlinear_stats.n_tightened > 0:
+                lb = tightened_lb
+                ub = tightened_ub
+                changed = True
+
         # Evaluate Jacobian at midpoint of current bounds
         mid = np.clip(lb, -_SPC, _SPC)
         span = np.clip(ub, -_SPC, _SPC) - mid
@@ -1389,7 +1407,7 @@ def solve_model(
 
     if problem_class is not None:
         if problem_class == ProblemClass.LP:
-            return _solve_lp(model, t_start)
+            return _solve_lp(model, t_start, time_limit)
         elif problem_class == ProblemClass.QP:
             return _solve_qp(model, t_start)
         elif problem_class == ProblemClass.MILP:
@@ -3411,8 +3429,12 @@ def _decompose_eq_slack_form(
     return A_ub, b_ub, A_eq, b_eq
 
 
-def _solve_lp(model: Model, t_start: float) -> SolveResult:
-    """Solve an LP using the pure-JAX LP IPM (no NLP evaluator needed)."""
+def _solve_lp(model: Model, t_start: float, time_limit: Optional[float] = None) -> SolveResult:
+    """Solve an LP, preferring HiGHS and falling back to the pure-JAX LP IPM."""
+    result = _solve_lp_highs(model, t_start, time_limit)
+    if result is not None:
+        return result
+
     from discopt._jax.lp_ipm import lp_ipm_solve
     from discopt._jax.problem_classifier import extract_lp_data
 
@@ -3441,7 +3463,7 @@ def _solve_lp(model: Model, t_start: float) -> SolveResult:
     else:
         status = "error"
 
-    return SolveResult(
+    sr = SolveResult(
         status=status,
         objective=obj_val,
         bound=obj_val if status == "optimal" else None,
@@ -3453,6 +3475,88 @@ def _solve_lp(model: Model, t_start: float) -> SolveResult:
         jax_time=jax_time,
         python_time=wall_time - jax_time,
     )
+    if status == "optimal":
+        sr.convex_fast_path = True
+    return sr
+
+
+def _solve_lp_highs(
+    model: Model,
+    t_start: float,
+    time_limit: Optional[float] = None,
+) -> Optional[SolveResult]:
+    """Solve an LP using HiGHS. Returns None if HiGHS is unavailable."""
+    try:
+        from discopt.solvers.lp_highs import solve_lp as _highs_solve_lp
+    except ImportError:
+        return None
+
+    from discopt._jax.problem_classifier import extract_lp_data
+    from discopt.modeling.core import ObjectiveSense
+    from discopt.solvers import SolveStatus
+
+    lp_data = extract_lp_data(model)
+    n_orig = sum(v.size for v in model._variables)
+
+    bounds = list(
+        zip(
+            np.asarray(lp_data.x_l[:n_orig]).tolist(),
+            np.asarray(lp_data.x_u[:n_orig]).tolist(),
+        )
+    )
+
+    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    n_slack = n_total - n_orig
+    A_eq_full = np.asarray(lp_data.A_eq)
+    b_eq_full = np.asarray(lp_data.b_eq)
+    A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
+
+    try:
+        result = _highs_solve_lp(
+            c=np.asarray(lp_data.c[:n_orig]),
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds,
+            time_limit=time_limit,
+        )
+    except Exception as e:
+        logger.debug("HiGHS LP solve failed: %s", e)
+        return None
+
+    wall_time = time.perf_counter() - t_start
+
+    if result.status == SolveStatus.OPTIMAL:
+        assert result.x is not None and result.objective is not None
+        obj_val = result.objective + lp_data.obj_const
+
+        assert model._objective is not None
+        if model._objective.sense == ObjectiveSense.MAXIMIZE:
+            obj_val = -obj_val
+
+        sr = SolveResult(
+            status="optimal",
+            objective=obj_val,
+            bound=obj_val,
+            gap=0.0,
+            x=_unpack_solution(model, result.x[:n_orig]),
+            wall_time=wall_time,
+            node_count=0,
+            rust_time=0.0,
+            jax_time=0.0,
+            python_time=wall_time,
+        )
+        sr.convex_fast_path = True
+        return sr
+    if result.status == SolveStatus.INFEASIBLE:
+        return SolveResult(status="infeasible", wall_time=wall_time)
+    if result.status == SolveStatus.UNBOUNDED:
+        return SolveResult(status="unbounded", wall_time=wall_time)
+    if result.status == SolveStatus.TIME_LIMIT:
+        return SolveResult(status="time_limit", wall_time=wall_time)
+
+    return None
 
 
 def _solve_qp(model: Model, t_start: float) -> SolveResult:

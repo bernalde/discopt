@@ -449,6 +449,7 @@ def build_milp_relaxation(
     convhull_formulation: str = "disaggregated",
     convhull_ebd: bool = False,
     convhull_ebd_encoding: str = "gray",
+    bound_override: Optional[tuple[np.ndarray, np.ndarray]] = None,
 ) -> tuple["MilpRelaxationModel", dict]:
     """Build a MILP relaxation with piecewise McCormick for bilinear/monomial terms.
 
@@ -493,7 +494,11 @@ def build_milp_relaxation(
         MilpRelaxationModel has a .solve() method returning MilpRelaxationResult.
         varmap maps auxiliary variable keys to MILP column indices.
     """
-    flat_lb, flat_ub = flat_variable_bounds(model)
+    if bound_override is None:
+        flat_lb, flat_ub = flat_variable_bounds(model)
+    else:
+        flat_lb = np.asarray(bound_override[0], dtype=np.float64)
+        flat_ub = np.asarray(bound_override[1], dtype=np.float64)
     n_orig = len(flat_lb)
     convhull_mode = _normalize_convhull_formulation(convhull_formulation)
     if convhull_ebd and convhull_mode != "sos2":

@@ -24,16 +24,28 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from importlib.util import find_spec
 from typing import Callable, Optional
 
 import numpy as np
 
 from discopt._jax.milp_relaxation import _normalize_convhull_formulation
 from discopt._jax.model_utils import flat_variable_bounds
-from discopt.modeling.core import Model, ObjectiveSense, SolveResult, VarType
+from discopt._jax.nonlinear_bound_tightening import (
+    is_effectively_finite,
+    tighten_nonlinear_bounds,
+)
+from discopt.modeling.core import (
+    Model,
+    ObjectiveSense,
+    SolveResult,
+    VarType,
+)
 
 logger = logging.getLogger(__name__)
 _DEFAULT_MAX_OA_CUTS = 128
+_SMALL_INT_FALLBACK_MAX_ASSIGNMENTS = 128
+_HAS_CYIPOPT = find_spec("cyipopt") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +68,55 @@ def _extract_orig_solution(x_milp: np.ndarray, n_orig: int) -> np.ndarray:
     return x_milp[:n_orig]
 
 
+def _snapshot_variable_bounds(model: Model) -> list[tuple[object, np.ndarray, np.ndarray]]:
+    """Capture model variable bounds so temporary overrides can be restored."""
+    saved_bounds: list[tuple[object, np.ndarray, np.ndarray]] = []
+    for var in model._variables:
+        saved_bounds.append(
+            (
+                var,
+                np.array(var.lb, dtype=np.float64, copy=True),
+                np.array(var.ub, dtype=np.float64, copy=True),
+            )
+        )
+    return saved_bounds
+
+
+def _restore_variable_bounds(saved_bounds: list[tuple[object, np.ndarray, np.ndarray]]) -> None:
+    """Restore variable bounds previously returned by _snapshot_variable_bounds()."""
+    for var, orig_lb, orig_ub in saved_bounds:
+        var.lb = orig_lb
+        var.ub = orig_ub
+
+
+def _apply_flat_bounds_to_model(model: Model, lb: np.ndarray, ub: np.ndarray) -> None:
+    """Apply flat bound arrays to model variables in-place."""
+    offset = 0
+    for var in model._variables:
+        size = var.size
+        var.lb = np.asarray(lb[offset : offset + size], dtype=np.float64).reshape(var.shape).copy()
+        var.ub = np.asarray(ub[offset : offset + size], dtype=np.float64).reshape(var.shape).copy()
+        offset += size
+
+
+def _default_nlp_start(flat_lb: np.ndarray, flat_ub: np.ndarray) -> np.ndarray:
+    """Build a neutral NLP start point that behaves sensibly on semi-infinite domains."""
+    x0 = np.zeros_like(flat_lb, dtype=np.float64)
+    finite_lb = np.vectorize(is_effectively_finite)(flat_lb)
+    finite_ub = np.vectorize(is_effectively_finite)(flat_ub)
+
+    both = finite_lb & finite_ub
+    x0[both] = 0.5 * (flat_lb[both] + flat_ub[both])
+
+    only_lb = finite_lb & ~finite_ub
+    x0[only_lb] = np.maximum(flat_lb[only_lb], 0.0)
+
+    only_ub = ~finite_lb & finite_ub
+    x0[only_ub] = np.minimum(flat_ub[only_ub], 0.0)
+
+    return x0
+
+
 def _solve_nlp_subproblem(
     evaluator,
     x0: np.ndarray,
@@ -71,21 +132,42 @@ def _solve_nlp_subproblem(
         lb_clip = np.clip(lb, -1e8, 1e8)
         ub_clip = np.clip(ub, -1e8, 1e8)
         x0_clipped = np.clip(x0, lb_clip, ub_clip)
+        model = evaluator._model
+        saved_bounds = _snapshot_variable_bounds(model)
+        _apply_flat_bounds_to_model(model, lb, ub)
+        try:
+            solver_sequence = [nlp_solver]
+            if nlp_solver == "ipm" and _HAS_CYIPOPT:
+                # The pure-JAX IPM is less robust on the tightly fixed integer
+                # subproblems used in AMP's local incumbent search. Retry with
+                # Ipopt before giving up so feasible incumbents are not missed.
+                solver_sequence.append("ipopt")
 
-        if nlp_solver == "ipm" and hasattr(evaluator, "_obj_fn"):
-            from discopt._jax.ipm import solve_nlp_ipm
+            result = None
+            for solver_name in solver_sequence:
+                if solver_name == "ipm" and hasattr(evaluator, "_obj_fn"):
+                    from discopt._jax.ipm import solve_nlp_ipm
 
-            result = solve_nlp_ipm(
-                evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300}
-            )
-        else:
-            from discopt.solvers.nlp_ipopt import solve_nlp
+                    trial = solve_nlp_ipm(
+                        evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300}
+                    )
+                else:
+                    from discopt.solvers.nlp_ipopt import solve_nlp
 
-            result = solve_nlp(evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300})
+                    trial = solve_nlp(
+                        evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300}
+                    )
+                result = trial
+                from discopt.solvers import SolveStatus
+
+                if trial.status == SolveStatus.OPTIMAL:
+                    break
+        finally:
+            _restore_variable_bounds(saved_bounds)
 
         from discopt.solvers import SolveStatus
 
-        if result.status == SolveStatus.OPTIMAL:
+        if result is not None and result.status == SolveStatus.OPTIMAL:
             obj = float(evaluator.evaluate_objective(result.x))
             return result.x, obj
     except Exception as e:
@@ -114,6 +196,7 @@ def _integer_rounding_candidates(
     """Generate nearest-first integer rounding candidates within variable bounds."""
     base = np.asarray(x, dtype=np.float64).copy()
     integer_entries: list[tuple[int, list[int]]] = []
+    full_domain_product = 1
 
     offset = 0
     for v in model._variables:
@@ -128,18 +211,44 @@ def _integer_rounding_candidates(
                 lo_i = int(np.ceil(lb_i - 1e-9))
                 hi_i = int(np.floor(ub_i + 1e-9))
 
-                options: list[int] = []
-                for raw in (
-                    int(round(clipped)),
-                    int(np.floor(clipped)),
-                    int(np.ceil(clipped)),
-                ):
+                if lo_i <= hi_i:
+                    domain_size = hi_i - lo_i + 1
+                    full_domain_product *= max(1, domain_size)
+                else:
+                    domain_size = max_candidates + 1
+                    full_domain_product = max_candidates + 1
+
+                if lo_i <= hi_i and full_domain_product <= max_candidates:
+                    center = min(max(int(round(clipped)), lo_i), hi_i)
+                    options = list(range(lo_i, hi_i + 1))
+                    options.sort(key=lambda value: (abs(value - clipped), abs(value - center), value))
+                else:
+                    center = int(round(clipped))
                     if lo_i <= hi_i:
-                        cand_int = min(max(raw, lo_i), hi_i)
-                    else:
-                        cand_int = int(round(clipped))
-                    if cand_int not in options:
-                        options.append(cand_int)
+                        center = min(max(center, lo_i), hi_i)
+
+                    options = []
+                    for raw in (
+                        center,
+                        int(np.floor(clipped)),
+                        int(np.ceil(clipped)),
+                    ):
+                        if lo_i <= hi_i:
+                            cand_int = min(max(raw, lo_i), hi_i)
+                        else:
+                            cand_int = raw
+                        if cand_int not in options:
+                            options.append(cand_int)
+
+                    neighbor_radius = 2
+                    for delta in range(1, neighbor_radius + 1):
+                        for raw in (center - delta, center + delta):
+                            if lo_i <= hi_i:
+                                cand_int = min(max(raw, lo_i), hi_i)
+                            else:
+                                cand_int = raw
+                            if cand_int not in options:
+                                options.append(cand_int)
 
                 integer_entries.append((idx, options))
         offset += v.size
@@ -215,8 +324,8 @@ def _build_fixed_integer_bounds(
     return nlp_lb, nlp_ub
 
 
-def _solve_best_nlp_candidate(
-    x0: np.ndarray,
+def _select_best_nlp_candidate(
+    candidates: list[np.ndarray],
     model: Model,
     evaluator,
     flat_lb: np.ndarray,
@@ -229,7 +338,7 @@ def _solve_best_nlp_candidate(
     best_x: Optional[np.ndarray] = None
     best_obj: Optional[float] = None
 
-    for x0_nlp in _integer_rounding_candidates(x0, model):
+    for x0_nlp in candidates:
         nlp_lb, nlp_ub = _build_fixed_integer_bounds(x0_nlp, model, flat_lb, flat_ub)
         cand_x, cand_obj = _solve_nlp_subproblem(
             evaluator,
@@ -258,6 +367,87 @@ def _solve_best_nlp_candidate(
     return best_x, best_obj
 
 
+def _solve_best_nlp_candidate(
+    x0: np.ndarray,
+    model: Model,
+    evaluator,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+    constraint_lb: np.ndarray,
+    constraint_ub: np.ndarray,
+    nlp_solver: str,
+) -> tuple[Optional[np.ndarray], Optional[float]]:
+    """Return the best feasible NLP candidate across the integer-rounding set."""
+    return _select_best_nlp_candidate(
+        _integer_rounding_candidates(x0, model),
+        model,
+        evaluator,
+        flat_lb,
+        flat_ub,
+        constraint_lb,
+        constraint_ub,
+        nlp_solver,
+    )
+
+
+def _small_integer_domain_size(model: Model, max_assignments: int) -> Optional[int]:
+    """Return the exact integer-domain size when it is finite and small enough."""
+    total = 1
+    has_integer = False
+
+    for var in model._variables:
+        if var.var_type not in (VarType.BINARY, VarType.INTEGER):
+            continue
+        has_integer = True
+        for lb_i, ub_i in zip(
+            np.asarray(var.lb, dtype=np.float64).ravel(),
+            np.asarray(var.ub, dtype=np.float64).ravel(),
+        ):
+            if not (is_effectively_finite(float(lb_i)) and is_effectively_finite(float(ub_i))):
+                return None
+            lo_i = int(np.ceil(float(lb_i) - 1e-9))
+            hi_i = int(np.floor(float(ub_i) + 1e-9))
+            if lo_i > hi_i:
+                return 0
+            total *= hi_i - lo_i + 1
+            if total > max_assignments:
+                return None
+
+    return total if has_integer else None
+
+
+def _solve_small_integer_domain_fallback(
+    model: Model,
+    evaluator,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+    constraint_lb: np.ndarray,
+    constraint_ub: np.ndarray,
+    nlp_solver: str,
+    max_assignments: int = _SMALL_INT_FALLBACK_MAX_ASSIGNMENTS,
+) -> tuple[Optional[np.ndarray], Optional[float]]:
+    """Enumerate a small finite integer domain directly when the MILP relaxation fails."""
+    domain_size = _small_integer_domain_size(model, max_assignments)
+    if domain_size is None or domain_size == 0:
+        return None, None
+
+    base_x0 = _default_nlp_start(flat_lb, flat_ub)
+    candidates = _integer_rounding_candidates(base_x0, model, max_candidates=max_assignments)
+    if len(candidates) < domain_size:
+        return None, None
+
+    return _select_best_nlp_candidate(
+        candidates,
+        model,
+        evaluator,
+        flat_lb,
+        flat_ub,
+        constraint_lb,
+        constraint_ub,
+        nlp_solver,
+    )
+
+
 def _solve_milp_with_oa_recovery(
     model: Model,
     terms,
@@ -269,6 +459,7 @@ def _solve_milp_with_oa_recovery(
     convhull_formulation: str,
     convhull_ebd: bool,
     convhull_ebd_encoding: str,
+    bound_override: Optional[tuple[np.ndarray, np.ndarray]] = None,
 ):
     """Retry MILP solves after dropping the oldest half of OA cuts on infeasibility."""
     from discopt._jax.milp_relaxation import build_milp_relaxation
@@ -288,6 +479,7 @@ def _solve_milp_with_oa_recovery(
             convhull_formulation=convhull_formulation,
             convhull_ebd=convhull_ebd,
             convhull_ebd_encoding=convhull_ebd_encoding,
+            bound_override=bound_override,
         )
         milp_result = milp_model.solve(
             time_limit=time_limit,
@@ -535,11 +727,39 @@ def solve_amp(
     if convhull_ebd and convhull_mode != "sos2":
         raise ValueError("convhull_ebd requires convhull_formulation='sos2' or the 'lambda' alias.")
 
+    if all(v.var_type == VarType.CONTINUOUS for v in model._variables):
+        try:
+            from discopt._jax.convexity import classify_model as _classify_convexity
+            from discopt.solver import solve_model as _solve_model
+
+            is_convex, _ = _classify_convexity(model)
+            if is_convex:
+                logger.info(
+                    "AMP: convex continuous model detected; delegating to direct solver path"
+                )
+                return _solve_model(
+                    model,
+                    time_limit=time_limit,
+                    gap_tolerance=rel_gap,
+                    nlp_solver=nlp_solver,
+                )
+        except Exception as exc:
+            logger.debug("AMP: convex delegation check failed: %s", exc)
+
     def _from_minimization_space(value: float) -> float:
         return -float(value) if maximize else float(value)
 
     n_orig = sum(v.size for v in model._variables)
     flat_lb, flat_ub = flat_variable_bounds(model)
+    tightened_lb, tightened_ub, nonlinear_bt_stats = tighten_nonlinear_bounds(model, flat_lb, flat_ub)
+    if nonlinear_bt_stats.n_tightened > 0:
+        flat_lb = tightened_lb
+        flat_ub = tightened_ub
+        logger.info(
+            "AMP: nonlinear bound tightening adjusted %d bounds via %s",
+            nonlinear_bt_stats.n_tightened,
+            ", ".join(nonlinear_bt_stats.applied_rules),
+        )
     evaluator = NLPEvaluator(model)
     constraint_lb, constraint_ub = _infer_constraint_bounds(model)
 
@@ -653,6 +873,7 @@ def solve_amp(
                 convhull_formulation=convhull_mode,
                 convhull_ebd=convhull_ebd,
                 convhull_ebd_encoding=convhull_ebd_encoding,
+                bound_override=(flat_lb, flat_ub),
             )
             oa_cuts = active_oa_cuts
         except Exception as e:
@@ -668,6 +889,25 @@ def solve_amp(
             if LB == -np.inf:
                 # Problem may be infeasible
                 if iteration == 1:
+                    fallback_x, fallback_obj = _solve_small_integer_domain_fallback(
+                        model,
+                        evaluator,
+                        flat_lb,
+                        flat_ub,
+                        constraint_lb,
+                        constraint_ub,
+                        nlp_solver,
+                    )
+                    if fallback_x is not None and fallback_obj is not None:
+                        return SolveResult(
+                            status="feasible",
+                            objective=_from_minimization_space(fallback_obj),
+                            bound=None,
+                            gap=None,
+                            x=_build_x_dict(fallback_x, model),
+                            wall_time=time.perf_counter() - t_start,
+                            gap_certified=False,
+                        )
                     return SolveResult(
                         status="infeasible",
                         wall_time=time.perf_counter() - t_start,
@@ -885,8 +1125,6 @@ def solve_amp(
 
         if gap_certified:
             status = "optimal"
-        elif elapsed >= time_limit:
-            status = "time_limit"
         else:
             status = "feasible"
 

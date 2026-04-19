@@ -27,6 +27,7 @@ Sections:
 from __future__ import annotations
 
 import os
+from importlib.util import find_spec
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["JAX_ENABLE_X64"] = "1"
@@ -34,10 +35,23 @@ os.environ["JAX_ENABLE_X64"] = "1"
 import discopt.modeling as dm
 import numpy as np
 import pytest
+from discopt._jax.model_utils import flat_variable_bounds
 from discopt.modeling.core import (
     Model,
     SolveResult,
 )
+from test_minlptests import NLP_MI_INSTANCES
+
+HAS_CYIPOPT = find_spec("cyipopt") is not None
+
+
+def _unwrap_minlptests_case(case):
+    return case.values[0] if hasattr(case, "values") else case
+
+
+MINLPTESTS_MI_BY_ID = {
+    instance.problem_id: instance for instance in map(_unwrap_minlptests_case, NLP_MI_INSTANCES)
+}
 
 # ---------------------------------------------------------------------------
 # Shared helpers / problem builders
@@ -1519,6 +1533,19 @@ class TestCurrentCodeWeaknesses:
         assert len(candidates) == 64
         assert tuple(float(v) for v in candidates[0]) == tuple(0.0 for _ in range(100))
 
+    def test_integer_rounding_candidates_enumerate_small_finite_domains(self):
+        """Small finite integer boxes should be enumerated instead of a single rounded point."""
+        from discopt.solvers import amp as amp_mod
+
+        m = Model("rounding_box")
+        m.integer("y", lb=0, ub=4, shape=(2,))
+
+        candidates = amp_mod._integer_rounding_candidates(np.array([4.0, 4.0]), m)
+        rounded = {tuple(float(v) for v in cand) for cand in candidates}
+
+        assert len(candidates) == 25
+        assert (3.0, 2.0) in rounded
+
     def test_build_fixed_integer_bounds_clamps_to_integer_domain(self):
         """Rounded fixed bounds should stay within the realizable integer domain."""
         from discopt.solvers import amp as amp_mod
@@ -1658,6 +1685,160 @@ class TestCurrentCodeWeaknesses:
 
         assert best_x is None
         assert best_obj is None
+
+    def test_amp_recovers_minlptests_integer_incumbent_from_small_finite_box(self):
+        """AMP should recover finite-domain MINLP incumbents even from integral MILP points."""
+        instance = MINLPTESTS_MI_BY_ID["nlp_mi_003_014"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+            apply_partitioning=False,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+
+    def test_tighten_sum_of_squares_bounds_infers_finite_integer_domain(self):
+        """Quadratic norm constraints should clamp otherwise unbounded domains."""
+        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+
+        m = Model("sum_of_squares_bound_tightening")
+        x = m.continuous("x", lb=-1.0, ub=1.0)
+        y = m.continuous("y")
+        z = m.integer("z", lb=-1e20, ub=1e20)
+        m.minimize(x * 0.0)
+        m.subject_to(x**2 + y**2 + z**2 <= 10.0)
+
+        flat_lb, flat_ub = flat_variable_bounds(m)
+        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(m, flat_lb, flat_ub)
+
+        assert tightened_lb[1] == pytest.approx(-np.sqrt(10.0))
+        assert tightened_ub[1] == pytest.approx(np.sqrt(10.0))
+        assert tightened_lb[2] == pytest.approx(-3.0)
+        assert tightened_ub[2] == pytest.approx(3.0)
+        assert stats.applied_rules == ("sum_of_squares_upper_bound",)
+
+    def test_solver_fbbt_applies_nonlinear_rules_without_linear_constraints(self):
+        """The shared nonlinear tightening rules should run through solver FBBT too."""
+        from discopt._jax.nlp_evaluator import NLPEvaluator
+        from discopt.solver import _infer_constraint_bounds, _tighten_node_bounds
+
+        m = Model("nonlinear_fbbt_sum_of_squares")
+        x = m.continuous("x", lb=-1.0, ub=1.0)
+        y = m.continuous("y")
+        z = m.integer("z", lb=-1e20, ub=1e20)
+        m.minimize(x * 0.0)
+        m.subject_to(x**2 + y**2 + z**2 <= 10.0)
+
+        evaluator = NLPEvaluator(m)
+        flat_lb, flat_ub = flat_variable_bounds(m)
+        cl_list, cu_list = _infer_constraint_bounds(m, evaluator)
+        tightened_lb, tightened_ub = _tighten_node_bounds(
+            evaluator, flat_lb, flat_ub, cl_list, cu_list
+        )
+
+        assert tightened_lb[1] == pytest.approx(-np.sqrt(10.0))
+        assert tightened_ub[1] == pytest.approx(np.sqrt(10.0))
+        assert tightened_lb[2] == pytest.approx(-3.0)
+        assert tightened_ub[2] == pytest.approx(3.0)
+
+    def test_nonlinear_bound_tightening_accepts_custom_rules(self):
+        """The shared nonlinear tightening runner should stay open to new rules."""
+        from discopt._jax.nonlinear_bound_tightening import (
+            NonlinearBoundTighteningRule,
+            tighten_nonlinear_bounds,
+        )
+
+        class CustomClampRule(NonlinearBoundTighteningRule):
+            name = "custom_clamp"
+
+            def tighten(self, model, flat_lb, flat_ub, metadata):
+                tightened_lb = flat_lb.copy()
+                tightened_ub = flat_ub.copy()
+                tightened_lb[0] = max(tightened_lb[0], -2.0)
+                tightened_ub[0] = min(tightened_ub[0], 2.0)
+                return tightened_lb, tightened_ub
+
+        m = Model("custom_nonlinear_rule")
+        m.continuous("x", lb=-10.0, ub=10.0)
+        m.minimize(0.0)
+
+        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(
+            m,
+            np.array([-10.0], dtype=np.float64),
+            np.array([10.0], dtype=np.float64),
+            rules=(CustomClampRule(),),
+        )
+
+        assert tightened_lb[0] == pytest.approx(-2.0)
+        assert tightened_ub[0] == pytest.approx(2.0)
+        assert stats.applied_rules == ("custom_clamp",)
+
+    def test_amp_fallback_enumerates_small_integer_domain_when_milp_relaxation_fails(self):
+        """AMP should still recover a bounded integer optimum if the first MILP errors out."""
+        if not HAS_CYIPOPT:
+            pytest.skip("requires cyipopt for the fixed-integer NLP fallback")
+
+        instance = MINLPTESTS_MI_BY_ID["nlp_mi_001_010"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+            apply_partitioning=False,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+
+    def test_amp_recovers_quadratic_norm_integer_optimum_with_unbounded_integer_var(self):
+        """AMP should infer a finite integer box from simple quadratic norm constraints."""
+        instance = MINLPTESTS_MI_BY_ID["nlp_mi_004_010"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+            apply_partitioning=False,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+
+    def test_amp_fixed_integer_nlp_retries_with_ipopt(self):
+        """Fixed-integer NLP candidates should not be lost when the JAX IPM stalls."""
+        if not HAS_CYIPOPT:
+            pytest.skip("requires cyipopt for the ipopt retry path")
+
+        instance = MINLPTESTS_MI_BY_ID["nlp_mi_005_010"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+            apply_partitioning=False,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
 
     def test_oa_cut_recovery_drops_oldest_half(self, monkeypatch):
         """OA recovery should retry with the oldest half of cuts removed."""
