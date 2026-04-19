@@ -21,21 +21,8 @@ DISCOPT_INPUT_JSON="${DISCOPT_INPUT_JSON:-}"
 PYTHON_RUNNER_LABEL=""
 declare -a PYTHON_RUNNER=()
 
-if [[ -n "${ALPINE_PROJECT:-}" ]]; then
-  ALPINE_PROJECT="${ALPINE_PROJECT}"
-elif [[ -d "${REPO_ROOT}/../Alpine.jl" ]]; then
-  ALPINE_PROJECT="${REPO_ROOT}/../Alpine.jl"
-else
-  ALPINE_PROJECT="/home/bernalde/repos/Alpine.jl"
-fi
-
-if [[ -n "${MINLPTESTS_PATH:-}" ]]; then
-  MINLPTESTS_PATH="${MINLPTESTS_PATH}"
-elif [[ -d "${REPO_ROOT}/../MINLPTests.jl" ]]; then
-  MINLPTESTS_PATH="${REPO_ROOT}/../MINLPTests.jl"
-else
-  MINLPTESTS_PATH="/home/bernalde/repos/MINLPTests.jl"
-fi
+ALPINE_PROJECT="${ALPINE_PROJECT:-${REPO_ROOT}/../Alpine.jl}"
+MINLPTESTS_PATH="${MINLPTESTS_PATH:-${REPO_ROOT}/../MINLPTests.jl}"
 
 DISCOPT_JSON="${OUTPUT_DIR}/minlptests-full-discopt.json"
 DISCOPT_MD="${OUTPUT_DIR}/minlptests-full-discopt.md"
@@ -96,11 +83,13 @@ log "JAX_ENABLE_X64: ${JAX_ENABLE_X64}"
 
 if [[ ! -d "${ALPINE_PROJECT}" ]]; then
   echo "Missing Alpine.jl checkout: ${ALPINE_PROJECT}" >&2
+  echo "Set ALPINE_PROJECT or place Alpine.jl next to this repo." >&2
   exit 1
 fi
 
 if [[ ! -d "${MINLPTESTS_PATH}" ]]; then
   echo "Missing MINLPTests.jl checkout: ${MINLPTESTS_PATH}" >&2
+  echo "Set MINLPTESTS_PATH or place MINLPTests.jl next to this repo." >&2
   exit 1
 fi
 
