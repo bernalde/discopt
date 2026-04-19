@@ -189,6 +189,21 @@ class TestConvexFastPathSolutions:
         assert result.convex_fast_path is True
         assert result.gap == 0.0
 
+    def test_zero_objective_lp_reports_no_relative_gap(self):
+        """Direct LP dispatch should leave the relative gap undefined at zero objective."""
+        m = Model("zero_gap_lp")
+        x = m.continuous("x", lb=-1.0, ub=1.0)
+        m.minimize(x)
+        m.subject_to(x == 0.0)
+
+        result = m.solve()
+
+        assert result.status == "optimal"
+        assert result.convex_fast_path is True
+        assert result.objective is not None
+        assert abs(result.objective) <= 1e-9
+        assert result.gap is None
+
 
 class TestConvexFastPathConstraints:
     """Test constraint handling in convex detection."""

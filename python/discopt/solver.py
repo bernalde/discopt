@@ -381,13 +381,8 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
     lb = node_lb.copy()
     ub = node_ub.copy()
 
-    try:
-        lb, ub, _ = tighten_nonlinear_bounds(evaluator._model, lb, ub)
-    except Exception:
-        pass
-
     if evaluator.n_constraints == 0 or not cl_list:
-        return lb, ub
+        return _apply_nonlinear_tightening(evaluator._model, lb, ub)
 
     n = len(lb)
     m = len(cl_list)
@@ -409,20 +404,16 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
         return lb, ub  # can't determine linearity, skip FBBT
 
     if not np.any(is_linear):
-        return lb, ub  # no linear constraints to tighten
+        return _apply_nonlinear_tightening(evaluator._model, lb, ub)
 
     for _ in range(max_rounds):
         changed = False
 
-        try:
-            tightened_lb, tightened_ub, nonlinear_stats = tighten_nonlinear_bounds(evaluator._model, lb, ub)
-        except Exception:
-            nonlinear_stats = None
-        else:
-            if nonlinear_stats.n_tightened > 0:
-                lb = tightened_lb
-                ub = tightened_ub
-                changed = True
+        tightened_lb, tightened_ub = _apply_nonlinear_tightening(evaluator._model, lb, ub)
+        if np.any(np.abs(tightened_lb - lb) > 1e-12) or np.any(np.abs(tightened_ub - ub) > 1e-12):
+            lb = tightened_lb
+            ub = tightened_ub
+            changed = True
 
         # Evaluate Jacobian at midpoint of current bounds
         mid = np.clip(lb, -_SPC, _SPC)
@@ -496,6 +487,21 @@ def _tighten_node_bounds(evaluator, node_lb, node_ub, cl_list, cu_list, max_roun
             break
 
     return lb, ub
+
+
+def _apply_nonlinear_tightening(
+    model: Model,
+    lb: np.ndarray,
+    ub: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply opportunistic nonlinear bound tightening without aborting node processing."""
+    try:
+        tightened_lb, tightened_ub, _ = tighten_nonlinear_bounds(model, lb, ub)
+    except Exception as exc:
+        logger.debug("Skipping nonlinear tightening after error: %s", exc)
+        return lb, ub
+
+    return tightened_lb, tightened_ub
 
 
 def _infer_constraint_bounds(model: Model, evaluator=None):
@@ -3429,6 +3435,11 @@ def _decompose_eq_slack_form(
     return A_ub, b_ub, A_eq, b_eq
 
 
+def _optimal_relative_gap(objective: float) -> Optional[float]:
+    """Return the relative gap for a certified optimum."""
+    return None if abs(float(objective)) <= 1e-10 else 0.0
+
+
 def _solve_lp(model: Model, t_start: float, time_limit: Optional[float] = None) -> SolveResult:
     """Solve an LP, preferring HiGHS and falling back to the pure-JAX LP IPM."""
     result = _solve_lp_highs(model, t_start, time_limit)
@@ -3467,7 +3478,7 @@ def _solve_lp(model: Model, t_start: float, time_limit: Optional[float] = None) 
         status=status,
         objective=obj_val,
         bound=obj_val if status == "optimal" else None,
-        gap=0.0 if status == "optimal" else None,
+        gap=_optimal_relative_gap(obj_val) if status == "optimal" else None,
         x=_unpack_solution(model, x_flat),
         wall_time=wall_time,
         node_count=0,
@@ -3539,7 +3550,7 @@ def _solve_lp_highs(
             status="optimal",
             objective=obj_val,
             bound=obj_val,
-            gap=0.0,
+            gap=_optimal_relative_gap(obj_val),
             x=_unpack_solution(model, result.x[:n_orig]),
             wall_time=wall_time,
             node_count=0,
@@ -3646,7 +3657,7 @@ def _solve_qp_highs(
             status="optimal",
             objective=obj_val,
             bound=obj_val,
-            gap=0.0,
+            gap=_optimal_relative_gap(obj_val),
             x=_unpack_solution(model, x_flat),
             wall_time=wall_time,
             node_count=result.node_count,
@@ -3796,7 +3807,7 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
         status=status,
         objective=obj_val,
         bound=obj_val if status == "optimal" else None,
-        gap=0.0 if status == "optimal" else None,
+        gap=_optimal_relative_gap(obj_val) if status == "optimal" else None,
         x=_unpack_solution(model, x_flat),
         wall_time=wall_time,
         node_count=0,

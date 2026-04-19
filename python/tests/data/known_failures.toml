@@ -27,6 +27,17 @@ note     = "user-defined function via JuMP.register() has no dm equivalent"
 # RESOLVED: Fixed in f6d15a5 ("Fix maximize objective sign in solver and QP
 # extractor"). All 14 entries removed after rebase confirmed they now pass.
 
+# ── NaN on division + integer (issue #7) ─────────────────────────────────────
+#
+# AMP now recovers this translated case, but the default solve path still times
+# out on the MINLPTests regression surface. Keep the tracker until both paths
+# pass reliably.
+
+[minlptests."nlp_mi_005_010/primary"]
+category = "no_convergence"
+issue    = 7
+note     = "default solve path still times out on the reciprocal/integer MINLP regression"
+
 # ── IPM iteration_limit on unbounded variables ───────────────────────────────
 # Variables without explicit bounds get lb=-1e20,ub=1e20 which causes the IPM
 # to hit iteration_limit. All 501_011 (sqrt-constraint) variants are affected,

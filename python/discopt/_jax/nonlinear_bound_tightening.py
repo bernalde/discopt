@@ -19,8 +19,8 @@ from discopt.modeling.core import (
     IndexExpression,
     Model,
     UnaryOp,
-    VarType,
     Variable,
+    VarType,
 )
 
 _EFFECTIVE_INF = 1e19

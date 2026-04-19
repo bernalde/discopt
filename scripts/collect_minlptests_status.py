@@ -8,11 +8,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
-import types
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = REPO_ROOT / "python"
@@ -87,45 +86,45 @@ def case_catalog(
     for raw in mod.NLP_INSTANCES:
         inst = unwrap_case(raw)
         cases.append(
-                {
-                    "category": "nlp",
-                    "directory": "nlp",
-                    "symbol": inst.problem_id,
-                    "instance": inst,
-                    "time_limit": per_instance_time_limit,
-                    "gap_tolerance": 1e-6,
-                    "expected_status": "optimal",
-                }
-            )
+            {
+                "category": "nlp",
+                "directory": "nlp",
+                "symbol": inst.problem_id,
+                "instance": inst,
+                "time_limit": per_instance_time_limit,
+                "gap_tolerance": 1e-6,
+                "expected_status": "optimal",
+            }
+        )
 
     for raw in mod.NLP_MI_INSTANCES:
         inst = unwrap_case(raw)
         cases.append(
-                {
-                    "category": "nlp_mi",
-                    "directory": "nlp-mi",
-                    "symbol": inst.problem_id,
-                    "instance": inst,
-                    "time_limit": per_instance_time_limit,
-                    "gap_tolerance": 1e-6,
-                    "expected_status": "optimal",
-                }
-            )
+            {
+                "category": "nlp_mi",
+                "directory": "nlp-mi",
+                "symbol": inst.problem_id,
+                "instance": inst,
+                "time_limit": per_instance_time_limit,
+                "gap_tolerance": 1e-6,
+                "expected_status": "optimal",
+            }
+        )
 
     for raw in mod.INFEASIBLE_INSTANCES:
         inst = unwrap_case(raw)
         directory = "nlp-mi" if inst.problem_id.startswith("nlp_mi_") else "nlp"
         cases.append(
-                {
-                    "category": "infeasible",
-                    "directory": directory,
-                    "symbol": inst.problem_id,
-                    "instance": inst,
-                    "time_limit": per_instance_time_limit,
-                    "gap_tolerance": None,
-                    "expected_status": "infeasible",
-                }
-            )
+            {
+                "category": "infeasible",
+                "directory": directory,
+                "symbol": inst.problem_id,
+                "instance": inst,
+                "time_limit": per_instance_time_limit,
+                "gap_tolerance": None,
+                "expected_status": "infeasible",
+            }
+        )
 
     return cases
 
@@ -206,7 +205,8 @@ def run_alpine_cases(
         output_path = tmpdir_path / "results.jsonl"
 
         request_lines = [
-            "\t".join((case["instance"].problem_id, case["category"], case["symbol"])) for case in cases
+            "\t".join((case["instance"].problem_id, case["category"], case["symbol"]))
+            for case in cases
         ]
         request_path.write_text("\n".join(request_lines) + "\n", encoding="utf-8")
 
@@ -278,17 +278,30 @@ def build_markdown(
     lines: list[str] = [
         "# MINLPTests Status",
         "",
-        "Generated from the discopt AMP run and the matching Alpine.jl run on the same translated MINLPTests problem IDs.",
+        (
+            "Generated from the discopt AMP run and the matching Alpine.jl run "
+            "on the same translated MINLPTests problem IDs."
+        ),
         "",
     ]
 
     def add_summary_table(title: str, records: list[dict[str, Any]]) -> None:
-        lines.extend([f"## {title}", "", "| Category | Pass | Fail | Error | Total |", "| --- | ---: | ---: | ---: | ---: |"])
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| Category | Pass | Fail | Error | Total |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
         summary = summarize(records)
         for category in ("nlp", "nlp_mi", "infeasible", "nlp_cvx"):
             row = summary.get(category, {})
             lines.append(
-                f"| {category} | {row.get('pass', 0)} | {row.get('fail', 0)} | {row.get('error', 0)} | {row.get('total', 0)} |"
+                (
+                    f"| {category} | {row.get('pass', 0)} | {row.get('fail', 0)} | "
+                    f"{row.get('error', 0)} | {row.get('total', 0)} |"
+                )
             )
         lines.append("")
 
@@ -349,13 +362,23 @@ def build_markdown(
             for discopt, alpine in gap_rows:
                 note = discopt["note"].replace("|", "\\|")
                 lines.append(
-                    f"| {discopt['problem_id']} | {discopt['category']} | {discopt['outcome']} | {alpine['outcome']} | {note} |"
+                    (
+                        f"| {discopt['problem_id']} | {discopt['category']} | "
+                        f"{discopt['outcome']} | {alpine['outcome']} | {note} |"
+                    )
                 )
         else:
             lines.append("No discopt-only gaps were found in cases that Alpine passes.")
         lines.append("")
 
-    lines.extend(["## Discopt Failures", "", "| Problem | Category | Outcome | Status | Note |", "| --- | --- | --- | --- | --- |"])
+    lines.extend(
+        [
+            "## Discopt Failures",
+            "",
+            "| Problem | Category | Outcome | Status | Note |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
     shown = False
     for record in discopt_records:
         if record["outcome"] == "pass":
@@ -363,7 +386,12 @@ def build_markdown(
         shown = True
         status = "" if record["status"] is None else str(record["status"])
         note = record["note"].replace("|", "\\|")
-        lines.append(f"| {record['problem_id']} | {record['category']} | {record['outcome']} | {status} | {note} |")
+        lines.append(
+            (
+                f"| {record['problem_id']} | {record['category']} | "
+                f"{record['outcome']} | {status} | {note} |"
+            )
+        )
     if not shown:
         lines.append("| none | - | - | - | - |")
     lines.append("")
@@ -372,8 +400,15 @@ def build_markdown(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run discopt and Alpine MINLPTests status sweeps.")
-    parser.add_argument("--output-json", type=Path, required=True, help="Path to write the merged JSON result payload.")
+    parser = argparse.ArgumentParser(
+        description="Run discopt and Alpine MINLPTests status sweeps."
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        required=True,
+        help="Path to write the merged JSON result payload.",
+    )
     parser.add_argument(
         "--output-markdown",
         type=Path,
@@ -387,7 +422,10 @@ def main() -> None:
     parser.add_argument(
         "--include-convex",
         action="store_true",
-        help="Include the convex nlp-cvx cases. By default the runner uses the nonconvex Phase 6 scope only.",
+        help=(
+            "Include the convex nlp-cvx cases. By default the runner uses the "
+            "nonconvex Phase 6 scope only."
+        ),
     )
     parser.add_argument(
         "--per-instance-time-limit",
@@ -399,7 +437,10 @@ def main() -> None:
         "--discopt-mode",
         choices=("amp", "default"),
         default="amp",
-        help="Solve the translated MINLPTests cases with the AMP solver or the default solve path.",
+        help=(
+            "Solve the translated MINLPTests cases with the AMP solver or the "
+            "default solve path."
+        ),
     )
     parser.add_argument(
         "--alpine-project",
@@ -417,7 +458,10 @@ def main() -> None:
     parser.add_argument(
         "--julia-channel",
         default="+release",
-        help="Optional juliaup channel argument, e.g. '+release'. Use an empty string to disable it.",
+        help=(
+            "Optional juliaup channel argument, e.g. '+release'. Use an empty "
+            "string to disable it."
+        ),
     )
     args = parser.parse_args()
 

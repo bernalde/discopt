@@ -24,6 +24,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from functools import lru_cache
 from importlib.util import find_spec
 from typing import Callable, Optional
 
@@ -45,12 +46,17 @@ from discopt.modeling.core import (
 logger = logging.getLogger(__name__)
 _DEFAULT_MAX_OA_CUTS = 128
 _SMALL_INT_FALLBACK_MAX_ASSIGNMENTS = 128
-_HAS_CYIPOPT = find_spec("cyipopt") is not None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _has_cyipopt() -> bool:
+    """Return True when cyipopt is importable in the active environment."""
+    return find_spec("cyipopt") is not None
 
 
 def _build_x_dict(x_flat: np.ndarray, model: Model) -> dict:
@@ -137,7 +143,7 @@ def _solve_nlp_subproblem(
         _apply_flat_bounds_to_model(model, lb, ub)
         try:
             solver_sequence = [nlp_solver]
-            if nlp_solver == "ipm" and _HAS_CYIPOPT:
+            if nlp_solver == "ipm" and _has_cyipopt():
                 # The pure-JAX IPM is less robust on the tightly fixed integer
                 # subproblems used in AMP's local incumbent search. Retry with
                 # Ipopt before giving up so feasible incumbents are not missed.
@@ -221,7 +227,9 @@ def _integer_rounding_candidates(
                 if lo_i <= hi_i and full_domain_product <= max_candidates:
                     center = min(max(int(round(clipped)), lo_i), hi_i)
                     options = list(range(lo_i, hi_i + 1))
-                    options.sort(key=lambda value: (abs(value - clipped), abs(value - center), value))
+                    options.sort(
+                        key=lambda value: (abs(value - clipped), abs(value - center), value)
+                    )
                 else:
                     center = int(round(clipped))
                     if lo_i <= hi_i:
@@ -697,7 +705,9 @@ def solve_amp(
     Returns
     -------
     SolveResult
-        With gap_certified=True if termination is by gap criterion.
+        With gap_certified=True if termination is by gap criterion. When AMP
+        reaches the wall-clock limit with an incumbent but no certificate, the
+        status remains ``"time_limit"`` and the incumbent is returned.
     """
     t_start = time.perf_counter()
 
@@ -751,7 +761,9 @@ def solve_amp(
 
     n_orig = sum(v.size for v in model._variables)
     flat_lb, flat_ub = flat_variable_bounds(model)
-    tightened_lb, tightened_ub, nonlinear_bt_stats = tighten_nonlinear_bounds(model, flat_lb, flat_ub)
+    tightened_lb, tightened_ub, nonlinear_bt_stats = tighten_nonlinear_bounds(
+        model, flat_lb, flat_ub
+    )
     if nonlinear_bt_stats.n_tightened > 0:
         flat_lb = tightened_lb
         flat_ub = tightened_ub
@@ -1125,6 +1137,8 @@ def solve_amp(
 
         if gap_certified:
             status = "optimal"
+        elif elapsed >= time_limit:
+            status = "time_limit"
         else:
             status = "feasible"
 
