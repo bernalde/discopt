@@ -62,7 +62,46 @@ function build_optimizer(per_instance_time_limit::Float64)
     )
 end
 
-function run_case(optimizer, problem_id::AbstractString, symbol_name::AbstractString, minlptests)
+function resolve_symbol_name(symbol_name::AbstractString, minlptests)
+    symbol_name_str = String(symbol_name)
+    requested = Symbol(symbol_name_str)
+    if isdefined(minlptests, requested)
+        return symbol_name_str
+    end
+
+    match_501 = match(r"^(nlp_cvx_501_01[01])_[0-9]+d$", symbol_name_str)
+    if match_501 !== nothing
+        canonical_name = match_501.captures[1]
+        if isdefined(minlptests, Symbol(canonical_name))
+            return canonical_name
+        end
+    end
+
+    return nothing
+end
+
+function missing_symbol_record(problem_id::AbstractString, symbol_name::AbstractString)
+    problem_id_str = String(problem_id)
+    symbol_name_str = String(symbol_name)
+    return Dict(
+        "problem_id" => problem_id_str,
+        "symbol" => symbol_name_str,
+        "outcome" => "error",
+        "passes" => 0,
+        "fails" => 0,
+        "errors" => 1,
+        "broken" => 0,
+        "wall_time_sec" => 0.0,
+        "note" => "missing MINLPTests symbol: " * symbol_name_str,
+    )
+end
+
+function run_case(
+    optimizer,
+    problem_id::AbstractString,
+    symbol_name::AbstractString,
+    minlptests,
+)
     problem_id_str = String(problem_id)
     symbol_name_str = String(symbol_name)
     f = getfield(minlptests, Symbol(symbol_name_str))
@@ -117,6 +156,7 @@ function main()
     minlptests = Base.invokelatest(() -> getfield(Main, :MINLPTests))
 
     optimizer = build_optimizer(per_instance_time_limit)
+    cached_records = Dict{String, Dict{String, Any}}()
 
     open(output_path, "w") do io
         for line in eachline(request_path)
@@ -126,7 +166,22 @@ function main()
                 error("expected 3 tab-separated fields per line in request file")
             end
             problem_id, category, symbol_name = fields
-            record = run_case(optimizer, problem_id, symbol_name, minlptests)
+            canonical_symbol_name = resolve_symbol_name(symbol_name, minlptests)
+
+            if canonical_symbol_name === nothing
+                record = missing_symbol_record(problem_id, symbol_name)
+            else
+                cached = get!(cached_records, canonical_symbol_name) do
+                    run_case(optimizer, problem_id, canonical_symbol_name, minlptests)
+                end
+                record = copy(cached)
+                record["problem_id"] = String(problem_id)
+                record["symbol"] = String(symbol_name)
+                if canonical_symbol_name != symbol_name
+                    record["canonical_symbol"] = canonical_symbol_name
+                end
+            end
+
             record["category"] = category
             write_record(io, record)
         end
