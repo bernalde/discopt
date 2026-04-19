@@ -18,99 +18,109 @@ This phase now has concrete outputs instead of a placeholder checklist.
 - `scripts/collect_minlptests_status.py` and
   `scripts/alpine_minlptests_status.jl` provide the reproducible comparison run.
 
-The current benchmark slice is the 31 translated nonconvex and infeasible
-MINLPTests cases already present in the repo:
+The current benchmark slice is the full translated MINLPTests suite already
+present in the repo:
 
-- 15 feasible `nlp`
-- 13 feasible `nlp_mi`
+- 91 convex `nlp_cvx`
+- 15 feasible nonconvex `nlp`
+- 13 feasible nonconvex `nlp_mi`
 - 3 infeasible cases
 
 ## Reproduction
 
-discopt AMP only:
+Full discopt + Alpine comparison:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache-pr14 PYTHONPATH=python \
-~/.local/bin/uv run --extra dev python scripts/collect_minlptests_status.py \
-  --skip-alpine \
-  --output-json /tmp/discopt-amp-minlptests-phase6.json \
-  --output-markdown /tmp/discopt-amp-minlptests-phase6.md
+source .venv/bin/activate
+unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_PROMPT_MODIFIER CONDA_SHLVL
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OUT="/tmp/minlptests-full-benchmark-${STAMP}"
+UV_CACHE_DIR=/tmp/discopt-uv-cache maturin develop
+FORCE_RERUN=1 OUTPUT_DIR="$OUT" JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 \
+  bash ./scripts/run_full_minlptests_benchmark.sh
 ```
 
-Alpine.jl only:
+Alpine-only refresh against an existing discopt artifact:
 
 ```bash
-julia +release --project=. /tmp/discopt-pr14/scripts/alpine_minlptests_status.jl \
-  /tmp/alpine-minlptests-request.tsv \
-  /tmp/alpine-minlptests-results.jsonl \
-  /home/bernalde/repos/MINLPTests.jl
-```
-
-Combined comparison:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache-pr14 PYTHONPATH=python \
-~/.local/bin/uv run --extra dev python scripts/collect_minlptests_status.py \
-  --output-json /tmp/minlptests-phase6-comparison.json \
-  --output-markdown /tmp/minlptests-phase6-comparison.md
+source .venv/bin/activate
+unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_PROMPT_MODIFIER CONDA_SHLVL
+DISCOPT_DIR="/tmp/minlptests-discopt-run"
+OUT="/tmp/minlptests-alpine-only-$(date +%Y%m%d-%H%M%S)"
+FORCE_RERUN=1 OUTPUT_DIR="$OUT" RUN_DISCOPT=0 RUN_ALPINE=1 RUN_COMPARISON=1 \
+  DISCOPT_INPUT_JSON="${DISCOPT_DIR}/minlptests-full-discopt.json" \
+  JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 \
+  bash ./scripts/run_full_minlptests_benchmark.sh
 ```
 
 ## Benchmark Summary
 
-| Solver | NLP pass | NLP fail | NLP-MI pass | NLP-MI fail | Infeasible pass | Infeasible fail | Total pass | Total fail |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| discopt AMP | 7 | 8 | 0 | 13 | 2 | 1 | 9 | 22 |
-| Alpine.jl | 0 | 15 | 0 | 13 | 0 | 3 | 0 | 31 |
+| Solver | NLP-CVX pass | NLP-CVX fail | NLP pass | NLP fail | NLP-MI pass | NLP-MI fail | Infeasible pass | Infeasible fail | Total pass | Total fail |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| discopt AMP | 62 | 29 | 9 | 6 | 11 | 2 | 3 | 0 | 85 | 37 |
+| Alpine.jl | 2 | 89 | 0 | 15 | 0 | 13 | 0 | 3 | 2 | 120 |
 
 ## Head-to-Head Outcome Split
 
 | Outcome split | Count | Interpretation |
 | --- | ---: | --- |
-| `discopt_only_pass` | 9 | AMP solved the case to the MINLPTests expectation and Alpine did not. |
-| `both_pass` | 0 | There is no shared solved subset yet. |
-| `alpine_only_pass` | 0 | Alpine does not currently solve any case in this translated slice. |
-| `both_fail` | 22 | AMP still misses the case and Alpine rejects it earlier. |
+| `discopt_only_pass` | 83 | AMP solved the case to the MINLPTests expectation and Alpine did not. |
+| `both_pass` | 2 | The shared solved subset is `nlp_cvx_001_010` and `nlp_cvx_002_010`. |
+| `alpine_only_pass` | 0 | The refreshed full-suite run leaves no Alpine-only translated wins. |
+| `both_fail` | 37 | AMP still misses the case and Alpine rejects it earlier. |
 
-## Focused Update: translated `nlp_mi`
+## Current AMP Failure Families
 
-A focused rerun of the translated `nlp_mi` slice after the current AMP fixes
-uses the same benchmark-harness validation path as the Phase 6 report, but with
-a `20s` per-instance cap:
+The remaining 37 AMP misses cluster into a few families:
 
-| Solver | NLP-MI pass | NLP-MI fail | Notes |
-| --- | ---: | ---: | --- |
-| discopt AMP | 13 | 0 | `nlp_mi_001_010` through `nlp_mi_005_010` now pass; the `003_*` and `005_010` variants return `feasible` with the expected objective when proof budget expires. |
-| Alpine.jl | 0 | 13 | Still blocked by unsupported operators (`exp`, `sqrt`, `tan`, reciprocal terms) or by the finite-domain requirement on integer bridges. |
+- Convex false infeasibility: `nlp_cvx_108_010` to `nlp_cvx_108_013`,
+  `nlp_cvx_203_010` to `nlp_cvx_206_010`, and the whole
+  `nlp_cvx_501_011_{1d..20d}` family still return `infeasible`.
+- Convex wrong objective: `nlp_cvx_106_010` returns a feasible point with
+  objective `-1.149074984` instead of `-1.857215513`.
+- Nonconvex NLP false infeasibility: `nlp_001_010`, `nlp_002_010`,
+  `nlp_008_010`, `nlp_008_011`, and `nlp_009_010` still return `infeasible`.
+- Nonconvex NLP wrong objective: `nlp_004_010` returns `optimal`, but at
+  `-4.911509745` instead of `-4.872159041`.
+- Mixed-integer proof-budget/status gap: `nlp_mi_003_014` and
+  `nlp_mi_003_015` recover the expected objective `11.0`, but now report
+  `time_limit` rather than `optimal` or `feasible`, so they remain benchmark
+  failures under the current pass criteria.
 
-This means the old mixed-integer row in the summary table above is stale. The
-headline Phase 6 comparison still needs a full 31-case rerun, but the mixed-
-integer sub-slice is no longer an AMP failure bucket.
+Relative to the earlier Phase 6 checkpoints, the main change is that there are
+no longer any Alpine-only wins to chase. The remaining work is now purely on
+the discopt side.
 
 ## Alpine Failure Modes
 
-| Failure mode | Count | Affected problems |
-| --- | ---: | --- |
-| unsupported `exp` on variable | 16 | `nlp_001_010`, `nlp_003_010`, `nlp_003_012`, `nlp_003_013`, `nlp_003_014`, `nlp_003_015`, `nlp_003_016`, `nlp_008_010`, `nlp_008_011`, `nlp_mi_003_010`, `nlp_mi_003_012`, `nlp_mi_003_013`, `nlp_mi_003_014`, `nlp_mi_003_015`, `nlp_mi_003_016`, `nlp_007_010` |
-| integer finite-domain bridge required | 7 | `nlp_mi_001_010`, `nlp_mi_002_010`, `nlp_mi_004_010`, `nlp_mi_004_011`, `nlp_mi_004_012`, `nlp_mi_005_010`, `nlp_mi_007_010` |
-| `Symbol.head` `FieldError` | 3 | `nlp_009_010`, `nlp_009_011`, `nlp_mi_007_020` |
-| unsupported `sqrt` on variable | 2 | `nlp_003_011`, `nlp_mi_003_011` |
-| unsupported `log` on variable | 1 | `nlp_002_010` |
-| unsupported `tan` on variable | 1 | `nlp_004_010` |
-| unsupported reciprocal denominator | 1 | `nlp_005_010` |
+| Failure mode | Count |
+| --- | ---: |
+| quadratic `>=` constraints unsupported | 37 |
+| unsupported `sqrt` on variable | 23 |
+| unsupported `exp` on variable | 22 |
+| quadratic `<=` constraints unsupported | 16 |
+| `Symbol.head` `FieldError` | 7 |
+| integer finite-domain bridge required | 7 |
+| unsupported `sin` on variable | 2 |
+| unsupported `log` on variable | 2 |
+| unsupported reciprocal denominator | 2 |
+| unsupported non-integer exponent pattern | 1 |
+| unsupported `tan` on variable | 1 |
 
-These numbers mean the Alpine comparison is still useful, but not yet as a
-head-to-head objective comparison. At the moment it is mostly a coverage
-boundary: Alpine rejects the entire current translated slice before global
-optimization quality can be compared.
+The refreshed comparison still matters, but it is no longer an Alpine-gap
+tracker. It now shows that AMP dominates the translated overlap numerically,
+while Alpine still rejects most of the suite before a global-optimality
+comparison is meaningful.
 
 ## What Is Missing for AMP
 
 | Gap | Evidence | Affected problems | What remains to be done |
 | --- | --- | --- | --- |
-| False infeasible on feasible NLP | AMP returns `infeasible` on more than half of the feasible nonconvex NLP slice. | `nlp_001_010`, `nlp_002_010`, `nlp_003_014`, `nlp_003_015`, `nlp_004_010`, `nlp_008_010`, `nlp_008_011`, `nlp_009_010` | Tighten the feasibility recovery path for transcendental continuous relaxations and stop pruning feasible incumbents as infeasible. |
-| Residual mixed-integer infeasibility proof gap | The feasible translated `nlp_mi` slice now passes in the focused rerun, but the infeasible mixed-integer equality case still does not get certified. | `nlp_mi_007_010` | Finish the nonlinear domain-propagation and infeasibility-proof work so AMP can close the last mixed-integer benchmark gap without exhausting the wall clock. |
-| Incomplete infeasibility proof | AMP times out instead of proving one infeasible mixed-integer case. | `nlp_mi_007_010` | Strengthen infeasibility detection for the mixed-integer branch-and-bound path. |
-| No shared solved subset with Alpine | Alpine is still at `0/31` on this translated scope. | whole comparison slice | Either narrow the published comparison to Alpine-supported operators or keep the full table and present Alpine as a coverage baseline, not as a quality baseline. |
+| Convex false infeasibility | AMP still returns `infeasible` on 28 translated convex cases, dominated by the `501_011` family and the `108_*` / `203_*` families. | `nlp_cvx_108_010` to `nlp_cvx_108_013`, `nlp_cvx_203_010` to `nlp_cvx_206_010`, `nlp_cvx_501_011_{1d..20d}` | Improve convex nonlinear feasibility recovery and avoid pruning valid roots when the relaxation or local solve is numerically weak. |
+| Convex objective miss | AMP finds a feasible point but not the right one on one translated convex case. | `nlp_cvx_106_010` | Tighten the upper-bound/local-solve policy for convex nonlinear cases that do not take the direct fast path. |
+| Nonconvex NLP robustness | Five nonconvex NLP cases still end in false infeasibility, and one still converges to the wrong objective. | `nlp_001_010`, `nlp_002_010`, `nlp_004_010`, `nlp_008_010`, `nlp_008_011`, `nlp_009_010` | Continue the start-quality and multi-start local solve work in the remediation plan. |
+| Mixed-integer proof-budget/status gap | Two translated MINLP cases recover the right incumbent objective but still exit as `time_limit`, which the benchmark counts as a miss. | `nlp_mi_003_014`, `nlp_mi_003_015` | Decide whether AMP should convert incumbent-holding timeouts into `feasible` for benchmark purposes, or increase proof strength so the two cases certify before the wall clock expires. |
+| Alpine parity tracker | The refreshed full run leaves no Alpine-only wins. | none | Close issue `#19`; remaining follow-up work belongs under issues `#15` to `#18` and the discopt-side remediation plan. |
 
 ## What Is Left To Be Done
 
@@ -118,8 +128,8 @@ optimization quality can be compared.
 | --- | --- | --- |
 | MINLPTests integration | Present in `python/tests/test_minlptests.py`; benchmark slice can be run reproducibly. | Keep the AMP report current as solver fixes land. |
 | Benchmark runner support | `amp` is now wired into the nonconvex and global benchmark categories. | Add a dedicated CLI target or report artifact once the pass rate is high enough to compare runs over time. |
-| Alpine comparison | Reproducible on local `../Alpine.jl` and `../MINLPTests.jl` using Julia `+release`. | Decide whether unsupported operators stay in-scope or whether the comparison should publish a smaller overlapping subset. |
-| Notebook update | Not started in this phase. | Defer the notebook result table until there is a meaningful shared solved subset and the false-infeasible AMP gaps are reduced. |
+| Alpine comparison | Reproducible on local `../Alpine.jl` and `../MINLPTests.jl` using Julia `+release`; refreshed result is `alpine_only_pass = 0`. | Keep the full-suite comparison as a regression artifact, but move the remaining work to discopt-side issues rather than Alpine-gap tracking. |
+| Notebook update | Not started in this phase. | Defer the notebook result table until the 37 remaining AMP failures are reduced enough to make the comparison more than a failure ledger. |
 
 The instance-led remediation plan derived from these failures is tracked in
 `plans/amp-completion/07-minlptests-remediation.md`.

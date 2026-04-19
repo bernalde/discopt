@@ -23,10 +23,14 @@ general NLP solve path, and unbounded integer domains are handed directly to AMP
 
 ## Update after the current AMP patch
 
-The translated feasible `nlp_mi` slice is no longer the main blocker.
+The translated feasible `nlp_mi` slice is no longer the main blocker, but the
+latest full-suite benchmark does not yet count it as completely clean.
 
-- AMP now passes `13/13` feasible translated `nlp_mi` instances in the focused
-  benchmark rerun.
+- In the refreshed full-suite benchmark, AMP passes `11/13` translated
+  `nlp_mi` instances and the only remaining misses are `nlp_mi_003_014` and
+  `nlp_mi_003_015`.
+- Those two cases recover the expected incumbent objective `11.0`, but exit as
+  `time_limit`, so they still fail the current benchmark pass criteria.
 - The fixes were:
   - exhaustive enumeration of small finite integer domains for the incumbent
     NLP fallback
