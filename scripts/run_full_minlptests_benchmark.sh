@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv}"
 UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-pr14}"
 PER_INSTANCE_TIME_LIMIT="${PER_INSTANCE_TIME_LIMIT:-300}"
@@ -11,6 +12,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-/tmp/minlptests-full-benchmark}"
 JULIA_BIN="${JULIA_BIN:-julia}"
 JULIA_CHANNEL="${JULIA_CHANNEL:-+release}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
+JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+PYTHON_RUNNER_LABEL=""
+declare -a PYTHON_RUNNER=()
 
 if [[ -n "${ALPINE_PROJECT:-}" ]]; then
   ALPINE_PROJECT="${ALPINE_PROJECT}"
@@ -46,6 +51,23 @@ log() {
   echo "[$(timestamp)] $*"
 }
 
+resolve_python_runner() {
+  if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    PYTHON_RUNNER=("${VENV_DIR}/bin/python")
+    PYTHON_RUNNER_LABEL="${VENV_DIR}/bin/python"
+    return 0
+  fi
+
+  if [[ -x "${UV_BIN}" ]]; then
+    PYTHON_RUNNER=("${UV_BIN}" "run" "--extra" "dev" "python")
+    PYTHON_RUNNER_LABEL="${UV_BIN} run --extra dev python"
+    return 0
+  fi
+
+  echo "Missing Python runner: neither ${VENV_DIR}/bin/python nor ${UV_BIN} is executable" >&2
+  exit 1
+}
+
 if [[ "${NO_INTERNAL_LOG:-0}" != "1" ]]; then
   exec > >(tee -a "${RUN_LOG}") 2>&1
 fi
@@ -60,10 +82,10 @@ log "Per-instance time limit: ${PER_INSTANCE_TIME_LIMIT}s"
 log "Force rerun: ${FORCE_RERUN}"
 echo
 
-if [[ ! -x "${UV_BIN}" ]]; then
-  echo "Missing uv executable: ${UV_BIN}" >&2
-  exit 1
-fi
+resolve_python_runner
+log "Python runner: ${PYTHON_RUNNER_LABEL}"
+log "JAX_PLATFORMS: ${JAX_PLATFORMS}"
+log "JAX_ENABLE_X64: ${JAX_ENABLE_X64}"
 
 if [[ ! -d "${ALPINE_PROJECT}" ]]; then
   echo "Missing Alpine.jl checkout: ${ALPINE_PROJECT}" >&2
@@ -82,7 +104,8 @@ else
   (
     cd "${REPO_ROOT}"
     UV_CACHE_DIR="${UV_CACHE_DIR}" PYTHONPATH=python \
-      "${UV_BIN}" run --extra dev python scripts/collect_minlptests_status.py \
+      JAX_PLATFORMS="${JAX_PLATFORMS}" JAX_ENABLE_X64="${JAX_ENABLE_X64}" \
+      "${PYTHON_RUNNER[@]}" scripts/collect_minlptests_status.py \
         --skip-alpine \
         --include-convex \
         --per-instance-time-limit "${PER_INSTANCE_TIME_LIMIT}" \
@@ -102,7 +125,8 @@ else
   (
     cd "${REPO_ROOT}"
     UV_CACHE_DIR="${UV_CACHE_DIR}" PYTHONPATH=python \
-      "${UV_BIN}" run --extra dev python - <<PY
+      JAX_PLATFORMS="${JAX_PLATFORMS}" JAX_ENABLE_X64="${JAX_ENABLE_X64}" \
+      "${PYTHON_RUNNER[@]}" - <<PY
 from pathlib import Path
 from scripts.collect_minlptests_status import case_catalog, load_test_module
 
@@ -157,7 +181,8 @@ else
   (
     cd "${REPO_ROOT}"
     UV_CACHE_DIR="${UV_CACHE_DIR}" PYTHONPATH=python \
-      "${UV_BIN}" run --extra dev python - <<PY
+      JAX_PLATFORMS="${JAX_PLATFORMS}" JAX_ENABLE_X64="${JAX_ENABLE_X64}" \
+      "${PYTHON_RUNNER[@]}" - <<PY
 import json
 from pathlib import Path
 
