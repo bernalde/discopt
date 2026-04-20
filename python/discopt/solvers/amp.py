@@ -123,6 +123,41 @@ def _default_nlp_start(flat_lb: np.ndarray, flat_ub: np.ndarray) -> np.ndarray:
     return x0
 
 
+def _continuous_recovery_starts(
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+    initial_point: Optional[np.ndarray] = None,
+) -> list[np.ndarray]:
+    """Candidate starts for pure-continuous incumbent recovery."""
+    starts: list[np.ndarray] = []
+
+    if initial_point is not None:
+        starts.append(np.asarray(initial_point, dtype=np.float64).copy())
+
+    lb_clip = np.clip(flat_lb, -1e8, 1e8)
+    ub_clip = np.clip(flat_ub, -1e8, 1e8)
+    midpoint = 0.5 * (lb_clip + ub_clip)
+    fully_unbounded = (flat_lb <= -1e15) & (flat_ub >= 1e15)
+    midpoint = np.where(fully_unbounded, 0.5, midpoint)
+    midpoint = np.clip(
+        midpoint,
+        np.maximum(flat_lb, -10.0),
+        np.minimum(flat_ub, 10.0),
+    )
+    starts.append(midpoint)
+    starts.append(np.clip(np.zeros_like(flat_lb), flat_lb, flat_ub))
+    starts.append(np.clip(np.ones_like(flat_lb), flat_lb, flat_ub))
+
+    unique: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for start in starts:
+        key = tuple(float(v) for v in np.asarray(start, dtype=np.float64).ravel())
+        if key not in seen:
+            seen.add(key)
+            unique.append(np.asarray(start, dtype=np.float64))
+    return unique
+
+
 def _solve_nlp_subproblem(
     evaluator,
     x0: np.ndarray,
@@ -183,64 +218,63 @@ def _solve_nlp_subproblem(
 
 def _recover_pure_continuous_solution(
     model: Model,
+    evaluator,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
     *,
     nlp_solver: str,
     t_start: float,
     time_limit: float,
     initial_point: Optional[np.ndarray] = None,
 ) -> Optional[SolveResult]:
-    """Try a direct continuous NLP solve before AMP declares infeasibility.
+    """Try an AMP-local NLP solve to recover a feasible incumbent.
 
-    This is a last-resort feasibility recovery path for pure continuous models
-    where AMP failed to produce any incumbent. If the direct solve is not a
-    convex fast-path certificate, the recovered point is reported as
-    ``"feasible"`` rather than ``"optimal"``.
+    This is a last-resort incumbent recovery path for pure continuous models
+    where AMP failed to produce any incumbent from its relaxation loop. The
+    NLP solve is treated as a local feasibility heuristic within AMP, not as
+    a global solution certificate, so successful recovery is reported as
+    ``"feasible"``.
     """
     remaining = max(0.0, time_limit - (time.perf_counter() - t_start))
     if remaining <= 0.0:
         return None
 
-    trial_points: list[Optional[np.ndarray]] = [initial_point]
-    if initial_point is not None:
-        trial_points.append(None)
+    solver_sequence = [nlp_solver]
+    if nlp_solver == "ipm" and _has_cyipopt():
+        solver_sequence = ["ipopt", "ipm"]
 
-    for trial_initial_point in trial_points:
+    best_x: Optional[np.ndarray] = None
+    best_obj: Optional[float] = None
 
-        try:
-            from discopt.solver import solve_model as _solve_model
-
-            trial = _solve_model(
-                model,
-                time_limit=remaining,
-                nlp_solver=nlp_solver,
-                initial_point=trial_initial_point,
+    for x0 in _continuous_recovery_starts(flat_lb, flat_ub, initial_point):
+        for solver_name in solver_sequence:
+            recovered_x, recovered_obj = _solve_nlp_subproblem(
+                evaluator,
+                x0,
+                flat_lb,
+                flat_ub,
+                solver_name,
             )
-        except Exception as exc:
-            logger.debug("AMP: pure continuous recovery solve failed: %s", exc)
-            continue
+            if recovered_x is None or recovered_obj is None:
+                continue
+            if best_obj is None or recovered_obj < best_obj:
+                best_x = recovered_x
+                best_obj = recovered_obj
 
-        if (
-            trial.x is None
-            or trial.objective is None
-            or trial.status not in ("optimal", "feasible")
-        ):
-            continue
+    if best_x is None or best_obj is None:
+        return None
 
-        is_certified = getattr(trial, "convex_fast_path", False) is True
-        status = trial.status if is_certified else "feasible"
-        bound = trial.bound if is_certified else None
-        gap = trial.gap if is_certified else None
-        return SolveResult(
-            status=status,
-            objective=trial.objective,
-            bound=bound,
-            gap=gap,
-            x=trial.x,
-            wall_time=time.perf_counter() - t_start,
-            gap_certified=is_certified,
-        )
-
-    return None
+    maximize = model._objective is not None and model._objective.sense == ObjectiveSense.MAXIMIZE
+    obj_val = -best_obj if maximize else best_obj
+    return SolveResult(
+        status="feasible",
+        objective=obj_val,
+        bound=None,
+        gap=None,
+        x=_build_x_dict(best_x, model),
+        wall_time=time.perf_counter() - t_start,
+        gap_certified=False,
+    )
 
 
 def _check_integer_feasible(x: np.ndarray, model: Model, int_tol: float = 1e-5) -> bool:
@@ -969,6 +1003,9 @@ def solve_amp(
                     if pure_continuous:
                         recovered = _recover_pure_continuous_solution(
                             model,
+                            evaluator,
+                            flat_lb,
+                            flat_ub,
                             nlp_solver=nlp_solver,
                             t_start=t_start,
                             time_limit=time_limit,
@@ -1230,6 +1267,9 @@ def solve_amp(
     if pure_continuous:
         recovered = _recover_pure_continuous_solution(
             model,
+            evaluator,
+            flat_lb,
+            flat_ub,
             nlp_solver=nlp_solver,
             t_start=t_start,
             time_limit=time_limit,
