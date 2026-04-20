@@ -200,11 +200,6 @@ category = "no_convergence"
 issue    = 32
 note     = "iteration_limit: unbounded y,z with tan/abs objective"
 
-[minlptests."nlp_009_010/primary"]
-category = "no_convergence"
-issue    = 32
-note     = "iteration_limit: min/max smoothing with unbounded x"
-
 # ── False infeasible ─────────────────────────────────────────────────────────
 
 [minlptests."nlp_cvx_105_011/primary"]

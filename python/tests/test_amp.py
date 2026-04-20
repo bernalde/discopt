@@ -40,7 +40,7 @@ from discopt.modeling.core import (
     Model,
     SolveResult,
 )
-from test_minlptests import NLP_CVX_INSTANCES, NLP_MI_INSTANCES
+from test_minlptests import NLP_CVX_INSTANCES, NLP_INSTANCES, NLP_MI_INSTANCES
 
 HAS_CYIPOPT = find_spec("cyipopt") is not None
 
@@ -54,6 +54,9 @@ MINLPTESTS_MI_BY_ID = {
 }
 MINLPTESTS_CVX_BY_ID = {
     instance.problem_id: instance for instance in map(_unwrap_minlptests_case, NLP_CVX_INSTANCES)
+}
+MINLPTESTS_NLP_BY_ID = {
+    instance.problem_id: instance for instance in map(_unwrap_minlptests_case, NLP_INSTANCES)
 }
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +1817,36 @@ class TestCurrentCodeWeaknesses:
     def test_amp_solves_translated_convex_108_family(self, problem_id):
         """AMP should not report false infeasible on the translated 108 convex family."""
         instance = MINLPTESTS_CVX_BY_ID[problem_id]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+
+    @pytest.mark.parametrize(
+        "problem_id",
+        [
+            "nlp_001_010",
+            "nlp_002_010",
+            "nlp_008_010",
+            "nlp_008_011",
+            "nlp_009_010",
+        ],
+    )
+    def test_amp_recovers_remaining_pure_continuous_minlptests_cases(self, problem_id):
+        """AMP should return a recovered incumbent instead of false infeasible."""
+        if not HAS_CYIPOPT:
+            pytest.skip("requires cyipopt for pure continuous NLP recovery")
+
+        instance = MINLPTESTS_NLP_BY_ID[problem_id]
         m = instance.build_fn()
 
         result = m.solve(

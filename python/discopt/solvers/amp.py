@@ -181,6 +181,68 @@ def _solve_nlp_subproblem(
     return None, None
 
 
+def _recover_pure_continuous_solution(
+    model: Model,
+    *,
+    nlp_solver: str,
+    t_start: float,
+    time_limit: float,
+    initial_point: Optional[np.ndarray] = None,
+) -> Optional[SolveResult]:
+    """Try a direct continuous NLP solve before AMP declares infeasibility.
+
+    This is a last-resort feasibility recovery path for pure continuous models
+    where AMP failed to produce any incumbent. If the direct solve is not a
+    convex fast-path certificate, the recovered point is reported as
+    ``"feasible"`` rather than ``"optimal"``.
+    """
+    remaining = max(0.0, time_limit - (time.perf_counter() - t_start))
+    if remaining <= 0.0:
+        return None
+
+    trial_points: list[Optional[np.ndarray]] = [initial_point]
+    if initial_point is not None:
+        trial_points.append(None)
+
+    for trial_initial_point in trial_points:
+
+        try:
+            from discopt.solver import solve_model as _solve_model
+
+            trial = _solve_model(
+                model,
+                time_limit=remaining,
+                nlp_solver=nlp_solver,
+                initial_point=trial_initial_point,
+            )
+        except Exception as exc:
+            logger.debug("AMP: pure continuous recovery solve failed: %s", exc)
+            continue
+
+        if (
+            trial.x is None
+            or trial.objective is None
+            or trial.status not in ("optimal", "feasible")
+        ):
+            continue
+
+        is_certified = getattr(trial, "convex_fast_path", False) is True
+        status = trial.status if is_certified else "feasible"
+        bound = trial.bound if is_certified else None
+        gap = trial.gap if is_certified else None
+        return SolveResult(
+            status=status,
+            objective=trial.objective,
+            bound=bound,
+            gap=gap,
+            x=trial.x,
+            wall_time=time.perf_counter() - t_start,
+            gap_certified=is_certified,
+        )
+
+    return None
+
+
 def _check_integer_feasible(x: np.ndarray, model: Model, int_tol: float = 1e-5) -> bool:
     """Return True if all integer/binary variables satisfy integrality."""
     offset = 0
@@ -904,6 +966,15 @@ def solve_amp(
             if LB == -np.inf:
                 # Problem may be infeasible
                 if iteration == 1:
+                    if pure_continuous:
+                        recovered = _recover_pure_continuous_solution(
+                            model,
+                            nlp_solver=nlp_solver,
+                            t_start=t_start,
+                            time_limit=time_limit,
+                        )
+                        if recovered is not None:
+                            return recovered
                     fallback_x, fallback_obj = _solve_small_integer_domain_fallback(
                         model,
                         evaluator,
@@ -1156,6 +1227,16 @@ def solve_amp(
         )
 
     # No feasible solution found
+    if pure_continuous:
+        recovered = _recover_pure_continuous_solution(
+            model,
+            nlp_solver=nlp_solver,
+            t_start=t_start,
+            time_limit=time_limit,
+        )
+        if recovered is not None:
+            return recovered
+
     if elapsed >= time_limit:
         status = "time_limit"
     else:
