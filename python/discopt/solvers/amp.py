@@ -707,7 +707,9 @@ def solve_amp(
     SolveResult
         With gap_certified=True if termination is by gap criterion. When AMP
         reaches the wall-clock limit with an incumbent but no certificate, the
-        status remains ``"time_limit"`` and the incumbent is returned.
+        status remains ``"time_limit"`` for mixed-integer models. Purely
+        continuous models return ``"feasible"`` with the incumbent so false
+        infeasible/time-limit exits do not hide a valid continuous solution.
     """
     t_start = time.perf_counter()
 
@@ -724,6 +726,7 @@ def solve_amp(
 
     assert model._objective is not None
     maximize = model._objective.sense == ObjectiveSense.MAXIMIZE
+    pure_continuous = all(v.var_type == VarType.CONTINUOUS for v in model._variables)
     part_lbs: list[float] = []
     part_ubs: list[float] = []
 
@@ -737,7 +740,7 @@ def solve_amp(
     if convhull_ebd and convhull_mode != "sos2":
         raise ValueError("convhull_ebd requires convhull_formulation='sos2' or the 'lambda' alias.")
 
-    if all(v.var_type == VarType.CONTINUOUS for v in model._variables):
+    if pure_continuous:
         try:
             from discopt._jax.convexity import classify_model as _classify_convexity
             from discopt.solver import solve_model as _solve_model
@@ -1137,7 +1140,7 @@ def solve_amp(
 
         if gap_certified:
             status = "optimal"
-        elif elapsed >= time_limit:
+        elif elapsed >= time_limit and not pure_continuous:
             status = "time_limit"
         else:
             status = "feasible"

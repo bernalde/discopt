@@ -104,6 +104,28 @@ def _constant_value(expr) -> Optional[float]:
     return float(values[0])
 
 
+def _match_scaled_linear_var(
+    expr,
+    scale: float,
+    metadata: FlatVariableMetadata,
+) -> Optional[tuple[int, float]]:
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        return _match_scaled_linear_var(expr.operand, -scale, metadata)
+
+    if isinstance(expr, BinaryOp) and expr.op == "*":
+        left_const = _constant_value(expr.left)
+        if left_const is not None:
+            return _match_scaled_linear_var(expr.right, scale * left_const, metadata)
+        right_const = _constant_value(expr.right)
+        if right_const is not None:
+            return _match_scaled_linear_var(expr.left, scale * right_const, metadata)
+
+    flat_idx = metadata.scalar_flat_index(expr)
+    if flat_idx is None:
+        return None
+    return flat_idx, scale
+
+
 def _flatten_sum(expr, scale: float, out: list[tuple[float, object]]) -> None:
     if isinstance(expr, BinaryOp) and expr.op == "+":
         _flatten_sum(expr.left, scale, out)
@@ -114,6 +136,45 @@ def _flatten_sum(expr, scale: float, out: list[tuple[float, object]]) -> None:
         _flatten_sum(expr.right, -scale, out)
         return
     out.append((scale, expr))
+
+
+def _min_univariate_quadratic(a: float, b: float, lb: float, ub: float) -> float:
+    """Return min of a*x^2 + b*x over [lb, ub] for a >= 0."""
+    if a < -1e-12:
+        raise ValueError("nonconvex univariate quadratic is not supported")
+
+    if abs(a) <= 1e-12:
+        return min(b * lb, b * ub)
+
+    x_star = -b / (2.0 * a)
+    x_eval = min(max(x_star, lb), ub)
+    return min(a * lb * lb + b * lb, a * x_eval * x_eval + b * x_eval, a * ub * ub + b * ub)
+
+
+def _tighten_univariate_quadratic_interval(
+    a: float,
+    b: float,
+    rhs: float,
+    lb: float,
+    ub: float,
+) -> Optional[tuple[float, float]]:
+    """Intersect [lb, ub] with the feasible set of a*x^2 + b*x <= rhs for a >= 0."""
+    if abs(a) <= 1e-12:
+        if abs(b) <= 1e-12:
+            return (lb, ub) if rhs >= -1e-12 else None
+        bound = rhs / b
+        if b > 0.0:
+            return (lb, min(ub, bound))
+        return (max(lb, bound), ub)
+
+    discriminant = b * b + 4.0 * a * rhs
+    if discriminant < -1e-12:
+        return None
+    discriminant = max(discriminant, 0.0)
+    sqrt_disc = float(np.sqrt(discriminant))
+    root_lo = (-b - sqrt_disc) / (2.0 * a)
+    root_hi = (-b + sqrt_disc) / (2.0 * a)
+    return (max(lb, root_lo), min(ub, root_hi))
 
 
 class SumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
@@ -214,8 +275,139 @@ class SumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
         return tightened_lb, tightened_ub
 
 
+class SeparableQuadraticUpperBoundRule(NonlinearBoundTighteningRule):
+    """Tighten bounds from separable convex quadratic constraints like x + y^2 <= c."""
+
+    name = "separable_quadratic_upper_bound"
+
+    def _match_scaled_square(
+        self,
+        expr,
+        scale: float,
+        metadata: FlatVariableMetadata,
+    ) -> Optional[tuple[int, float]]:
+        if isinstance(expr, UnaryOp) and expr.op == "neg":
+            return self._match_scaled_square(expr.operand, -scale, metadata)
+
+        if isinstance(expr, BinaryOp) and expr.op == "*":
+            left_const = _constant_value(expr.left)
+            if left_const is not None:
+                return self._match_scaled_square(expr.right, scale * left_const, metadata)
+            right_const = _constant_value(expr.right)
+            if right_const is not None:
+                return self._match_scaled_square(expr.left, scale * right_const, metadata)
+
+        if isinstance(expr, BinaryOp) and expr.op == "**":
+            exponent = _constant_value(expr.right)
+            if exponent is None or abs(exponent - 2.0) > 1e-12:
+                return None
+            flat_idx = metadata.scalar_flat_index(expr.left)
+            if flat_idx is None:
+                return None
+            return flat_idx, scale
+
+        return None
+
+    def tighten(
+        self,
+        model: Model,
+        flat_lb: np.ndarray,
+        flat_ub: np.ndarray,
+        metadata: FlatVariableMetadata,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tightened_lb = flat_lb.copy()
+        tightened_ub = flat_ub.copy()
+
+        for constraint in model._constraints:
+            if getattr(constraint, "sense", None) != "<=":
+                continue
+
+            terms: list[tuple[float, object]] = []
+            _flatten_sum(constraint.body, 1.0, terms)
+
+            constant_term = 0.0
+            quad_coeffs: dict[int, float] = {}
+            linear_coeffs: dict[int, float] = {}
+            matches_pattern = True
+
+            for scale, term in terms:
+                const_val = _constant_value(term)
+                if const_val is not None:
+                    constant_term += scale * const_val
+                    continue
+
+                square_match = self._match_scaled_square(term, scale, metadata)
+                if square_match is not None:
+                    flat_idx, coeff = square_match
+                    quad_coeffs[flat_idx] = quad_coeffs.get(flat_idx, 0.0) + coeff
+                    continue
+
+                linear_match = _match_scaled_linear_var(term, scale, metadata)
+                if linear_match is not None:
+                    flat_idx, coeff = linear_match
+                    linear_coeffs[flat_idx] = linear_coeffs.get(flat_idx, 0.0) + coeff
+                    continue
+
+                matches_pattern = False
+                break
+
+            if not matches_pattern or (not quad_coeffs and not linear_coeffs):
+                continue
+
+            coeffs = {
+                flat_idx: (
+                    quad_coeffs.get(flat_idx, 0.0),
+                    linear_coeffs.get(flat_idx, 0.0),
+                )
+                for flat_idx in set(quad_coeffs) | set(linear_coeffs)
+            }
+            if any(a < -1e-12 for a, _ in coeffs.values()):
+                continue
+
+            min_contribs: dict[int, float] = {}
+            for flat_idx, (a, b) in coeffs.items():
+                min_contribs[flat_idx] = _min_univariate_quadratic(
+                    a,
+                    b,
+                    float(tightened_lb[flat_idx]),
+                    float(tightened_ub[flat_idx]),
+                )
+
+            total_min = float(sum(min_contribs.values()))
+            for flat_idx, (a, b) in coeffs.items():
+                rhs = -constant_term - (total_min - min_contribs[flat_idx])
+                if not np.isfinite(rhs):
+                    continue
+
+                interval = _tighten_univariate_quadratic_interval(
+                    a,
+                    b,
+                    rhs,
+                    float(tightened_lb[flat_idx]),
+                    float(tightened_ub[flat_idx]),
+                )
+                if interval is None:
+                    continue
+
+                new_lb, new_ub = interval
+                var_type = metadata.flat_var_types[flat_idx]
+                if var_type == VarType.BINARY:
+                    new_lb = max(new_lb, 0.0)
+                    new_ub = min(new_ub, 1.0)
+                elif var_type == VarType.INTEGER:
+                    new_lb = float(np.ceil(new_lb - 1e-9))
+                    new_ub = float(np.floor(new_ub + 1e-9))
+
+                if new_lb <= new_ub:
+                    tightened_lb[flat_idx] = new_lb
+                    tightened_ub[flat_idx] = new_ub
+
+        return tightened_lb, tightened_ub
+
+
 DEFAULT_NONLINEAR_BOUND_RULES: tuple[NonlinearBoundTighteningRule, ...] = (
     SumOfSquaresUpperBoundRule(),
+    SeparableQuadraticUpperBoundRule(),
 )
 
 

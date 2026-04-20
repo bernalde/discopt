@@ -40,7 +40,7 @@ from discopt.modeling.core import (
     Model,
     SolveResult,
 )
-from test_minlptests import NLP_MI_INSTANCES
+from test_minlptests import NLP_CVX_INSTANCES, NLP_MI_INSTANCES
 
 HAS_CYIPOPT = find_spec("cyipopt") is not None
 
@@ -51,6 +51,9 @@ def _unwrap_minlptests_case(case):
 
 MINLPTESTS_MI_BY_ID = {
     instance.problem_id: instance for instance in map(_unwrap_minlptests_case, NLP_MI_INSTANCES)
+}
+MINLPTESTS_CVX_BY_ID = {
+    instance.problem_id: instance for instance in map(_unwrap_minlptests_case, NLP_CVX_INSTANCES)
 }
 
 # ---------------------------------------------------------------------------
@@ -1782,6 +1785,48 @@ class TestCurrentCodeWeaknesses:
         assert tightened_lb[0] == pytest.approx(-2.0)
         assert tightened_ub[0] == pytest.approx(2.0)
         assert stats.applied_rules == ("custom_clamp",)
+
+    def test_tighten_separable_quadratic_bounds_infers_finite_box(self):
+        """Constraints like x + y^2 <= c should infer finite bounds for both variables."""
+        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+
+        instance = MINLPTESTS_CVX_BY_ID["nlp_cvx_108_010"]
+        m = instance.build_fn()
+
+        flat_lb, flat_ub = flat_variable_bounds(m)
+        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(m, flat_lb, flat_ub)
+
+        assert tightened_lb[0] == pytest.approx(0.0)
+        assert tightened_ub[0] == pytest.approx(2.0)
+        assert tightened_lb[1] == pytest.approx(0.0)
+        assert tightened_ub[1] == pytest.approx(np.sqrt(2.0))
+        assert "separable_quadratic_upper_bound" in stats.applied_rules
+
+    @pytest.mark.parametrize(
+        "problem_id",
+        [
+            "nlp_cvx_108_010",
+            "nlp_cvx_108_011",
+            "nlp_cvx_108_012",
+            "nlp_cvx_108_013",
+        ],
+    )
+    def test_amp_solves_translated_convex_108_family(self, problem_id):
+        """AMP should not report false infeasible on the translated 108 convex family."""
+        instance = MINLPTESTS_CVX_BY_ID[problem_id]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
 
     def test_amp_fallback_enumerates_small_integer_domain_when_milp_relaxation_fails(self):
         """AMP should still recover a bounded integer optimum if the first MILP errors out."""
