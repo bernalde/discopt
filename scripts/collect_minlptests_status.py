@@ -147,9 +147,14 @@ def run_discopt_cases(
     solver_mode: str,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    total_cases = len(cases)
 
-    for case in cases:
+    for index, case in enumerate(cases, start=1):
         inst = case["instance"]
+        print(
+            f"[discopt_{solver_mode} {index}/{total_cases}] starting {inst.problem_id}",
+            flush=True,
+        )
 
         t0 = time.perf_counter()
         result = None
@@ -186,6 +191,12 @@ def run_discopt_cases(
                 "wall_time_sec": wall_time,
                 "note": note,
             }
+        )
+        print(
+            f"[discopt_{solver_mode} {index}/{total_cases}] finished {inst.problem_id} "
+            f"outcome={outcome} status={getattr(result, 'status', None)} "
+            f"time={wall_time:.3f}s",
+            flush=True,
         )
 
     return records

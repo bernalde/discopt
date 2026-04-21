@@ -158,21 +158,45 @@ def _continuous_recovery_starts(
     return unique
 
 
+def _dedupe_candidate_points(points: list[np.ndarray]) -> list[np.ndarray]:
+    """Return candidate points with duplicates removed in insertion order."""
+    unique: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for point in points:
+        arr = np.asarray(point, dtype=np.float64)
+        key = tuple(float(v) for v in arr.ravel())
+        if key not in seen:
+            seen.add(key)
+            unique.append(arr)
+    return unique
+
+
+def _remaining_wall_time(deadline: Optional[float]) -> Optional[float]:
+    """Return seconds remaining until a deadline, or None when uncapped."""
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.perf_counter())
+
+
 def _solve_nlp_subproblem(
     evaluator,
     x0: np.ndarray,
     lb: np.ndarray,
     ub: np.ndarray,
     nlp_solver: str = "ipm",
+    time_limit: Optional[float] = None,
 ) -> tuple[Optional[np.ndarray], Optional[float]]:
     """Solve the NLP relaxation with given bounds.
 
     Returns (x_opt, obj_val) or (None, None) on failure.
     """
+    if time_limit is not None and time_limit <= 0.0:
+        return None, None
     try:
         lb_clip = np.clip(lb, -1e8, 1e8)
         ub_clip = np.clip(ub, -1e8, 1e8)
         x0_clipped = np.clip(x0, lb_clip, ub_clip)
+        local_deadline = time.perf_counter() + time_limit if time_limit is not None else None
         model = evaluator._model
         saved_bounds = _snapshot_variable_bounds(model)
         _apply_flat_bounds_to_model(model, lb, ub)
@@ -186,17 +210,31 @@ def _solve_nlp_subproblem(
 
             result = None
             for solver_name in solver_sequence:
+                remaining = _remaining_wall_time(local_deadline)
+                if remaining is not None and remaining <= 0.0:
+                    break
                 if solver_name == "ipm" and hasattr(evaluator, "_obj_fn"):
                     from discopt._jax.ipm import solve_nlp_ipm
 
+                    options = {"print_level": 0, "max_iter": 300}
+                    if remaining is not None:
+                        options["max_wall_time"] = max(remaining, 0.05)
                     trial = solve_nlp_ipm(
-                        evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300}
+                        evaluator,
+                        x0_clipped,
+                        options=options,
                     )
                 else:
                     from discopt.solvers.nlp_ipopt import solve_nlp
 
+                    options = {"print_level": 0, "max_iter": 300}
+                    if remaining is not None:
+                        options["max_wall_time"] = max(remaining, 0.05)
+                        options["max_cpu_time"] = max(remaining, 0.05)
                     trial = solve_nlp(
-                        evaluator, x0_clipped, options={"print_level": 0, "max_iter": 300}
+                        evaluator,
+                        x0_clipped,
+                        options=options,
                     )
                 result = trial
                 from discopt.solvers import SolveStatus
@@ -245,15 +283,23 @@ def _recover_pure_continuous_solution(
 
     best_x: Optional[np.ndarray] = None
     best_obj: Optional[float] = None
+    deadline = t_start + time_limit
 
     for x0 in _continuous_recovery_starts(flat_lb, flat_ub, initial_point):
+        remaining = _remaining_wall_time(deadline)
+        if remaining is not None and remaining <= 0.0:
+            break
         for solver_name in solver_sequence:
+            remaining = _remaining_wall_time(deadline)
+            if remaining is not None and remaining <= 0.0:
+                break
             recovered_x, recovered_obj = _solve_nlp_subproblem(
                 evaluator,
                 x0,
                 flat_lb,
                 flat_ub,
                 solver_name,
+                time_limit=remaining,
             )
             if recovered_x is None or recovered_obj is None:
                 continue
@@ -437,12 +483,16 @@ def _select_best_nlp_candidate(
     constraint_lb: np.ndarray,
     constraint_ub: np.ndarray,
     nlp_solver: str,
+    deadline: Optional[float] = None,
 ) -> tuple[Optional[np.ndarray], Optional[float]]:
     """Return the best feasible NLP candidate across the integer-rounding set."""
     best_x: Optional[np.ndarray] = None
     best_obj: Optional[float] = None
 
     for x0_nlp in candidates:
+        remaining = _remaining_wall_time(deadline)
+        if remaining is not None and remaining <= 0.0:
+            break
         nlp_lb, nlp_ub = _build_fixed_integer_bounds(x0_nlp, model, flat_lb, flat_ub)
         cand_x, cand_obj = _solve_nlp_subproblem(
             evaluator,
@@ -450,6 +500,7 @@ def _select_best_nlp_candidate(
             nlp_lb,
             nlp_ub,
             nlp_solver,
+            time_limit=remaining,
         )
         if cand_x is None or cand_obj is None:
             continue
@@ -480,10 +531,25 @@ def _solve_best_nlp_candidate(
     constraint_lb: np.ndarray,
     constraint_ub: np.ndarray,
     nlp_solver: str,
+    incumbent: Optional[np.ndarray] = None,
+    deadline: Optional[float] = None,
 ) -> tuple[Optional[np.ndarray], Optional[float]]:
     """Return the best feasible NLP candidate across the integer-rounding set."""
+    if all(v.var_type == VarType.CONTINUOUS for v in model._variables):
+        starts: list[np.ndarray] = []
+        for seed in (x0, incumbent):
+            if seed is not None:
+                starts.extend(_continuous_recovery_starts(flat_lb, flat_ub, seed))
+        candidates = _dedupe_candidate_points(starts)
+    else:
+        candidates = _integer_rounding_candidates(x0, model)
+        if incumbent is not None:
+            candidates = _dedupe_candidate_points(
+                _integer_rounding_candidates(incumbent, model) + candidates
+            )
+
     return _select_best_nlp_candidate(
-        _integer_rounding_candidates(x0, model),
+        candidates,
         model,
         evaluator,
         flat_lb,
@@ -491,6 +557,7 @@ def _solve_best_nlp_candidate(
         constraint_lb,
         constraint_ub,
         nlp_solver,
+        deadline=deadline,
     )
 
 
@@ -529,6 +596,7 @@ def _solve_small_integer_domain_fallback(
     constraint_ub: np.ndarray,
     nlp_solver: str,
     max_assignments: int = _SMALL_INT_FALLBACK_MAX_ASSIGNMENTS,
+    deadline: Optional[float] = None,
 ) -> tuple[Optional[np.ndarray], Optional[float]]:
     """Enumerate a small finite integer domain directly when the MILP relaxation fails."""
     domain_size = _small_integer_domain_size(model, max_assignments)
@@ -549,6 +617,7 @@ def _solve_small_integer_domain_fallback(
         constraint_lb,
         constraint_ub,
         nlp_solver,
+        deadline=deadline,
     )
 
 
@@ -707,7 +776,12 @@ def _compute_relative_gap(
     upper_bound: float,
 ) -> Optional[float]:
     """Return a relative gap, or None when the upper bound is numerically zero."""
-    if abs_gap is None or not np.isfinite(upper_bound) or abs(upper_bound) <= 1e-10:
+    if (
+        abs_gap is None
+        or abs_gap < 0.0
+        or not np.isfinite(upper_bound)
+        or abs(upper_bound) <= 1e-10
+    ):
         return None
     return abs(abs_gap) / abs(upper_bound)
 
@@ -802,10 +876,8 @@ def solve_amp(
     -------
     SolveResult
         With gap_certified=True if termination is by gap criterion. When AMP
-        reaches the wall-clock limit with an incumbent but no certificate, the
-        status remains ``"time_limit"`` for mixed-integer models. Purely
-        continuous models return ``"feasible"`` with the incumbent so false
-        infeasible/time-limit exits do not hide a valid continuous solution.
+        has a valid incumbent but no certificate, it returns ``"feasible"``
+        together with the incumbent and any trustworthy bound information.
     """
     t_start = time.perf_counter()
 
@@ -873,6 +945,7 @@ def solve_amp(
         )
     evaluator = NLPEvaluator(model)
     constraint_lb, constraint_ub = _infer_constraint_bounds(model)
+    deadline = t_start + time_limit
 
     # ── Classify nonlinear terms ─────────────────────────────────────────────
     terms = classify_nonlinear_terms(model)
@@ -1020,6 +1093,7 @@ def solve_amp(
                         constraint_lb,
                         constraint_ub,
                         nlp_solver,
+                        deadline=deadline,
                     )
                     if fallback_x is not None and fallback_obj is not None:
                         return SolveResult(
@@ -1061,6 +1135,8 @@ def solve_amp(
             constraint_lb,
             constraint_ub,
             nlp_solver,
+            incumbent=incumbent,
+            deadline=deadline,
         )
 
         if x_nlp is not None and obj_nlp_min is not None:
@@ -1121,44 +1197,55 @@ def solve_amp(
             )
 
         if UB < np.inf and LB > -np.inf:
-            abs_gap = UB - LB
-            rel_g = _compute_relative_gap(abs_gap, UB)
+            raw_abs_gap = UB - LB
             if maximize:
                 display_lb = _from_minimization_space(UB)
                 display_ub = _from_minimization_space(LB)
             else:
                 display_lb = LB
                 display_ub = UB
-            if rel_g is None:
-                logger.info(
-                    "AMP iter %d: LB=%.6g, UB=%.6g, abs_gap=%.6g (relative gap undefined)",
+            if raw_abs_gap < -abs_tol:
+                logger.warning(
+                    "AMP iter %d: invalid bound ordering LB=%.6g, UB=%.6g; "
+                    "skipping gap certification",
                     iteration,
                     display_lb,
                     display_ub,
-                    abs_gap,
                 )
             else:
-                logger.info(
-                    "AMP iter %d: LB=%.6g, UB=%.6g, gap=%.4g%%",
-                    iteration,
-                    display_lb,
-                    display_ub,
-                    100 * rel_g,
-                )
-            if abs_gap <= abs_tol or (rel_g is not None and rel_g <= rel_gap):
-                gap_certified = True
+                abs_gap = max(0.0, raw_abs_gap)
+                rel_g = _compute_relative_gap(abs_gap, UB)
                 if rel_g is None:
                     logger.info(
-                        "AMP: gap certified at iteration %d by absolute tolerance",
+                        "AMP iter %d: LB=%.6g, UB=%.6g, abs_gap=%.6g "
+                        "(relative gap undefined)",
                         iteration,
+                        display_lb,
+                        display_ub,
+                        abs_gap,
                     )
                 else:
                     logger.info(
-                        "AMP: gap certified at iteration %d (gap=%.4g%%)",
+                        "AMP iter %d: LB=%.6g, UB=%.6g, gap=%.4g%%",
                         iteration,
+                        display_lb,
+                        display_ub,
                         100 * rel_g,
                     )
-                break
+                if abs_gap <= abs_tol or (rel_g is not None and rel_g <= rel_gap):
+                    gap_certified = True
+                    if rel_g is None:
+                        logger.info(
+                            "AMP: gap certified at iteration %d by absolute tolerance",
+                            iteration,
+                        )
+                    else:
+                        logger.info(
+                            "AMP: gap certified at iteration %d (gap=%.4g%%)",
+                            iteration,
+                            100 * rel_g,
+                        )
+                    break
 
         # ── Step 4: Adaptive partition refinement ────────────────────────────
         if not part_vars:
@@ -1243,20 +1330,34 @@ def solve_amp(
         )
 
     if incumbent is not None:
-        abs_gap_final = UB - LB if LB > -np.inf else None
-        rel_gap_final = _compute_relative_gap(abs_gap_final, UB)
+        raw_abs_gap_final = UB - LB if LB > -np.inf else None
+        bound_is_trustworthy = (
+            raw_abs_gap_final is None or raw_abs_gap_final >= -abs_tol
+        )
+        if not bound_is_trustworthy and raw_abs_gap_final is not None:
+            logger.warning(
+                "AMP: final bound ordering invalid (LB=%.6g, UB=%.6g); omitting bound and gap",
+                _from_minimization_space(LB),
+                _from_minimization_space(UB),
+            )
 
-        if gap_certified:
-            status = "optimal"
-        elif elapsed >= time_limit and not pure_continuous:
-            status = "time_limit"
-        else:
-            status = "feasible"
+        abs_gap_final = (
+            None
+            if raw_abs_gap_final is None or not bound_is_trustworthy
+            else max(0.0, raw_abs_gap_final)
+        )
+        rel_gap_final = _compute_relative_gap(abs_gap_final, UB)
+        timed_out = elapsed >= time_limit
+        status = "optimal" if gap_certified else ("time_limit" if timed_out else "feasible")
 
         return SolveResult(
             status=status,
             objective=_from_minimization_space(UB),
-            bound=_from_minimization_space(LB) if LB > -np.inf else None,
+            bound=(
+                _from_minimization_space(LB)
+                if LB > -np.inf and bound_is_trustworthy
+                else None
+            ),
             gap=float(rel_gap_final) if rel_gap_final is not None else None,
             x=_build_x_dict(incumbent, model),
             wall_time=elapsed,

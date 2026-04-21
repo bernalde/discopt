@@ -80,6 +80,7 @@ class MilpRelaxationModel:
         bounds: list[tuple[float, float]],
         obj_offset: float = 0.0,
         integrality: Optional[np.ndarray] = None,
+        objective_bound_valid: bool = True,
     ):
         self._c = c
         self._A_ub = A_ub
@@ -87,6 +88,7 @@ class MilpRelaxationModel:
         self._bounds = bounds
         self._obj_offset = obj_offset
         self._integrality = integrality
+        self._objective_bound_valid = objective_bound_valid
 
     def solve(
         self,
@@ -118,7 +120,7 @@ class MilpRelaxationModel:
         status_str = status_map.get(result.status, str(result.status))
 
         obj = None
-        if result.objective is not None:
+        if result.objective is not None and self._objective_bound_valid:
             obj = float(result.objective) + self._obj_offset
 
         return MilpRelaxationResult(status=status_str, objective=obj, x=result.x)
@@ -1061,10 +1063,14 @@ def build_milp_relaxation(
             monomial_var_map,
             n_total,
         )
+        objective_bound_valid = True
     except ValueError:
-        # Fallback: trivial objective (LP gives ‑∞ lower bound — acceptable for soundness)
+        # Keep a feasibility objective so the relaxation can still produce a point,
+        # but do not treat the resulting LP value as a sound global bound.
         c_obj = np.zeros(n_total)
         const_obj = 0.0
+        objective_bound_valid = False
+        logger.debug("AMP: objective is not linearizable; MILP relaxation bound is unavailable")
 
     # Negate for maximization
     if model._objective.sense == ObjectiveSense.MAXIMIZE:
@@ -1094,6 +1100,7 @@ def build_milp_relaxation(
         bounds=all_bounds,
         obj_offset=const_obj,
         integrality=integrality_arr if has_integers else None,
+        objective_bound_valid=objective_bound_valid,
     )
 
     varmap: dict = {

@@ -184,15 +184,17 @@ function main()
 
     optimizer = build_optimizer(per_instance_time_limit, mip_backend)
     cached_records = Dict{String, Dict{String, Any}}()
+    request_lines = filter(line -> !isempty(strip(line)), readlines(request_path))
+    total_cases = length(request_lines)
 
     open(output_path, "w") do io
-        for line in eachline(request_path)
-            isempty(strip(line)) && continue
+        for (index, line) in enumerate(request_lines)
             fields = split(line, '\t')
             if length(fields) != 3
                 error("expected 3 tab-separated fields per line in request file")
             end
             problem_id, category, symbol_name = fields
+            println("[alpine $(index)/$(total_cases)] starting $(problem_id)")
             canonical_symbol_name = resolve_symbol_name(symbol_name, minlptests)
 
             if canonical_symbol_name === nothing
@@ -212,6 +214,10 @@ function main()
             record["category"] = category
             record["mip_solver"] = mip_backend
             write_record(io, record)
+            flush(io)
+            status = get(record, "outcome", "unknown")
+            elapsed = get(record, "wall_time_sec", 0.0)
+            println("[alpine $(index)/$(total_cases)] finished $(problem_id) outcome=$(status) time=$(round(elapsed; digits=3))s")
         end
     end
 end

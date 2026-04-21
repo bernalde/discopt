@@ -26,6 +26,7 @@ Sections:
 
 from __future__ import annotations
 
+import logging
 import os
 from importlib.util import find_spec
 
@@ -1831,6 +1832,23 @@ class TestCurrentCodeWeaknesses:
         tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
         assert abs(result.objective - instance.expected_obj) <= tol
 
+    def test_amp_multistart_recovers_translated_convex_106_010(self):
+        """Pure continuous AMP should retry multiple starts before giving up on 106_010."""
+        instance = MINLPTESTS_CVX_BY_ID["nlp_cvx_106_010"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+        )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+
     @pytest.mark.parametrize(
         "problem_id",
         [
@@ -1860,6 +1878,97 @@ class TestCurrentCodeWeaknesses:
         assert result.objective is not None
         tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
         assert abs(result.objective - instance.expected_obj) <= tol
+
+    def test_amp_does_not_certify_invalid_negative_gap_on_nlp_004_010(self):
+        """A lower bound above the incumbent must not be reported as certified optimality."""
+        instance = MINLPTESTS_NLP_BY_ID["nlp_004_010"]
+        m = instance.build_fn()
+
+        result = m.solve(
+            solver="amp",
+            nlp_solver="ipm",
+            time_limit=30.0,
+            gap_tolerance=1e-3,
+        )
+
+        assert result.status == "feasible"
+        assert result.gap_certified is False
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+        assert result.gap is None or result.gap >= 0.0
+
+    @pytest.mark.parametrize("problem_id", ["nlp_003_010", "nlp_003_011"])
+    def test_amp_omits_invalid_bound_when_objective_relaxation_is_unavailable(
+        self,
+        problem_id,
+        caplog,
+    ):
+        """Nonlinear objectives without a relaxation bound must not report fake LB/UB inversions."""
+        instance = MINLPTESTS_NLP_BY_ID[problem_id]
+        m = instance.build_fn()
+
+        with caplog.at_level(logging.WARNING):
+            result = m.solve(
+                solver="amp",
+                nlp_solver="ipm",
+                time_limit=30.0,
+                gap_tolerance=1e-3,
+            )
+
+        assert result.status in ("optimal", "feasible")
+        assert result.objective is not None
+        tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
+        assert abs(result.objective - instance.expected_obj) <= tol
+        assert result.bound is None
+        assert result.gap is None
+        assert not any("invalid bound ordering" in record.message for record in caplog.records)
+
+    def test_select_best_nlp_candidate_respects_deadline(self, monkeypatch):
+        """Candidate NLP retries should stop when the remaining wall-clock budget is exhausted."""
+        from discopt.solvers import amp as amp_mod
+
+        remaining_limits = []
+        fake_clock = iter([0.0, 0.4, 0.7])
+
+        monkeypatch.setattr(amp_mod.time, "perf_counter", lambda: next(fake_clock))
+        monkeypatch.setattr(
+            amp_mod,
+            "_solve_nlp_subproblem",
+            lambda evaluator, x0, lb, ub, nlp_solver, time_limit=None: (
+                remaining_limits.append(time_limit) or (np.asarray(x0, dtype=np.float64), 1.0)
+            ),
+        )
+        monkeypatch.setattr(
+            amp_mod,
+            "_check_constraints_with_evaluator",
+            lambda *args, **kwargs: True,
+        )
+
+        m = _make_circle()
+        candidates = [
+            np.array([1.0, 1.0], dtype=np.float64),
+            np.array([0.9, 1.1], dtype=np.float64),
+            np.array([0.8, 1.2], dtype=np.float64),
+        ]
+
+        x_best, obj_best = amp_mod._select_best_nlp_candidate(
+            candidates,
+            m,
+            evaluator=None,
+            flat_lb=np.array([0.0, 0.0], dtype=np.float64),
+            flat_ub=np.array([2.0, 2.0], dtype=np.float64),
+            constraint_lb=np.array([], dtype=np.float64),
+            constraint_ub=np.array([], dtype=np.float64),
+            nlp_solver="ipm",
+            deadline=0.6,
+        )
+
+        assert x_best is not None
+        assert obj_best == pytest.approx(1.0)
+        assert len(remaining_limits) == 2
+        assert remaining_limits[0] == pytest.approx(0.6)
+        assert remaining_limits[1] == pytest.approx(0.2)
 
     def test_amp_fallback_enumerates_small_integer_domain_when_milp_relaxation_fails(self):
         """AMP should still recover a bounded integer optimum if the first MILP errors out."""
@@ -2103,6 +2212,45 @@ class TestCurrentCodeWeaknesses:
         assert result.status == "feasible"
         assert result.gap_certified is False
         assert result.objective is not None
+
+    def test_amp_time_limit_with_incumbent_returns_time_limit(self, monkeypatch):
+        """Timing out after finding an incumbent should return time_limit, not feasible."""
+        from discopt._jax.milp_relaxation import MilpRelaxationResult
+        from discopt.solvers import amp as amp_mod
+
+        fake_clock = iter([0.0, 0.0, 1.5])
+
+        monkeypatch.setattr(amp_mod.time, "perf_counter", lambda: next(fake_clock))
+        monkeypatch.setattr(
+            amp_mod,
+            "_solve_milp_with_oa_recovery",
+            lambda **kwargs: (
+                MilpRelaxationResult(
+                    status="optimal",
+                    objective=0.0,
+                    x=np.array([2.0, 2.0], dtype=np.float64),
+                ),
+                {},
+                [],
+            ),
+        )
+        monkeypatch.setattr(
+            amp_mod,
+            "_solve_best_nlp_candidate",
+            lambda *args, **kwargs: (np.array([2.0, 2.0], dtype=np.float64), 10.0),
+        )
+
+        result = amp_mod.solve_amp(
+            _make_nlp1(),
+            apply_partitioning=False,
+            presolve_bt=False,
+            max_iter=1,
+            time_limit=1.0,
+        )
+
+        assert result.status == "time_limit"
+        assert result.objective is not None
+        assert result.gap_certified is False
 
     def test_adaptive_partition_selection_path_runs_inside_amp(self, monkeypatch):
         """AMP should re-pick partition variables when adaptive selection is enabled."""
