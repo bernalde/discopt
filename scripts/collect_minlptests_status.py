@@ -4,9 +4,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import math
-import os
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -148,17 +145,11 @@ def run_discopt_cases(
     cases: list[dict[str, Any]],
     *,
     solver_mode: str,
-    amp_max_iter: int | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    total_cases = len(cases)
 
-    for index, case in enumerate(cases, start=1):
+    for case in cases:
         inst = case["instance"]
-        print(
-            f"[discopt_{solver_mode} {index}/{total_cases}] starting {inst.problem_id}",
-            flush=True,
-        )
 
         t0 = time.perf_counter()
         result = None
@@ -168,8 +159,6 @@ def run_discopt_cases(
             if solver_mode == "amp":
                 solve_kwargs["solver"] = "amp"
                 solve_kwargs["nlp_solver"] = "ipm"
-                if amp_max_iter is not None:
-                    solve_kwargs["max_iter"] = amp_max_iter
                 if case["gap_tolerance"] is not None:
                     solve_kwargs["gap_tolerance"] = 1e-3
             elif case["gap_tolerance"] is not None:
@@ -196,15 +185,7 @@ def run_discopt_cases(
                 "objective": getattr(result, "objective", None),
                 "wall_time_sec": wall_time,
                 "note": note,
-                "mip_count": getattr(result, "mip_count", None),
-                "amp_max_iter": amp_max_iter if solver_mode == "amp" else None,
             }
-        )
-        print(
-            f"[discopt_{solver_mode} {index}/{total_cases}] finished {inst.problem_id} "
-            f"outcome={outcome} status={getattr(result, 'status', None)} "
-            f"time={wall_time:.3f}s",
-            flush=True,
         )
 
     return records
@@ -217,8 +198,6 @@ def run_alpine_cases(
     julia_bin: str,
     julia_channel: str,
     per_instance_time_limit: float,
-    mip_solver: str = "highs",
-    max_iter: int | None = None,
 ) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="alpine-minlptests-") as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -244,18 +223,14 @@ def run_alpine_cases(
                 str(per_instance_time_limit),
             ]
         )
-        env = dict(os.environ)
-        env["ALPINE_MIP_SOLVER"] = mip_solver
-        if max_iter is not None:
-            env["ALPINE_MAX_ITER"] = str(max_iter)
-        subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
+        subprocess.run(cmd, check=True, cwd=REPO_ROOT)
 
         records: list[dict[str, Any]] = []
         with output_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if line.strip():
                     payload = json.loads(line)
-                    payload["solver"] = f"alpine_{mip_solver}"
+                    payload["solver"] = "alpine"
                     records.append(payload)
         return records
 
@@ -272,335 +247,156 @@ def compare_outcomes(
     discopt_records: list[dict[str, Any]],
     alpine_records: list[dict[str, Any]],
 ) -> dict[str, int]:
-    counts = compare_solver_pair(discopt_records, alpine_records)
-    return {
-        "both_pass": counts["both_pass"],
-        "discopt_only_pass": counts["left_only_pass"],
-        "alpine_only_pass": counts["right_only_pass"],
-        "both_fail": counts["both_fail"],
-    }
-
-
-def compare_solver_pair(
-    left_records: list[dict[str, Any]],
-    right_records: list[dict[str, Any]],
-) -> dict[str, int]:
-    right_by_problem = {record["problem_id"]: record for record in right_records}
+    alpine_by_problem = {record["problem_id"]: record for record in alpine_records}
     counts = Counter(
         {
             "both_pass": 0,
-            "left_only_pass": 0,
-            "right_only_pass": 0,
+            "discopt_only_pass": 0,
+            "alpine_only_pass": 0,
             "both_fail": 0,
         }
     )
-    for left in left_records:
-        right = right_by_problem.get(left["problem_id"])
-        left_pass = left["outcome"] == "pass"
-        right_pass = right is not None and right["outcome"] == "pass"
-        if left_pass and right_pass:
+    for discopt in discopt_records:
+        alpine = alpine_by_problem.get(discopt["problem_id"])
+        discopt_pass = discopt["outcome"] == "pass"
+        alpine_pass = alpine is not None and alpine["outcome"] == "pass"
+        if discopt_pass and alpine_pass:
             counts["both_pass"] += 1
-        elif left_pass:
-            counts["left_only_pass"] += 1
-        elif right_pass:
-            counts["right_only_pass"] += 1
+        elif discopt_pass:
+            counts["discopt_only_pass"] += 1
+        elif alpine_pass:
+            counts["alpine_only_pass"] += 1
         else:
             counts["both_fail"] += 1
     return dict(counts)
-
-
-def _positive_wall_times(records: list[dict[str, Any]]) -> list[float]:
-    return [
-        float(record["wall_time_sec"])
-        for record in records
-        if record["outcome"] == "pass" and float(record.get("wall_time_sec", 0.0)) > 0.0
-    ]
-
-
-def geometric_median(values: list[float]) -> float | None:
-    positive_values = [float(value) for value in values if float(value) > 0.0]
-    if not positive_values:
-        return None
-    return float(math.exp(statistics.median(math.log(value) for value in positive_values)))
-
-
-def summarize_timing(records: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    wall_times = _positive_wall_times(records)
-    if not wall_times:
-        return {
-            "pass_count": 0,
-            "median_sec": None,
-            "geometric_median_sec": None,
-        }
-
-    return {
-        "pass_count": len(wall_times),
-        "median_sec": float(statistics.median(wall_times)),
-        "geometric_median_sec": geometric_median(wall_times),
-    }
-
-
-def summarize_mip_counts(records: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    mip_counts = [
-        int(record["mip_count"])
-        for record in records
-        if record.get("mip_count") is not None
-    ]
-    if not mip_counts:
-        return {
-            "counted_cases": 0,
-            "total_mip_count": None,
-            "median_mip_count": None,
-            "mean_mip_count": None,
-        }
-
-    return {
-        "counted_cases": len(mip_counts),
-        "total_mip_count": int(sum(mip_counts)),
-        "median_mip_count": float(statistics.median(mip_counts)),
-        "mean_mip_count": float(statistics.mean(mip_counts)),
-    }
-
-
-def compare_pairwise_timing(
-    left_records: list[dict[str, Any]],
-    right_records: list[dict[str, Any]],
-) -> dict[str, float | int | None]:
-    right_by_problem = {
-        record["problem_id"]: record
-        for record in right_records
-        if record["outcome"] == "pass" and float(record.get("wall_time_sec", 0.0)) > 0.0
-    }
-    shared_left: list[float] = []
-    shared_right: list[float] = []
-    shared_ratios: list[float] = []
-
-    for left in left_records:
-        if left["outcome"] != "pass":
-            continue
-        left_time = float(left.get("wall_time_sec", 0.0))
-        if left_time <= 0.0:
-            continue
-        right = right_by_problem.get(left["problem_id"])
-        if right is None:
-            continue
-        right_time = float(right.get("wall_time_sec", 0.0))
-        if right_time <= 0.0:
-            continue
-        shared_left.append(left_time)
-        shared_right.append(right_time)
-        shared_ratios.append(left_time / right_time)
-
-    return {
-        "shared_pass_count": len(shared_ratios),
-        "left_geometric_median_sec": geometric_median(shared_left),
-        "right_geometric_median_sec": geometric_median(shared_right),
-        "geometric_median_ratio_left_over_right": geometric_median(shared_ratios),
-    }
-
-
-def build_solver_comparison_payload(
-    solver_records: dict[str, list[dict[str, Any]]],
-) -> dict[str, Any]:
-    solver_order = list(solver_records)
-    payload: dict[str, Any] = {
-        "solver_order": solver_order,
-        "solvers": solver_records,
-        "solver_summaries": {
-            solver: summarize(records) for solver, records in solver_records.items()
-        },
-        "timing_summaries": {
-            solver: summarize_timing(records) for solver, records in solver_records.items()
-        },
-        "mip_summaries": {
-            solver: summarize_mip_counts(records) for solver, records in solver_records.items()
-        },
-        "pairwise_outcomes": {},
-        "pairwise_timing": {},
-    }
-
-    for idx, left_solver in enumerate(solver_order):
-        for right_solver in solver_order[idx + 1 :]:
-            pair_key = f"{left_solver}__vs__{right_solver}"
-            left_records = solver_records[left_solver]
-            right_records = solver_records[right_solver]
-            payload["pairwise_outcomes"][pair_key] = compare_solver_pair(
-                left_records,
-                right_records,
-            )
-            payload["pairwise_timing"][pair_key] = compare_pairwise_timing(
-                left_records,
-                right_records,
-            )
-
-    return payload
-
-
-def build_solver_comparison_markdown(
-    solver_records: dict[str, list[dict[str, Any]]],
-) -> str:
-    payload = build_solver_comparison_payload(solver_records)
-    lines: list[str] = [
-        "# MINLPTests Status",
-        "",
-        "Generated from translated MINLPTests runs on the same problem IDs.",
-        "",
-        "Geometric median timing is computed as `exp(median(log(time_sec)))` on solved cases.",
-        "",
-    ]
-    lines.extend(
-        [
-            "## Solver Summary By Category",
-            "",
-            "| Solver | Category | Pass | Fail | Error | Total |",
-            "| --- | --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for solver in payload["solver_order"]:
-        summary = payload["solver_summaries"][solver]
-        for category in ("nlp", "nlp_mi", "infeasible", "nlp_cvx"):
-            row = summary.get(category, {})
-            lines.append(
-                (
-                    f"| {solver} | {category} | {row.get('pass', 0)} | "
-                    f"{row.get('fail', 0)} | {row.get('error', 0)} | {row.get('total', 0)} |"
-                )
-            )
-    lines.append("")
-
-    if payload["pairwise_outcomes"]:
-        lines.extend(
-            [
-                "## Pairwise Outcome Comparison",
-                "",
-                (
-                    "| Left solver | Right solver | Both pass | Left only pass | "
-                    "Right only pass | Both fail |"
-                ),
-                "| --- | --- | ---: | ---: | ---: | ---: |",
-            ]
-        )
-        for pair_key, counts in payload["pairwise_outcomes"].items():
-            left_solver, right_solver = pair_key.split("__vs__")
-            lines.append(
-                (
-                    f"| {left_solver} | {right_solver} | {counts['both_pass']} | "
-                    f"{counts['left_only_pass']} | {counts['right_only_pass']} | "
-                    f"{counts['both_fail']} |"
-                )
-            )
-        lines.append("")
-
-    lines.extend(
-        [
-            "## Timing Summary On Passes",
-            "",
-            "| Solver | Passes | Median sec | Geometric median sec |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-    )
-    for solver in payload["solver_order"]:
-        timing = payload["timing_summaries"][solver]
-        median_sec = timing["median_sec"]
-        geom_sec = timing["geometric_median_sec"]
-        lines.append(
-            (
-                f"| {solver} | {timing['pass_count']} | "
-                f"{'' if median_sec is None else f'{median_sec:.3f}'} | "
-                f"{'' if geom_sec is None else f'{geom_sec:.3f}'} |"
-            )
-        )
-    lines.append("")
-
-    lines.extend(
-        [
-            "## MIP Count Summary",
-            "",
-            "| Solver | Counted cases | Total MIPs | Median MIPs | Mean MIPs |",
-            "| --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for solver in payload["solver_order"]:
-        mip_summary = payload["mip_summaries"][solver]
-        total_mips = mip_summary["total_mip_count"]
-        median_mips = mip_summary["median_mip_count"]
-        mean_mips = mip_summary["mean_mip_count"]
-        lines.append(
-            (
-                f"| {solver} | {mip_summary['counted_cases']} | "
-                f"{'' if total_mips is None else total_mips} | "
-                f"{'' if median_mips is None else f'{median_mips:.1f}'} | "
-                f"{'' if mean_mips is None else f'{mean_mips:.2f}'} |"
-            )
-        )
-    lines.append("")
-
-    if payload["pairwise_timing"]:
-        lines.extend(
-            [
-                "## Pairwise Geometric Timing Comparison",
-                "",
-                "A ratio below `1.0` means the left solver is faster on the shared solved cases.",
-                "",
-                (
-                    "| Left solver | Right solver | Shared passes | Left geom median sec | "
-                    "Right geom median sec | Geom median ratio left/right |"
-                ),
-                "| --- | --- | ---: | ---: | ---: | ---: |",
-            ]
-        )
-        for pair_key, timing in payload["pairwise_timing"].items():
-            left_solver, right_solver = pair_key.split("__vs__")
-            left_geom = timing["left_geometric_median_sec"]
-            right_geom = timing["right_geometric_median_sec"]
-            ratio = timing["geometric_median_ratio_left_over_right"]
-            lines.append(
-                (
-                    f"| {left_solver} | {right_solver} | {timing['shared_pass_count']} | "
-                    f"{'' if left_geom is None else f'{left_geom:.3f}'} | "
-                    f"{'' if right_geom is None else f'{right_geom:.3f}'} | "
-                    f"{'' if ratio is None else f'{ratio:.3f}'} |"
-                )
-            )
-        lines.append("")
-
-    for solver in payload["solver_order"]:
-        lines.extend(
-            [
-                f"## Failures: {solver}",
-                "",
-                "| Problem | Category | Outcome | Status | Note |",
-                "| --- | --- | --- | --- | --- |",
-            ]
-        )
-        shown = False
-        for record in solver_records[solver]:
-            if record["outcome"] == "pass":
-                continue
-            shown = True
-            status = "" if record.get("status") is None else str(record["status"])
-            note = str(record.get("note", "")).replace("|", "\\|")
-            lines.append(
-                (
-                    f"| {record['problem_id']} | {record['category']} | "
-                    f"{record['outcome']} | {status} | {note} |"
-                )
-            )
-        if not shown:
-            lines.append("| none | - | - | - | - |")
-        lines.append("")
-
-    return "\n".join(lines)
 
 
 def build_markdown(
     discopt_records: list[dict[str, Any]],
     alpine_records: list[dict[str, Any]],
 ) -> str:
-    solver_records = {"discopt": discopt_records}
+    lines: list[str] = [
+        "# MINLPTests Status",
+        "",
+        (
+            "Generated from the discopt AMP run and the matching Alpine.jl run "
+            "on the same translated MINLPTests problem IDs."
+        ),
+        "",
+    ]
+
+    def add_summary_table(title: str, records: list[dict[str, Any]]) -> None:
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| Category | Pass | Fail | Error | Total |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        summary = summarize(records)
+        for category in ("nlp", "nlp_mi", "infeasible", "nlp_cvx"):
+            row = summary.get(category, {})
+            lines.append(
+                (
+                    f"| {category} | {row.get('pass', 0)} | {row.get('fail', 0)} | "
+                    f"{row.get('error', 0)} | {row.get('total', 0)} |"
+                )
+            )
+        lines.append("")
+
+    add_summary_table("discopt", discopt_records)
     if alpine_records:
-        solver_records["alpine"] = alpine_records
-    return build_solver_comparison_markdown(solver_records)
+        add_summary_table("Alpine.jl", alpine_records)
+
+        comparison = compare_outcomes(discopt_records, alpine_records)
+        lines.extend(
+            [
+                "## Head-to-Head Comparison",
+                "",
+                "| Outcome split | Count |",
+                "| --- | ---: |",
+                f"| both_pass | {comparison['both_pass']} |",
+                f"| discopt_only_pass | {comparison['discopt_only_pass']} |",
+                f"| alpine_only_pass | {comparison['alpine_only_pass']} |",
+                f"| both_fail | {comparison['both_fail']} |",
+                "",
+            ]
+        )
+
+        alpine_failure_modes = Counter(
+            record["note"] for record in alpine_records if record["outcome"] != "pass"
+        )
+        lines.extend(
+            [
+                "## Alpine Failure Modes",
+                "",
+                "| Failure mode | Count |",
+                "| --- | ---: |",
+            ]
+        )
+        for note, count in alpine_failure_modes.most_common():
+            escaped_note = note.replace("|", "\\|")
+            lines.append(f"| {escaped_note} | {count} |")
+        lines.append("")
+
+        alpine_by_problem = {record["problem_id"]: record for record in alpine_records}
+        gap_rows = []
+        for record in discopt_records:
+            if record["outcome"] not in {"fail", "error"}:
+                continue
+            alpine = alpine_by_problem.get(record["problem_id"])
+            if alpine is None:
+                continue
+            if alpine["outcome"] == "pass":
+                gap_rows.append((record, alpine))
+
+        lines.extend(["## Discopt Gaps Where Alpine Passes", ""])
+        if gap_rows:
+            lines.extend(
+                [
+                    "| Problem | Category | discopt | Alpine | Note |",
+                    "| --- | --- | --- | --- | --- |",
+                ]
+            )
+            for discopt, alpine in gap_rows:
+                note = discopt["note"].replace("|", "\\|")
+                lines.append(
+                    (
+                        f"| {discopt['problem_id']} | {discopt['category']} | "
+                        f"{discopt['outcome']} | {alpine['outcome']} | {note} |"
+                    )
+                )
+        else:
+            lines.append("No discopt-only gaps were found in cases that Alpine passes.")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Discopt Failures",
+            "",
+            "| Problem | Category | Outcome | Status | Note |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    shown = False
+    for record in discopt_records:
+        if record["outcome"] == "pass":
+            continue
+        shown = True
+        status = "" if record["status"] is None else str(record["status"])
+        note = record["note"].replace("|", "\\|")
+        lines.append(
+            (
+                f"| {record['problem_id']} | {record['category']} | "
+                f"{record['outcome']} | {status} | {note} |"
+            )
+        )
+    if not shown:
+        lines.append("| none | - | - | - | - |")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -667,24 +463,6 @@ def main() -> None:
             "string to disable it."
         ),
     )
-    parser.add_argument(
-        "--alpine-mip-solver",
-        choices=("highs", "gurobi"),
-        default="highs",
-        help="MIP backend for the Alpine.jl run.",
-    )
-    parser.add_argument(
-        "--discopt-amp-max-iter",
-        type=int,
-        default=None,
-        help="Optional outer AMP iteration cap for translated discopt runs.",
-    )
-    parser.add_argument(
-        "--alpine-max-iter",
-        type=int,
-        default=None,
-        help="Optional outer Alpine partitioning-iteration cap.",
-    )
     args = parser.parse_args()
 
     mod = load_test_module()
@@ -693,12 +471,7 @@ def main() -> None:
         include_convex=args.include_convex,
         per_instance_time_limit=args.per_instance_time_limit,
     )
-    discopt_records = run_discopt_cases(
-        mod,
-        cases,
-        solver_mode=args.discopt_mode,
-        amp_max_iter=args.discopt_amp_max_iter,
-    )
+    discopt_records = run_discopt_cases(mod, cases, solver_mode=args.discopt_mode)
     alpine_records: list[dict[str, Any]] = []
 
     if not args.skip_alpine:
@@ -709,8 +482,6 @@ def main() -> None:
             args.julia_bin,
             args.julia_channel,
             args.per_instance_time_limit,
-            mip_solver=args.alpine_mip_solver,
-            max_iter=args.alpine_max_iter,
         )
 
     payload = {
@@ -719,11 +490,6 @@ def main() -> None:
         "discopt_summary": summarize(discopt_records),
         "alpine_summary": summarize(alpine_records),
         "comparison_summary": compare_outcomes(discopt_records, alpine_records),
-        "discopt_timing_summary": summarize_timing(discopt_records),
-        "alpine_timing_summary": summarize_timing(alpine_records),
-        "discopt_mip_summary": summarize_mip_counts(discopt_records),
-        "alpine_mip_summary": summarize_mip_counts(alpine_records),
-        "pairwise_timing_summary": compare_pairwise_timing(discopt_records, alpine_records),
     }
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

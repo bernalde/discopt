@@ -64,12 +64,7 @@ function build_mip_solver(per_instance_time_limit::Float64, mip_backend::Abstrac
     error("unsupported ALPINE_MIP_SOLVER=$(mip_backend); expected 'highs' or 'gurobi'")
 end
 
-function build_optimizer(
-    per_instance_time_limit::Float64,
-    mip_backend::AbstractString,
-    max_iter::Union{Nothing, Int},
-    optimizer_ref::Base.RefValue{Any},
-)
+function build_optimizer(per_instance_time_limit::Float64, mip_backend::AbstractString)
     ipopt = MOI.OptimizerWithAttributes(
         Ipopt.Optimizer,
         MOI.Silent() => true,
@@ -84,30 +79,12 @@ function build_optimizer(
         "mip_solver" => mip_solver,
         "nl_solver" => ipopt,
     )
-    optimizer_spec = if max_iter !== nothing
-        JuMP.optimizer_with_attributes(
-            Alpine.Optimizer,
-            "nlp_solver" => ipopt,
-            "mip_solver" => mip_solver,
-            "minlp_solver" => juniper,
-            "time_limit" => per_instance_time_limit,
-            "max_iter" => max_iter,
-        )
-    else
-        JuMP.optimizer_with_attributes(
-            Alpine.Optimizer,
-            "nlp_solver" => ipopt,
-            "mip_solver" => mip_solver,
-            "minlp_solver" => juniper,
-            "time_limit" => per_instance_time_limit,
-        )
-    end
     return JuMP.optimizer_with_attributes(
-        () -> begin
-            opt = MOI.instantiate(optimizer_spec)
-            optimizer_ref[] = opt
-            return opt
-        end,
+        Alpine.Optimizer,
+        "nlp_solver" => ipopt,
+        "mip_solver" => mip_solver,
+        "minlp_solver" => juniper,
+        "time_limit" => per_instance_time_limit,
     )
 end
 
@@ -142,14 +119,11 @@ function missing_symbol_record(problem_id::AbstractString, symbol_name::Abstract
         "broken" => 0,
         "wall_time_sec" => 0.0,
         "note" => "missing MINLPTests symbol: " * symbol_name_str,
-        "mip_count" => nothing,
-        "presolve_bt_iterations" => nothing,
     )
 end
 
 function run_case(
     optimizer,
-    optimizer_ref::Base.RefValue{Any},
     problem_id::AbstractString,
     symbol_name::AbstractString,
     minlptests,
@@ -160,7 +134,6 @@ function run_case(
     ts = Test.DefaultTestSet(problem_id_str)
     Test.push_testset(ts)
     err_text = nothing
-    optimizer_ref[] = nothing
     wall_time = @elapsed begin
         try
             Base.invokelatest(
@@ -181,20 +154,6 @@ function run_case(
     counts = Test.get_test_counts(ts)
     outcome = (err_text === nothing && counts.fails == 0 && counts.errors == 0 && counts.broken == 0) ? "pass" : "fail"
     note = err_text === nothing ? "" : split(err_text, '\n')[1]
-    mip_count = nothing
-    presolve_bt_iterations = nothing
-    if optimizer_ref[] !== nothing
-        try
-            mip_count = Int(MOI.get(optimizer_ref[], Alpine.NumberOfIterations()))
-        catch
-        end
-        try
-            presolve_bt_iterations = Int(
-                MOI.get(optimizer_ref[], Alpine.NumberOfPresolveIterations()),
-            )
-        catch
-        end
-    end
     return Dict(
         "problem_id" => problem_id_str,
         "symbol" => symbol_name_str,
@@ -205,8 +164,6 @@ function run_case(
         "broken" => counts.broken,
         "wall_time_sec" => wall_time,
         "note" => note,
-        "mip_count" => mip_count,
-        "presolve_bt_iterations" => presolve_bt_iterations,
     )
 end
 
@@ -220,33 +177,29 @@ function main()
     minlptests_path = ARGS[3]
     per_instance_time_limit = parse(Float64, ARGS[4])
     mip_backend = get(ENV, "ALPINE_MIP_SOLVER", "highs")
-    max_iter = haskey(ENV, "ALPINE_MAX_ITER") ? parse(Int, ENV["ALPINE_MAX_ITER"]) : nothing
 
     push!(LOAD_PATH, minlptests_path)
     Base.eval(Main, :(using MINLPTests))
     minlptests = Base.invokelatest(() -> getfield(Main, :MINLPTests))
 
-    optimizer_ref = Ref{Any}(nothing)
-    optimizer = build_optimizer(per_instance_time_limit, mip_backend, max_iter, optimizer_ref)
+    optimizer = build_optimizer(per_instance_time_limit, mip_backend)
     cached_records = Dict{String, Dict{String, Any}}()
-    request_lines = filter(line -> !isempty(strip(line)), readlines(request_path))
-    total_cases = length(request_lines)
 
     open(output_path, "w") do io
-        for (index, line) in enumerate(request_lines)
+        for line in eachline(request_path)
+            isempty(strip(line)) && continue
             fields = split(line, '\t')
             if length(fields) != 3
                 error("expected 3 tab-separated fields per line in request file")
             end
             problem_id, category, symbol_name = fields
-            println("[alpine $(index)/$(total_cases)] starting $(problem_id)")
             canonical_symbol_name = resolve_symbol_name(symbol_name, minlptests)
 
             if canonical_symbol_name === nothing
                 record = missing_symbol_record(problem_id, symbol_name)
             else
                 cached = get!(cached_records, canonical_symbol_name) do
-                    run_case(optimizer, optimizer_ref, problem_id, canonical_symbol_name, minlptests)
+                    run_case(optimizer, problem_id, canonical_symbol_name, minlptests)
                 end
                 record = copy(cached)
                 record["problem_id"] = String(problem_id)
@@ -258,12 +211,7 @@ function main()
 
             record["category"] = category
             record["mip_solver"] = mip_backend
-            record["alpine_max_iter"] = max_iter
             write_record(io, record)
-            flush(io)
-            status = get(record, "outcome", "unknown")
-            elapsed = get(record, "wall_time_sec", 0.0)
-            println("[alpine $(index)/$(total_cases)] finished $(problem_id) outcome=$(status) time=$(round(elapsed; digits=3))s")
         end
     end
 end
