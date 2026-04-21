@@ -16,11 +16,14 @@ RUN_DISCOPT="${RUN_DISCOPT:-1}"
 RUN_ALPINE="${RUN_ALPINE:-1}"
 RUN_COMPARISON="${RUN_COMPARISON:-1}"
 ALPINE_MIP_SOLVER="${ALPINE_MIP_SOLVER:-highs}"
+ALPINE_MIP_SOLVERS="${ALPINE_MIP_SOLVERS:-}"
 JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
 JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 DISCOPT_INPUT_JSON="${DISCOPT_INPUT_JSON:-}"
 PYTHON_RUNNER_LABEL=""
 declare -a PYTHON_RUNNER=()
+declare -a ALPINE_SOLVER_LIST=()
+declare -a ALPINE_JSONLS=()
 
 ALPINE_PROJECT="${ALPINE_PROJECT:-${REPO_ROOT}/../Alpine.jl}"
 MINLPTESTS_PATH="${MINLPTESTS_PATH:-${REPO_ROOT}/../MINLPTests.jl}"
@@ -28,7 +31,6 @@ MINLPTESTS_PATH="${MINLPTESTS_PATH:-${REPO_ROOT}/../MINLPTests.jl}"
 DISCOPT_JSON="${OUTPUT_DIR}/minlptests-full-discopt.json"
 DISCOPT_MD="${OUTPUT_DIR}/minlptests-full-discopt.md"
 ALPINE_REQUEST="${OUTPUT_DIR}/alpine-full-request.tsv"
-ALPINE_JSONL="${OUTPUT_DIR}/alpine-full-results.jsonl"
 COMPARISON_JSON="${OUTPUT_DIR}/minlptests-full-comparison.json"
 COMPARISON_MD="${OUTPUT_DIR}/minlptests-full-comparison.md"
 RUN_LOG="${OUTPUT_DIR}/run.log"
@@ -41,6 +43,47 @@ timestamp() {
 
 log() {
   echo "[$(timestamp)] $*"
+}
+
+resolve_alpine_solvers() {
+  local solver_csv="${ALPINE_MIP_SOLVERS}"
+  if [[ -z "${solver_csv}" ]]; then
+    solver_csv="${ALPINE_MIP_SOLVER}"
+  fi
+
+  IFS=',' read -r -a ALPINE_SOLVER_LIST <<< "${solver_csv}"
+  ALPINE_SOLVER_LIST=("${ALPINE_SOLVER_LIST[@]}")
+
+  local cleaned=()
+  local solver=""
+  for solver in "${ALPINE_SOLVER_LIST[@]}"; do
+    solver="${solver//[[:space:]]/}"
+    [[ -z "${solver}" ]] && continue
+    case "${solver}" in
+      highs|gurobi) cleaned+=("${solver}") ;;
+      *)
+        echo "Unsupported Alpine MIP solver: ${solver}" >&2
+        echo "Use ALPINE_MIP_SOLVER or ALPINE_MIP_SOLVERS with 'highs' and/or 'gurobi'." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ "${#cleaned[@]}" -eq 0 ]]; then
+    echo "No Alpine MIP solvers were configured." >&2
+    exit 1
+  fi
+
+  ALPINE_SOLVER_LIST=("${cleaned[@]}")
+}
+
+alpine_jsonl_path() {
+  local solver="$1"
+  if [[ "${#ALPINE_SOLVER_LIST[@]}" -eq 1 ]]; then
+    echo "${OUTPUT_DIR}/alpine-full-results.jsonl"
+  else
+    echo "${OUTPUT_DIR}/alpine-${solver}-full-results.jsonl"
+  fi
 }
 
 resolve_python_runner() {
@@ -64,6 +107,11 @@ if [[ "${NO_INTERNAL_LOG:-0}" != "1" ]]; then
   exec > >(tee -a "${RUN_LOG}") 2>&1
 fi
 
+resolve_alpine_solvers
+for alpine_solver in "${ALPINE_SOLVER_LIST[@]}"; do
+  ALPINE_JSONLS+=("$(alpine_jsonl_path "${alpine_solver}")")
+done
+
 trap 'log "ERROR: benchmark runner failed at line ${LINENO}"' ERR
 
 log "Repository: ${REPO_ROOT}"
@@ -75,7 +123,7 @@ log "Force rerun: ${FORCE_RERUN}"
 log "Run discopt: ${RUN_DISCOPT}"
 log "Run Alpine: ${RUN_ALPINE}"
 log "Run comparison: ${RUN_COMPARISON}"
-log "Alpine MIP solver: ${ALPINE_MIP_SOLVER}"
+log "Alpine MIP solvers: ${ALPINE_SOLVER_LIST[*]}"
 echo
 
 resolve_python_runner
@@ -157,10 +205,14 @@ PY
   fi
   echo
 
-  if [[ "${FORCE_RERUN}" != "1" && -s "${ALPINE_JSONL}" ]]; then
-    log "Skipping Step 3/4: Alpine output already exists"
-  else
-    log "=== Step 3/4: Alpine.jl full translated suite ==="
+  for alpine_solver in "${ALPINE_SOLVER_LIST[@]}"; do
+    ALPINE_JSONL="$(alpine_jsonl_path "${alpine_solver}")"
+    if [[ "${FORCE_RERUN}" != "1" && -s "${ALPINE_JSONL}" ]]; then
+      log "Skipping Step 3/4 (${alpine_solver}): Alpine output already exists"
+      continue
+    fi
+
+    log "=== Step 3/4: Alpine.jl full translated suite (${alpine_solver}) ==="
     JULIA_CMD=("${JULIA_BIN}")
     if [[ -n "${JULIA_CHANNEL}" ]]; then
       JULIA_CMD+=("${JULIA_CHANNEL}")
@@ -175,11 +227,11 @@ PY
     )
     (
       cd "${ALPINE_PROJECT}"
-      ALPINE_MIP_SOLVER="${ALPINE_MIP_SOLVER}" "${JULIA_CMD[@]}"
+      ALPINE_MIP_SOLVER="${alpine_solver}" "${JULIA_CMD[@]}"
     )
-    log "Alpine output:"
+    log "Alpine output (${alpine_solver}):"
     log "  ${ALPINE_JSONL}"
-  fi
+  done
 else
   log "Skipping Step 2/4 and Step 3/4: Alpine run disabled"
 fi
@@ -190,10 +242,18 @@ if [[ "${RUN_COMPARISON}" == "1" ]]; then
     echo "Missing discopt JSON for comparison: ${COMPARISON_DISCOPT_JSON}" >&2
     exit 1
   fi
-  if [[ ! -s "${ALPINE_JSONL}" ]]; then
-    echo "Missing Alpine JSONL for comparison: ${ALPINE_JSONL}" >&2
-    exit 1
-  fi
+  ALPINE_COMPARE_SPECS=""
+  for alpine_solver in "${ALPINE_SOLVER_LIST[@]}"; do
+    ALPINE_JSONL="$(alpine_jsonl_path "${alpine_solver}")"
+    if [[ ! -s "${ALPINE_JSONL}" ]]; then
+      echo "Missing Alpine JSONL for comparison: ${ALPINE_JSONL}" >&2
+      exit 1
+    fi
+    if [[ -n "${ALPINE_COMPARE_SPECS}" ]]; then
+      ALPINE_COMPARE_SPECS="${ALPINE_COMPARE_SPECS};"
+    fi
+    ALPINE_COMPARE_SPECS="${ALPINE_COMPARE_SPECS}${alpine_solver}:${ALPINE_JSONL}"
+  done
 
   if [[ "${FORCE_RERUN}" != "1" && -s "${COMPARISON_JSON}" && -s "${COMPARISON_MD}" ]]; then
     log "Skipping Step 4/4: comparison outputs already exist"
@@ -201,40 +261,42 @@ if [[ "${RUN_COMPARISON}" == "1" ]]; then
     log "=== Step 4/4: synthesize combined comparison ==="
     (
       cd "${REPO_ROOT}"
-      UV_CACHE_DIR="${UV_CACHE_DIR}" PYTHONPATH=python \
+      UV_CACHE_DIR="${UV_CACHE_DIR}" PYTHONPATH=python ALPINE_COMPARE_SPECS="${ALPINE_COMPARE_SPECS}" \
         JAX_PLATFORMS="${JAX_PLATFORMS}" JAX_ENABLE_X64="${JAX_ENABLE_X64}" \
         "${PYTHON_RUNNER[@]}" - <<PY
 import json
+import os
 from pathlib import Path
 
-from scripts.collect_minlptests_status import build_markdown, compare_outcomes, summarize
+from scripts.collect_minlptests_status import (
+    build_solver_comparison_markdown,
+    build_solver_comparison_payload,
+)
 
 output_dir = Path("${OUTPUT_DIR}")
 discopt_payload = json.loads(Path("${COMPARISON_DISCOPT_JSON}").read_text(encoding="utf-8"))
-discopt_records = discopt_payload["discopt"]
-alpine_records = [
-    json.loads(line)
-    for line in Path("${ALPINE_JSONL}").read_text(encoding="utf-8").splitlines()
-    if line.strip()
-]
+solver_records = {"discopt_amp": discopt_payload["discopt"]}
 
-payload = {
-    "discopt": discopt_records,
-    "alpine": alpine_records,
-    "discopt_summary": summarize(discopt_records),
-    "alpine_summary": summarize(alpine_records),
-    "comparison_summary": compare_outcomes(discopt_records, alpine_records),
-}
+for entry in os.environ["ALPINE_COMPARE_SPECS"].split(";"):
+    backend, jsonl_path = entry.split(":", 1)
+    solver_records[f"alpine_{backend}"] = [
+        json.loads(line)
+        for line in Path(jsonl_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+payload = build_solver_comparison_payload(solver_records)
 
 Path("${COMPARISON_JSON}").write_text(
     json.dumps(payload, indent=2, sort_keys=True),
     encoding="utf-8",
 )
 Path("${COMPARISON_MD}").write_text(
-    build_markdown(discopt_records, alpine_records),
+    build_solver_comparison_markdown(solver_records),
     encoding="utf-8",
 )
-print("Comparison summary:", payload["comparison_summary"])
+print("Pairwise outcomes:", payload["pairwise_outcomes"])
+print("Timing summaries:", payload["timing_summaries"])
 print("Wrote ${COMPARISON_JSON}")
 print("Wrote ${COMPARISON_MD}")
 PY
@@ -253,7 +315,9 @@ if [[ "${RUN_DISCOPT}" == "1" ]]; then
 else
   log "  discopt input: ${COMPARISON_DISCOPT_JSON}"
 fi
-log "  ${ALPINE_JSONL}"
+for ALPINE_JSONL in "${ALPINE_JSONLS[@]}"; do
+  log "  ${ALPINE_JSONL}"
+done
 log "  ${COMPARISON_JSON}"
 log "  ${COMPARISON_MD}"
 log "  ${RUN_LOG}"
