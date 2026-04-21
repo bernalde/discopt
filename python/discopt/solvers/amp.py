@@ -879,7 +879,9 @@ def solve_amp(
     SolveResult
         With gap_certified=True if termination is by gap criterion. When AMP
         has a valid incumbent but no certificate, it returns ``"feasible"``
-        together with the incumbent and any trustworthy bound information.
+        together with the incumbent and any trustworthy bound information,
+        unless the wall-clock limit is reached first, in which case the status
+        remains ``"time_limit"``.
     """
     t_start = time.perf_counter()
 

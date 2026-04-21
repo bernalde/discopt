@@ -253,6 +253,18 @@ class TestUnknownExpressions:
 class TestSpecialConvexPatterns:
     """Regression tests for convex patterns beyond basic DCP composition."""
 
+    def test_bilinear_upper_bound_is_not_treated_as_quadratic_over_linear(self):
+        m = Model("bilinear_upper_bound")
+        x = m.continuous("x", lb=0.1, ub=10)
+        y = m.continuous("y", lb=0.1, ub=10)
+        m.minimize(x + y)
+        m.subject_to(x * y <= 5)
+
+        is_convex, mask = classify_model(m)
+
+        assert is_convex is False
+        assert mask == [False]
+
     def test_psd_quadratic_form_with_cross_term_is_convex(self):
         instance = MINLPTESTS_CVX_BY_ID["nlp_cvx_108_010"]
         m = instance.build_fn()

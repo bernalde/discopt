@@ -400,6 +400,8 @@ def _classify_fractional_epigraph_constraint(
         c0 = float(const)
         d = float(coeff_vec[other_idx])
         e = float(coeff_const)
+        if abs(a) <= 1e-10:
+            continue
         lb = float(other_var.lb)
         ub = float(other_var.ub)
         coeff_lo, coeff_hi = _affine_range_1d(d, e, lb, ub)
