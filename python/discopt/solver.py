@@ -17,6 +17,7 @@ import numpy as np
 from scipy.optimize import minimize as scipy_minimize
 
 from discopt._jax.alphabb import estimate_alpha as _estimate_alpha_jax
+from discopt._jax.model_utils import flat_variable_bounds
 from discopt._jax.nlp_evaluator import NLPEvaluator
 from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 from discopt._rust import PyTreeManager
@@ -1103,18 +1104,17 @@ def _strong_branch_lp(
 _BOUND_WARN_THRESHOLD = 1e15
 
 
-def _check_finite_bounds(model: Model) -> None:
-    """Warn if any variable has very large or infinite bounds.
-
-    Interior point methods use barrier terms that require reasonably sized
-    bounds. Bounds beyond 1e15 cause numerical difficulties (NaN gradients,
-    ill-conditioned KKT systems) and the solver silently produces NaN
-    objectives or reports iteration_limit. This check warns users early.
-    """
-    bad_vars = []
+def _format_bad_bound_entries(
+    model: Model,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+) -> list[str]:
+    """Return human-readable entries for scalar variables with problematic bounds."""
+    bad_vars: list[str] = []
+    offset = 0
     for v in model._variables:
-        lb_flat = v.lb.flatten()
-        ub_flat = v.ub.flatten()
+        lb_flat = np.asarray(flat_lb[offset : offset + v.size], dtype=np.float64)
+        ub_flat = np.asarray(flat_ub[offset : offset + v.size], dtype=np.float64)
         for j in range(v.size):
             lo, hi = float(lb_flat[j]), float(ub_flat[j])
             if (
@@ -1125,17 +1125,56 @@ def _check_finite_bounds(model: Model) -> None:
             ):
                 name = v.name if v.size == 1 else f"{v.name}[{j}]"
                 bad_vars.append(f"{name} (lb={lo:.2g}, ub={hi:.2g})")
-    if bad_vars:
-        import warnings
+        offset += v.size
+    return bad_vars
 
-        warnings.warn(
-            f"Variables with very large or infinite bounds: "
-            f"{', '.join(bad_vars[:5])}. "
-            f"NLP solvers may fail (NaN, iteration_limit) when bounds "
-            f"exceed ~1e15. Add tighter explicit bounds, e.g. "
-            f"m.continuous('x', lb=0, ub=1000).",
-            stacklevel=3,
+
+def _check_finite_bounds(model: Model) -> None:
+    """Warn if any variable still has very large or infinite bounds after cheap tightening.
+
+    Interior point methods use barrier terms that require reasonably sized
+    bounds. Bounds beyond 1e15 cause numerical difficulties (NaN gradients,
+    ill-conditioned KKT systems) and the solver silently produces NaN
+    objectives or reports iteration_limit. This check first applies the
+    lightweight nonlinear tightening rules used elsewhere in discopt and only
+    warns if large bounds remain afterward.
+    """
+    raw_lb, raw_ub = flat_variable_bounds(model)
+    raw_bad_vars = _format_bad_bound_entries(model, raw_lb, raw_ub)
+    if not raw_bad_vars:
+        return
+
+    tightened_lb = raw_lb
+    tightened_ub = raw_ub
+    tightening_note = ""
+    try:
+        tightened_lb, tightened_ub, bt_stats = tighten_nonlinear_bounds(model, raw_lb, raw_ub)
+        if bt_stats.n_tightened > 0:
+            tightening_note = (
+                f" Nonlinear tightening adjusted {bt_stats.n_tightened} bounds"
+                f" via {', '.join(bt_stats.applied_rules)}."
+            )
+    except Exception as exc:
+        logger.debug("Skipping nonlinear bound warning refinement after error: %s", exc)
+
+    bad_vars = _format_bad_bound_entries(model, tightened_lb, tightened_ub)
+    if not bad_vars:
+        logger.info(
+            "Large declared bounds were eliminated by nonlinear tightening for model %s",
+            model.name,
         )
+        return
+
+    import warnings
+
+    warnings.warn(
+        f"Variables with very large or infinite bounds after nonlinear tightening: "
+        f"{', '.join(bad_vars[:5])}.{tightening_note} "
+        f"NLP solvers may fail (NaN, iteration_limit) when bounds "
+        f"exceed ~1e15. Add tighter explicit bounds, e.g. "
+        f"m.continuous('x', lb=0, ub=1000).",
+        stacklevel=3,
+    )
 
 
 def _is_pure_continuous(model: Model) -> bool:

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from importlib.util import find_spec
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -1848,6 +1849,34 @@ class TestCurrentCodeWeaknesses:
         assert result.objective is not None
         tol = 1e-6 + 1e-4 * abs(instance.expected_obj)
         assert abs(result.objective - instance.expected_obj) <= tol
+
+    def test_large_bound_warning_is_suppressed_when_nonlinear_tightening_fixes_it(self):
+        """Large raw bounds should not warn once shared tightening recovers a finite box."""
+        from discopt.solver import _check_finite_bounds
+
+        instance = MINLPTESTS_CVX_BY_ID["nlp_cvx_108_010"]
+        m = instance.build_fn()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _check_finite_bounds(m)
+
+        assert not any("very large or infinite bounds" in str(w.message) for w in caught)
+
+    def test_large_bound_warning_reports_post_tightening_residuals(self):
+        """The warning should describe remaining large bounds after cheap tightening."""
+        from discopt.solver import _check_finite_bounds
+
+        instance = MINLPTESTS_CVX_BY_ID["nlp_cvx_501_010_3d"]
+        m = instance.build_fn()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _check_finite_bounds(m)
+
+        messages = [str(w.message) for w in caught]
+        assert any("after nonlinear tightening" in message for message in messages)
+        assert any("x0" in message for message in messages)
 
     @pytest.mark.parametrize(
         "problem_id",
