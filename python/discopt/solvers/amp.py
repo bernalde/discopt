@@ -641,6 +641,7 @@ def _solve_milp_with_oa_recovery(
     max_retries = max(1, len(active_oa_cuts).bit_length() + 1)
     milp_result = None
     varmap = None
+    mip_solve_count = 0
 
     for _retry in range(max_retries):
         milp_model, varmap = build_milp_relaxation(
@@ -658,8 +659,9 @@ def _solve_milp_with_oa_recovery(
             time_limit=time_limit,
             gap_tolerance=gap_tolerance,
         )
+        mip_solve_count += 1
         if milp_result.status != "infeasible" or not active_oa_cuts:
-            return milp_result, varmap, active_oa_cuts
+            return milp_result, varmap, active_oa_cuts, mip_solve_count
 
         drop_count = max(1, len(active_oa_cuts) // 2)
         logger.info(
@@ -671,7 +673,7 @@ def _solve_milp_with_oa_recovery(
 
     assert milp_result is not None
     assert varmap is not None
-    return milp_result, varmap, active_oa_cuts
+    return milp_result, varmap, active_oa_cuts, mip_solve_count
 
 
 def _check_constraints(x: np.ndarray, model: Model, tol: float = 1e-4) -> bool:
@@ -1025,6 +1027,7 @@ def solve_amp(
     incumbent = None
     gap_certified = False
     oa_cuts: list = []  # accumulated OA linearizations from NLP incumbents
+    mip_count = 0
 
     for iteration in range(1, max_iter + 1):
         elapsed = time.perf_counter() - t_start
@@ -1046,7 +1049,7 @@ def solve_amp(
         )
 
         try:
-            milp_result, varmap, active_oa_cuts = _solve_milp_with_oa_recovery(
+            milp_result, varmap, active_oa_cuts, iter_mip_count = _solve_milp_with_oa_recovery(
                 model=model,
                 terms=terms,
                 disc_state=disc_state,
@@ -1059,6 +1062,7 @@ def solve_amp(
                 convhull_ebd_encoding=convhull_ebd_encoding,
                 bound_override=(flat_lb, flat_ub),
             )
+            mip_count += iter_mip_count
             oa_cuts = active_oa_cuts
         except Exception as e:
             logger.warning("AMP: MILP build/solve failed at iteration %d: %s", iteration, e)
@@ -1084,6 +1088,7 @@ def solve_amp(
                             time_limit=time_limit,
                         )
                         if recovered is not None:
+                            recovered.mip_count = mip_count
                             return recovered
                     fallback_x, fallback_obj = _solve_small_integer_domain_fallback(
                         model,
@@ -1103,11 +1108,13 @@ def solve_amp(
                             gap=None,
                             x=_build_x_dict(fallback_x, model),
                             wall_time=time.perf_counter() - t_start,
+                            mip_count=mip_count,
                             gap_certified=False,
                         )
                     return SolveResult(
                         status="infeasible",
                         wall_time=time.perf_counter() - t_start,
+                        mip_count=mip_count,
                     )
             break
 
@@ -1327,6 +1334,7 @@ def solve_amp(
         return SolveResult(
             status="infeasible",
             wall_time=elapsed,
+            mip_count=mip_count,
         )
 
     if incumbent is not None:
@@ -1361,6 +1369,7 @@ def solve_amp(
             gap=float(rel_gap_final) if rel_gap_final is not None else None,
             x=_build_x_dict(incumbent, model),
             wall_time=elapsed,
+            mip_count=mip_count,
             gap_certified=gap_certified,
         )
 
@@ -1376,6 +1385,7 @@ def solve_amp(
             time_limit=time_limit,
         )
         if recovered is not None:
+            recovered.mip_count = mip_count
             return recovered
 
     if elapsed >= time_limit:
@@ -1390,5 +1400,6 @@ def solve_amp(
         gap=None,
         x=None,
         wall_time=elapsed,
+        mip_count=mip_count,
         gap_certified=False,
     )

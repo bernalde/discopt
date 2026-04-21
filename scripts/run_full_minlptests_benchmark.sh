@@ -17,6 +17,8 @@ RUN_ALPINE="${RUN_ALPINE:-1}"
 RUN_COMPARISON="${RUN_COMPARISON:-1}"
 ALPINE_MIP_SOLVER="${ALPINE_MIP_SOLVER:-highs}"
 ALPINE_MIP_SOLVERS="${ALPINE_MIP_SOLVERS:-}"
+ALPINE_MAX_ITER="${ALPINE_MAX_ITER:-}"
+DISCOPT_AMP_MAX_ITER="${DISCOPT_AMP_MAX_ITER:-}"
 JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
 JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 DISCOPT_INPUT_JSON="${DISCOPT_INPUT_JSON:-}"
@@ -24,6 +26,7 @@ PYTHON_RUNNER_LABEL=""
 declare -a PYTHON_RUNNER=()
 declare -a ALPINE_SOLVER_LIST=()
 declare -a ALPINE_JSONLS=()
+declare -a DISCOPT_AMP_MAX_ITER_ARGS=()
 
 ALPINE_PROJECT="${ALPINE_PROJECT:-${REPO_ROOT}/../Alpine.jl}"
 MINLPTESTS_PATH="${MINLPTESTS_PATH:-${REPO_ROOT}/../MINLPTests.jl}"
@@ -111,6 +114,9 @@ resolve_alpine_solvers
 for alpine_solver in "${ALPINE_SOLVER_LIST[@]}"; do
   ALPINE_JSONLS+=("$(alpine_jsonl_path "${alpine_solver}")")
 done
+if [[ -n "${DISCOPT_AMP_MAX_ITER}" ]]; then
+  DISCOPT_AMP_MAX_ITER_ARGS=(--discopt-amp-max-iter "${DISCOPT_AMP_MAX_ITER}")
+fi
 
 trap 'log "ERROR: benchmark runner failed at line ${LINENO}"' ERR
 
@@ -124,6 +130,8 @@ log "Run discopt: ${RUN_DISCOPT}"
 log "Run Alpine: ${RUN_ALPINE}"
 log "Run comparison: ${RUN_COMPARISON}"
 log "Alpine MIP solvers: ${ALPINE_SOLVER_LIST[*]}"
+log "DISCOPT_AMP_MAX_ITER: ${DISCOPT_AMP_MAX_ITER:-default}"
+log "ALPINE_MAX_ITER: ${ALPINE_MAX_ITER:-default}"
 echo
 
 resolve_python_runner
@@ -161,6 +169,7 @@ if [[ "${RUN_DISCOPT}" == "1" ]]; then
           --skip-alpine \
           --include-convex \
           --per-instance-time-limit "${PER_INSTANCE_TIME_LIMIT}" \
+          "${DISCOPT_AMP_MAX_ITER_ARGS[@]}" \
           --output-json "${DISCOPT_JSON}" \
           --output-markdown "${DISCOPT_MD}"
     )
@@ -227,7 +236,11 @@ PY
     )
     (
       cd "${ALPINE_PROJECT}"
-      ALPINE_MIP_SOLVER="${alpine_solver}" "${JULIA_CMD[@]}"
+      if [[ -n "${ALPINE_MAX_ITER}" ]]; then
+        ALPINE_MIP_SOLVER="${alpine_solver}" ALPINE_MAX_ITER="${ALPINE_MAX_ITER}" "${JULIA_CMD[@]}"
+      else
+        ALPINE_MIP_SOLVER="${alpine_solver}" "${JULIA_CMD[@]}"
+      fi
     )
     log "Alpine output (${alpine_solver}):"
     log "  ${ALPINE_JSONL}"

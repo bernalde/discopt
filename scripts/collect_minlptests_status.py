@@ -148,6 +148,7 @@ def run_discopt_cases(
     cases: list[dict[str, Any]],
     *,
     solver_mode: str,
+    amp_max_iter: int | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     total_cases = len(cases)
@@ -167,6 +168,8 @@ def run_discopt_cases(
             if solver_mode == "amp":
                 solve_kwargs["solver"] = "amp"
                 solve_kwargs["nlp_solver"] = "ipm"
+                if amp_max_iter is not None:
+                    solve_kwargs["max_iter"] = amp_max_iter
                 if case["gap_tolerance"] is not None:
                     solve_kwargs["gap_tolerance"] = 1e-3
             elif case["gap_tolerance"] is not None:
@@ -193,6 +196,8 @@ def run_discopt_cases(
                 "objective": getattr(result, "objective", None),
                 "wall_time_sec": wall_time,
                 "note": note,
+                "mip_count": getattr(result, "mip_count", None),
+                "amp_max_iter": amp_max_iter if solver_mode == "amp" else None,
             }
         )
         print(
@@ -213,6 +218,7 @@ def run_alpine_cases(
     julia_channel: str,
     per_instance_time_limit: float,
     mip_solver: str = "highs",
+    max_iter: int | None = None,
 ) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="alpine-minlptests-") as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -240,6 +246,8 @@ def run_alpine_cases(
         )
         env = dict(os.environ)
         env["ALPINE_MIP_SOLVER"] = mip_solver
+        if max_iter is not None:
+            env["ALPINE_MAX_ITER"] = str(max_iter)
         subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
 
         records: list[dict[str, Any]] = []
@@ -332,6 +340,28 @@ def summarize_timing(records: list[dict[str, Any]]) -> dict[str, float | int | N
     }
 
 
+def summarize_mip_counts(records: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    mip_counts = [
+        int(record["mip_count"])
+        for record in records
+        if record.get("mip_count") is not None
+    ]
+    if not mip_counts:
+        return {
+            "counted_cases": 0,
+            "total_mip_count": None,
+            "median_mip_count": None,
+            "mean_mip_count": None,
+        }
+
+    return {
+        "counted_cases": len(mip_counts),
+        "total_mip_count": int(sum(mip_counts)),
+        "median_mip_count": float(statistics.median(mip_counts)),
+        "mean_mip_count": float(statistics.mean(mip_counts)),
+    }
+
+
 def compare_pairwise_timing(
     left_records: list[dict[str, Any]],
     right_records: list[dict[str, Any]],
@@ -381,6 +411,9 @@ def build_solver_comparison_payload(
         },
         "timing_summaries": {
             solver: summarize_timing(records) for solver, records in solver_records.items()
+        },
+        "mip_summaries": {
+            solver: summarize_mip_counts(records) for solver, records in solver_records.items()
         },
         "pairwise_outcomes": {},
         "pairwise_timing": {},
@@ -475,6 +508,29 @@ def build_solver_comparison_markdown(
                 f"| {solver} | {timing['pass_count']} | "
                 f"{'' if median_sec is None else f'{median_sec:.3f}'} | "
                 f"{'' if geom_sec is None else f'{geom_sec:.3f}'} |"
+            )
+        )
+    lines.append("")
+
+    lines.extend(
+        [
+            "## MIP Count Summary",
+            "",
+            "| Solver | Counted cases | Total MIPs | Median MIPs | Mean MIPs |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for solver in payload["solver_order"]:
+        mip_summary = payload["mip_summaries"][solver]
+        total_mips = mip_summary["total_mip_count"]
+        median_mips = mip_summary["median_mip_count"]
+        mean_mips = mip_summary["mean_mip_count"]
+        lines.append(
+            (
+                f"| {solver} | {mip_summary['counted_cases']} | "
+                f"{'' if total_mips is None else total_mips} | "
+                f"{'' if median_mips is None else f'{median_mips:.1f}'} | "
+                f"{'' if mean_mips is None else f'{mean_mips:.2f}'} |"
             )
         )
     lines.append("")
@@ -617,6 +673,18 @@ def main() -> None:
         default="highs",
         help="MIP backend for the Alpine.jl run.",
     )
+    parser.add_argument(
+        "--discopt-amp-max-iter",
+        type=int,
+        default=None,
+        help="Optional outer AMP iteration cap for translated discopt runs.",
+    )
+    parser.add_argument(
+        "--alpine-max-iter",
+        type=int,
+        default=None,
+        help="Optional outer Alpine partitioning-iteration cap.",
+    )
     args = parser.parse_args()
 
     mod = load_test_module()
@@ -625,7 +693,12 @@ def main() -> None:
         include_convex=args.include_convex,
         per_instance_time_limit=args.per_instance_time_limit,
     )
-    discopt_records = run_discopt_cases(mod, cases, solver_mode=args.discopt_mode)
+    discopt_records = run_discopt_cases(
+        mod,
+        cases,
+        solver_mode=args.discopt_mode,
+        amp_max_iter=args.discopt_amp_max_iter,
+    )
     alpine_records: list[dict[str, Any]] = []
 
     if not args.skip_alpine:
@@ -637,6 +710,7 @@ def main() -> None:
             args.julia_channel,
             args.per_instance_time_limit,
             mip_solver=args.alpine_mip_solver,
+            max_iter=args.alpine_max_iter,
         )
 
     payload = {
@@ -647,6 +721,8 @@ def main() -> None:
         "comparison_summary": compare_outcomes(discopt_records, alpine_records),
         "discopt_timing_summary": summarize_timing(discopt_records),
         "alpine_timing_summary": summarize_timing(alpine_records),
+        "discopt_mip_summary": summarize_mip_counts(discopt_records),
+        "alpine_mip_summary": summarize_mip_counts(alpine_records),
         "pairwise_timing_summary": compare_pairwise_timing(discopt_records, alpine_records),
     }
 

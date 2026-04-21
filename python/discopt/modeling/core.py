@@ -832,6 +832,8 @@ class SolveResult:
         Total wall-clock solve time in seconds.
     node_count : int
         Number of Branch & Bound nodes explored.
+    mip_count : int
+        Number of MIP/MILP solves performed by the algorithm, when tracked.
     rust_time : float
         Time spent in the Rust backend (B&B tree management).
     jax_time : float
@@ -858,6 +860,7 @@ class SolveResult:
     x: Optional[dict[str, np.ndarray]] = None
     wall_time: float = 0.0
     node_count: int = 0
+    mip_count: int = 0
 
     # Layer profiling
     rust_time: float = 0.0

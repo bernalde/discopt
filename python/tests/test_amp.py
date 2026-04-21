@@ -2102,7 +2102,7 @@ class TestCurrentCodeWeaknesses:
             fake_build,
         )
 
-        result, _, kept_cuts = amp_mod._solve_milp_with_oa_recovery(
+        result, _, kept_cuts, mip_count = amp_mod._solve_milp_with_oa_recovery(
             model=None,
             terms=None,
             disc_state=None,
@@ -2118,6 +2118,7 @@ class TestCurrentCodeWeaknesses:
         assert call_sizes == [4, 2]
         assert kept_cuts == [("c3", 3), ("c4", 4)]
         assert result.status == "optimal"
+        assert mip_count == 2
 
     def test_obbt_presolve_tightens_bilinear_demo_bounds(self):
         """OBBT should shrink the initial [0, 10]^2 box to the linear hull x + y = 1."""
@@ -2261,6 +2262,7 @@ class TestCurrentCodeWeaknesses:
                 ),
                 {},
                 [],
+                1,
             ),
         )
         monkeypatch.setattr(
