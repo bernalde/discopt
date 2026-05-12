@@ -21,6 +21,7 @@ Theory: Nagarajan et al., JOGO 2018, Section 4 (piecewise McCormick relaxation).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -39,6 +40,7 @@ from discopt.modeling.core import (
     BinaryOp,
     Constant,
     Expression,
+    FunctionCall,
     IndexExpression,
     Model,
     ObjectiveSense,
@@ -177,6 +179,203 @@ def _normalize_convhull_formulation(formulation: str) -> str:
         ) from err
 
 
+def _trig_expr_key(expr: FunctionCall) -> tuple[str, str]:
+    """Return a stable key for a supported unary trigonometric call."""
+    return (expr.func_name, repr(expr.args[0]))
+
+
+def _is_supported_trig_call(expr: Expression) -> bool:
+    return (
+        isinstance(expr, FunctionCall)
+        and expr.func_name in {"sin", "cos", "tan"}
+        and len(expr.args) == 1
+    )
+
+
+def _linearize_affine_expr(expr: Expression, model: Model, n_orig: int) -> tuple[np.ndarray, float]:
+    """Return coeff/constant for an affine expression over original variables."""
+    coeff = np.zeros(n_orig, dtype=np.float64)
+    const_acc = [0.0]
+
+    def visit(e: Expression, scale: float) -> None:
+        if isinstance(e, Constant):
+            const_acc[0] += scale * float(e.value)
+            return
+        if isinstance(e, Variable):
+            offset = _compute_var_offset(e, model)
+            if e.size != 1:
+                raise ValueError(f"Non-scalar variable in affine expression: {e}")
+            coeff[offset] += scale
+            return
+        if isinstance(e, IndexExpression):
+            flat = _get_flat_index(e, model)
+            if flat is None:
+                raise ValueError(f"Cannot linearize affine IndexExpression: {e}")
+            coeff[flat] += scale
+            return
+        if isinstance(e, UnaryOp):
+            if e.op != "neg":
+                raise ValueError(f"Cannot linearize affine UnaryOp: {e.op}")
+            visit(e.operand, -scale)
+            return
+        if isinstance(e, BinaryOp):
+            if e.op == "+":
+                visit(e.left, scale)
+                visit(e.right, scale)
+                return
+            if e.op == "-":
+                visit(e.left, scale)
+                visit(e.right, -scale)
+                return
+            if e.op == "/":
+                if not isinstance(e.right, Constant):
+                    raise ValueError(f"Cannot linearize non-constant affine division: {e}")
+                visit(e.left, scale / float(e.right.value))
+                return
+            if e.op == "*":
+                if isinstance(e.left, Constant):
+                    visit(e.right, scale * float(e.left.value))
+                    return
+                if isinstance(e.right, Constant):
+                    visit(e.left, scale * float(e.right.value))
+                    return
+                raise ValueError(f"Cannot linearize non-affine product: {e}")
+        if isinstance(e, SumExpression):
+            visit(e.operand, scale)
+            return
+        if isinstance(e, SumOverExpression):
+            for term in e.terms:
+                visit(term, scale)
+            return
+        raise ValueError(f"Cannot linearize affine {type(e).__name__}: {e}")
+
+    visit(expr, 1.0)
+    return coeff, const_acc[0]
+
+
+def _affine_interval(
+    coeff: np.ndarray,
+    const: float,
+    flat_lb: np.ndarray,
+    flat_ub: np.ndarray,
+) -> tuple[float, float] | None:
+    """Compute the exact interval of an affine expression over a bound box."""
+    lo = float(const)
+    hi = float(const)
+    for c_i, lb_i, ub_i in zip(coeff, flat_lb, flat_ub):
+        c_i = float(c_i)
+        if abs(c_i) <= 0.0:
+            continue
+        if not (np.isfinite(lb_i) and np.isfinite(ub_i)):
+            return None
+        if c_i >= 0.0:
+            lo += c_i * float(lb_i)
+            hi += c_i * float(ub_i)
+        else:
+            lo += c_i * float(ub_i)
+            hi += c_i * float(lb_i)
+    return lo, hi
+
+
+def _critical_points_in_interval(start: float, period: float, lb: float, ub: float) -> list[float]:
+    tol = 1e-12
+    k_min = math.ceil((lb - start - tol) / period)
+    k_max = math.floor((ub - start + tol) / period)
+    return [start + k * period for k in range(k_min, k_max + 1)]
+
+
+def _trig_value(func: str, x: float) -> float:
+    if func == "sin":
+        return math.sin(x)
+    if func == "cos":
+        return math.cos(x)
+    if func == "tan":
+        return math.tan(x)
+    raise ValueError(f"Unsupported trig function: {func}")
+
+
+def _trig_derivative(func: str, x: float) -> float:
+    if func == "sin":
+        return math.cos(x)
+    if func == "cos":
+        return -math.sin(x)
+    if func == "tan":
+        c = math.cos(x)
+        return 1.0 / (c * c)
+    raise ValueError(f"Unsupported trig function: {func}")
+
+
+def _tan_range(lb: float, ub: float) -> tuple[float, float] | None:
+    """Return tan interval bounds only when [lb, ub] stays on one safe branch."""
+    if not (np.isfinite(lb) and np.isfinite(ub)):
+        return None
+    margin = 1e-7
+    k_min = math.floor((lb - math.pi / 2.0) / math.pi) - 1
+    k_max = math.ceil((ub - math.pi / 2.0) / math.pi) + 1
+    for k in range(k_min, k_max + 1):
+        asymptote = math.pi / 2.0 + k * math.pi
+        if lb - margin <= asymptote <= ub + margin:
+            return None
+    vals = [math.tan(lb), math.tan(ub)]
+    if not all(np.isfinite(v) for v in vals):
+        return None
+    return min(vals), max(vals)
+
+
+def _trig_range(func: str, lb: float, ub: float) -> tuple[float, float] | None:
+    """Compute exact range bounds for supported trig functions on [lb, ub]."""
+    if lb > ub:
+        lb, ub = ub, lb
+    if func == "tan":
+        return _tan_range(lb, ub)
+    if not (np.isfinite(lb) and np.isfinite(ub)):
+        return None
+    if ub - lb >= 2.0 * math.pi:
+        return -1.0, 1.0
+    points = [lb, ub]
+    if func == "sin":
+        points.extend(_critical_points_in_interval(math.pi / 2.0, math.pi, lb, ub))
+    elif func == "cos":
+        points.extend(_critical_points_in_interval(0.0, math.pi, lb, ub))
+    else:
+        return None
+    vals = [_trig_value(func, p) for p in points if lb - 1e-12 <= p <= ub + 1e-12]
+    return min(vals), max(vals)
+
+
+def _trig_curvature(func: str, value_lb: float, value_ub: float) -> str | None:
+    """Classify univariate trig curvature over an interval, if sign-certifiable."""
+    tol = 1e-12
+    if func in {"sin", "cos"}:
+        if value_lb >= -tol:
+            return "concave"
+        if value_ub <= tol:
+            return "convex"
+    elif func == "tan":
+        if value_lb >= -tol:
+            return "convex"
+        if value_ub <= tol:
+            return "concave"
+    return None
+
+
+def _line_at(func: str, x: float) -> tuple[float, float]:
+    """Return slope/intercept for the tangent line to f at x."""
+    slope = _trig_derivative(func, x)
+    intercept = _trig_value(func, x) - slope * x
+    return slope, intercept
+
+
+def _secant_line(func: str, lb: float, ub: float) -> tuple[float, float] | None:
+    if abs(ub - lb) <= 1e-12:
+        return None
+    f_lb = _trig_value(func, lb)
+    f_ub = _trig_value(func, ub)
+    slope = (f_ub - f_lb) / (ub - lb)
+    intercept = f_lb - slope * lb
+    return slope, intercept
+
+
 def _choose_trilinear_pair(
     term: tuple[int, int, int],
     partitioned_vars: set[int],
@@ -262,6 +461,8 @@ def _linearize_expr(
     monomial_var_map: dict[tuple[int, int], int],
     n_total_vars: int,
     fractional_power_var_map: Optional[dict[tuple[int, float], int]] = None,
+    trig_var_map: Optional[dict[tuple[str, str], int]] = None,
+    trig_square_var_map: Optional[dict[tuple[tuple[str, str], int], int]] = None,
 ) -> tuple[np.ndarray, float]:
     """Walk expression tree and return (coeff, constant) for linearized form.
 
@@ -310,6 +511,18 @@ def _linearize_expr(
                     raise ValueError(f"Cannot linearize non-constant division: {e}")
 
             elif e.op == "**":
+                if (
+                    isinstance(e.left, FunctionCall)
+                    and _is_supported_trig_call(e.left)
+                    and isinstance(e.right, Constant)
+                    and float(e.right.value) == 2.0
+                ):
+                    trig_key = _trig_expr_key(e.left)
+                    square_key = (trig_key, 2)
+                    if trig_square_var_map and square_key in trig_square_var_map:
+                        coeff[trig_square_var_map[square_key]] += scale
+                        return
+                    raise ValueError(f"Trig square {square_key} has no aux column")
                 flat = _get_flat_index(e.left, model)
                 if flat is not None and isinstance(e.right, Constant):
                     exp_val = float(e.right.value)
@@ -388,6 +601,14 @@ def _linearize_expr(
                 visit(e.operand, -scale)
             else:
                 raise ValueError(f"Cannot linearize UnaryOp: {e.op}")
+
+        elif isinstance(e, FunctionCall):
+            if _is_supported_trig_call(e):
+                trig_key = _trig_expr_key(e)
+                if trig_var_map and trig_key in trig_var_map:
+                    coeff[trig_var_map[trig_key]] += scale
+                    return
+            raise ValueError(f"Cannot linearize FunctionCall: {e}")
 
         elif isinstance(e, SumExpression):
             op = e.operand
@@ -591,6 +812,114 @@ def build_milp_relaxation(
 
     for key in bilinear_with_fp_keys:
         bilinear_var_map[key] = _ensure_bilinear_aux(*key)
+
+    # ── Lifted affine-argument trig aux columns ────────────────────────────
+    trig_var_map: dict[tuple[str, str], int] = {}
+    trig_square_var_map: dict[tuple[tuple[str, str], int], int] = {}
+    trig_specs: list[dict] = []
+    trig_square_specs: list[dict] = []
+
+    def _ensure_trig_aux(expr: FunctionCall) -> int | None:
+        nonlocal col_idx
+        if not _is_supported_trig_call(expr):
+            return None
+        key = _trig_expr_key(expr)
+        if key in trig_var_map:
+            return trig_var_map[key]
+        try:
+            arg_coeff, arg_const = _linearize_affine_expr(expr.args[0], model, n_orig)
+        except ValueError:
+            return None
+        arg_interval = _affine_interval(arg_coeff, arg_const, flat_lb, flat_ub)
+        if arg_interval is None:
+            return None
+        arg_lb, arg_ub = arg_interval
+        value_interval = _trig_range(expr.func_name, arg_lb, arg_ub)
+        if value_interval is None:
+            return None
+        value_lb, value_ub = value_interval
+        trig_var_map[key] = col_idx
+        all_bounds.append((float(value_lb), float(value_ub)))
+        integrality_flags.append(0)
+        trig_specs.append(
+            {
+                "func": expr.func_name,
+                "arg_coeff": arg_coeff,
+                "arg_const": float(arg_const),
+                "arg_lb": float(arg_lb),
+                "arg_ub": float(arg_ub),
+                "value_lb": float(value_lb),
+                "value_ub": float(value_ub),
+                "col": col_idx,
+                "convexity": _trig_curvature(expr.func_name, value_lb, value_ub),
+            }
+        )
+        col_idx += 1
+        return trig_var_map[key]
+
+    def _ensure_trig_square_aux(expr: FunctionCall) -> int | None:
+        nonlocal col_idx
+        trig_col = _ensure_trig_aux(expr)
+        if trig_col is None:
+            return None
+        trig_key = _trig_expr_key(expr)
+        square_key = (trig_key, 2)
+        if square_key in trig_square_var_map:
+            return trig_square_var_map[square_key]
+        trig_lb, trig_ub = [float(v) for v in all_bounds[trig_col]]
+        vals = [trig_lb * trig_lb, trig_ub * trig_ub]
+        if trig_lb <= 0.0 <= trig_ub:
+            vals.append(0.0)
+        trig_square_var_map[square_key] = col_idx
+        all_bounds.append((min(vals), max(vals)))
+        integrality_flags.append(0)
+        trig_square_specs.append(
+            {
+                "base_col": trig_col,
+                "col": col_idx,
+                "base_lb": trig_lb,
+                "base_ub": trig_ub,
+            }
+        )
+        col_idx += 1
+        return trig_square_var_map[square_key]
+
+    def _scan_trig_expr(expr: Expression) -> None:
+        if isinstance(expr, FunctionCall) and _is_supported_trig_call(expr):
+            _ensure_trig_aux(expr)
+            for arg in expr.args:
+                _scan_trig_expr(arg)
+            return
+        if isinstance(expr, BinaryOp):
+            if (
+                expr.op == "**"
+                and isinstance(expr.left, FunctionCall)
+                and _is_supported_trig_call(expr.left)
+                and isinstance(expr.right, Constant)
+                and float(expr.right.value) == 2.0
+            ):
+                _ensure_trig_square_aux(expr.left)
+            _scan_trig_expr(expr.left)
+            _scan_trig_expr(expr.right)
+            return
+        if isinstance(expr, UnaryOp):
+            _scan_trig_expr(expr.operand)
+            return
+        if isinstance(expr, FunctionCall):
+            for arg in expr.args:
+                _scan_trig_expr(arg)
+            return
+        if isinstance(expr, SumExpression):
+            _scan_trig_expr(expr.operand)
+            return
+        if isinstance(expr, SumOverExpression):
+            for term in expr.terms:
+                _scan_trig_expr(term)
+
+    if model._objective is not None:
+        _scan_trig_expr(distribute_products(model._objective.expression))
+    for constraint in model._constraints:
+        _scan_trig_expr(distribute_products(constraint.body))
 
     bilinear_pw_map: dict[tuple[int, int], list] = {}
     bilinear_lambda_map: dict[tuple[int, int], dict] = {}
@@ -1242,6 +1571,70 @@ def build_milp_relaxation(
             row[var_idx] = -secant_slope
             _add_row(row, secant_intercept)
 
+    # ── Lifted trig envelope constraints ───────────────────────────────────
+    def _add_univariate_lower(spec: dict, slope: float, intercept: float) -> None:
+        # y >= slope * arg + intercept
+        row = np.zeros(n_total)
+        row[int(spec["col"])] = -1.0
+        row[:n_orig] += slope * np.asarray(spec["arg_coeff"], dtype=np.float64)
+        rhs = -intercept - slope * float(spec["arg_const"])
+        _add_row(row, rhs)
+
+    def _add_univariate_upper(spec: dict, slope: float, intercept: float) -> None:
+        # y <= slope * arg + intercept
+        row = np.zeros(n_total)
+        row[int(spec["col"])] = 1.0
+        row[:n_orig] -= slope * np.asarray(spec["arg_coeff"], dtype=np.float64)
+        rhs = intercept + slope * float(spec["arg_const"])
+        _add_row(row, rhs)
+
+    for spec in trig_specs:
+        func = str(spec["func"])
+        arg_lb = float(spec["arg_lb"])
+        arg_ub = float(spec["arg_ub"])
+        convexity = spec["convexity"]
+        if convexity not in {"convex", "concave"}:
+            continue
+        tangent_pts = [arg_lb, arg_ub]
+        mid = 0.5 * (arg_lb + arg_ub)
+        if abs(arg_ub - arg_lb) > 1e-10 and all(abs(mid - t) > 1e-10 for t in tangent_pts):
+            tangent_pts.append(mid)
+        secant = _secant_line(func, arg_lb, arg_ub)
+        if convexity == "convex":
+            for t in tangent_pts:
+                slope, intercept = _line_at(func, t)
+                _add_univariate_lower(spec, slope, intercept)
+            if secant is not None:
+                _add_univariate_upper(spec, *secant)
+        else:
+            if secant is not None:
+                _add_univariate_lower(spec, *secant)
+            for t in tangent_pts:
+                slope, intercept = _line_at(func, t)
+                _add_univariate_upper(spec, slope, intercept)
+
+    # q = s^2 for lifted trig calls. This composes the existing square
+    # relaxation pattern with the trig range/lift, so trig-square constraints
+    # stay in the MILP even when the trig graph itself has mixed curvature.
+    for spec in trig_square_specs:
+        base_col = int(spec["base_col"])
+        q_col = int(spec["col"])
+        lb_i = float(spec["base_lb"])
+        ub_i = float(spec["base_ub"])
+        tangent_pts = [lb_i, ub_i]
+        if lb_i <= 0.0 <= ub_i:
+            tangent_pts.append(0.0)
+        for t in sorted(set(tangent_pts)):
+            row = np.zeros(n_total)
+            row[q_col] = -1.0
+            row[base_col] = 2.0 * t
+            _add_row(row, t * t)
+        if abs(ub_i - lb_i) > 1e-12:
+            row = np.zeros(n_total)
+            row[q_col] = 1.0
+            row[base_col] = -(lb_i + ub_i)
+            _add_row(row, -lb_i * ub_i)
+
     # Model constraints
     for constraint in model._constraints:
         body = distribute_products(constraint.body)
@@ -1255,6 +1648,8 @@ def build_milp_relaxation(
                 monomial_var_map,
                 n_total,
                 fractional_power_var_map=fractional_power_var_map,
+                trig_var_map=trig_var_map,
+                trig_square_var_map=trig_square_var_map,
             )
             # body ≤ 0  →  c @ z + const ≤ 0  →  c @ z ≤ -const
             if sense == "<=":
@@ -1295,6 +1690,8 @@ def build_milp_relaxation(
             monomial_var_map,
             n_total,
             fractional_power_var_map=fractional_power_var_map,
+            trig_var_map=trig_var_map,
+            trig_square_var_map=trig_square_var_map,
         )
         objective_bound_valid = True
     except ValueError as err:
@@ -1351,6 +1748,8 @@ def build_milp_relaxation(
         "monomial": monomial_var_map,
         "bilinear_pw": bilinear_pw_map,
         "bilinear_lambda": bilinear_lambda_map,
+        "trig": trig_var_map,
+        "trig_square": trig_square_var_map,
         "convhull_formulation": convhull_mode,
     }
 

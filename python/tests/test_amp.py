@@ -26,6 +26,8 @@ Sections:
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -973,6 +975,121 @@ class TestMilpRelaxation:
         assert result.status == "optimal"
         assert result.objective is None
         assert result.x is not None
+
+    def test_affine_trig_constraints_are_retained_in_relaxation(self, caplog):
+        """Affine-argument sin/cos constraints should be lifted instead of omitted."""
+        from discopt._jax.discretization import DiscretizationState
+
+        m = Model("nlp_cvx_106_trig_relax")
+        x = m.continuous("x", lb=-3.0, ub=3.0)
+        y = m.continuous("y", lb=-1.0, ub=1.0)
+        m.minimize(-x - y)
+        m.subject_to(dm.sin(-x - 1.0) + x / 2 + 0.5 <= y)
+        m.subject_to(dm.cos(x - 0.5) + x / 4 - 0.5 >= y)
+
+        terms = self.classify(m)
+        with caplog.at_level(logging.WARNING, logger="discopt._jax.milp_relaxation"):
+            milp_model, varmap = self.build_milp(
+                m,
+                terms,
+                DiscretizationState(partitions={}),
+                incumbent=None,
+            )
+
+        result = milp_model.solve()
+
+        assert len(varmap["trig"]) == 2
+        assert "omitting constraint" not in caplog.text
+        assert result.status == "optimal"
+        assert result.objective is not None
+
+    def test_trig_square_constraints_apply_range_bounds(self):
+        """sin(x)^2 and cos(y)^2 constraints should constrain the MILP relaxation."""
+        from discopt._jax.discretization import DiscretizationState
+
+        sin_model = Model("sin_square_relax")
+        x = sin_model.integer("x", lb=0, ub=4)
+        y = sin_model.integer("y", lb=0, ub=4)
+        sin_model.maximize(y)
+        sin_model.subject_to(y <= dm.sin(x) ** 2 + 2)
+
+        terms = self.classify(sin_model)
+        sin_relax, sin_varmap = self.build_milp(
+            sin_model,
+            terms,
+            DiscretizationState(partitions={}),
+            incumbent=None,
+        )
+        sin_result = sin_relax.solve()
+
+        assert len(sin_varmap["trig_square"]) == 1
+        assert sin_result.status == "optimal"
+        assert sin_result.x is not None
+        assert sin_result.x[1] <= 3.0 + 1e-8
+
+        cos_model = Model("cos_square_relax")
+        z = cos_model.integer("z", lb=1, ub=4)
+        b = cos_model.binary("b")
+        cos_model.maximize(z)
+        cos_model.subject_to(z <= dm.cos(b) ** 2 + 1.5)
+
+        terms = self.classify(cos_model)
+        cos_relax, cos_varmap = self.build_milp(
+            cos_model,
+            terms,
+            DiscretizationState(partitions={}),
+            incumbent=None,
+        )
+        cos_result = cos_relax.solve()
+
+        assert len(cos_varmap["trig_square"]) == 1
+        assert cos_result.status == "optimal"
+        assert cos_result.x is not None
+        assert cos_result.x[0] <= 2.0 + 1e-8
+
+    def test_safe_tan_objective_keeps_relaxation_bound(self):
+        """tan(x) should be lifted when the argument interval avoids asymptotes."""
+        from discopt._jax.discretization import DiscretizationState
+
+        m = Model("safe_tan_objective")
+        x = m.continuous("x", lb=-1.0, ub=1.0)
+        m.minimize(dm.tan(x))
+
+        terms = self.classify(m)
+        milp_model, varmap = self.build_milp(
+            m,
+            terms,
+            DiscretizationState(partitions={}),
+            incumbent=None,
+        )
+        result = milp_model.solve()
+
+        assert len(varmap["trig"]) == 1
+        assert result.status == "optimal"
+        assert result.objective == pytest.approx(math.tan(-1.0), abs=1e-8)
+
+    def test_unsafe_tan_objective_still_falls_back(self, caplog):
+        """tan(x) intervals crossing an asymptote should remain unsupported."""
+        from discopt._jax.discretization import DiscretizationState
+
+        m = Model("unsafe_tan_objective")
+        x = m.continuous("x", lb=1.0, ub=2.0)
+        m.minimize(dm.tan(x))
+
+        terms = self.classify(m)
+        with caplog.at_level(logging.WARNING, logger="discopt._jax.milp_relaxation"):
+            milp_model, varmap = self.build_milp(
+                m,
+                terms,
+                DiscretizationState(partitions={}),
+                incumbent=None,
+            )
+        result = milp_model.solve()
+
+        assert varmap["trig"] == {}
+        assert result.status == "optimal"
+        assert result.objective is None
+        assert "could not linearize the objective" in caplog.text
 
     def test_piecewise_interval_rows_force_inactive_wbar_to_zero_with_negative_bounds(self):
         """Disaggregated intervals must include the lower δ-forcing row even when wk_lo < 0."""
