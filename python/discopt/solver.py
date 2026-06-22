@@ -7962,14 +7962,16 @@ def _solve_milp_gurobi(
         if sense == ObjectiveSense.MAXIMIZE:
             objective = -objective
 
-    # For a maximization solved as internal minimization, a non-optimal Gurobi
-    # ObjBound is an upper bound in the user's original sense, not discopt's
-    # lower-bound field. Keep it only for proven optima.
+    # ``result.bound`` is a valid lower bound for the internal minimization.
+    # Map it back to the original sense: lower bound for minimize, upper bound
+    # for maximize (matching discopt's existing SolveResult convention).
     bound = None
     if result.status == SolveStatus.OPTIMAL and objective is not None:
         bound = objective
-    elif sense == ObjectiveSense.MINIMIZE and result.bound is not None:
+    elif result.bound is not None:
         bound = float(result.bound) + float(lp_data.obj_const)
+        if sense == ObjectiveSense.MAXIMIZE:
+            bound = -bound
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and objective is not None

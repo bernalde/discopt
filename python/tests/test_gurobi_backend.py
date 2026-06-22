@@ -9,7 +9,7 @@ import discopt.modeling as dm
 import numpy as np
 import pytest
 from discopt.modeling.core import SolveResult
-from discopt.solvers import SolveStatus
+from discopt.solvers import MILPResult, SolveStatus
 from discopt.solvers import gurobi as gurobi_backend
 
 
@@ -146,6 +146,46 @@ def test_model_solve_gurobi_rejects_qp_for_stage_one(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="LP and MILP"):
         m.solve(solver="gurobi")
+
+
+def test_gurobi_milp_maximize_time_limit_maps_dual_bound(monkeypatch):
+    _install_fake_rust_classifier(monkeypatch, "milp")
+    import discopt.solver as solver
+    from discopt._jax import problem_classifier
+
+    m = dm.Model("gurobi_max_milp_bound_mapping")
+    y = m.integer("y", lb=0, ub=10)
+    m.maximize(y)
+
+    lp_data = problem_classifier.LPData(
+        c=np.array([-1.0]),
+        A_eq=np.zeros((0, 1)),
+        b_eq=np.zeros(0),
+        x_l=np.array([0.0]),
+        x_u=np.array([10.0]),
+        obj_const=0.0,
+    )
+    monkeypatch.setattr(problem_classifier, "extract_lp_data", lambda _model: lp_data)
+
+    def fake_solve_milp(**_kwargs):
+        return MILPResult(
+            status=SolveStatus.TIME_LIMIT,
+            x=np.array([8.0]),
+            objective=-8.0,
+            bound=-10.0,
+            gap=0.25,
+            node_count=7,
+        )
+
+    monkeypatch.setattr(gurobi_backend, "solve_milp", fake_solve_milp)
+
+    result = solver._solve_milp_gurobi(m, t_start=0.0, time_limit=1.0)
+
+    assert result.status == "time_limit"
+    assert result.objective == pytest.approx(8.0)
+    assert result.bound == pytest.approx(10.0)
+    assert result.gap == pytest.approx(0.25)
+    assert result.node_count == 7
 
 
 def test_gurobi_lp_smoke_if_available():
