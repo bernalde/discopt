@@ -169,7 +169,6 @@ class TestOAConvexMINLP:
         assert result.x["y"] == pytest.approx(1.0, abs=INTEGRALITY_TOL)
 
 
-@pytest.mark.slow
 class TestMindtPyBaselineParity:
     """Native discopt coverage for the small Pyomo MindtPy OA/ECP baselines."""
 
@@ -256,7 +255,7 @@ class TestOANonConvex:
 class TestOAEdgeCases:
     """Edge cases and degenerate problems."""
 
-    def test_pure_nlp_no_integers(self):
+    def test_no_discrete_short_circuit(self):
         """No integer variables: MIP-NLP should solve one continuous NLP."""
         m = dm.Model("no_discrete_short_circuit")
         x = m.continuous("x", lb=0, ub=10)
