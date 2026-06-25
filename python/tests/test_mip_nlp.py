@@ -155,7 +155,7 @@ def test_mip_nlp_rejects_native_gdp_solver_method(monkeypatch):
 
     monkeypatch.setattr(mip_nlp_module, "solve_mip_nlp", fake_solve_mip_nlp)
 
-    with pytest.raises(ValueError, match="Unknown gdp_method='loa'"):
+    with pytest.raises(ValueError, match="conflicts with solver='mip-nlp'"):
         _binary_model("native_gdp_method").solve(solver="mip-nlp", gdp_method="loa")
 
     assert called is False
@@ -188,6 +188,7 @@ def test_mip_nlp_and_deprecated_oa_alias_reformulate_gdp(monkeypatch):
         ("roa", "#116/#117"),
         ("goa", "#118"),
         ("lp_nlp_bb", "#119"),
+        ("lp/nlp-bb", "#119"),
     ],
 )
 def test_mip_nlp_reserved_methods_raise(method, issue):

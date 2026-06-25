@@ -23,8 +23,8 @@ _OA_OPTION_KEYS = {"equality_relaxation", "ecp_mode", "feasibility_cuts"}
 def _normalize_method(method: Any) -> str:
     if not isinstance(method, str):
         raise ValueError(f"mip_nlp_method must be a string, got {type(method).__name__}.")
-    normalized = method.strip().lower().replace("-", "_")
-    normalized = _METHOD_ALIASES.get(normalized, normalized)
+    raw = method.strip().lower()
+    normalized = _METHOD_ALIASES.get(raw, raw.replace("-", "_"))
     if normalized not in SUPPORTED_METHODS:
         reserved = ", ".join(sorted(_RESERVED_METHOD_ISSUES))
         raise ValueError(

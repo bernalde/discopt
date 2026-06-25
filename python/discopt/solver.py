@@ -2384,6 +2384,7 @@ def solve_model(
             mip_nlp_method = "ecp" if bool(mip_nlp_kwargs.get("ecp_mode", False)) else "oa"
 
         gdp_methods = {"big-m", "hull", "mbigm", "auto"}
+        native_gdp_methods = {"loa"}
         if gdp_method == "oa":
             warnings.warn(
                 "gdp_method='oa' is deprecated for selecting MINLP OA. Use "
@@ -2395,6 +2396,13 @@ def solve_model(
             resolved_gdp_method = "big-m"
         elif gdp_method in gdp_methods:
             resolved_gdp_method = gdp_method
+        elif gdp_method in native_gdp_methods:
+            allowed = ", ".join(sorted(gdp_methods))
+            raise ValueError(
+                f"gdp_method={gdp_method!r} conflicts with solver='mip-nlp'. "
+                "Use mip_nlp_method to select the MIP-NLP algorithm and reserve "
+                f"gdp_method for GDP reformulation methods: {allowed}."
+            )
         else:
             allowed = ", ".join(sorted(gdp_methods | {"oa"}))
             raise ValueError(
