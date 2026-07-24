@@ -12,6 +12,14 @@ The release procedure that produces these entries is documented in
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.7.0] - 2026-07-24
+
+### Added
+
 - **SGO integer signomial MINLPs + exact single-negative-monomial transform**
   (`feat`, #741 Task 2, inside the default-off `DISCOPT_SGO` path). The signomial
   global optimizer now admits the `cvxnonsep_nsig*` family — positive-bounded
@@ -136,11 +144,70 @@ The release procedure that produces these entries is documented in
   `DISCOPT_CONTINUOUS_MULTISTART=0` / `SolverTuning.continuous_multistart=False`
   restores the prior behavior.
 
+- **Reduced-space global optimization of hidden-function (`CustomCall`) models**
+  (`feat`, #713). A model term written as opaque JAX code and wrapped with
+  `dm.custom(...)` is now solved to a **certified global optimum** by relaxing the
+  opaque body through the reduced-space McCormick type (`MCBox`) and branching
+  **only on the true degrees of freedom** — the hidden internal intermediates never
+  become optimization or branching variables (the signature capability of MAiNGO,
+  {cite:t}`Bongartz2018`). Continuous *and* integer-DOF models are supported (P3.1,
+  P3.2); the `MCBox` intrinsic namespace covers arithmetic plus `exp`/`log`/`sqrt`
+  and **even, odd, and fractional/signomial powers** `x**a`, each with a tight
+  monomial hull (P1.3, P1.4). The contract is **sound-or-refuse**: a body that does
+  not trace soundly through `MCBox` (raw `jnp` intrinsic, non-affine hidden
+  division, unbounded box) falls back to the local NLP path — a valid solution but
+  no global certificate — never a partial or invalid global bound. Non-affine
+  reciprocal lifting was investigated and **falsified** (the refusal stands). New
+  worked example: `docs/notebooks/reduced_space_customcall.md` (a reactor cascade of
+  nested `CustomCall` units), complementing the `m.implicit(...)` recycle-loop
+  notebook.
+
+- **Root disjunctive configuration bound** (`feat`, #732, default-off behind
+  `DISCOPT_DISJUNCTIVE_CONFIG_BOUND`). For reforms carrying configuration structure
+  (range-{0,1} indicator and span≥2 count factors of exact-linearized products,
+  e.g. ex1252's pump counts), a root pass **partitions** on the configuration
+  variables instead of relaxing across them: it enumerates the 2^k indicator
+  patterns (a valid partition — every feasible point has integral indicators),
+  bounds each configuration box by per-box interval FBBT → budgeted OBBT → node LP,
+  and takes the min across boxes as a rigorous root dual bound. On ex1252 this lifts
+  the root dual from 0 → 42725. Default-off pending a corpus-wide graduation panel.
+
+- **Convex LP-OA branch-and-cut kernel** (`feat`, #798/#799, default-off behind
+  `DISCOPT_CONVEX_KERNEL`). An in-house LP-relaxation-per-node branch-and-cut path
+  for the convex MINLP family (Quesada–Grossmann OA + GMI/cover/MIR separation,
+  best-bound tree, pseudocost branching, Neumaier–Shcherbina safe bounds, #779
+  incumbent verification). Certifies the convex `rsyn*`/`syn*` family cert-clean
+  and decisively faster than the NLP-BB path (panel certifies in ~24 s vs NLP-BB
+  timing out uncertified at 482 s). Larger-instance SCIP-parity and default-ON
+  graduation remain open (#800).
+
+- **Native spatial branch-and-bound kernel** (`feat`, #764, default-off). An
+  in-house spatial B&B with FBBT propagation, finite-slack certification, and
+  driver-side incumbent seeding; certifies `tanksize` natively with a verified
+  incumbent. (A false-certificate bug found and fixed as part of the FBBT pass.)
+
+- **Native-warm-LP node solve** (`feat`, #807, default-off behind
+  `DISCOPT_CVX_NATIVELP`). A shared persistent-LP warm-restart path (bounds-in-place
+  dual reoptimize + node-local cuts). Built and **sound** (cert-clean, flag-OFF
+  bit-identical), but a durable measurement shows it does not net out on the full
+  cut-driven certifying panel; it stays default-off with the finding recorded.
+
+- **Big-M coefficient tightening, re-implemented** (`feat`, #774/#780, default-off
+  behind `DISCOPT_COEF_TIGHTEN`).
+
+- **NLP-BB root cutting-plane stage** (`feat`, #781/#784, default-off behind
+  `DISCOPT_NLPBB_ROOT_CUTS`): GMI cuts + efficacy×orthogonality selection at the
+  root, with a root-cut quality gate and model-row safety margin (#781/#785).
+
 ### Changed
 
 - **`pounce-solver` minimum raised to `>=0.9`** (`chore(deps)`). Bumps the core
   dependency (and the back-compat `[pounce]` alias extra) from `>=0.8`; discopt's
   usage is unaffected.
+
+- **CI: fast-correctness PR lane** (`ci`, #813). Every PR now runs a dedicated
+  `python-correctness` lane so the `incorrect_count == 0` gate is enforced before
+  merge, not only nightly.
 
 - **OBBT-on-auxiliaries reverse-FBBT cascade graduated default-ON** (`perf`, #208).
   The root branch-and-reduce fixpoint now propagates OBBT-tightened auxiliary
@@ -179,6 +246,47 @@ The release procedure that produces these entries is documented in
   The `gnn`/`learned` extras remain — equinox/optax still power the ICNN
   learned-relaxations path. Default branching is unchanged: reliability
   (pseudocost + priority + strong branching) in the Rust `TreeManager`.
+
+### Fixed
+
+- **Convex single-NLP certificate soundness hardening** (`fix(correctness)`,
+  #849 / #850 / #853). Three related false-certificate classes on the convex /
+  pure-LP fast paths, each of which certified a dual bound that crossed the true
+  optimum, are closed. **#849**: the convexity-certified single-NLP path trusted the
+  backend's *scaled* `optimal`; under a large objective/constraint coefficient the
+  returned point satisfied the scaled stopping test yet grossly violated the
+  *unscaled* KKT conditions (`min -x s.t. x²≤1e18` certified ~20× short of the
+  optimum). It now recomputes the unscaled KKT residuals and withholds the
+  certificate when they are not met. **#850**: the pure-LP fast path returned
+  contradictory certificates depending only on the LP engine — POUNCE deferred to
+  `unbounded` on the default box where the exact simplex returns `optimal` at the
+  corner, and accepted a super-optimal constraint-infeasible incumbent on a general
+  inequality row; a per-row term-scaled feasibility tolerance and a relaxed-bound
+  guard restore cross-backend consistency. **#853**: a convex objective whose
+  gradient asymptotically vanishes (`min -log(x)`) was certified `optimal` at an
+  interior stall whose stationarity residual is small only because the Hessian
+  flattens, while the true optimum sits at a distant box bound (including the
+  default ~9.999e19 box). The fast path now runs a Frank–Wolfe better-point
+  refutation over the box and withholds the certificate when it exhibits a
+  strictly-better feasible point. All three only ever *downgrade* a certificate, so
+  they cannot introduce a false optimum or a wrong bound.
+
+- **nvs16 garbage dual-bound guard restored** (`fix(correctness)`, #812 / #248).
+  The uniform relaxer again rejects a non-finite / garbage bound, fixing an unsound
+  dual bound on nvs16.
+
+- **`solve()` no longer crashes with `RecursionError` on deeply-nested
+  expressions** (`fix`, #810/#811). `_expression_degree` (the incumbent-verification
+  fast-family guard, on the default solve path) recursed on the expression tree
+  with no depth guard, so a long left-associated sum overflowed the Python stack.
+  Rewritten as an iterative post-order over the expression DAG with memoization by
+  node identity. Surfaced by the MINLPLib benchmark (`autocorr_bern*`); those
+  instances now solve. Not a correctness bug — a hard crash on a valid model.
+
+- **Native spatial kernel robustness** (`fix`, #764/#788/#789/#790): honor the
+  outer wall-clock budget (#788/#795); feature-safe routing + final-incumbent
+  verification (#789/#794); a full warm-startable simplex basis on slackless
+  equality LPs, P1.0 (#790/#793, default-off gated).
 
 ## [0.6.0] - 2026-07-12
 
@@ -679,7 +787,8 @@ git log v0.2.0..v0.2.1
 
 Going forward, every release will have a section above with curated entries.
 
-[Unreleased]: https://github.com/jkitchin/discopt/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jkitchin/discopt/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jkitchin/discopt/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jkitchin/discopt/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jkitchin/discopt/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jkitchin/discopt/compare/v0.3.0...v0.4.0

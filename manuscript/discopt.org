@@ -476,6 +476,7 @@ The third backend uses the industry-standard Ipopt solver cite:&Wachter2006 via 
   :PROPERTIES:
   :CUSTOM_ID: sec-lp-engine
   :END:
+#+LATEX: \label{sec-lp-engine}
 
 The linear subproblems that dominate the global solver --- the McCormick/AMP LP relaxation solved at every spatial-B&B node, the MILP master of the AMP loop (Section ref:sec-amp), and standalone LP/MILP models --- are handled by a self-hosted, pure-Rust revised simplex rather than an external library. A primal simplex handles cold and root solves; a bounded-variable /dual/ simplex re-optimizes each B&B child from its parent's optimal basis, the warm start that makes node throughput competitive. The basis factorization is a pure-Rust sparse LU (the companion =feral= crate) with threshold partial pivoting and Forrest--Tomlin product-form updates between periodic refactorizations, so the engine carries no C or Fortran dependency and preserves the clean-wheel build.
 
