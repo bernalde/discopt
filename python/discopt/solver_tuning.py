@@ -143,8 +143,8 @@ class SolverTuning:
     certified
     verdict (`numerical`, or a spurious `infeasible` with no Farkas proof — the
     hda-class ill-conditioned relaxations), drop the rows whose coefficients
-    float64 cannot resolve at the feasibility tolerance (nonzero |coefficients|
-    spanning > 1e6 orders, or outside ``[1e-8, 1e8]``) and re-solve once
+    float64 cannot resolve at the feasibility tolerance (nonzero coefficient
+    magnitudes spanning > 1e6 orders, or outside ``[1e-8, 1e8]``) and re-solve once
     (``DISCOPT_RELAX_ROW_FILTER``, default ON — issue #671). Fires in
     ``mccormick_lp._solve_at_node_impl`` after the primary solve; **not** at build
     time. **Sound by construction**: removing relaxation rows yields a superset
