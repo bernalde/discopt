@@ -48,7 +48,7 @@ GAMS at once, built on machinery that already exists (the exporters).
 
 | Engine | Language | Role | Availability |
 |---|---|---|---|
-| **POUNCE** | Rust (Ipopt port) | All production LP/QP/NLP relaxation solves; node solves in the self-hosted B&B | **Core dep** (`pounce-solver>=0.3`, `pyproject.toml:31`) |
+| **POUNCE** | Rust (Ipopt port) | All production LP/QP/NLP relaxation solves; node solves in the self-hosted B&B | **Core dep** (`pounce-solver>=0.9`, `pyproject.toml:31`) |
 | **discopt B&B** | Rust tree + JAX McCormick/relaxations | Integer & spatial branch-and-bound, presolve/FBBT, OBBT, cuts (cover/clique/GMI/MIR), crossover | Core |
 | **HiGHS** | C++ (via `highspy`) | LP/MILP matrix solves; CI correctness oracle (QP/MIQP routing removed, #359) | Optional extra `highs` (`pyproject.toml:45`) |
 | **cyipopt / IPOPT** | C++ | NLP node/continuous solves | Optional extra `ipopt` (`pyproject.toml:44`) |

@@ -138,6 +138,10 @@ The release procedure that produces these entries is documented in
 
 ### Changed
 
+- **`pounce-solver` minimum raised to `>=0.9`** (`chore(deps)`). Bumps the core
+  dependency (and the back-compat `[pounce]` alias extra) from `>=0.8`; discopt's
+  usage is unaffected.
+
 - **OBBT-on-auxiliaries reverse-FBBT cascade graduated default-ON** (`perf`, #208).
   The root branch-and-reduce fixpoint now propagates OBBT-tightened auxiliary
   (product/ratio) column bounds back onto the original variables through the
