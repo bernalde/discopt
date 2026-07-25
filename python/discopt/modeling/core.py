@@ -55,15 +55,30 @@ def _lp_spatial_fallback_enabled() -> bool:
     the default path failed to find, on models the engine provably serves
     (pure-integer, minimize), so it cannot alter a solve that already produced one.
 
-    **Why not default-ON yet.** The capability is real and regression-free — measured
-    at a 60 s budget it turns tln4 from *no incumbent* into 9.0 (opt 8.3) and tln5
-    into 11.0 (opt 10.3), while nvs04/nvs06/nvs09/nvs15 come back byte-identical and
-    still certified. What blocks the default flip is wall-clock: on tln6 the engine
-    overshoots the overall budget (89.7 s against 60 s) even with the root OBBT pass
-    disabled. Three fixes took that from 16x down to ~1.5x (deadline polling in the
-    dive/pump loops, a budgeted root OBBT, then dropping OBBT here entirely), but a
-    path that can overrun a caller's stated ``time_limit`` by half must not be the
-    default. Flip this on once the residual overshoot is closed.
+    **Why not default-ON.** Measured on an idle machine (load 3.54, no competing
+    process) at a 60 s budget, fallback off vs on:
+
+    ==============  ===========  ====================  ==========
+    instance        off          on                    wall ratio
+    ==============  ===========  ====================  ==========
+    tln4            no incumbent 8.7 (opt 8.3)         1.00x
+    tln5            no incumbent 15.1 (opt 10.3)       **1.38x**
+    tln6            no incumbent no incumbent          **1.48x**
+    ball_mk2_30     no incumbent no incumbent          **1.67x**
+    nvs04/06/09/15  certified    identical, certified  ~0.00x
+    ==============  ===========  ====================  ==========
+
+    So: 2 gains, 0 lost incumbents, 0 certification regressions — but **3 of 4
+    in-scope targets overshoot the caller's ``time_limit`` by 1.38-1.67x**, while the
+    default path holds 1.00-1.01x on every one. A path that can overrun a stated
+    budget by half must not be the default, however good its primal.
+
+    Three fixes already took that overshoot from 16x down to this range (deadline
+    polling in the dive/pump loops, a budgeted root OBBT, and dropping OBBT from this
+    pass). The residual is engine-internal and only appears when the engine runs
+    *after* a primary solve in the same process — in isolation it honours its budget
+    to 1.00x. Closing that gap is the single remaining blocker to flipping this on.
+    Evidence: ``scratchpad/844_quiet_panel.log``.
     """
     import os as _os
 
