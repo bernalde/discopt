@@ -32,12 +32,15 @@ fails — it can never make a solve unsound.
 from __future__ import annotations
 
 import heapq
+import logging
 import time
 from typing import NamedTuple, Optional
 
 import numpy as np
 
 from discopt.modeling.core import Model, ObjectiveSense, VarType
+
+logger = logging.getLogger(__name__)
 
 _INT_TOL = 1e-6
 _PROD_TOL = 1e-5
@@ -157,14 +160,14 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
                 # feasible region, never removing a feasible point.
                 margin = 1e-7 * (1.0 + float(np.abs(row).sum()))
                 cuts.append((row, -float(gc[1][i]) + margin))
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial GMI separation skipped: %s: %s", type(exc).__name__, exc)
     # complemented-MIR (multi-row aggregation)
     try:
         mc = separate_cmir(A, b, x, lb, ub, is_int, max_cuts=max_cuts)
         cuts.extend(mc)
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial c-MIR separation skipped: %s: %s", type(exc).__name__, exc)
     # Native Marchand–Wolsey aggregation c-MIR (cert:P3). DEFAULT-OFF, gated by
     # DISCOPT_CMIR_AGGREGATION. Pairs <= rows with nonnegative weights to cancel a
     # column, then applies the native Rust complemented MIR to the aggregate —
@@ -190,8 +193,8 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
                 acoef, arhs = np.asarray(res[0]), np.asarray(res[1])
                 for i in range(min(acoef.shape[0], max_cuts)):
                     cuts.append((acoef[i][:ncol], float(arhs[i])))
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial aggregated cuts skipped: %s: %s", type(exc).__name__, exc)
     return cuts
 
 
@@ -271,8 +274,12 @@ def solve_lp_spatial_bb(
             if not r.infeasible:
                 lb0 = np.maximum(lb0, np.floor(np.asarray(r.lb) + 1e-9))
                 ub0 = np.minimum(ub0, np.ceil(np.asarray(r.ub) - 1e-9))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never let root tightening break the solve -- but never hide it either.
+            # A silently-skipped capability is precisely the failure mode that cost
+            # #844 several wrong conclusions (a swallowed TypeError made a whole
+            # fallback an invisible no-op).
+            logger.debug("lp_spatial root OBBT skipped: %s: %s", type(exc).__name__, exc)
 
     # Fast path: incremental McCormick LP (structure built once, box-dependent rows
     # patched per node, warm-started). Guarded by its own validation against
