@@ -51,10 +51,28 @@ def _integer_model(n: int = 12) -> dm.Model:
     return m
 
 
+def _incremental_model(n: int = 12) -> dm.Model:
+    """Like :func:`_integer_model`, but with the bilinear terms in the OBJECTIVE so the
+    incremental McCormick structure actually builds.
+
+    ``_integer_model`` does *not* build one — its bilinear constraint rows lift to 5
+    envelope rows where the closed-form patch emits 4 — so every test using it
+    exercises the per-node cold build. That is the right control for the deadline
+    tests, but useless for asserting anything about the fast path.
+    """
+    m = dm.Model("incremental_probe")
+    xs = [m.integer(f"x{i}", lb=0, ub=20) for i in range(n)]
+    m.minimize(sum(xs[i] * xs[i + 1] for i in range(n - 1)))
+    for i in range(n - 1):
+        m.subject_to(xs[i] + xs[i + 1] >= 7)
+    return m
+
+
 def test_model_is_in_scope():
     """Guard: if this model stopped being in scope the deadline test below would
     vacuously pass by bailing out immediately."""
     assert _is_in_scope(_integer_model()) is True
+    assert _is_in_scope(_incremental_model()) is True
 
 
 @pytest.mark.parametrize("limit", [3.0, 6.0])
@@ -80,6 +98,83 @@ def test_root_obbt_is_budgeted():
     solve_lp_spatial_bb(_integer_model(16), time_limit=3.0, gap_tolerance=1e-4, use_obbt=True)
     wall = time.perf_counter() - t0
     assert wall < 9.0, f"root OBBT escaped the budget: {wall:.1f}s against a 3s limit"
+
+
+def test_expired_ambient_deadline_does_not_disable_the_incremental_structure():
+    """``model._solve_deadline`` is written once per ``solve_model`` and never cleared.
+
+    A *later* in-process consumer with a budget of its own — the #844 no-incumbent
+    fallback, which by construction runs after a primary solve that spent its whole
+    budget — therefore read an already-expired deadline, and the #654 guard in
+    ``IncrementalMcCormickLP`` declined to build the structure at all. The engine then
+    silently degraded to the trusted-but-~30x-slower per-node cold build. Measured on
+    tln5 at a 21 s budget: ``ok=False`` gave 5 nodes in 43.8 s (2.08x, slowest node
+    42.4 s) where ``ok=True`` gives 13158 nodes in 21.0 s (1.00x, slowest node 0.04 s).
+    """
+    from discopt._jax.incremental_mccormick import IncrementalMcCormickLP
+    from discopt._jax.term_classifier import classify_nonlinear_terms
+
+    m = _incremental_model(6)
+    terms = classify_nonlinear_terms(m)
+    # Control: with no ambient deadline the structure builds. If this ever fails the
+    # rest of the test is vacuous.
+    assert IncrementalMcCormickLP(m, terms).ok is True
+
+    m._solve_deadline = time.perf_counter() - 1000.0
+    # The #654 guard still binds on the ambient stash (that behaviour is deliberate)…
+    assert IncrementalMcCormickLP(m, terms).ok is False
+    # …but an explicit caller budget overrides it, which is what the engine passes.
+    assert IncrementalMcCormickLP(m, terms, deadline=time.perf_counter() + 60.0).ok is True
+
+
+def test_engine_does_not_degrade_after_a_previous_solve(monkeypatch):
+    """End-to-end form of the above: a stale ``_solve_deadline`` must not cost the
+    engine its fast path.
+
+    The structure's ``ok`` is the observable, not node throughput — no synthetic model
+    small enough for a unit test is *also* hard enough for the cold path's slowness to
+    show up in a node count, so a throughput assertion here would pass vacuously.
+    """
+    import discopt._jax.incremental_mccormick as im
+
+    built: list[bool] = []
+    real = im.IncrementalMcCormickLP
+
+    class _Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self.ok)
+
+    monkeypatch.setattr(im, "IncrementalMcCormickLP", _Spy)
+
+    m = _incremental_model()
+    m._solve_deadline = time.perf_counter() - 1000.0  # a completed prior solve
+    solve_lp_spatial_bb(m, time_limit=3.0, gap_tolerance=1e-4)
+
+    assert built, "spy never fired — the engine built no structure, so this asserts nothing"
+    assert built[0] is True, (
+        "a stale _solve_deadline from a previous solve degraded the engine to the "
+        "per-node cold build"
+    )
+
+
+def test_require_incremental_declines_when_the_fast_path_is_unavailable():
+    """``require_incremental=True`` must decline rather than run the cold path.
+
+    ``_integer_model`` is in scope but its structure does not build, so it is exactly
+    the case the #844 fallback must refuse: on ball_mk2_30 (same situation) the cold
+    path spent 61 s on the root LP alone against a 21 s reserve and returned nothing.
+    """
+    m = _integer_model(8)
+    assert solve_lp_spatial_bb(m, time_limit=4.0, require_incremental=True) is None
+    # …while the default (cold path allowed) still runs, so the decline is caused by
+    # the flag and not by the model being out of scope.
+    assert solve_lp_spatial_bb(_integer_model(8), time_limit=4.0) is not None
+    # And a model whose structure DOES build is unaffected by the flag.
+    assert (
+        solve_lp_spatial_bb(_incremental_model(8), time_limit=4.0, require_incremental=True)
+        is not None
+    )
 
 
 def test_result_is_sound_when_one_is_returned():

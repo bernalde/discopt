@@ -51,38 +51,53 @@ from discopt.constants import SENTINEL_THRESHOLD as _SENTINEL_THRESHOLD
 def _lp_spatial_fallback_enabled() -> bool:
     """#844 no-incumbent fallback to the LP-per-node spatial engine.
 
-    Opt in with ``DISCOPT_LP_SPATIAL_FALLBACK=1``. It only ever fills in an incumbent
-    the default path failed to find, on models the engine provably serves
-    (pure-integer, minimize), so it cannot alter a solve that already produced one.
+    **Default ON**; opt out with ``DISCOPT_LP_SPATIAL_FALLBACK=0``. It only ever fills
+    in an incumbent the default path failed to find, on models the engine provably
+    serves (pure-integer, minimize), so it cannot alter a solve that already produced
+    one.
 
-    **Why not default-ON.** Measured on an idle machine (load 3.54, no competing
-    process) at a 60 s budget, fallback off vs on:
+    **Graduation panel.** Load-gated idle machine (load 2.64, no process above 50%
+    CPU), 60 s budget, interleaved off/on, 2 reps — byte-identical across reps:
 
     ==============  ===========  ====================  ==========
     instance        off          on                    wall ratio
     ==============  ===========  ====================  ==========
-    tln4            no incumbent 8.7 (opt 8.3)         1.00x
-    tln5            no incumbent 15.1 (opt 10.3)       **1.38x**
-    tln6            no incumbent no incumbent          **1.48x**
-    ball_mk2_30     no incumbent no incumbent          **1.67x**
+    tln4            no incumbent 19.6 (opt 8.3)        1.00x
+    tln5            no incumbent 32.8 (opt 10.3)       1.00x
+    tln6            no incumbent 50.4 (opt 15.3)       1.00x
+    ball_mk2_30     no incumbent no incumbent          0.65x
     nvs04/06/09/15  certified    identical, certified  ~0.00x
     ==============  ===========  ====================  ==========
 
-    So: 2 gains, 0 lost incumbents, 0 certification regressions — but **3 of 4
-    in-scope targets overshoot the caller's ``time_limit`` by 1.38-1.67x**, while the
-    default path holds 1.00-1.01x on every one. A path that can overrun a stated
-    budget by half must not be the default, however good its primal.
+    ``gains=3  lost_incumbents=0  cert_regressions=0  overshoots=0  unsound=0
+    false_primals=0``. Evidence: ``scratchpad/844_final_panel.log``.
 
-    Three fixes already took that overshoot from 16x down to this range (deadline
-    polling in the dive/pump loops, a budgeted root OBBT, and dropping OBBT from this
-    pass). The residual is engine-internal and only appears when the engine runs
-    *after* a primary solve in the same process — in isolation it honours its budget
-    to 1.00x. Closing that gap is the single remaining blocker to flipping this on.
-    Evidence: ``scratchpad/844_quiet_panel.log``.
+    **What closed the overshoot.** The engine used to overrun by 1.38-1.67x here, and
+    only when it ran *after* a primary solve in the same process — in isolation it
+    honoured its budget to 1.00x. Phase-timing both contexts found the cause:
+    ``model._solve_deadline`` is written once per ``solve_model`` and never cleared,
+    so by the time this fallback runs (necessarily *after* a primary that spent its
+    whole budget) that stash is in the past, and ``IncrementalMcCormickLP``'s #654
+    guard declined to build the structure at all. The engine then silently degraded to
+    the per-node cold build — no cuts, no feasibility pump — whose nodes are slow
+    enough that a single one runs past the top-of-loop deadline poll. On tln5 at a
+    21 s budget: 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) versus 13158 nodes in
+    21.0 s (1.00x, slowest node 0.04 s) once the engine passes its own deadline.
+    ball_mk2_30 declines the structure for a genuine structural reason (``monomial
+    x_0^2: root box spans zero``); there the fallback now refuses to run at all
+    (``require_incremental``) rather than spend 61 s on a single root LP for nothing.
+
+    **Known cost.** The incumbents are *worse* than the ones the degraded cold path
+    happened to report (tln4 19.6 vs 8.7, tln5 32.8 vs 15.1) — its slower, full-
+    fidelity per-node relaxation gave its root dive better points. Those numbers came
+    from runs that overran the budget by 1.38-1.67x, so they were never a legitimate
+    baseline; against the actual default path all three are gains from *no incumbent*.
+    Closing the remaining gap to the reference optima is primal-quality work, not a
+    budget bug.
     """
     import os as _os
 
-    return _os.environ.get("DISCOPT_LP_SPATIAL_FALLBACK", "0") not in (
+    return _os.environ.get("DISCOPT_LP_SPATIAL_FALLBACK", "1") not in (
         "0",
         "",
         "false",
@@ -4027,6 +4042,14 @@ class Model:
 
                 if _is_in_scope(self):
                     _fb_reserve = 0.35 * time_limit
+                    # NOTE: scope is checked here, but whether the engine can actually
+                    # build its incremental structure is only known once it runs (see
+                    # ``require_incremental`` below). A model that is in scope yet
+                    # unbuildable therefore hands back its reserve unused — the primary
+                    # keeps 65% of the budget and the fallback returns immediately.
+                    # Probing buildability here instead would mean building the
+                    # structure twice, and that build is itself the #654 overrun on
+                    # large factorable models, so the cheaper mistake is this one.
             except Exception:
                 _fb_reserve = 0.0
         _primary_tl = time_limit - _fb_reserve
@@ -4087,11 +4110,21 @@ class Model:
                     # exists to find a PRIMAL quickly, not to tighten the root box —
                     # the dual bound is the primary path's job. Dropping it keeps the
                     # fallback inside its reserve.
+                    #
+                    # require_incremental=True: without the incremental McCormick
+                    # structure the engine has no cuts, no feasibility pump, and
+                    # rebuilds the relaxation per node. On ball_mk2_30 — where the
+                    # structure legitimately declines (``monomial x_0^2: root box
+                    # spans zero``) — that cold path spent 61 s on the ROOT LP alone
+                    # against a 21 s reserve: 0 nodes, no incumbent, 2.91x over
+                    # budget. It cannot produce a primal inside a fallback-sized
+                    # budget, so declining costs no gain and removes the overrun.
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,
                         gap_tolerance=gap_tolerance,
                         use_obbt=False,
+                        require_incremental=True,
                     )
                 if _fb is not None and _fb.objective is not None:
                     from discopt.solver import _unpack_solution

@@ -206,8 +206,17 @@ def solve_lp_spatial_bb(
     max_nodes: int = 500_000,
     use_obbt: bool = True,
     root_cut_rounds: int = 0,
+    require_incremental: bool = False,
 ) -> Optional[LpSpatialResult]:
     """LP-node spatial branch-and-bound. Returns ``None`` if out of scope.
+
+    ``require_incremental`` declines the solve (returns ``None``) when the incremental
+    McCormick structure cannot be built. Set it when the caller has a *bounded* budget
+    and wants a primal: without that structure the engine has no cuts, no feasibility
+    pump, and rebuilds the whole relaxation per node. Measured on ball_mk2_30 at a
+    21 s budget, where the structure legitimately declines (``monomial x_0^2: root box
+    spans zero``), the cold path spent 61 s on the *root* LP alone — 0 nodes, no
+    incumbent, 2.91x over budget. Declining costs nothing there and cannot overrun.
 
     ``root_cut_rounds`` enables GMI + complemented-MIR separation at the root (cuts
     inherited by all nodes). Default 0 (off): with discopt's current Python-level
@@ -288,7 +297,30 @@ def solve_lp_spatial_bb(
     # branching (the no-cut-SCIP regime).
     from discopt._jax.incremental_mccormick import IncrementalMcCormickLP
 
-    _inc = IncrementalMcCormickLP(model, terms)
+    # Budget the structure build against THIS engine's deadline, not whatever
+    # ``model._solve_deadline`` a previous ``solve_model`` left behind. That stash is
+    # written once per solve and never cleared, so when this engine runs as the #844
+    # no-incumbent fallback -- i.e. *after* a primary solve that used its whole budget
+    # -- the ambient deadline is already in the PAST and the incremental structure
+    # declined to build at all (``ok=False``). The engine then silently degraded to
+    # the trusted-but-~30x-slower per-node cold build, which also disables cuts and
+    # the feasibility pump, and whose nodes are slow enough that a single one runs
+    # past the top-of-loop deadline poll. Measured on tln5 at a 21 s budget: ok=False
+    # gave 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) where ok=True gives 12643
+    # nodes in 21.0 s (1.00x, slowest node 0.04 s). Take the tighter of the two when
+    # an enclosing deadline is still live, so the #654 guard is never weakened.
+    _own_deadline = t0 + time_limit
+    _ambient = getattr(model, "_solve_deadline", None)
+    if _ambient is not None and float(_ambient) > t0:
+        _own_deadline = min(_own_deadline, float(_ambient))
+
+    _inc = IncrementalMcCormickLP(model, terms, deadline=_own_deadline)
+    if require_incremental and not _inc.ok:
+        logger.debug(
+            "lp_spatial declined: no incremental McCormick structure and the caller "
+            "requires it (the per-node cold build cannot serve a bounded budget)"
+        )
+        return None
     if _inc.ok:
         info = {"bilinear": _inc.bilinear, "monomial": _inc.monomial}
 

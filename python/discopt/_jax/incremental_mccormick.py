@@ -175,24 +175,41 @@ def _affine_square_aux_bounds(coeff, const, li, ui):
 class IncrementalMcCormickLP:
     """Build the McCormick LP structure once; patch box-dependent rows per node."""
 
-    def __init__(self, model, terms):
+    def __init__(self, model, terms, deadline=None):
+        """``deadline`` — absolute ``time.perf_counter()`` budget for construction.
+
+        Overrides the ambient ``model._solve_deadline`` stash. Pass it whenever the
+        caller has a budget of its own that is not the enclosing ``solve_model``'s:
+        ``_solve_deadline`` is written once per ``solve_model`` call and never
+        cleared, so a *later* in-process consumer reads an already-expired deadline
+        and silently declines to build (#844).
+        """
         self.ok = False
         self.model = model
         self.terms = terms
         self._validated_regimes = frozenset()  # sign regimes _validate exercised
+        self._deadline = (
+            deadline if deadline is not None else getattr(model, "_solve_deadline", None)
+        )
         # #654: if the solve budget is already spent when we get here, don't build
         # the incremental structure at all (its own cold builds cost seconds on
         # large factorable models) — leave ``ok=False`` and let ``solve_at_node``
         # use the trusted per-node cold build. No-op when budget remains (the common
         # case) or when no deadline was stashed (construction outside a solve).
-        _deadline = getattr(model, "_solve_deadline", None)
-        if _deadline is not None and time.perf_counter() > _deadline:
+        if self._deadline is not None and time.perf_counter() > self._deadline:
             return
         try:
             self._build_structure()
             self._validate()
-        except Exception:
+        except Exception as exc:
+            # Declining is always SOUND (the caller falls back to the per-node cold
+            # build) but it is never free: it costs the fast path, the cuts and the
+            # feasibility pump. A silently-declined structure is exactly how #844's
+            # overshoot hid for two rounds of measurement, so record why.
             self.ok = False
+            logger.debug(
+                "IncrementalMcCormickLP declined to build: %s: %s", type(exc).__name__, exc
+            )
 
     # -- construction ------------------------------------------------------ #
 
@@ -533,7 +550,7 @@ class IncrementalMcCormickLP:
         # forgoes the incremental speedup, never soundness; and checking before each
         # box bounds the overrun to at most one in-flight build (baron-gap-plan §8:
         # never truncate an in-flight bound-producing op).
-        _deadline = getattr(self.model, "_solve_deadline", None)
+        _deadline = self._deadline
         rng_boxes = self._validation_boxes()
         regimes = set()
         for lb, ub in rng_boxes:
