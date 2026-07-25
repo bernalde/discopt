@@ -254,7 +254,20 @@ def solve_lp_spatial_bb(
         try:
             from discopt._jax.obbt import obbt_tighten_root
 
-            r = obbt_tighten_root(model, lb0, ub0, rounds=5, time_limit_per_lp=0.5)
+            # Budget the root OBBT against the caller's deadline. Without this it
+            # runs |vars| x 2 x rounds LPs at up to time_limit_per_lp each, entirely
+            # outside time_limit -- on ball_mk2_30 (30 integers) that alone is up to
+            # 150 s against a 30 s budget. Cap it at a third of the remaining time so
+            # the node loop always gets the majority of the budget.
+            _obbt_budget = max(0.0, time_limit - (time.perf_counter() - t0)) / 3.0
+            r = obbt_tighten_root(
+                model,
+                lb0,
+                ub0,
+                rounds=5,
+                deadline=time.perf_counter() + _obbt_budget,
+                time_limit_per_lp=min(0.5, max(0.05, _obbt_budget / 10.0)),
+            )
             if not r.infeasible:
                 lb0 = np.maximum(lb0, np.floor(np.asarray(r.lb) + 1e-9))
                 ub0 = np.minimum(ub0, np.ceil(np.asarray(r.ub) - 1e-9))
@@ -397,6 +410,11 @@ def solve_lp_spatial_bb(
         the collapsed box) or the LP turns infeasible. Cheap, found nvs17's primal."""
         lo, hi = lb_d.copy(), ub_d.copy()
         for _ in range(2 * n + 2):
+            # Poll the deadline: this loop solves an LP per iteration (2n+2 of them)
+            # and is invoked at the root AND at every node, so without a check here
+            # the engine can blow past ``time_limit`` by an order of magnitude.
+            if (time.perf_counter() - t0) >= time_limit:
+                return None
             b_, xx, _bas = relax(lo, hi, None)
             if b_ is None:
                 return None
@@ -420,6 +438,10 @@ def solve_lp_spatial_bb(
         xhat = np.minimum(np.maximum(np.round(x[:n]), lb), ub)
         seen: set = set()
         for _ in range(max_iter):
+            # Same deadline poll as ``dive``: one LP per iteration, run at the root
+            # and at every node.
+            if (time.perf_counter() - t0) >= time_limit:
+                return None
             h = verify(xhat)
             if h is not None:
                 return h
