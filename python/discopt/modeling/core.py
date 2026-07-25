@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import builtins as _builtins
 import warnings
+import warnings as _warnings
 from dataclasses import dataclass
 from dataclasses import replace as _dc_replace
 from enum import Enum
@@ -45,6 +46,35 @@ from typing import (
 import numpy as np
 
 from discopt.constants import SENTINEL_THRESHOLD as _SENTINEL_THRESHOLD
+
+
+def _lp_spatial_fallback_enabled() -> bool:
+    """#844 no-incumbent fallback to the LP-per-node spatial engine.
+
+    Opt in with ``DISCOPT_LP_SPATIAL_FALLBACK=1``. It only ever fills in an incumbent
+    the default path failed to find, on models the engine provably serves
+    (pure-integer, minimize), so it cannot alter a solve that already produced one.
+
+    **Why not default-ON yet.** The capability is real and regression-free — measured
+    at a 60 s budget it turns tln4 from *no incumbent* into 9.0 (opt 8.3) and tln5
+    into 11.0 (opt 10.3), while nvs04/nvs06/nvs09/nvs15 come back byte-identical and
+    still certified. What blocks the default flip is wall-clock: on tln6 the engine
+    overshoots the overall budget (89.7 s against 60 s) even with the root OBBT pass
+    disabled. Three fixes took that from 16x down to ~1.5x (deadline polling in the
+    dive/pump loops, a budgeted root OBBT, then dropping OBBT here entirely), but a
+    path that can overrun a caller's stated ``time_limit`` by half must not be the
+    default. Flip this on once the residual overshoot is closed.
+    """
+    import os as _os
+
+    return _os.environ.get("DISCOPT_LP_SPATIAL_FALLBACK", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+        "off",
+    )
+
 
 if TYPE_CHECKING:
     from discopt.modeling.indexed import IndexedParam, IndexedVar
@@ -3969,11 +3999,28 @@ class Model:
         # while_loops (LP/QP/NLP IPM) can poll via host callback so they
         # self-terminate within ``time_limit + ε`` instead of running to
         # XLA convergence after Python's budget is gone (issue #80).
+        # #844: reserve a slice of the budget for the LP-per-node fallback below, but
+        # ONLY for models that engine can serve (pure-integer, minimize). Safe because
+        # the instances at risk certify almost instantly -- nvs04 in 0.2 s, nvs06 in
+        # 0.3 s of a 40 s budget -- so they finish long before the reduced primary
+        # budget binds, while the instances this targets (tln4/tln5) burn 100% of the
+        # budget and still return nothing. Out-of-scope models keep the full budget.
+        _fb_reserve = 0.0
+        if _lp_spatial_fallback_enabled() and not kwargs.get("lp_spatial", False):
+            try:
+                from discopt._jax.lp_spatial_bb import _is_in_scope
+
+                if _is_in_scope(self):
+                    _fb_reserve = 0.35 * time_limit
+            except Exception:
+                _fb_reserve = 0.0
+        _primary_tl = time_limit - _fb_reserve
+
         try:
-            with deadline_scope(time_limit):
+            with deadline_scope(_primary_tl):
                 result = solve_model(
                     self,
-                    time_limit=time_limit,
+                    time_limit=_primary_tl,
                     gap_tolerance=gap_tolerance,
                     threads=threads,
                     deterministic=deterministic,
@@ -3991,6 +4038,71 @@ class Model:
         finally:
             if _debug_guard is not None:
                 _debug_guard.__exit__(None, None, None)
+
+        # --- No-incumbent fallback to the LP-per-node spatial engine (#844) ---
+        # A class of pure-integer MINLPs (tln4/tln5/tln6, ball_mk2_30) returns NO
+        # incumbent from the default NLP-per-node path while this engine finds one:
+        # it solves a McCormick LP per node with LP-based dive/pump primals, where the
+        # NLP-based heuristics cannot round the loose bilinear envelope into
+        # feasibility (#826 falsified those; the LP variants were never tried because
+        # they sat behind an opt-in flag).
+        #
+        # It is a FALLBACK, not a route, and that ordering is what makes it safe --
+        # measured, not assumed. Routing in-scope models *instead of* the default path
+        # was built and panelled first (72 instances) and FAILED: 3 gains but 4
+        # certification regressions (nvs04 0.72 -> 6.3e8, nvs06, nvs09, nvs15). The
+        # panel split exactly along one line: every gain was an instance the default
+        # path leaves with no incumbent, every regression one it already certifies. As
+        # a fallback the gains are kept and the regressions cannot occur -- those four
+        # never reach this branch.
+        #
+        # Soundness: only ever fills in a MISSING incumbent, and the engine verifies
+        # every point it accepts against a ground-truth evaluator, so it cannot weaken
+        # or replace an existing certificate.
+        if _fb_reserve > 1.0 and result.objective is None:
+            try:
+                from discopt._jax.lp_spatial_bb import solve_lp_spatial_bb
+
+                # Fresh process-global deadline: the primary's scope has expired, and
+                # the JAX-compiled LP loops poll it.
+                with deadline_scope(_fb_reserve):
+                    # use_obbt=False: the root OBBT pass is the dominant source of
+                    # wall-clock overshoot here (measured on tln6: 77.4 s with it
+                    # versus 17.4 s without, against the same budget), and this pass
+                    # exists to find a PRIMAL quickly, not to tighten the root box —
+                    # the dual bound is the primary path's job. Dropping it keeps the
+                    # fallback inside its reserve.
+                    _fb = solve_lp_spatial_bb(
+                        self,
+                        time_limit=_fb_reserve,
+                        gap_tolerance=gap_tolerance,
+                        use_obbt=False,
+                    )
+                if _fb is not None and _fb.objective is not None:
+                    from discopt.solver import _unpack_solution
+
+                    result.status = _fb.status
+                    result.objective = _fb.objective
+                    result.x = _unpack_solution(self, np.asarray(_fb.x))
+                    # Keep the TIGHTER of the two dual bounds and never claim a
+                    # certificate the fallback did not actually prove.
+                    if _fb.bound is not None:
+                        result.bound = (
+                            _fb.bound if result.bound is None else max(result.bound, _fb.bound)
+                        )
+                    result.gap = _fb.gap
+                    result.gap_certified = _fb.status == "optimal"
+                    result.node_count = (result.node_count or 0) + _fb.node_count
+            except Exception as _fb_exc:
+                # Never break a solve -- but never swallow silently either. A bare
+                # ``except`` here previously turned a hard TypeError into an invisible
+                # no-op and cost several wrong conclusions.
+                _warnings.warn(
+                    f"#844 LP-spatial fallback failed, keeping the default-path "
+                    f"result: {type(_fb_exc).__name__}: {_fb_exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         # Attach model reference and auto-generate LLM explanation
         result._model = self
