@@ -431,6 +431,43 @@ def _trivial_primal_enabled() -> bool:
     )
 
 
+def _lp_spatial_route(model, kwargs) -> bool:
+    """Whether to route this solve to the LP-per-node spatial engine (#844).
+
+    Two ways in:
+
+    * ``solve(lp_spatial=True)`` — the pre-#844 explicit opt-in, honoured unchanged
+      (it bypasses the scope test exactly as before; the engine still self-checks and
+      returns ``None`` when it cannot serve the model).
+    * **Auto-routing** on the engine's own structural precondition
+      (``lp_spatial_bb._is_in_scope``: a pure-integer model with a MINIMIZE
+      objective). This is an *exact* classifier, not a heuristic guess, so it is used
+      the same way the convex fast path uses its convexity certificate — detect and
+      route, rather than hide the capability behind a flag a user has to already know
+      about. #826 and #844 both concluded this capability did not exist while a
+      working implementation sat behind the opt-in flag; that is the failure mode this
+      auto-route removes.
+
+    Auto-routing is gated by ``DISCOPT_LP_SPATIAL_AUTO``, **default OFF** pending the
+    §5 differential panel; the explicit kwarg is unaffected by the flag. On
+    graduation this default flips to ON and the flag becomes the ``=0`` opt-out.
+
+    The scope test runs *before* any dispatch so an out-of-scope model pays nothing —
+    no import, no engine call, no wall time — and its solve stays bit-identical to the
+    pre-#844 path.
+    """
+    if kwargs.get("lp_spatial", False):
+        return True
+    if os.environ.get("DISCOPT_LP_SPATIAL_AUTO", "0") in ("0", "", "false", "False", "off"):
+        return False
+    try:
+        from discopt._jax.lp_spatial_bb import _is_in_scope
+
+        return bool(_is_in_scope(model))
+    except Exception:  # pragma: no cover - defensive: never let routing break a solve
+        return False
+
+
 def _qubo_primal_enabled() -> bool:
     """Whether the #843 QUBO local-search primal is on (env flag, **default OFF**
     pending the §5 differential panel).
@@ -4629,7 +4666,23 @@ def solve_model(
     # nvs17 to proven optimality. Opt-in via ``solve(lp_spatial=True)``; returns
     # ``None`` (falls through to the default path, no behavior change) for any model
     # out of its scope (non-pure-integer, maximize, unbounded box) or on any error.
-    if kwargs.get("lp_spatial", False):
+    #
+    # #844: the engine is also AUTO-ROUTED on its exact structural precondition,
+    # the way the convex fast path above auto-detects convexity rather than hiding
+    # behind a user flag. Measured on the #844 family (docs/dev/844-primal-heuristics-plan.md):
+    # the default path returns NO incumbent on tln4/tln5/tln6/ball_mk2_30 while this
+    # engine finds one on every single one (tln4 9.5, tln5 12.1, tln6 37.4, and
+    # ball_mk2_30 reaches the exact optimum 0.0) — a capability that was invisible for
+    # two issues (#826, #844 both concluded it did not exist) purely because it sat
+    # behind an opt-in flag.
+    #
+    # Scope is evaluated HERE, before any dispatch, so a model the engine cannot serve
+    # pays exactly nothing (not even the module import) and its solve stays
+    # bit-identical to the pre-#844 path. The engine also self-checks scope on its
+    # first line, so this ordering is defence in depth rather than a fix for a
+    # measured regression: an out-of-scope gastrans040 reaches the same certified
+    # optimum with the engine attempted or not (both 0.0 at a fair budget).
+    if _lp_spatial_route(model, kwargs):
         try:
             from discopt._jax.lp_spatial_bb import solve_lp_spatial_bb
 
