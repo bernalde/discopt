@@ -348,15 +348,34 @@ def solve_lp_spatial_bb(
     def node_relax(lb, ub, basis, inherited, rounds):
         """Solve the node LP with inherited cuts, then run ``rounds`` of cut
         separation (add only bound-improving cuts), returning
-        (bound, x, basis, cuts)."""
+        ``(bound, x, basis, cuts, verdict)``.
+
+        ``verdict`` distinguishes the two very different reasons a node LP can come
+        back with no bound, which the caller MUST NOT conflate:
+
+        * ``"fathom"`` — the LP feasible set over this box is provably empty, proven
+          by a verified Farkas dual ray. Since the McCormick polytope is a valid
+          outer approximation, an empty relaxation means the subtree contains no
+          feasible point: dropping it is rigorous.
+        * ``"unresolved"`` — no certified verdict (numerical failure, time limit, or
+          an ``infeasible`` claim without a Farkas proof). The subtree is **not**
+          ruled out, so silently dropping it would remove live space from the search
+          and a later heap exhaustion could certify optimality over it. The caller
+          must fold such a node into ``unresolved_lb`` instead.
+        """
         if not cut_enabled:
             b_, x_, bas = relax(lb, ub, basis)
-            return b_, x_, bas, ()
+            # Cold path: ``_relax_bound`` collapses every failure mode into ``None``
+            # and cannot prove infeasibility, so the only sound reading is
+            # "unresolved". This is conservative in the safe direction — it can cost
+            # an optimality certificate, never create a false one.
+            return b_, x_, bas, (), ("optimal" if b_ is not None else "unresolved")
         cuts = list(inherited)
         A, b, bounds = _inc.assemble(lb, ub, cuts)
-        b_, x_, bas = _inc.solve_assembled(A, b, bounds, in_basis=basis)
+        _st, b_, x_, bas, _farkas = _inc.solve_assembled_full(A, b, bounds, in_basis=basis)
         if b_ is None:
-            return None, None, None, tuple(cuts)
+            _verdict = "fathom" if (_st == "infeasible" and _farkas) else "unresolved"
+            return None, None, None, tuple(cuts), _verdict
         for _r in range(rounds):
             if len(cuts) >= _MAX_INHERITED_CUTS:
                 break
@@ -372,9 +391,11 @@ def solve_lp_spatial_bb(
             b_, x_, bas = nb, nx, nbas
             if not improved:
                 break
-        return b_, x_, bas, tuple(cuts)
+        return b_, x_, bas, tuple(cuts), "optimal"
 
-    root_b, root_x, root_basis, root_cuts = node_relax(lb0, ub0, None, (), root_cut_rounds)
+    root_b, root_x, root_basis, root_cuts, _root_verdict = node_relax(
+        lb0, ub0, None, (), root_cut_rounds
+    )
     if root_b is None:
         return None
 
@@ -505,16 +526,30 @@ def solve_lp_spatial_bb(
         if cand is not None and cand[0] < inc_val:
             inc_val, inc_x = cand[0], cand[1].copy()
 
-    def child(lb, ub, parent_basis, parent_cuts, rounds):
+    def child(lb, ub, parent_basis, parent_cuts, rounds, parent_bound):
         """Solve a child node (inheriting parent cuts, separating ``rounds`` more);
-        push if promising. Returns its bound (or None)."""
-        nonlocal counter
+        push if promising. Returns its bound (or None).
+
+        ``parent_bound`` is a valid lower bound for this child (its box is contained
+        in the parent's), and is what gets recorded if the child's own relaxation
+        cannot be resolved -- see below.
+        """
+        nonlocal counter, unresolved_lb
         if np.any(lb > ub + 1e-9):
-            return None
-        b_, x_, basis_, cuts_ = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
+            return None  # empty integer box: genuinely nothing here, safe to drop
+        b_, x_, basis_, cuts_, verdict = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
         if b_ is not None and b_ < inc_val - 1e-9:
             heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_))
             counter += 1
+        elif b_ is None and verdict != "fathom":
+            # The child's relaxation gave no certified verdict, so its subtree is NOT
+            # ruled out. Dropping it silently (the pre-#844 behaviour) removes live
+            # space from the search, and a later heap exhaustion would then declare
+            # "optimal" over a region the engine never examined -- a false optimality
+            # certificate (CLAUDE.md §1). Record the parent's bound, which is a valid
+            # lower bound over the child's box, so the global bound can never close
+            # above unexamined space.
+            unresolved_lb = min(unresolved_lb, parent_bound)
         return b_
 
     # seed an incumbent: root dive (cheap) then a root feasibility pump (catches
@@ -562,8 +597,8 @@ def solve_lp_spatial_bb(
         if bi is not None:
             fd = x[bi] - np.floor(x[bi])
             fu = np.ceil(x[bi]) - x[bi]
-            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds)
-            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds)
+            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds, bound)
+            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds, bound)
             _update_pc(bi, "d", bound, bd, fd)
             _update_pc(bi, "u", bound, bu, fu)
             continue
@@ -584,8 +619,8 @@ def solve_lp_spatial_bb(
                 unresolved_lb = min(unresolved_lb, bound)
             continue
         mid = np.floor((lb[bv] + ub[bv]) / 2)
-        child(lb, _set(ub, bv, mid), basis, ncuts, _rounds)
-        child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds)
+        child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
+        child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound)
     else:
         # Heap exhausted. Optimal only if the unresolved-node floor does not sit below
         # the incumbent (else there is space the engine could not rule out -> feasible
