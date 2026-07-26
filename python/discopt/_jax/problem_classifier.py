@@ -1045,8 +1045,21 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
         Q[j, j] = f_ej[j] + f_neg_ej[j] - 2 * d
 
     # Q off-diagonal: Q[i,j] = f(e_i+e_j) - f(e_i) - f(e_j) + d
-    for i in range(n_orig):
-        for j in range(i + 1, n_orig):
+    #
+    # Restricted to the objective's SUPPORT (#863). A variable that does not appear
+    # in the objective at all has f(e_j) == f(-e_j) == d, so every product involving
+    # it is identically zero and probing that pair is pure waste. Sweeping all pairs
+    # is O(n^2) probes, each allocating an O(n) probe vector — on
+    # ``watercontamination0202`` (n = 106,711) that is 5.69e9 probes, measured to
+    # extrapolate to ~32 hours–178 days, and it is why the solve blew past its
+    # ``time_limit`` by >8x without ever reaching a solver.
+    #
+    # The support is free: ``f_ej`` / ``f_neg_ej`` are already computed above in O(n).
+    # That instance's objective touches just 101 of its 106,711 variables, so this
+    # takes the pair count from 5.69e9 to ~5.1e3.
+    support = [j for j in range(n_orig) if f_ej[j] != d or f_neg_ej[j] != d or Q[j, j] != 0.0]
+    for _si, i in enumerate(support):
+        for j in support[_si + 1 :]:
             eij = np.zeros(n_orig, dtype=np.float64)
             eij[i] = 1.0
             eij[j] = 1.0
