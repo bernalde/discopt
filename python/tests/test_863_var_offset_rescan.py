@@ -21,6 +21,23 @@ memoized (after)        0.012 ms      1.3 s
 ``time_limit`` by >8x without ever reaching a solver. Sampling only the *first* rows
 hides this completely — they reference the lowest-index variables, where the rescan
 is cheapest (measured there: 1.7x, not 340x).
+
+The rescan was copied verbatim into **eight** other places, so removing it only from
+the classifier fixed the instance, not the class (CLAUDE.md §2). With extraction
+fixed, stack sampling a ``solve(time_limit=30)`` on the same instance found the next
+>265 s sitting in ``convexity/linear_context._compute_var_offset`` — the same loop,
+reached from ``solver.py:_classify_model_convexity``. A/B on that path, with the
+instrument's call count and affine-hit count identical in both arms:
+
+======================  ============  =========================
+variant                 per row       extrapolated over 107,209
+======================  ============  =========================
+rescan (before)         4.085 ms      438 s
+memoized (after)        0.011 ms      1.1 s
+======================  ============  =========================
+
+Every copy now delegates to ``Model._flat_var_offset``: ``convexity/linear_context``,
+``sparsity``, ``obbt`` (x4, nested closures) and ``solvers/amp`` (x3).
 """
 
 from __future__ import annotations
@@ -31,7 +48,9 @@ import time
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
+import discopt._jax.convexity.linear_context as linear_context  # noqa: E402
 import discopt.modeling as dm  # noqa: E402
+import discopt.solvers.amp as amp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from discopt._jax.problem_classifier import (  # noqa: E402
@@ -39,6 +58,16 @@ from discopt._jax.problem_classifier import (  # noqa: E402
     dense_A,
     extract_lp_data,
 )
+from discopt._jax.sparsity import _var_offset  # noqa: E402
+
+# Every module-level copy of the offset helper. `obbt` has four more as nested
+# closures, which are the same one-line delegation but not reachable from here.
+OFFSET_HELPERS = {
+    "problem_classifier": _compute_var_offset,
+    "convexity.linear_context": linear_context._compute_var_offset,
+    "sparsity": _var_offset,
+    "solvers.amp": amp._compute_var_offset,
+}
 
 REFS_PER_ROW = 10
 
@@ -144,4 +173,57 @@ def test_constraint_extraction_does_not_scale_quadratically_with_variable_count(
         f"constraint extraction cost grew {ratio:.1f}x for 4x the variables "
         f"({t_small:.3f}s -> {t_large:.3f}s) — the per-reference offset rescan "
         "looks like it is back (measured 14.2x with it, 4.9x without)"
+    )
+
+
+@pytest.mark.parametrize("where", sorted(OFFSET_HELPERS))
+def test_every_offset_helper_matches_the_rescan_it_replaced(where):
+    """The rescan was duplicated in eight places; all of them now delegate to the
+    memoized table. Each must return exactly what re-summing
+    ``model._variables[: var._index]`` returned — a misplaced offset silently writes
+    a coefficient into the wrong column, which is a wrong-answer bug."""
+    fn = OFFSET_HELPERS[where]
+    m = dm.Model("mixed")
+    a = m.continuous("a", shape=(3,), lb=0.0, ub=1.0)
+    b = m.continuous("b", lb=0.0, ub=1.0)
+    c = m.continuous("c", shape=(4, 2), lb=0.0, ub=1.0)
+    d = m.binary("d")
+
+    for var in (a, b, c, d):
+        rescan = sum(v.size for v in m._variables[: var._index])
+        assert fn(var, m) == rescan, f"{where}: {fn(var, m)} != {rescan}"
+    assert [fn(v, m) for v in (a, b, c, d)] == [0, 3, 4, 12]
+
+
+@pytest.mark.slow
+def test_convexity_affine_extraction_does_not_scale_quadratically():
+    """The same scaling guarantee for the convexity classifier's affine walk, which
+    is where the next >265 s of a 30 s-limit solve went once extraction was fixed.
+
+    Measured on this model shape (n = 2000 -> 8000):
+
+        rescan     0.048 s -> 0.787 s   16.3x
+        memoized   0.001 s -> 0.006 s    4.1x
+    """
+
+    def _affine_pass(n):
+        model = _wide_model(n)
+        n_vars = sum(v.size for v in model._variables)
+        t0 = time.perf_counter()
+        hits = 0
+        for con in model._constraints:
+            if linear_context.extract_affine(con.body, model, n_vars) is not None:
+                hits += 1
+        assert hits == len(model._constraints), "the walk stopped being affine"
+        return time.perf_counter() - t0
+
+    _affine_pass(200)  # warm
+    t_small = _affine_pass(2000)
+    t_large = _affine_pass(8000)
+
+    ratio = t_large / max(t_small, 1e-6)
+    assert ratio < 9.0, (
+        f"convexity affine extraction grew {ratio:.1f}x for 4x the variables "
+        f"({t_small:.3f}s -> {t_large:.3f}s) — the per-reference offset rescan looks "
+        "like it is back in linear_context"
     )
