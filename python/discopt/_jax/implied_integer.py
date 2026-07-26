@@ -34,7 +34,7 @@ import numpy as np
 from discopt.modeling.core import Constraint, Model, VarType
 
 from .gdp_reformulate import _is_linear
-from .problem_classifier import _extract_linear_coefficients, _NotLinearError
+from .problem_classifier import _extract_linear_coefficients_sparse, _NotLinearError
 
 _INT_TOL = 1e-9
 
@@ -50,6 +50,35 @@ def detect_implied_integers(model: Model) -> set[tuple[int, int]]:
     Conservative: under-detection is safe (a missed tightening); the returned set
     is sound — constraining any of these variables integer leaves the feasible
     region's relevant projection, and hence the optimum, unchanged.
+
+    **Row representation (#863).** Rows are kept as their nonzeros only. The dense
+    predecessor built an ``np.zeros(n)`` per equality *body* and RETAINED one per
+    integer-data row, then re-derived each row's support with
+    ``np.nonzero(np.abs(a) > tol)`` — an O(n) scan per row per fixpoint round.
+    On ``watercontamination0202`` (106,711 variables / 107,209 constraints) this
+    function cost **71.1 s and +31.2 GiB RSS**. The dense full-width row was never
+    needed, only its support and the coefficients on it.
+
+    The marking is **identical**, not merely similar, and that matters because this
+    function marks variables INTEGER: a wrongly-marked variable cuts off feasible
+    points, the cardinal correctness violation. Identity holds term by term:
+
+    * ``_extract_linear_coefficients_sparse`` is the accumulator the dense wrapper
+      is already built on, so the coefficient values are bit-identical.
+    * The integer-coefficient test ran over all ``n`` slots; entries absent from the
+      row are exactly ``0.0``, which passes ``|a - round(a)| <= tol``, so testing
+      only the stored entries accepts and rejects exactly the same rows. It uses
+      ``np.round`` on the stored values for the same half-to-even tie behaviour.
+    * The support is sorted ASCENDING, which is the order ``np.nonzero`` produced,
+      and rows stay in ``model._constraints`` order. The fixpoint loop below is
+      order-sensitive in principle, so preserving both orders — rather than merely
+      preserving the set of rows — is what makes the marked set identical.
+    * The support is now computed once per row instead of once per row per round;
+      ``a`` never changes between rounds, so the recomputation was pure waste.
+
+    ``test_863_sparse_implied_integer.py`` checks that identity against an
+    independent dense reimplementation of the predecessor over the in-repo ``.nl``
+    corpus, not just that it got faster.
     """
     n = sum(v.size for v in model._variables)
     flat = [(v, e) for v in model._variables for e in range(v.size)]
@@ -59,32 +88,36 @@ def detect_implied_integers(model: Model) -> set[tuple[int, int]]:
         dtype=bool,
     )
 
-    # Pre-extract integer-data linear equality rows once.
-    eq_rows: list[tuple[np.ndarray, float]] = []
+    # Pre-extract integer-data linear equality rows once, as (support, coefficients)
+    # with the support ascending.
+    eq_rows: list[tuple[list[int], dict[int, float]]] = []
     for c in model._constraints:
         if not isinstance(c, Constraint) or c.sense != "==":
             continue
         if not _is_linear(c.body):
             continue
         try:
-            a, const = _extract_linear_coefficients(c.body, model, n)
+            terms, const = _extract_linear_coefficients_sparse(c.body, model, n)
         except _NotLinearError:
             continue
-        a = np.asarray(a, dtype=np.float64)
-        if not np.all(np.abs(a - np.round(a)) <= _INT_TOL) or not _is_int_value(float(const)):
+        if terms:
+            vals = np.fromiter(terms.values(), dtype=np.float64, count=len(terms))
+            if not np.all(np.abs(vals - np.round(vals)) <= _INT_TOL):
+                continue
+        if not _is_int_value(float(const)):
             continue
-        eq_rows.append((a, float(const)))
+        nz = sorted(i for i, v in terms.items() if abs(v) > _INT_TOL)
+        eq_rows.append((nz, terms))
 
     marked: set[tuple[int, int]] = set()
     changed = True
     while changed:
         changed = False
-        for a, _const in eq_rows:
-            nz = np.nonzero(np.abs(a) > _INT_TOL)[0]
+        for nz, terms in eq_rows:
             for idx in nz:
                 if is_int[idx]:
                     continue
-                if abs(abs(a[idx]) - 1.0) > _INT_TOL:
+                if abs(abs(terms[idx]) - 1.0) > _INT_TOL:
                     continue  # coefficient must be ±1 for the integer-quotient proof
                 if all(is_int[j] for j in nz if j != idx):
                     var, elem = flat[idx]
