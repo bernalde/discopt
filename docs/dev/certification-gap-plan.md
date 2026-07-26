@@ -1708,6 +1708,121 @@ convexity across zero.
   3. The per-family 200-box property test stands, drawing boxes from the family's
      admissible sign regime.
 
+*Re-measured and NARROWED (2026-07-26, issue #861 — the measurement wins, §0.4).*
+Re-scope item 2 above is **too broad for the even powers**. The 2026-07-02 probe was
+run against the *unflagged* `build_milp_relaxation`; the incremental structure
+compares itself against the build with `skip_separable_floor=True,
+skip_convex_lift=True`, and the sign-dependence the probe saw for `x²`/`x⁴` was
+entirely the extra separable-floor row `s ≥ 0` — a row the incremental path never
+regenerates and never sees. Under the flags the structure actually uses, the row
+count is (re-probe: `p ∈ {2,3,4}` × boxes `[-2,3]`, `[1,3]`, `[-3,-1]`):
+
+| power | spanning `[-2,3]` | positive `[1,3]` | negative `[-3,-1]` |
+|---|---|---|---|
+| `x²` | **4** | 4 | 4 |
+| `x⁴` | **4** | 4 | 4 |
+| `x³` | **2** | 4 | 4 |
+
+So the sign-regime hazard is **odd powers only**: `f'' = p(p-1)x^(p-2) ≥ 0` for even
+`p` on all of ℝ, hence one convexity, hence the same secant + 3-tangent envelope in
+every regime; an odd power is S-shaped across zero and the cold build swaps to
+`_emit_odd_power_hull`'s 2 facets — a facet-*count* change, which is what a fixed
+sparsity pattern genuinely cannot express. The gate is therefore
+`root_sign == 0 and p odd`, not `root_sign == 0`.
+
+Two generalizations were prerequisites, both now pinned by
+`python/tests/test_861_monomial_span_zero.py`:
+- **Aux enclosure.** `_monomial_aux_bounds` assumed monotonicity (endpoint
+  `min`/`max`), which on a straddling box floors `x²` at `min(l²,u²) > 0` and cuts
+  off the true point `x=0` — latent-unsound, unreachable only because of the gate.
+  It now reproduces `Interval.__pow__` exactly (exact square image for `p=2`,
+  repeated interval multiplication for `p≥3`), which is what the cold build takes
+  its aux bound from. Matching rather than tightening is the point: a tighter aux
+  bound is a *different* relaxation, and this path must be bound-neutral.
+- **Validation comparison.** `_validate`'s literal row-set equality could not
+  validate a *pinned* box (`lb==ub`, reached whenever integer branching fixes a
+  variable): the cold build emits no 1-D envelope rows at zero width while the fixed
+  pattern must fill its four reserved rows with the tangents/secant collapsed at the
+  pinned point. Those rows are exactly tight, i.e. vacuous over the box, so
+  `_rowset` now drops rows whose maximum over the column box already satisfies them.
+  Dropping a row that cannot cut the box provably leaves the polytope unchanged, so
+  the gate stays an exact polytope-identity test — it just stops requiring that two
+  identical polytopes be spelled with the same redundant rows. (This also *closes* a
+  pre-existing blind spot: the degenerate-box case was argued sound in a comment and
+  never actually validated, for sign-definite roots either.)
+
+*Measured (2026-07-26).* In-repo corpus panel (66 `.nl`, structure admission + root
+LP bound, flag OFF vs ON): **17 already-admitted instances, 0 root-bound drift, 0
+regressed to declined, 1 newly admitted (`st_miqp5`)** — which then solves to
+`-333.8888902720728`, `gap_certified=True`, `node_count=1`, incumbent independently
+feasibility-verified, identical to the pre-change result. On the ball_mk2_30 *class*
+(n integers straddling zero, one sign-mixed row, minimize) `solve_lp_spatial_bb(...,
+require_incremental=True)` went from returning `None` (n=10 and n=30) to
+`status='optimal', objective=0.0, bound=0.0, gap=0.0`. Bound-neutrality was checked
+directly: patched LP value vs the same-flag cold build over 62 (model, box) pairs on
+straddling boxes — max |Δ| `3.8e-15`, 0 drifts — and the incremental bound never
+exceeded the richer cold path.
+
+*Residual (revised after review of PR #873 — the real instance, not the proxy).*
+Two things remain, and the first was found only by running the **real**
+`ball_mk2_30` rather than the synthetic class probe (the #727 lesson again):
+
+1. **Admission is necessary but NOT sufficient on ball_mk2_30.** With the structure
+   admitted the engine now produces a sound dual bound where it previously produced
+   nothing — but it still returns **no incumbent**: `objective=None`, bound −24.90,
+   208,067 nodes at a 300 s budget (−25.89 / 79,843 nodes at 120 s), budget honoured
+   in both. The issue's premise "the primal is not the problem; admitting the model
+   is" is therefore **falsified**: the thin shell means no node LP rounds to the
+   origin. #861's relaxation-coverage half is closed; its stated symptom is not. The
+   remainder is primal work (the #844 family). A faithful reconstruction —
+   `min -Σxᵢ s.t. Σ(xᵢ² − 0.995825xᵢ) ≤ 0`, `xᵢ ∈ {−1,0,1}` — is pinned in
+   `test_861_monomial_span_zero.py` and reproduces this exactly; the earlier synthetic
+   probe could not, because its optimum sits at the origin and the root LP finds it.
+   *Side effect, and what it turned out to be.* ball_mk2_30 previously declined in
+   0.5 s under `require_incremental` (#858) and now consumes the whole fallback
+   reserve for no primal. The obvious response — re-tighten the guard so it excludes
+   the instance again — was **rejected on the evidence**, twice over:
+   - *No predicate can decide this in advance.* The guard would have to answer "will
+     a primal appear within the reserve", and the same panel that shows `ball_mk2_30`
+     (n=30) finding nothing shows `ball_mk2_20` finding the exact optimum `-0.0`.
+     Same family, same shell, opposite outcome. A "give up if no incumbent by X% of
+     the reserve" rule would forfeit the late incumbents this fallback exists to
+     catch (tln4/tln5), and tuning X until ball_mk2_30 exits early is a
+     single-instance fix, which §2 rejects.
+   - *The reserve was not producing nothing — it was producing something that got
+     thrown away.* `Model.solve`'s fallback merged the engine's result only when it
+     carried an objective, so a sound dual bound computed inside the reserve was
+     discarded. Measured at a 30 s budget: the fallback proved `bound = -27.88`
+     (≤ the 0.0 oracle) and the solve reported `bound=None`.
+
+   So the bound merge now runs whether or not a primal was found. Sound by the same
+   argument the merge already relied on: `_is_in_scope` admits only MINIMIZE, both
+   values are valid lower bounds, and the max of two valid lower bounds is valid; no
+   certificate is claimed without an incumbent (`gap_certified` untouched).
+   Differential solve panel over the 12 fallback-reachable in-repo instances plus
+   `ball_mk2_{20,30}`, before vs after: **13/14 byte-identical (status, objective,
+   bound, gap_certified), 1 changed — `ball_mk2_30` `bound: None → -27.88` — 0
+   certification regressions, 0 objective drift, 0 bounds above an incumbent or above
+   a known oracle, 0 bounds loosened.** A spent reserve now buys a dual bound instead
+   of nothing; closing the primal half remains #844 work.
+2. An **odd** power whose root box straddles zero is still declined (`ok=False` → the
+   trusted cold build). Closing it needs a fixed row count across the 2-facet/4-row
+   switch, i.e. a change to the cold build's emission, not to the patch — out of
+   scope for #861 and not worth the churn on the trusted path.
+
+*Also fixed under review (non-finite endpoints).* The `p >= 3` closed form returned
+`(NaN, NaN)` on an unbounded box (`0 * ±inf`), and `_monomial_rows` put NaN
+coefficients into `A`/`b` there. Both are reachable on a **sign-definite** root
+(`[-inf, 0]` carrying `x**4`), i.e. on models admitted before *and* after #861, and
+the validation gate never sees them because all six validation boxes are finite. NaN
+in an LP is worse than a loose bound — every comparison against it is `False`, so
+`NaN <= incumbent` can silently disable fathoming. The enclosure now delegates to
+`Interval.__pow__` when an endpoint is non-finite (the closed form cannot match it
+there: `Interval` outward-rounds per step, so `[0,inf]**3` is `[-inf,inf]`, and
+claiming the tighter `[0,inf]` would make the patched aux tighter than the cold
+build), and the envelope emits four vacuous rows — which is exactly the cold build's
+polytope, since `_emit_1d` bails under `_finite` and emits nothing.
+
 > **STOP / ESCALATED (2026-07-02, §0.4 + §0.6) — Phase 1's bound-neutrality
 > premise is falsified; needs a maintainer decision before any T1.2 code lands.**
 >

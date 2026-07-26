@@ -152,8 +152,10 @@ def solve_discopt_engine(model, capture_profile=False):
     """Call the Rust MILP engine directly (no Python budget cap)."""
     from discopt._rust import solve_milp_py
 
+    from discopt._jax.problem_classifier import dense_A
+
     lp, n_orig, int_idx = _lp_data(model)
-    A = np.ascontiguousarray(lp.A_eq, dtype=np.float64)
+    A = np.ascontiguousarray(dense_A(lp.A_eq))
     args = (
         np.ascontiguousarray(lp.c, dtype=np.float64),
         A,
@@ -200,8 +202,10 @@ def solve_highs_lp(model):
         return None
     import scipy.sparse as sp
 
+    from discopt._jax.problem_classifier import dense_A
+
     lp, _, _ = _lp_data(model)
-    A = sp.csr_matrix(np.asarray(lp.A_eq, dtype=np.float64))
+    A = sp.csr_matrix(dense_A(lp.A_eq))
     m, n = A.shape
     c = np.asarray(lp.c, dtype=np.float64)
     b = np.asarray(lp.b_eq, dtype=np.float64)

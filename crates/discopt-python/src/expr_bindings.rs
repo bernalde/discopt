@@ -424,11 +424,32 @@ impl PyModelRepr {
 
     /// Run FBBT (Feasibility-Based Bound Tightening) on the model.
     ///
+    /// `time_limit_ms` caps wall time (None / 0 = unlimited). FBBT is anytime: it
+    /// only ever tightens, and each constraint's inference is independently valid, so
+    /// on expiry it returns whatever it has contracted so far -- a valid, merely
+    /// looser box. Without a cap this runs `max_iter` full sweeps over every
+    /// constraint: on watercontamination0202 (106,711 vars / 107,209 rows) the root
+    /// call from `tighten_root_bounds_with_fbbt` ran for **>10 minutes** against a
+    /// 30 s solve budget with no way to interrupt it (issue #863).
+    ///
     /// Returns (lower_bounds, upper_bounds) as numpy arrays, one element per
     /// variable block (not per scalar variable).
-    fn fbbt(&self, py: Python<'_>, max_iter: usize, tol: f64) -> PyResult<(PyObject, PyObject)> {
-        use discopt_core::presolve::fbbt::fbbt;
-        let bounds = fbbt(&self.inner, max_iter, tol);
+    #[pyo3(signature = (max_iter, tol, time_limit_ms=None))]
+    fn fbbt(
+        &self,
+        py: Python<'_>,
+        max_iter: usize,
+        tol: f64,
+        time_limit_ms: Option<u64>,
+    ) -> PyResult<(PyObject, PyObject)> {
+        use discopt_core::presolve::fbbt::fbbt_until;
+        let deadline = match time_limit_ms {
+            Some(ms) if ms > 0 => {
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+            }
+            _ => None,
+        };
+        let bounds = fbbt_until(&self.inner, max_iter, tol, deadline);
         let lbs: Vec<f64> = bounds.iter().map(|b| b.lo).collect();
         let ubs: Vec<f64> = bounds.iter().map(|b| b.hi).collect();
         let lb_arr = numpy::PyArray1::from_vec(py, lbs);
@@ -494,16 +515,23 @@ impl PyModelRepr {
     ///
     /// Returns (lower_bounds, upper_bounds) as numpy arrays, one element per
     /// variable block.
-    #[pyo3(signature = (max_iter, tol, incumbent_bound=None))]
+    #[pyo3(signature = (max_iter, tol, incumbent_bound=None, time_limit_ms=None))]
     fn fbbt_with_cutoff(
         &self,
         py: Python<'_>,
         max_iter: usize,
         tol: f64,
         incumbent_bound: Option<f64>,
+        time_limit_ms: Option<u64>,
     ) -> PyResult<(PyObject, PyObject)> {
-        use discopt_core::presolve::fbbt::fbbt_with_cutoff;
-        let bounds = fbbt_with_cutoff(&self.inner, max_iter, tol, incumbent_bound);
+        use discopt_core::presolve::fbbt::fbbt_with_cutoff_until;
+        let deadline = match time_limit_ms {
+            Some(ms) if ms > 0 => {
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+            }
+            _ => None,
+        };
+        let bounds = fbbt_with_cutoff_until(&self.inner, max_iter, tol, incumbent_bound, deadline);
         let lbs: Vec<f64> = bounds.iter().map(|b| b.lo).collect();
         let ubs: Vec<f64> = bounds.iter().map(|b| b.hi).collect();
         let lb_arr = numpy::PyArray1::from_vec(py, lbs);

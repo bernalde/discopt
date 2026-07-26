@@ -83,9 +83,14 @@ def _lp_spatial_fallback_enabled() -> bool:
     enough that a single one runs past the top-of-loop deadline poll. On tln5 at a
     21 s budget: 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) versus 13158 nodes in
     21.0 s (1.00x, slowest node 0.04 s) once the engine passes its own deadline.
-    ball_mk2_30 declines the structure for a genuine structural reason (``monomial
-    x_0^2: root box spans zero``); there the fallback now refuses to run at all
-    (``require_incremental``) rather than spend 61 s on a single root LP for nothing.
+    A model whose structure declines for a genuine structural reason — e.g. an odd
+    power over a root box straddling zero, whose envelope changes facet count across
+    the sign change — makes the fallback refuse to run at all
+    (``require_incremental``) rather than spend a whole reserve on a single root LP
+    for nothing; measured at 61 s against a 21 s reserve on ball_mk2_30 back when its
+    ``x_0**2`` monomial also declined. #861 has since admitted the even powers, so
+    ball_mk2_30 now runs this path and produces a sound bound but still no incumbent —
+    the remaining gap there is primal, not relaxation coverage.
 
     **Known cost.** The incumbents are *worse* than the ones the degraded cold path
     happened to report (tln4 19.6 vs 8.7, tln5 32.8 vs 15.1) — its slower, full-
@@ -94,6 +99,17 @@ def _lp_spatial_fallback_enabled() -> bool:
     baseline; against the actual default path all three are gains from *no incumbent*.
     Closing the remaining gap to the reference optima is primal-quality work, not a
     budget bug.
+
+    **Incumbent quality is now measured (#862).** The panel above scored whether an
+    incumbent *exists*, is sound and stays in budget — never how good it is, so
+    nothing would have caught a change that halved incumbent quality. It does now:
+    ``discopt_benchmarks/scripts/issue844_primal_quality_panel.py`` re-runs this exact
+    OFF/ON differential and adds the primal gap to the reference optimum per instance,
+    the corpus aggregate, and quality regressions ON vs OFF. The quality gap itself is
+    still open: see ``docs/dev/lp-node-primal-quality.md`` for the measurement and for
+    the two primal levers it falsified (a rounding flip, and a narrowing dive), whose
+    common root cause is that the McCormick relaxation on this family is ~250x loose
+    at the root, so no rounding-based heuristic reading it can do better.
     """
     import os as _os
 
@@ -4223,12 +4239,29 @@ class Model:
                     #
                     # require_incremental=True: without the incremental McCormick
                     # structure the engine has no cuts, no feasibility pump, and
-                    # rebuilds the relaxation per node. On ball_mk2_30 — where the
-                    # structure legitimately declines (``monomial x_0^2: root box
-                    # spans zero``) — that cold path spent 61 s on the ROOT LP alone
-                    # against a 21 s reserve: 0 nodes, no incumbent, 2.91x over
-                    # budget. It cannot produce a primal inside a fallback-sized
-                    # budget, so declining costs no gain and removes the overrun.
+                    # rebuilds the relaxation per node. Measured on ball_mk2_30 while
+                    # its monomial still declined, that cold path spent 61 s on the
+                    # ROOT LP alone against a 21 s reserve: 0 nodes, no incumbent,
+                    # 2.91x over budget. It cannot produce a primal inside a
+                    # fallback-sized budget, so declining costs no gain and removes
+                    # the overrun. ball_mk2_30 itself now MAPS (#861 narrowed the
+                    # monomial gate to odd powers on a straddling root) and so takes
+                    # the incremental path here — but measured, it still returns no
+                    # incumbent, just a sound bound, having spent the reserve.
+                    #
+                    # The guard is deliberately NOT tightened to re-exclude it. Its
+                    # premise ("the structure builds" ⇒ "this path can find a primal")
+                    # is a proxy, and #861 widened the gap between the two — but no
+                    # predicate can decide in advance whether a primal is coming, and
+                    # a "give up if no incumbent by X% of the reserve" rule would
+                    # forfeit precisely the late incumbents this fallback exists to
+                    # catch (tln4/tln5 are found deep in the reserve, not early).
+                    # Tuning such a rule until ball_mk2_30 exits early would be a
+                    # single-instance fix, which this repo rejects. Instead the
+                    # reserve's OUTPUT is no longer discarded: the bound merge below
+                    # runs whether or not a primal was found, so a spent reserve now
+                    # buys a tighter dual bound rather than nothing. Closing the primal
+                    # half remains #844 work.
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,
@@ -4236,19 +4269,32 @@ class Model:
                         use_obbt=False,
                         require_incremental=True,
                     )
-                if _fb is not None and _fb.objective is not None:
-                    from discopt.solver import _unpack_solution
-
-                    result.status = _fb.status
-                    result.objective = _fb.objective
-                    result.x = _unpack_solution(self, np.asarray(_fb.x))
-                    # Keep the TIGHTER of the two dual bounds and never claim a
-                    # certificate the fallback did not actually prove. Which one is
-                    # tighter depends on the sense: for a minimize the dual bound is a
-                    # LOWER bound (larger is tighter), for a maximize it is an UPPER
-                    # bound (smaller is tighter) — #860, now that the engine serves
-                    # maximize models. Taking ``max`` unconditionally would still be
-                    # sound (both are valid upper bounds) but would keep the looser one.
+                if _fb is not None:
+                    # Keep the TIGHTER of the two dual bounds, and do it whether or not
+                    # the fallback found a primal.
+                    #
+                    # Which one is tighter depends on the SENSE: for a minimize the dual
+                    # bound is a LOWER bound (larger is tighter); for a maximize it is an
+                    # UPPER bound (smaller is tighter). ``_is_in_scope`` used to admit
+                    # minimize only, so an unconditional ``max`` was correct; #860 widens
+                    # the engine to maximize models, where ``max`` would still be SOUND
+                    # (both are valid upper bounds) but would keep the LOOSER one.
+                    # Merge conflict note: main moved this merge out of the
+                    # ``_fb.objective is not None`` block (#861 review, below) while #860
+                    # made it sense-aware; both are needed and they compose — placement
+                    # from main, sense from #860.
+                    #
+                    # Why it moved (#861 review): once a model is admitted but hard, the
+                    # fallback spends its whole reserve, computes a sound bound, finds no
+                    # primal, and everything was thrown away — the reserve produced
+                    # nothing *even though it produced something valid*. Measured on
+                    # ball_mk2_30 at a 30 s budget: the fallback returned bound -27.88
+                    # (<= the 0.0 oracle) and the solve reported ``bound=None``. That is
+                    # the real cost the review flagged as "spends the budget for
+                    # nothing", and it is a reporting gap, not a reason to re-tighten
+                    # ``require_incremental``: no predicate can decide in advance whether
+                    # a primal is coming, and a budget-fraction early exit would forfeit
+                    # exactly the late incumbents this fallback exists to catch.
                     if _fb.bound is not None:
                         if result.bound is None:
                             result.bound = _fb.bound
@@ -4259,9 +4305,16 @@ class Model:
                             result.bound = min(result.bound, _fb.bound)
                         else:
                             result.bound = max(result.bound, _fb.bound)
-                    result.gap = _fb.gap
-                    result.gap_certified = _fb.status == "optimal"
                     result.node_count = (result.node_count or 0) + _fb.node_count
+                if _fb is not None and _fb.objective is not None:
+                    from discopt.solver import _unpack_solution
+
+                    result.status = _fb.status
+                    result.objective = _fb.objective
+                    result.x = _unpack_solution(self, np.asarray(_fb.x))
+                    result.gap = _fb.gap
+                    # Never claim a certificate the fallback did not actually prove.
+                    result.gap_certified = _fb.status == "optimal"
             except Exception as _fb_exc:
                 # Never break a solve -- but never swallow silently either. A bare
                 # ``except`` here previously turned a hard TypeError into an invisible
