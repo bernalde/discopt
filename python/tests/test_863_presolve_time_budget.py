@@ -1,0 +1,177 @@
+"""#863: every root-presolve pass must honour ``time_limit_ms``, not just the loop.
+
+The Rust orchestrator checks its time budget **between passes**
+(``presolve/orchestrator.rs``), so a pass whose own internal fixed-point loop does
+not poll ``ctx.deadline`` runs to completion regardless of the budget. ``solve_model``
+relies on the opposite (its comment reads "the Rust side honours ``time_limit_ms``
+between sweeps, so the overrun is bounded by a single sweep"), which is only true
+while every long pass polls.
+
+Measured on ``watercontamination0202`` (106,711 vars / 107,209 constraints) against a
+7.5 s budget, one pass at a time — **five of ten passes overran**:
+
+    pass                        before              after
+    eliminate                   >90 s  (>12x)       7.53 s  1.0x  TimeBudget
+    aggregate                   >90 s  (>12x)       7.56 s  1.0x  TimeBudget
+    simplify                    >90 s  (>12x)       7.52 s  1.0x  TimeBudget
+    fbbt                        >90 s  (>12x)       7.57 s  1.0x  TimeBudget
+    probing                     >90 s  (>12x)       7.59 s  1.0x  TimeBudget
+    factorable_elim             7.51 s  1.0x        7.52 s  1.0x  (already polled)
+    redundancy                  7.12 s  0.9x        7.01 s  0.9x
+    implied_bounds              0.09 s              0.09 s
+    cliques                     0.04 s              0.04 s
+    coefficient_strengthening   0.02 s              0.02 s
+
+(">90 s" is where the probe was killed; they were still running.) ``probing`` is the
+instructive one: it *already* polled ``ctx.deadline`` — once per binary variable — but
+this instance has 107,209 constraints and only **7** binaries, and each binary costs
+two full FBBT runs. The poll was there and the granularity made it useless.
+
+Two levels of test here, and they prove different things:
+
+* the in-repo instances are small enough that these passes finish quickly whether or
+  not they poll, so those tests are a *guard* (they catch a pass that ignores the
+  budget outright, and a future pass that grows a fixed-point loop), not a
+  demonstration of the fix;
+* ``test_eliminate_honours_its_budget_on_a_large_instance`` is the decisive one and
+  it needs the full MINLPLib snapshot, so it skips when that is absent. The
+  authoritative fails-before evidence is the Rust unit tests
+  (``presolve::{eliminate,aggregate,fbbt,simplify}::tests::*deadline*``) plus the
+  measurement above.
+"""
+
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import discopt.modeling as dm  # noqa: E402
+import pytest  # noqa: E402
+
+_NL_DIR = Path(__file__).parent / "data" / "minlplib_nl"
+
+# Every pass the root pipeline can enable. A pass that ignores the deadline shows up
+# as a wall far above the budget on a big model; here it shows up as work done under
+# an already-expired budget.
+_PASSES = [
+    "eliminate",
+    "factorable_elim",
+    "aggregate",
+    "redundancy",
+    "simplify",
+    "coefficient_strengthening",
+    "implied_bounds",
+    "fbbt",
+    "probing",
+    "cliques",
+]
+
+
+def _repr_for(name: str):
+    from discopt._rust import model_to_repr
+
+    model = dm.from_nl(str(_NL_DIR / f"{name}.nl"))
+    return model_to_repr(model, getattr(model, "_builder", None))
+
+
+def _presolve(repr_, passes, time_limit_ms):
+    return repr_.presolve(
+        passes=passes,
+        max_iterations=16,
+        time_limit_ms=time_limit_ms,
+        work_unit_budget=0,
+        fbbt_max_iter=10,
+        fbbt_tol=1e-9,
+        reduced_cost_info=None,
+    )
+
+
+@pytest.mark.parametrize("pass_name", _PASSES)
+def test_each_pass_returns_promptly_under_a_one_millisecond_budget(pass_name):
+    """A 1 ms budget must not buy more than a moment of work from any single pass.
+
+    ``eliminate`` failed this before the fix: on a large model its fixed-point loop
+    never looked at the deadline. 5 s is a deliberately loose ceiling — the point is
+    to catch a pass that ignores the budget entirely, not to measure it.
+    """
+    repr_ = _repr_for("4stufen")
+    t = time.perf_counter()
+    _new_repr, raw = _presolve(repr_, [pass_name], 1)
+    elapsed = time.perf_counter() - t
+    assert elapsed < 5.0, (
+        f"pass {pass_name!r} took {elapsed:.2f}s under a 1 ms budget; it is not "
+        "polling ctx.deadline inside its own loop"
+    )
+    assert raw["iterations"] >= 1
+
+
+def test_eliminate_under_an_expired_budget_leaves_the_model_valid():
+    """Bailing early must perform FEWER eliminations, never wrong ones: the model
+    that comes back keeps the not-yet-eliminated constraints, so it stays equivalent
+    to the input. Compare constraint counts against an unbudgeted run."""
+    unbudgeted = _presolve(_repr_for("4stufen"), ["eliminate"], 0)
+    budgeted = _presolve(_repr_for("4stufen"), ["eliminate"], 1)
+    n_unbudgeted = unbudgeted[0].n_constraints
+    n_budgeted = budgeted[0].n_constraints
+    assert n_budgeted >= n_unbudgeted, (
+        f"the budgeted run removed MORE constraints ({n_budgeted} left) than the "
+        f"unbudgeted one ({n_unbudgeted} left); bailing must only do less work"
+    )
+
+
+def test_a_generous_budget_gives_the_same_result_as_no_budget():
+    """The deadline poll must be the only difference: with a budget far above the
+    work required, the presolve outcome must match the unbudgeted run exactly."""
+    unbudgeted = _presolve(_repr_for("4stufen"), ["eliminate"], 0)
+    generous = _presolve(_repr_for("4stufen"), ["eliminate"], 600_000)
+    assert unbudgeted[0].n_constraints == generous[0].n_constraints
+    assert unbudgeted[0].n_vars == generous[0].n_vars
+    assert unbudgeted[1]["iterations"] == generous[1]["iterations"]
+
+
+_BIG = Path(
+    os.path.expanduser(
+        "~/Dropbox/projects/discopt-minlp-benchmark/minlplib/nl/watercontamination0202.nl"
+    )
+)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _BIG.exists(), reason="needs the full MINLPLib snapshot")
+def test_eliminate_honours_its_budget_on_a_large_instance():
+    """The decisive test, on the instance that exposed the bug.
+
+    Before the fix: >90 s against a 7.5 s budget (>12x), still running when killed.
+    After: 7.52 s, ratio 1.0x, terminated_by=TimeBudget.
+    """
+    from discopt._rust import model_to_repr
+
+    model = dm.from_nl(str(_BIG))
+    repr_ = model_to_repr(model, getattr(model, "_builder", None))
+    budget_ms = 5_000
+    t = time.perf_counter()
+    _new_repr, raw = _presolve(repr_, ["eliminate"], budget_ms)
+    elapsed = time.perf_counter() - t
+    assert elapsed < 3.0 * budget_ms / 1000.0, (
+        f"eliminate took {elapsed:.1f}s against a {budget_ms / 1000:.1f}s budget "
+        f"({elapsed / (budget_ms / 1000):.1f}x); it is not polling ctx.deadline"
+    )
+    assert raw["terminated_by"] == "TimeBudget"
+
+
+def test_full_root_presolve_respects_its_budget():
+    """The pipeline as ``solve_model`` invokes it, with every default pass on."""
+    from discopt._jax.presolve_pipeline import run_root_presolve
+
+    t = time.perf_counter()
+    _repr, stats = run_root_presolve(
+        _repr_for("4stufen"), eliminate=True, fbbt=True, time_limit_ms=1
+    )
+    elapsed = time.perf_counter() - t
+    assert elapsed < 10.0, f"root presolve took {elapsed:.2f}s under a 1 ms budget"
+    assert stats["terminated_by"] in {"TimeBudget", "NoProgress", "IterationCap", "Infeasible"}

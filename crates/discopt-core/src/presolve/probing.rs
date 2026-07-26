@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use super::fbbt::{fbbt, fbbt_with_cutoff, Interval, FEAS_TOL};
+use super::fbbt::{fbbt_until, fbbt_with_cutoff_until, Interval, FEAS_TOL};
 use crate::expr::{ModelRepr, VarType};
 
 /// Result of probing all binary variables.
@@ -72,10 +72,16 @@ pub fn probe_binary_vars_until(
         }
 
         // Probe y=0.
+        //
+        // `fbbt_until`, not `fbbt`: the per-binary poll above is far too coarse on a
+        // large model. watercontamination0202 has 107,209 constraints and only SEVEN
+        // binaries, so each of these calls was ~13 s of unpollable work and this pass
+        // overran a 7.5 s budget by >12x with the poll already in place (#863). The
+        // deadline has to reach the inner sweeps.
         let mut bounds_zero = var_bounds.to_vec();
         bounds_zero[i] = Interval::new(0.0, 0.0);
         let model_zero = make_probing_model(model, &bounds_zero);
-        let result_zero = fbbt(&model_zero, max_fbbt_iter, fbbt_tol);
+        let result_zero = fbbt_until(&model_zero, max_fbbt_iter, fbbt_tol, deadline);
         // Declare a fixing infeasible only when a bound is empty beyond the
         // feasibility tolerance. An eps-scale inverted interval (e.g. from a
         // GDP hull perspective residual) is numerical noise, not proof that
@@ -87,7 +93,7 @@ pub fn probe_binary_vars_until(
         let mut bounds_one = var_bounds.to_vec();
         bounds_one[i] = Interval::new(1.0, 1.0);
         let model_one = make_probing_model(model, &bounds_one);
-        let result_one = fbbt(&model_one, max_fbbt_iter, fbbt_tol);
+        let result_one = fbbt_until(&model_one, max_fbbt_iter, fbbt_tol, deadline);
         let infeasible_one = result_one.iter().any(|b| b.is_empty_beyond(FEAS_TOL));
 
         if infeasible_zero && infeasible_one {
@@ -250,7 +256,7 @@ pub fn probe_node_bounds(
         let mut b = bnds.to_vec();
         b[idx] = Interval::new(val, val);
         let m = make_probing_model(model, &b);
-        fbbt_with_cutoff(&m, max_fbbt_iter, tol, incumbent)
+        fbbt_with_cutoff_until(&m, max_fbbt_iter, tol, incumbent, deadline)
     };
     let branch_infeasible =
         |res: &[Interval]| -> bool { res.iter().any(|b| b.is_empty_beyond(FEAS_TOL)) };

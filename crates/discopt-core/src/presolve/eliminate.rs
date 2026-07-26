@@ -58,6 +58,7 @@
 //!   equation already removed).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use super::polynomial::try_polynomial;
 use crate::expr::{ConstraintSense, ExprArena, ExprId, ExprNode, ModelRepr, VarType};
@@ -79,12 +80,46 @@ pub struct EliminationStats {
 /// Pure function: input is not modified. The caller decides whether
 /// to swap in the result.
 pub fn eliminate_variables(model: &ModelRepr) -> (ModelRepr, EliminationStats) {
+    eliminate_variables_until(model, None)
+}
+
+/// Like [`eliminate_variables`] but stops once `deadline` passes, returning the
+/// eliminations performed so far.
+///
+/// The fixed-point loop rebuilds the candidate leaf map every outer iteration and
+/// scans every candidate against every constraint body, and it fixes at most ONE
+/// variable per outer iteration — so the work is O(fixings · leaves · constraints ·
+/// body). The orchestrator only checks its time budget *between passes*
+/// (`orchestrator.rs`), so without an internal poll a single invocation runs to
+/// completion no matter what `time_limit_ms` says.
+///
+/// Measured on `watercontamination0202` (106,711 variables / 107,209 constraints,
+/// issue #863): this pass alone ran **>90 s against a 7.5 s budget** (>12x) and was
+/// still going, while its siblings honoured the same budget to 1.0x
+/// (`factorable_elim`: 7.51 s, terminated_by=TimeBudget). It is the reason a
+/// `solve(time_limit=30)` on that instance never reached branch-and-bound.
+///
+/// Bailing mid-loop only performs *fewer* sound eliminations: the returned model
+/// keeps the not-yet-eliminated variables unpinned and their defining equalities
+/// present, so it stays equivalent to the input. This mirrors
+/// [`super::factorable_elim::factorable_eliminate_until`] and
+/// [`super::probing::probe_binary_vars_until`], the two passes that already poll
+/// `ctx.deadline` for exactly this reason.
+pub fn eliminate_variables_until(
+    model: &ModelRepr,
+    deadline: Option<Instant>,
+) -> (ModelRepr, EliminationStats) {
     let mut out = model.clone();
     let mut stats = EliminationStats::default();
 
     // Iterate to a fixed point. Each pass may expose new fixings (e.g.
     // when a previous fix made another constraint singleton).
     loop {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
         let n_before = stats.variables_fixed;
 
         // For each candidate variable, find its unique scalar leaf id
@@ -98,6 +133,14 @@ pub fn eliminate_variables(model: &ModelRepr) -> (ModelRepr, EliminationStats) {
         let mut victim_value: f64 = 0.0;
 
         'cands: for (vblock, leaf) in &leaves {
+            // A single re-scan over all candidates can itself be slow on a large
+            // model (per candidate it walks every constraint body); poll the
+            // deadline here too so one outer iteration cannot overrun unbounded.
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    break 'cands;
+                }
+            }
             // Skip variables already pinned (lb == ub).
             let lb = out.variables[*vblock].lb[0];
             let ub = out.variables[*vblock].ub[0];
@@ -316,6 +359,92 @@ mod tests {
         assert_eq!(out.constraints.len(), 0);
         assert_eq!(out.variables[0].lb[0], 3.0);
         assert_eq!(out.variables[0].ub[0], 3.0);
+    }
+
+    #[test]
+    fn honors_past_deadline() {
+        // The same eliminable model as `fixes_singleton_equality`, but with a
+        // deadline already in the past. The fixed-point loop fixes at most one
+        // variable per outer iteration and re-scans every candidate against every
+        // constraint body, so on a large model a single invocation runs far past the
+        // orchestrator's *between-passes* time check: on watercontamination0202 it
+        // ran >90 s against a 7.5 s budget (#863). It must poll the deadline and
+        // bail. Bailing performs *fewer* sound eliminations, so the returned model
+        // keeps the (still-valid) equality and the unpinned variable.
+        let mut arena = ExprArena::new();
+        let x = scalar_var(&mut arena, "x", 0);
+        let two = arena.add(ExprNode::Constant(2.0));
+        let two_x = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Mul,
+            left: two,
+            right: x,
+        });
+        let model = ModelRepr {
+            arena,
+            objective: x,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body: two_x,
+                sense: ConstraintSense::Eq,
+                rhs: 6.0,
+                name: None,
+            }],
+            variables: vec![vinfo("x", 0.0, 10.0)],
+            n_vars: 1,
+        };
+
+        // No deadline: the variable is fixed (control).
+        let (_out, stats) = eliminate_variables_until(&model, None);
+        assert_eq!(stats.variables_fixed, 1);
+
+        // Deadline already passed: bail before any work; model unchanged and still
+        // valid (x is unpinned, its defining equality is still there).
+        let past = std::time::Instant::now();
+        let (out, stats) = eliminate_variables_until(&model, Some(past));
+        assert_eq!(
+            stats.variables_fixed, 0,
+            "elimination must bail before any work once the deadline has passed"
+        );
+        assert_eq!(stats.constraints_removed, 0);
+        assert_eq!(out.constraints.len(), 1);
+        assert_eq!(out.variables[0].lb[0], 0.0);
+        assert_eq!(out.variables[0].ub[0], 10.0);
+    }
+
+    #[test]
+    fn future_deadline_does_not_change_the_result() {
+        // A deadline far in the future must be indistinguishable from no deadline:
+        // the poll is the only difference, so the eliminations must be identical.
+        let mut arena = ExprArena::new();
+        let x = scalar_var(&mut arena, "x", 0);
+        let two = arena.add(ExprNode::Constant(2.0));
+        let two_x = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Mul,
+            left: two,
+            right: x,
+        });
+        let model = ModelRepr {
+            arena,
+            objective: x,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body: two_x,
+                sense: ConstraintSense::Eq,
+                rhs: 6.0,
+                name: None,
+            }],
+            variables: vec![vinfo("x", 0.0, 10.0)],
+            n_vars: 1,
+        };
+        let (a_out, a) = eliminate_variables_until(&model, None);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let (b_out, b) = eliminate_variables_until(&model, Some(future));
+        assert_eq!(a.variables_fixed, b.variables_fixed);
+        assert_eq!(a.constraints_removed, b.constraints_removed);
+        assert_eq!(a.candidates_examined, b.candidates_examined);
+        assert_eq!(a_out.constraints.len(), b_out.constraints.len());
+        assert_eq!(a_out.variables[0].lb[0], b_out.variables[0].lb[0]);
+        assert_eq!(a_out.variables[0].ub[0], b_out.variables[0].ub[0]);
     }
 
     #[test]

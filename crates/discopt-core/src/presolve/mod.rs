@@ -45,7 +45,9 @@ pub mod scaling;
 pub mod simplify;
 pub mod symmetry;
 
-pub use aggregate::{aggregate_variables, AggregationRecord, AggregationStats};
+pub use aggregate::{
+    aggregate_variables, aggregate_variables_until, AggregationRecord, AggregationStats,
+};
 pub use cliques::{extract_cliques, CliqueSet, CliqueStats};
 pub use coefficient_strengthening::{coefficient_strengthening, CoefficientStrengtheningStats};
 pub use delta::{
@@ -53,9 +55,12 @@ pub use delta::{
     VarAggregation,
 };
 pub use duality::{reduced_cost_fixing, ReducedCostInfo, ReducedCostStats};
-pub use eliminate::{eliminate_variables, EliminationStats};
+pub use eliminate::{eliminate_variables, eliminate_variables_until, EliminationStats};
 pub use factorable_elim::{factorable_eliminate, FactorableElimStats};
-pub use fbbt::{backward_propagate, fbbt, fbbt_with_cutoff, forward_propagate, Interval};
+pub use fbbt::{
+    backward_propagate, fbbt, fbbt_until, fbbt_with_cutoff, fbbt_with_cutoff_until,
+    forward_propagate, Interval,
+};
 pub use fbbt_fp::{fbbt_fixed_point, FbbtFpOptions, FbbtFpStats};
 pub use implied_bounds::{propagate_implied_bounds, ImpliedBoundsStats};
 pub use obbt::{apply_obbt_bounds, extract_linear_rows, obbt_candidates, LinearRow, ObbtResult};
@@ -75,5 +80,5 @@ pub use probing::{
 pub use reduction_constraints::{detect_reduction_constraints, ReductionStats};
 pub use redundancy::{detect_row_redundancy, RedundancyStats};
 pub use scaling::{compute_equilibration, ScalingFactors, ScalingStats};
-pub use simplify::{simplify, SimplifyResult};
+pub use simplify::{simplify, simplify_until, SimplifyResult};
 pub use symmetry::{detect_symmetries, Orbit, SymmetryStats};
