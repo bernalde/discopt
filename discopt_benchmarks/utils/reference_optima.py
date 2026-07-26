@@ -1,11 +1,15 @@
 """Reference optima ("oracles") for benchmark instances, from one accessor.
 
 A quality metric is only as good as the reference it scores against, and the
-reference lived in ~17 hand-rolled copies: every panel script re-implemented the
-same six-line ``minlplib.solu`` parse, or pasted a private ``OPT = {...}`` dict.
+reference lives in ~17 hand-rolled copies: every panel script re-implements the
+same six-line ``minlplib.solu`` parse, or pastes a private ``OPT = {...}`` dict.
 That is how a panel ends up silently unscored — the ``.solu`` snapshot is a local
 artifact that does not exist in CI, so a script keyed to it measures nothing there
 and says nothing about it.
+
+This is the accessor those copies should collapse into, but **no existing script has
+been migrated yet** — today this is the 18th reader, not a replacement for the other
+17. Migrating them is follow-up work; new panels should start here.
 
 This module resolves an instance name against every source the repo actually has,
 in decreasing order of authority:
@@ -24,8 +28,13 @@ scores the full corpus (tln4/5/6 included) from the upstream ``.solu``; in CI it
 still scores the vendored instances instead of degrading to a no-op.
 
 Sense: every value is stored in the instance's own sense, exactly as the source
-records it. The ``.nl`` reader normalizes MINLPLib instances to MINIMIZE, so for
-those the value is directly a lower-bound oracle.
+records it, and **this module does not record which sense that is**. The ``.nl``
+reader does *not* normalize to MINIMIZE — 5 of the vendored instances (``syn05m``,
+``syn05hfsg``, ``bchoco06/07/08``) load as MAXIMIZE — so a caller must obtain the
+sense from the model, never assume it. Assuming ``"min"`` against a maximize
+instance makes ``primal_quality.is_false_primal`` report a perfectly sound incumbent
+as a correctness violation; the scoring helpers therefore require an explicit sense
+and raise instead of defaulting.
 """
 
 from __future__ import annotations
@@ -111,7 +120,11 @@ def _parse_cert_optima(path: Path) -> dict[str, Oracle]:
 
 @lru_cache(maxsize=1)
 def oracle_table() -> dict[str, Oracle]:
-    """Merged oracle map, highest-authority source last-wins per name."""
+    """Merged oracle map, highest-authority source last-wins per name.
+
+    Cached, so ``$DISCOPT_MINLPLIB_SOLU`` is read once per process. A test or tool
+    that changes it mid-process must call ``oracle_table.cache_clear()``.
+    """
     table: dict[str, Oracle] = {}
     if _CERT_OPTIMA_JSON.is_file():
         table.update(_parse_cert_optima(_CERT_OPTIMA_JSON))

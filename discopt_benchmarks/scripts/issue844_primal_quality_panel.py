@@ -100,13 +100,19 @@ except Exception as exc:
 
 
 def _in_scope(path: str) -> bool:
-    """Is this a model the LP-node engine serves (pure integer, minimize)?"""
+    """Is this a model the LP-node engine serves (pure integer, minimize)?
+
+    A model that fails to load is *reported*, not silently dropped: a swallowed
+    exception here would quietly shrink the corpus and make the panel look clean
+    because it measured less (CLAUDE.md §3, and the #864 sweep of silent swallows).
+    """
     try:
         from discopt._jax.lp_spatial_bb import _is_in_scope
         from discopt.modeling.core import from_nl
 
         return bool(_is_in_scope(from_nl(path)))
-    except Exception:
+    except Exception as exc:
+        print(f"  !! could not classify {Path(path).stem}: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -126,13 +132,16 @@ def _run(path: str, flag: str, time_limit: float) -> dict:
     return {"error": "no_result", "stderr": proc.stderr[-300:]}
 
 
-def _row(name: str, res: dict, optimum: float | None) -> dict:
+def _row(name: str, res: dict, optimum: float | None, sense: str = "min") -> dict:
     obj = res.get("objective")
     return {
         "name": name,
         "objective": obj,
         "optimum": optimum,
-        "sense": "min",
+        # ``_is_in_scope`` admits MINIMIZE only, so this is "min" by construction --
+        # but it is threaded as a parameter rather than hardcoded at the use site so
+        # widening that scope cannot silently leave a maximize row labelled "min".
+        "sense": sense,
         "bound": res.get("bound"),
         "status": res.get("status"),
         "gap_certified": res.get("gap_certified"),
@@ -141,7 +150,7 @@ def _row(name: str, res: dict, optimum: float | None) -> dict:
         "incumbent_verification_failed": res.get("incumbent_verification_failed"),
         "error": res.get("error"),
         "primal_gap": primal_gap(obj, optimum),
-        "relative_excess": relative_excess(obj, optimum, "min"),
+        "relative_excess": relative_excess(obj, optimum, sense),
     }
 
 
@@ -214,7 +223,13 @@ def main() -> int:
             lost += 1
         if a["gap_certified"] and not b["gap_certified"]:
             cert_regressions += 1
-        if (b["wall"] or 0.0) > args.time_limit * 1.25:
+        if b["error"] == "harness_timeout":
+            # By definition this row blew the budget: the harness killed it at
+            # time_limit+180. ``wall`` is None here, and ``wall or 0.0`` would have
+            # scored the worst possible overrun as 0.0 s and passed the gate.
+            overshoots += 1
+            print(f"  OVERSHOOT {b['name']}: harness_timeout (>{args.time_limit + 180:.0f}s)")
+        elif (b["wall"] or 0.0) > args.time_limit * 1.25:
             overshoots += 1
             print(f"  OVERSHOOT {b['name']}: {b['wall']:.1f}s vs {args.time_limit}s")
         if b["incumbent_verification_failed"]:
@@ -227,7 +242,7 @@ def main() -> int:
         ):
             unsound += 1
             print(f"  UNSOUND {b['name']}: bound {b['bound']} > incumbent {b['objective']}")
-        if is_false_primal(b["objective"], b["optimum"], "min"):
+        if is_false_primal(b["objective"], b["optimum"], b["sense"]):
             false_primals += 1
             print(f"  FALSE PRIMAL {b['name']}: {b['objective']} < reference {b['optimum']}")
         if (
@@ -248,6 +263,14 @@ def main() -> int:
     # demanding it everywhere fails a corpus the fallback correctly never engages on,
     # and dropping it silently would weaken the gate to a tautology. So it is applied
     # exactly when it can be met, and its applicability is reported either way.
+    # An errored run has no objective, which the gains/lost logic above reads as
+    # "no incumbent" -- so an OFF-arm crash silently scores as a GAIN and suppresses
+    # quality-regression detection for that instance. Errors are a broken
+    # measurement, not a result: surface them and fail the gate.
+    errored = [r for r in off_rows + on_rows if r["error"]]
+    for r in errored:
+        print(f"  ERROR {r['name']}: {r['error']}")
+
     no_incumbent_off = sum(1 for a in off_rows if a["objective"] is None)
     net_positive_applies = no_incumbent_off > 0
     net_positive_ok = gains > 0 if net_positive_applies else True
@@ -267,7 +290,7 @@ def main() -> int:
         )
     )
     gate_ok = net_positive_ok and lost == 0 and cert_regressions == 0 and overshoots == 0
-    gate_ok = gate_ok and unsound == 0 and false_primals == 0
+    gate_ok = gate_ok and unsound == 0 and false_primals == 0 and not errored
 
     print("\n=== #862 incumbent quality ===")
     for label, q in (("OFF", q_off), ("ON", q_on)):
@@ -301,7 +324,18 @@ def main() -> int:
                 f"pgap={r['primal_gap']:.4f} excess={exc}"
             )
 
-    quality_ok = not regressions
+    # Vacuity guard. ``not regressions`` is trivially True on a corpus where nothing
+    # could be scored (no oracles, or no incumbents), so without this a --gate-quality
+    # run could pass having measured NOTHING -- the exact "no measurement reads as no
+    # problem" failure this panel exists to prevent. Scoring nothing is an unmeasured
+    # verdict, not a clean one.
+    quality_measured = q_on.scored > 0
+    quality_ok = quality_measured and not regressions
+    if not quality_measured:
+        print(
+            "  !! QUALITY UNMEASURED: 0 instances scored "
+            f"({q_on.unscored} unscored) -- no oracle or no incumbent anywhere"
+        )
     ok = gate_ok and (quality_ok or not args.gate_quality)
     print(f"\n  GATE OK: {gate_ok}   QUALITY CLEAN: {quality_ok}   PANEL OK: {ok}")
 

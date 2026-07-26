@@ -27,14 +27,32 @@ from utils.reference_optima import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture
+def vendored_only(monkeypatch, tmp_path):
+    """Force the CI configuration: no .solu snapshot reachable.
+
+    ``oracle_table`` is ``lru_cache``d, so pointing the env var elsewhere is not
+    enough -- the cache has to be cleared on the way in AND on the way out, or this
+    test resolves through a real snapshot on a machine that has one (and poisons the
+    cache for every test after it).
+    """
+    monkeypatch.setenv("DISCOPT_MINLPLIB_SOLU", str(tmp_path / "absent.solu"))
+    oracle_table.cache_clear()
+    yield
+    oracle_table.cache_clear()
+
+
 class TestVendoredSources:
-    def test_resolves_without_a_solu_snapshot(self):
+    def test_resolves_without_a_solu_snapshot(self, vendored_only):
         # The CI configuration: no .solu on disk, oracles still available.
+        from utils.reference_optima import solu_path
+
+        assert solu_path() is None, "fixture failed to neutralise the snapshot"
         assert reference_optimum("nvs17") == pytest.approx(-1100.4)
         assert reference_optimum("nvs19") == pytest.approx(-1098.4)
         assert reference_optimum("nvs24") == pytest.approx(-1033.2)
 
-    def test_covers_the_lp_node_engine_scope_added_for_862(self):
+    def test_covers_the_lp_node_engine_scope_added_for_862(self, vendored_only):
         for name in ("nvs03", "nvs10", "nvs11", "nvs12", "nvs15", "st_miqp1", "st_testgr3"):
             assert reference_optimum(name) is not None, name
 
@@ -99,7 +117,7 @@ class TestRegistryIntegrity:
             assert entry.get("source"), f"{name}: missing source"
             assert entry.get("status"), f"{name}: missing status"
 
-    def test_registry_agrees_with_the_legacy_in_repo_constants(self):
+    def test_registry_agrees_with_the_legacy_in_repo_constants(self, vendored_only):
         """Cross-check against the tables the values were consolidated from, so a
         divergence shows up as a test failure rather than two disagreeing oracles."""
         legacy = {

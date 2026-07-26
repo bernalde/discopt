@@ -47,6 +47,26 @@ if TYPE_CHECKING:
 # reference optimum of exactly zero -- see ``primal_gap``.
 _ABS_TOL = 1e-6
 
+_SENSES = ("min", "max")
+
+
+def _check_sense(sense: str) -> str:
+    """Validate an objective sense, raising rather than assuming.
+
+    ``sense`` used to default to ``"min"``. That default was unsafe: the ``.nl``
+    reader does NOT normalize to MINIMIZE (5 of the vendored instances --
+    ``syn05m``, ``syn05hfsg``, ``bchoco06/07/08`` -- load as MAXIMIZE), so a
+    maximize row reaching :func:`is_false_primal` with an assumed ``"min"`` would
+    report a perfectly sound incumbent as a **correctness violation**, and
+    :func:`relative_excess` would report a 10%-worse incumbent as *better than
+    optimal*. A silently wrong metric is worse than no metric, because it launders
+    regressions as passes. So the sense is required and an unrecognised value is a
+    loud error, never a guess.
+    """
+    if sense not in _SENSES:
+        raise ValueError(f"sense must be one of {_SENSES}, got {sense!r}")
+    return sense
+
 
 def primal_gap(
     objective: float | None, optimum: float | None, atol: float = _ABS_TOL
@@ -94,9 +114,7 @@ def primal_gap(
     return abs(p - o) / max(abs(p), abs(o))
 
 
-def relative_excess(
-    objective: float | None, optimum: float | None, sense: str = "min"
-) -> float | None:
+def relative_excess(objective: float | None, optimum: float | None, sense: str) -> float | None:
     """Signed fractional excess of an incumbent over the reference optimum.
 
     ``+3.27`` means "227% worse than optimal" in the issue's phrasing — this is the
@@ -105,6 +123,7 @@ def relative_excess(
     Returns ``None`` when unscoreable, including at ``optimum == 0`` where the ratio
     is undefined; use :func:`primal_gap` for anything that has to aggregate.
     """
+    _check_sense(sense)
     if objective is None or optimum is None:
         return None
     p, o = float(objective), float(optimum)
@@ -117,7 +136,7 @@ def relative_excess(
 def is_false_primal(
     objective: float | None,
     optimum: float | None,
-    sense: str = "min",
+    sense: str,
     tol: float = 1e-4,
 ) -> bool:
     """True when an incumbent beats the reference optimum — a soundness failure.
@@ -127,6 +146,7 @@ def is_false_primal(
     wrong). This is a hard gate with zero slack beyond numerical tolerance; it is
     never a quality question.
     """
+    _check_sense(sense)
     if objective is None or optimum is None:
         return False
     p, o = float(objective), float(optimum)
@@ -168,13 +188,25 @@ class QualitySummary:
 
 
 def summarize(rows: Iterable[dict], sense_key: str = "sense") -> QualitySummary:
-    """Aggregate ``{"name", "objective", "optimum"[, "sense"]}`` rows.
+    """Aggregate ``{"name", "objective", "optimum", "sense"}`` rows.
 
-    Instances with no incumbent are *not* folded in as gap 1.0: "found nothing" and
-    "found something poor" are different failures with different fixes, and averaging
-    them together would let a change that trades incumbents for quality (or the
-    reverse) look neutral. They are counted in ``unscored`` / ``with_incumbent``
-    instead.
+    Every row must carry ``sense_key``; a missing sense raises rather than being
+    assumed to be ``"min"`` (see :func:`_check_sense` for why that default was
+    unsafe).
+
+    Two classes of row are counted but deliberately kept out of the gap statistics:
+
+    * **No incumbent / no oracle.** "Found nothing" and "found something poor" are
+      different failures with different fixes, and averaging them together would let
+      a change that trades incumbents for quality (or the reverse) look neutral.
+      They land in ``unscored`` / ``with_incumbent``.
+    * **False primals.** An incumbent that beats the reference optimum is not a
+      measurement of quality, it is a corruption of one — and because
+      :func:`primal_gap` is symmetric, it scores a false primal as *better* than an
+      honest incumbent the same distance away (min, opt 10: honest 12 -> 0.167;
+      false 9 -> 0.100). Folding that into ``mean_gap`` would let a soundness
+      failure read as a quality improvement. It is counted in ``false_primals``,
+      which the panel gates on separately, and excluded from the aggregate.
     """
     gaps: list[float] = []
     worst_gap: float | None = None
@@ -183,10 +215,18 @@ def summarize(rows: Iterable[dict], sense_key: str = "sense") -> QualitySummary:
     for row in rows:
         obj = row.get("objective")
         opt = row.get("optimum")
+        if sense_key not in row:
+            raise KeyError(
+                f"row {row.get('name')!r} has no {sense_key!r}; the objective sense is "
+                "required (assuming 'min' can manufacture a false soundness violation)"
+            )
+        sense = _check_sense(row[sense_key])
         if obj is not None:
             with_incumbent += 1
-        if is_false_primal(obj, opt, row.get(sense_key, "min")):
+        if is_false_primal(obj, opt, sense):
             false_primals += 1
+            unscored += 1
+            continue
         g = primal_gap(obj, opt)
         if g is None:
             unscored += 1

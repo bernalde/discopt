@@ -61,6 +61,16 @@ measurement first, and tightening a graduation bar on the same commit that first
 measures the thing would retroactively fail a flag graduated honestly under the bar
 of its day. `--gate-quality` opts into failing on quality regressions.
 
+**What `--gate-quality` does NOT protect against, stated plainly.** It is a
+*differential* bar: it fires when an instance's primal gap gets worse ON vs OFF. It
+therefore cannot fire on the case #862 was actually filed about — tln6 at +327% is a
+gain from *no incumbent* OFF, and gaining a bad incumbent from nothing is by
+construction never a regression. (A live tln run reported `QUALITY CLEAN: True` on an
+ON arm returning tln6 at +541%.) Absolute quality is *reported* — `worst_gap`,
+`relative_excess`, and the "worst incumbents ON" list — but nothing gates on it.
+Anyone wiring this to a graduation bar must add an absolute-quality threshold; the
+differential alone is not enough.
+
 ### First run (vendored corpus, 20 s, `results/issue862/quality_panel_vendored_20s.json`)
 
 | arm | incumbents | scored | unscored | mean gap | median | worst |
@@ -70,8 +80,8 @@ of its day. `--gate-quality` opts into failing on quality regressions.
 
 No quality regressions ON vs OFF. Incumbent quality on this corpus is **not** the
 problem — 19 of 20 scored instances are at gap 0 and the worst is 7.3e-4. The
-tln-scale gaps in the issue's table are not reproducible here; that needs the
-MINLPLib snapshot (§2).
+tln-scale gaps in the issue's table need the MINLPLib snapshot to reach (§2); they
+have since been confirmed present through the oracle chain during review.
 
 **The run did surface two things the 8-instance #844 case list could not**, both
 caught by the *existing* gate rather than the new axis:
@@ -95,11 +105,18 @@ front.
 
 ## 2. Entry experiment: the class reproduces, on a different instance
 
-> **Constraint on this work.** `tln4/5/6` are not vendored, and `minlplib.org` is
-> policy-blocked from this environment, so the issue's own instances could not be
-> re-run. Everything below is measured on the vendored pure-integer MINIMIZE corpus
-> (24 in-scope instances), under the exact fallback configuration
-> (`use_obbt=False`, `require_incremental=True`, bounded budget).
+> **Where these numbers come from.** `tln4/5/6` are not vendored and `minlplib.org`
+> is policy-blocked from the container this section was measured in, so everything
+> below is measured on the vendored pure-integer MINIMIZE corpus (24 in-scope
+> instances) under the exact fallback configuration (`use_obbt=False`,
+> `require_incremental=True`, bounded budget). This is a limitation of *that
+> environment only* — on a machine with the MINLPLib snapshot at the CLAUDE.md path
+> the panel reaches tln4/5/6 directly (§6), and review of this change did exactly
+> that: the metric reproduces the issue's table through the real `.solu` chain
+> (tln4 +12.05%, tln5 +212.6%, tln6 +326.8% against the issue's +12 / +213 / +327),
+> and an end-to-end `--instances tln4,tln5,tln6,nvs17` run scored 4/4 with tln6
+> correctly worst. So the tln-scale gaps **are** real and the metric does catch
+> them; what remains unmeasured here is a full tln fallback panel, not the metric.
 
 At a 10 s budget the engine splits cleanly into three groups:
 

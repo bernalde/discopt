@@ -88,9 +88,9 @@ class TestPrimalGap:
 
 class TestRelativeExcess:
     def test_reproduces_the_percentages_quoted_in_the_issue(self):
-        assert relative_excess(9.3, 8.3) == pytest.approx(0.1205, abs=1e-4)  # +12%
-        assert relative_excess(32.2, 10.3) == pytest.approx(2.1262, abs=1e-4)  # +213%
-        assert relative_excess(65.3, 15.3) == pytest.approx(3.2680, abs=1e-4)  # +327%
+        assert relative_excess(9.3, 8.3, "min") == pytest.approx(0.1205, abs=1e-4)  # +12%
+        assert relative_excess(32.2, 10.3, "min") == pytest.approx(2.1262, abs=1e-4)  # +213%
+        assert relative_excess(65.3, 15.3, "min") == pytest.approx(3.2680, abs=1e-4)  # +327%
 
     def test_positive_always_means_worse_for_either_sense(self):
         assert relative_excess(12.0, 10.0, "min") > 0
@@ -99,7 +99,7 @@ class TestRelativeExcess:
         assert relative_excess(12.0, 10.0, "max") < 0
 
     def test_undefined_at_zero_optimum(self):
-        assert relative_excess(1.0, 0.0) is None
+        assert relative_excess(1.0, 0.0, "min") is None
 
 
 class TestFalsePrimal:
@@ -119,13 +119,40 @@ class TestFalsePrimal:
         assert not is_false_primal(-1200.0, None, "min")
 
 
+class TestSenseIsRequired:
+    """The review's blocking finding: ``sense`` used to default to ``"min"``, and the
+    .nl reader does NOT normalize to MINIMIZE (syn05m, syn05hfsg, bchoco06/07/08 all
+    load as MAXIMIZE). A wrong sense manufactures a correctness violation, so it must
+    raise rather than guess."""
+
+    def test_unrecognised_sense_raises(self):
+        with pytest.raises(ValueError, match="sense must be one of"):
+            is_false_primal(1.0, 2.0, "minimize")
+        with pytest.raises(ValueError, match="sense must be one of"):
+            relative_excess(1.0, 2.0, "MIN")
+
+    def test_summarize_requires_a_sense_on_every_row(self):
+        with pytest.raises(KeyError, match="objective sense is required"):
+            summarize([{"name": "a", "objective": 9.3, "optimum": 8.3}])
+
+    def test_a_sound_maximize_incumbent_is_not_a_false_primal(self):
+        # Assuming "min" here would flag a perfectly sound incumbent as unsound.
+        assert not is_false_primal(0.9 * 5685067.877, 5685067.877, "max")
+        assert is_false_primal(0.9 * 5685067.877, 5685067.877, "min")
+
+    def test_a_worse_maximize_incumbent_reports_as_worse_not_better(self):
+        # Under an assumed "min" this reported -0.100 -- "better than optimal".
+        assert relative_excess(9.0, 10.0, "max") == pytest.approx(0.1)
+        assert relative_excess(9.0, 10.0, "min") == pytest.approx(-0.1)
+
+
 class TestSummarize:
     def test_counts_unscored_separately_from_scored(self):
         s = summarize(
             [
-                {"name": "a", "objective": 9.3, "optimum": 8.3},
-                {"name": "b", "objective": None, "optimum": 15.3},  # no incumbent
-                {"name": "c", "objective": 4.0, "optimum": None},  # no oracle
+                {"name": "a", "objective": 9.3, "optimum": 8.3, "sense": "min"},
+                {"name": "b", "objective": None, "optimum": 15.3, "sense": "min"},  # no incumbent
+                {"name": "c", "objective": 4.0, "optimum": None, "sense": "min"},  # no oracle
             ]
         )
         assert (s.scored, s.unscored, s.with_incumbent) == (1, 2, 2)
@@ -134,8 +161,8 @@ class TestSummarize:
         # Otherwise a change trading incumbents for quality would look neutral.
         with_none = summarize(
             [
-                {"name": "a", "objective": 10.0, "optimum": 10.0},
-                {"name": "b", "objective": None, "optimum": 1.0},
+                {"name": "a", "objective": 10.0, "optimum": 10.0, "sense": "min"},
+                {"name": "b", "objective": None, "optimum": 1.0, "sense": "min"},
             ]
         )
         assert with_none.mean_gap == 0.0
@@ -144,20 +171,53 @@ class TestSummarize:
     def test_reports_the_worst_instance_by_name(self):
         s = summarize(
             [
-                {"name": "tln4", "objective": 9.3, "optimum": 8.3},
-                {"name": "tln6", "objective": 65.3, "optimum": 15.3},
+                {"name": "tln4", "objective": 9.3, "optimum": 8.3, "sense": "min"},
+                {"name": "tln6", "objective": 65.3, "optimum": 15.3, "sense": "min"},
             ]
         )
         assert s.worst_instance == "tln6"
         assert s.worst_gap == pytest.approx(50.0 / 65.3)
 
     def test_false_primals_are_counted_not_averaged_away(self):
-        s = summarize([{"name": "x", "objective": -1200.0, "optimum": -1100.4}])
+        """primal_gap is symmetric, so a false primal scores as *better* than an
+        honest incumbent the same distance away (min, opt 10: honest 12 -> 0.167,
+        false 9 -> 0.100). Folding it into mean_gap would let a soundness failure
+        read as a quality improvement, so it is counted and excluded."""
+        s = summarize([{"name": "x", "objective": -1200.0, "optimum": -1100.4, "sense": "min"}])
         assert s.false_primals == 1
+        assert s.scored == 0
+        assert s.mean_gap is None  # not averaged in
+        assert s.unscored == 1
+
+    def test_a_false_primal_does_not_improve_a_corpus_mean(self):
+        honest = summarize([{"name": "a", "objective": 12.0, "optimum": 10.0, "sense": "min"}])
+        with_false = summarize(
+            [
+                {"name": "a", "objective": 12.0, "optimum": 10.0, "sense": "min"},
+                {"name": "b", "objective": 9.0, "optimum": 10.0, "sense": "min"},
+            ]
+        )
+        assert with_false.false_primals == 1
+        assert with_false.mean_gap == pytest.approx(honest.mean_gap)
 
     def test_empty_corpus_yields_no_statistics_rather_than_zeros(self):
         s = summarize([])
         assert s.mean_gap is None and s.worst_gap is None and s.scored == 0
+
+    def test_a_corpus_with_no_oracles_scores_nothing(self):
+        """The precondition the panel's vacuity guard keys on. Without a
+        ``scored > 0`` check, ``not regressions`` is trivially True over a corpus
+        where nothing could be scored -- a --gate-quality run would pass having
+        measured NOTHING, which is the exact failure this panel exists to prevent."""
+        s = summarize(
+            [
+                {"name": f"i{i}", "objective": 1e6 * i, "optimum": None, "sense": "min"}
+                for i in range(30)
+            ]
+        )
+        assert s.scored == 0
+        assert s.unscored == 30
+        assert s.with_incumbent == 30
 
 
 class TestQualityRegressions:
