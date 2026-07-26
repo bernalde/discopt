@@ -554,5 +554,449 @@
    "nodes": 7,
    "ivf": false
   }
+ },
+ "heatexch_gen3": {
+  "name": "heatexch_gen3",
+  "off": {
+   "wall": 23.09042831400029,
+   "status": "time_limit",
+   "obj": null,
+   "bound": null,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  },
+  "on": {
+   "wall": 17.27911373200004,
+   "status": "time_limit",
+   "obj": null,
+   "bound": null,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  }
+ },
+ "m3": {
+  "name": "m3",
+  "off": {
+   "wall": 8.065178269000171,
+   "status": "optimal",
+   "obj": 37.799999669978845,
+   "bound": 37.79999951039202,
+   "gapc": true,
+   "nodes": 47,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 37.799999669978845
+  },
+  "on": {
+   "wall": 7.562382453999817,
+   "status": "optimal",
+   "obj": 37.799999669978845,
+   "bound": 37.79999951039202,
+   "gapc": true,
+   "nodes": 47,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 37.799999669978845
+  }
+ },
+ "nvs01": {
+  "name": "nvs01",
+  "off": {
+   "wall": 1.628890341999977,
+   "status": "optimal",
+   "obj": 12.46966882156821,
+   "bound": 12.46966882156821,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 12.46966882156821
+  },
+  "on": {
+   "wall": 1.5044494610001493,
+   "status": "optimal",
+   "obj": 12.46966882156821,
+   "bound": 12.46966882156821,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 12.46966882156821
+  }
+ },
+ "nvs02": {
+  "name": "nvs02",
+  "off": {
+   "wall": 0.3426850280002327,
+   "status": "optimal",
+   "obj": 5.96418452307,
+   "bound": 5.96418452307,
+   "gapc": true,
+   "nodes": 337,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 5.96418452307
+  },
+  "on": {
+   "wall": 0.3804011430001992,
+   "status": "optimal",
+   "obj": 5.96418452307,
+   "bound": 5.96418452307,
+   "gapc": true,
+   "nodes": 337,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 5.96418452307
+  }
+ },
+ "nvs05": {
+  "name": "nvs05",
+  "off": {
+   "wall": 20.089912812999955,
+   "status": "feasible",
+   "obj": 8.731956986640078,
+   "bound": 3.5424692441047068,
+   "gapc": false,
+   "nodes": 41,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 8.731956986640078
+  },
+  "on": {
+   "wall": 13.134198775999721,
+   "status": "feasible",
+   "obj": 8.731956986640078,
+   "bound": 3.5139117087764977,
+   "gapc": false,
+   "nodes": 25,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 8.731956986640078
+  }
+ },
+ "nvs08": {
+  "name": "nvs08",
+  "off": {
+   "wall": 1.3908734560000084,
+   "status": "optimal",
+   "obj": 23.449727347139827,
+   "bound": 23.44972734516655,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 23.449727347139827
+  },
+  "on": {
+   "wall": 1.1638891720003812,
+   "status": "optimal",
+   "obj": 23.449727347139827,
+   "bound": 23.44972734516655,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 23.449727347139827
+  }
+ },
+ "nvs14": {
+  "name": "nvs14",
+  "off": {
+   "wall": 0.7299275679997663,
+   "status": "optimal",
+   "obj": -40358.15476929996,
+   "bound": -40358.15476929999,
+   "gapc": true,
+   "nodes": 223,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -40358.1547693
+  },
+  "on": {
+   "wall": 0.7619844540004124,
+   "status": "optimal",
+   "obj": -40358.15476929996,
+   "bound": -40358.15476929999,
+   "gapc": true,
+   "nodes": 223,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -40358.1547693
+  }
+ },
+ "nvs21": {
+  "name": "nvs21",
+  "off": {
+   "wall": 6.492603726000198,
+   "status": "optimal",
+   "obj": -5.684782628025259,
+   "bound": -5.684782628025259,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -5.684782628025259
+  },
+  "on": {
+   "wall": 6.7868782960003955,
+   "status": "optimal",
+   "obj": -5.684782628025259,
+   "bound": -5.684782628025259,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -5.684782628025259
+  }
+ },
+ "oaer": {
+  "name": "oaer",
+  "off": {
+   "wall": 1.026705151999522,
+   "status": "optimal",
+   "obj": -1.923098499884843,
+   "bound": -1.923098601139822,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -1.92309850098788
+  },
+  "on": {
+   "wall": 0.9039749130006385,
+   "status": "optimal",
+   "obj": -1.923098499884843,
+   "bound": -1.923098601139822,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -1.92309850098788
+  }
+ },
+ "st_e13": {
+  "name": "st_e13",
+  "off": {
+   "wall": 0.3293718949998947,
+   "status": "optimal",
+   "obj": 2.0000003463351197,
+   "bound": 1.9999999825187809,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.0000003463351197
+  },
+  "on": {
+   "wall": 0.25525427699994907,
+   "status": "optimal",
+   "obj": 2.0000003463351197,
+   "bound": 1.9999999825187809,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.0000003463351197
+  }
+ },
+ "st_e29": {
+  "name": "st_e29",
+  "off": {
+   "wall": 3.7670972200003234,
+   "status": "optimal",
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000166,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -0.9434704942820806
+  },
+  "on": {
+   "wall": 2.7177147920001516,
+   "status": "optimal",
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000166,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -0.9434704942820806
+  }
+ },
+ "st_e36": {
+  "name": "st_e36",
+  "off": {
+   "wall": 9.377294026000527,
+   "status": "optimal",
+   "obj": -245.99999999999997,
+   "bound": -246.00000000170422,
+   "gapc": true,
+   "nodes": 85,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -245.99999999999997
+  },
+  "on": {
+   "wall": 8.206686686000467,
+   "status": "optimal",
+   "obj": -245.99999999999997,
+   "bound": -246.00000000170422,
+   "gapc": true,
+   "nodes": 85,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -245.99999999999997
+  }
+ },
+ "st_e38": {
+  "name": "st_e38",
+  "off": {
+   "wall": 1.6315893389992198,
+   "status": "optimal",
+   "obj": 7197.727116826533,
+   "bound": 7197.727116826533,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 7197.727116826534
+  },
+  "on": {
+   "wall": 1.4941501829998742,
+   "status": "optimal",
+   "obj": 7197.727116826533,
+   "bound": 7197.727116826533,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 7197.727116826534
+  }
+ },
+ "st_miqp4": {
+  "name": "st_miqp4",
+  "off": {
+   "wall": 0.028630167999835976,
+   "status": "optimal",
+   "obj": -4574.000004423649,
+   "bound": -4574.000004423649,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -4574.0000044236485
+  },
+  "on": {
+   "wall": 0.026895776999481313,
+   "status": "optimal",
+   "obj": -4574.000004423649,
+   "bound": -4574.000004423649,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -4574.0000044236485
+  }
+ },
+ "st_miqp5": {
+  "name": "st_miqp5",
+  "off": {
+   "wall": 0.03180315099962172,
+   "status": "optimal",
+   "obj": -333.8888902720728,
+   "bound": -333.8888902720728,
+   "gapc": true,
+   "nodes": 1,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -333.88889027207284
+  },
+  "on": {
+   "wall": 0.028467226000429946,
+   "status": "optimal",
+   "obj": -333.8888902720728,
+   "bound": -333.8888902720728,
+   "gapc": true,
+   "nodes": 1,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -333.88889027207284
+  }
+ },
+ "syn05hfsg": {
+  "name": "syn05hfsg",
+  "off": {
+   "wall": 14.53700275600022,
+   "status": "optimal",
+   "obj": 837.732412391107,
+   "bound": 837.732412391107,
+   "gapc": true,
+   "nodes": 185,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 837.7324125099896
+  },
+  "on": {
+   "wall": 12.212029635999897,
+   "status": "optimal",
+   "obj": 837.732412391107,
+   "bound": 837.732412391107,
+   "gapc": true,
+   "nodes": 185,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 837.7324125099896
+  }
+ },
+ "tanksize": {
+  "name": "tanksize",
+  "off": {
+   "wall": 20.26072421399931,
+   "status": "feasible",
+   "obj": 1.2686437852381225,
+   "bound": 0.8716343114421118,
+   "gapc": false,
+   "nodes": 35,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 1.2686437852381225
+  },
+  "on": {
+   "wall": 13.62224176899963,
+   "status": "feasible",
+   "obj": 1.2686437852381225,
+   "bound": 0.8528765311589279,
+   "gapc": false,
+   "nodes": 19,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 1.2686437852381225
+  }
+ },
+ "tls2": {
+  "name": "tls2",
+  "off": {
+   "wall": 20.072858062000705,
+   "status": "feasible",
+   "obj": 11.299999856725538,
+   "bound": 2.0999999901667694,
+   "gapc": false,
+   "nodes": 317,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 11.3
+  },
+  "on": {
+   "wall": 13.583608351000294,
+   "status": "time_limit",
+   "obj": null,
+   "bound": null,
+   "gapc": false,
+   "nodes": 95,
+   "ivf": false
+  }
  }
 }
