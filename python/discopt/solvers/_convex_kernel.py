@@ -26,6 +26,34 @@ Routing an unproven-convex model would give an unsound (too-tight) dual bound an
 a possible false ``optimal`` — so the gate is conservative by construction: any
 unrecognized function, non-affine argument, bilinear term, or wrong-curvature
 term makes the whole model fall back.
+
+## Perspective terms (#865)
+
+Hull-reformulated (``*hfsg``) models — ``syn*hfsg``, ``rsyn*hfsg``, and the rest of
+the smoothed-hull family — write their disjunctive nonlinearities as the
+**perspective** ``s·f(a/s)``, e.g. ``syn05hfsg``'s
+
+    (x2/ε − log(x0/ε + 1)) · ε ≤ 0 ,    ε = 0.001 + 0.999·y ,  y binary
+
+which distributes to ``x2 − ε·log(x0/ε + 1) ≤ 0``. Syntactically this is a product
+of two non-constant subexpressions, so the plain gate rejected it as a "bilinear
+product"; mathematically it is nothing of the sort — the perspective of a convex
+``f`` is JOINTLY CONVEX in ``(a, s)`` on ``s > 0``, and ``a``/``s`` are affine in
+``x``, so ``s·f(a/s)`` is convex in ``x``. Admitting it is recognising convexity the
+syntactic gate missed, not loosening anything.
+
+A perspective term is accepted only when ALL of these hold (else the model falls
+back exactly as before):
+
+* the same curvature rule as a plain term — ``sign(coeff)·curvature(func) ≥ 0``;
+* ``s > 0`` PROVEN by interval arithmetic over the variable box (this is the
+  convexity precondition — the perspective is convex only on the open half-space
+  ``s > 0``; the smoothing floor ``0.001`` is exactly what makes it hold here);
+* ``a/s`` lies inside ``func``'s domain over the box, so value and tangent are
+  finite everywhere the kernel can evaluate them.
+
+Bounds enter the gate here, so an unbounded/undetermined box is a refusal, not a
+guess.
 """
 
 from __future__ import annotations
@@ -84,12 +112,19 @@ def _col_of(node, offsets: dict[int, int]) -> int:
 
 
 class _Decomp:
+    """Affine part + composite terms.
+
+    A term is ``{coeff, func, arg_aff, arg_const, sc_aff, sc_const}``. With
+    ``sc_aff is None`` it denotes ``coeff·func(arg)``; otherwise it denotes the
+    perspective ``coeff·s·func(arg/s)`` with ``s = sc_aff·x + sc_const``.
+    """
+
     __slots__ = ("aff", "const", "terms")
 
     def __init__(self):
         self.aff: dict[int, float] = {}
         self.const: float = 0.0
-        self.terms: list[dict] = []  # {coeff, func, arg_aff, arg_const}
+        self.terms: list[dict] = []
 
     def scale(self, k: float) -> _Decomp:
         self.const *= k
@@ -138,7 +173,11 @@ def _decompose(node, offsets) -> _Decomp:
                 return _decompose(node.right, offsets).scale(lc)
             if rc is not None:
                 return _decompose(node.left, offsets).scale(rc)
-            raise NotConvexKernel("bilinear product")
+            # Neither factor is constant. Before declaring it bilinear, try the
+            # PERSPECTIVE shape `s · h(·/s)` (#865): if one factor is an affine `s`
+            # and the other is built from `·/s` ratios, the product is a sum of
+            # affine terms and perspectives — convex, not bilinear.
+            return _try_perspective(node, offsets)
         if node.op == "/":
             rc = _as_const(node.right)
             if rc is not None and rc != 0.0:
@@ -153,22 +192,203 @@ def _decompose(node, offsets) -> _Decomp:
         arg = _decompose(node.args[0], offsets)
         if arg.terms:
             raise NotConvexKernel("non-affine function argument")
-        d.terms.append(
-            {"coeff": 1.0, "func": node.func_name, "arg_aff": arg.aff, "arg_const": arg.const}
-        )
+        d.terms.append(_term(1.0, node.func_name, arg.aff, arg.const))
         return d
     raise NotConvexKernel(f"node {type(node).__name__}")
 
 
-def _assert_convex_le(d: _Decomp) -> None:
-    """Every term of a `≤`-normal-form g must be convex, else raise."""
+def _term(coeff, func, arg_aff, arg_const, sc_aff=None, sc_const=0.0) -> dict:
+    return {
+        "coeff": coeff,
+        "func": func,
+        "arg_aff": arg_aff,
+        "arg_const": arg_const,
+        "sc_aff": sc_aff,
+        "sc_const": sc_const,
+    }
+
+
+# ── perspective recognition (#865) ────────────────────────────────────────────
+
+
+def _affine_of(node, offsets) -> _Decomp:
+    """Decompose `node`, requiring it to be purely affine (no composite terms)."""
+    d = _decompose(node, offsets)
+    if d.terms:
+        raise NotConvexKernel("non-affine factor")
+    return d
+
+
+def _same_affine(a: _Decomp, b: _Decomp, tol: float = 1e-12) -> bool:
+    """True iff two affine forms are the same expression (coefficient-wise)."""
+    if abs(a.const - b.const) > tol:
+        return False
+    for col in set(a.aff) | set(b.aff):
+        if abs(a.aff.get(col, 0.0) - b.aff.get(col, 0.0)) > tol:
+            return False
+    return True
+
+
+def _try_perspective(node, offsets) -> _Decomp:
+    """Decompose `L * R` as a perspective, or raise ``bilinear product``.
+
+    One factor must be an affine `s`; the other must decompose in "ratio space"
+    (every occurrence of a variable divided by that same `s`). Multiplying the
+    ratio-space form back by `s` clears every division, leaving affine terms plus
+    perspective terms — see the module docstring.
+    """
+    for scale_node, inner_node in ((node.left, node.right), (node.right, node.left)):
+        try:
+            s = _affine_of(scale_node, offsets)
+        except NotConvexKernel:
+            continue
+        if not s.aff:  # a constant `s` is the plain scaling case, handled above
+            continue
+        try:
+            return _lift_by_scale(_decompose_over(inner_node, s, offsets), s)
+        except NotConvexKernel:
+            continue
+    raise NotConvexKernel("bilinear product")
+
+
+def _decompose_over(node, s: _Decomp, offsets) -> _Decomp:
+    """Decompose `node` in *ratio space* relative to the affine scale `s`.
+
+    The returned ``_Decomp`` is read with its ``aff`` coefficients applying to the
+    ratios ``x_col / s`` rather than to ``x_col`` (``const`` and the term arguments'
+    affine parts follow the same convention). A bare variable — anything NOT under a
+    ``/ s`` — is a genuine bilinear factor and raises.
+    """
+    d = _Decomp()
+    c = _as_const(node)
+    if c is not None:
+        d.const = c
+        return d
+    if isinstance(node, UnaryOp):
+        if node.op == "neg":
+            return _decompose_over(node.operand, s, offsets).scale(-1.0)
+        raise NotConvexKernel(f"unary {node.op}")
+    if isinstance(node, BinaryOp):
+        if node.op == "+":
+            return _decompose_over(node.left, s, offsets).add(
+                _decompose_over(node.right, s, offsets)
+            )
+        if node.op == "-":
+            return _decompose_over(node.left, s, offsets).add(
+                _decompose_over(node.right, s, offsets).scale(-1.0)
+            )
+        if node.op == "*":
+            lc, rc = _as_const(node.left), _as_const(node.right)
+            if lc is not None:
+                return _decompose_over(node.right, s, offsets).scale(lc)
+            if rc is not None:
+                return _decompose_over(node.left, s, offsets).scale(rc)
+            raise NotConvexKernel("bilinear product")
+        if node.op == "/":
+            rc = _as_const(node.right)
+            if rc is not None and rc != 0.0:
+                return _decompose_over(node.left, s, offsets).scale(1.0 / rc)
+            den = _affine_of(node.right, offsets)
+            if not _same_affine(den, s):
+                raise NotConvexKernel("division by non-constant")
+            num = _affine_of(node.left, offsets)
+            # `(a·x + b)/s` would contribute `b/s`, which is not a ratio of the
+            # admitted form; only a constant-free numerator is representable.
+            if abs(num.const) > 1e-12:
+                raise NotConvexKernel("perspective numerator has a constant")
+            d.aff = dict(num.aff)
+            return d
+        raise NotConvexKernel(f"binary {node.op}")
+    if isinstance(node, FunctionCall):
+        if node.func_name not in _FUNC:
+            raise NotConvexKernel(f"unsupported func {node.func_name}")
+        if len(node.args) != 1:
+            raise NotConvexKernel(f"multi-arg func {node.func_name}")
+        arg = _decompose_over(node.args[0], s, offsets)
+        if arg.terms:
+            raise NotConvexKernel("non-affine function argument")
+        d.terms.append(_term(1.0, node.func_name, arg.aff, arg.const))
+        return d
+    # A `Variable`/`IndexExpression` reached here is NOT under a `/s`, so the
+    # product really is bilinear.
+    raise NotConvexKernel("bilinear product")
+
+
+def _lift_by_scale(r: _Decomp, s: _Decomp) -> _Decomp:
+    """Multiply a ratio-space decomposition `r` by its scale `s`.
+
+    * ``Σ k·(x_c/s) · s`` → the plain affine ``Σ k·x_c``;
+    * ``b · s`` → the affine ``b·s``;
+    * ``k·f(Σ a_j (x_j/s) + q) · s`` → the perspective ``k·s·f(A/s)`` with the
+      affine numerator ``A = Σ a_j x_j + q·s``, since ``Σ a_j x_j/s + q = A/s``.
+    """
+    d = _Decomp()
+    d.aff = dict(r.aff)
+    if r.const:
+        for col, k in s.aff.items():
+            d.aff[col] = d.aff.get(col, 0.0) + r.const * k
+        d.const += r.const * s.const
+    for t in r.terms:
+        q = t["arg_const"]
+        arg_aff = dict(t["arg_aff"])
+        for col, k in s.aff.items():
+            arg_aff[col] = arg_aff.get(col, 0.0) + q * k
+        d.terms.append(_term(t["coeff"], t["func"], arg_aff, q * s.const, dict(s.aff), s.const))
+    return d
+
+
+# Below this the perspective `s·f(a/s)` is numerically meaningless (and `1/s`
+# unusable), so a box that cannot prove `s` above it is a refusal, not a guess.
+_MIN_SCALE = 1e-9
+
+
+def _aff_interval(aff: dict[int, float], const: float, lb, ub) -> tuple[float, float]:
+    """Interval of `aff·x + const` over the box `[lb, ub]` (may be ±inf)."""
+    lo = hi = const
+    for col, k in aff.items():
+        if k == 0.0:
+            continue
+        if k > 0.0:
+            lo += k * lb[col]
+            hi += k * ub[col]
+        else:
+            lo += k * ub[col]
+            hi += k * lb[col]
+    return lo, hi
+
+
+def _assert_convex_le(d: _Decomp, lb, ub) -> None:
+    """Every term of a `≤`-normal-form g must be provably convex, else raise."""
     for t in d.terms:
         _val, curv = _FUNC[t["func"]]
         # convex iff sign(coeff)*curvature >= 0 (coeff==0 term is trivially fine).
+        # This rule is the same for a plain term and for its perspective: the
+        # perspective of a convex function is jointly convex on `s > 0`.
         if t["coeff"] * curv < -1e-15:
             raise NotConvexKernel(
                 f"nonconvex term coeff={t['coeff']:+.3g} func={t['func']} (curv={curv:+d})"
             )
+        if t["sc_aff"] is None:
+            continue
+        # `s > 0` is the perspective's convexity precondition — PROVE it on the box.
+        s_lo, _s_hi = _aff_interval(t["sc_aff"], t["sc_const"], lb, ub)
+        if not (s_lo >= _MIN_SCALE):
+            raise NotConvexKernel(f"perspective scale not provably positive (lo={s_lo:.3g})")
+        # With `s > 0`, `sign(a/s) == sign(a)`, so the domain of `f(a/s)` reduces to
+        # a condition on the numerator's interval (log1p needs `a/s > −1` ⟺ `a+s > 0`).
+        a_lo, _a_hi = _aff_interval(t["arg_aff"], t["arg_const"], lb, ub)
+        func = t["func"]
+        if func == "log" and not (a_lo > 0.0):
+            raise NotConvexKernel(f"perspective log argument not provably positive ({a_lo:.3g})")
+        if func == "sqrt" and not (a_lo >= 0.0):
+            raise NotConvexKernel(f"perspective sqrt argument not provably >= 0 ({a_lo:.3g})")
+        if func == "log1p":
+            sum_aff = dict(t["arg_aff"])
+            for col, k in t["sc_aff"].items():
+                sum_aff[col] = sum_aff.get(col, 0.0) + k
+            lo, _hi = _aff_interval(sum_aff, t["arg_const"] + t["sc_const"], lb, ub)
+            if not (lo > 0.0):
+                raise NotConvexKernel(f"perspective log1p argument out of domain ({lo:.3g})")
 
 
 def build_convex_spec(model, bounds=None) -> Optional[dict]:
@@ -251,7 +471,17 @@ def _build(model, bounds) -> dict:
         d = _decompose(expr, offsets)
         if s == ">=":  # normalize g ≥ 0 → (−g) ≤ 0
             d.scale(-1.0)
-        _assert_convex_le(d)
+        _assert_convex_le(d, lb, ub)
+        if not d.terms:
+            # The row's nonlinearity cancelled under decomposition (a perspective
+            # whose every term was a bare ratio, e.g. `ε·(x/ε) ≤ 0`). It is exactly
+            # linear now — emit it as a linear row rather than a term-less "convex"
+            # one, so the kernel sees it in its natural form.
+            a = np.zeros(n)
+            for col, k in d.aff.items():
+                a[col] = k
+            le_rows.append((a, -d.const))
+            continue
         nl_specs.append(d)
 
     return _marshal(n, c, sense_max, is_int, lb, ub, le_rows, eq_rows, nl_specs)
@@ -297,6 +527,10 @@ def _marshal(n, c, sense_max, is_int, lb, ub, le_rows, eq_rows, nl_specs) -> dic
     nl_term_ptr = [0]
     term_coeff, term_func, term_arg_const = [], [], []
     term_arg_ptr, term_arg_cols, term_arg_coeffs = [0], [], []
+    # Perspective scale per term; an empty CSR row with a zero constant marks a
+    # plain composite term (#865).
+    term_scale_const = []
+    term_scale_ptr, term_scale_cols, term_scale_coeffs = [0], [], []
     for d in nl_specs:
         lc, lk = _affine_csr(d.aff)
         nl_lin_cols.extend(lc.tolist())
@@ -312,6 +546,12 @@ def _marshal(n, c, sense_max, is_int, lb, ub, le_rows, eq_rows, nl_specs) -> dic
             term_arg_cols.extend(ac.tolist())
             term_arg_coeffs.extend(ak.tolist())
             term_arg_ptr.append(len(term_arg_cols))
+            sc_aff = t["sc_aff"] or {}
+            sc, sk = _affine_csr(sc_aff)
+            term_scale_cols.extend(sc.tolist())
+            term_scale_coeffs.extend(sk.tolist())
+            term_scale_ptr.append(len(term_scale_cols))
+            term_scale_const.append(t["sc_const"] if t["sc_aff"] is not None else 0.0)
         nl_term_ptr.append(len(term_coeff))
 
     return dict(
@@ -341,6 +581,10 @@ def _marshal(n, c, sense_max, is_int, lb, ub, le_rows, eq_rows, nl_specs) -> dic
         term_arg_ptr=np.asarray(term_arg_ptr, np.int64),
         term_arg_cols=np.asarray(term_arg_cols, np.int64),
         term_arg_coeffs=np.asarray(term_arg_coeffs, float),
+        term_scale_const=np.asarray(term_scale_const, float),
+        term_scale_ptr=np.asarray(term_scale_ptr, np.int64),
+        term_scale_cols=np.asarray(term_scale_cols, np.int64),
+        term_scale_coeffs=np.asarray(term_scale_coeffs, float),
     )
 
 
