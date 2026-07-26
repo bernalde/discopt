@@ -1,0 +1,142 @@
+{
+ "4stufen": {
+  "name": "4stufen",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 0.7608188250001149,
+   "declined": true
+  }
+ },
+ "alan": {
+  "name": "alan",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 0.08560263299978033,
+   "declined": false,
+   "status": "feasible",
+   "obj": 2.932649872536388,
+   "bound": 1.6255144032921773,
+   "gap": 0.3323803317382956,
+   "nodes": 9,
+   "x_feasible": true,
+   "x_true_obj": 2.932649872536388
+  }
+ },
+ "bchoco06": {
+  "name": "bchoco06",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 7.30185662599979,
+   "declined": true
+  }
+ },
+ "bchoco07": {
+  "name": "bchoco07",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 8.09406809400025,
+   "declined": true
+  }
+ },
+ "bchoco08": {
+  "name": "bchoco08",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 9.303226861999974,
+   "declined": true
+  }
+ },
+ "beuster": {
+  "name": "beuster",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 0.50811576399974,
+   "declined": true
+  }
+ },
+ "casctanks": {
+  "name": "casctanks",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 20.055729753999913,
+   "declined": false,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 4.93636462852202,
+   "gap": null,
+   "nodes": 2
+  }
+ },
+ "clay0303hfsg": {
+  "name": "clay0303hfsg",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 20.00754207199998,
+   "declined": false,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 1360.0,
+   "gap": null,
+   "nodes": 92
+  }
+ },
+ "contvar": {
+  "name": "contvar",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 10.468364807999933,
+   "declined": true
+  }
+ },
+ "cvxnonsep_nsig30": {
+  "name": "cvxnonsep_nsig30",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 20.008413320999807,
+   "declined": false,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 46.91331750159184,
+   "gap": null,
+   "nodes": 299
+  }
+ },
+ "cvxnonsep_psig40r": {
+  "name": "cvxnonsep_psig40r",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 0.41163393999977416,
+   "declined": false,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 40.00004,
+   "gap": null,
+   "nodes": 1
+  }
+ },
+ "ex1221": {
+  "name": "ex1221",
+  "engine": {
+   "in_scope": true,
+   "in_scope_legacy": false,
+   "wall": 0.05611375099988436,
+   "declined": false,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 7.667083704792532,
+   "gap": null,
+   "nodes": 1
+  }
+ }
+}

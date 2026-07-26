@@ -30,13 +30,14 @@ def main():
                 best_min[name] = min(best_min.get(name, math.inf), v)
                 best_max[name] = max(best_max.get(name, -math.inf), v)
 
-    # Objective sense: the engine reports a bound on the same side as the sense, so
-    # infer it from the run that has both. (The panel worker does not record it
-    # directly; ``bound <= obj`` => minimize, ``bound >= obj`` => maximize.)
-    for name, r in rows.items():
-        e = r.get("engine") or {}
-        if e.get("obj") is not None and e.get("bound") is not None:
-            sense[name] = "max" if e["bound"] > e["obj"] + TOL else "min"
+    # Objective sense per instance, read off the models themselves (precomputed by
+    # ``panel860_senses.json``). Inferring it from ``bound`` vs ``obj`` would be
+    # circular — that relation is exactly what the soundness check tests — and would
+    # silently default a bound-only maximize run to the minimize check.
+    try:
+        sense.update(json.load(open("scratchpad/panel860_senses.json")))
+    except OSError:
+        print("WARNING: no panel860_senses.json; every instance treated as minimize")
 
     unsound, false_opt, cert_reg, drift, ivf = [], [], [], [], []
     scope_new, engine_inc, engine_declined = [], [], []
