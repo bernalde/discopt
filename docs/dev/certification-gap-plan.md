@@ -1705,6 +1705,66 @@ convexity across zero.
   3. The per-family 200-box property test stands, drawing boxes from the family's
      admissible sign regime.
 
+*Re-measured and NARROWED (2026-07-26, issue #861 — the measurement wins, §0.4).*
+Re-scope item 2 above is **too broad for the even powers**. The 2026-07-02 probe was
+run against the *unflagged* `build_milp_relaxation`; the incremental structure
+compares itself against the build with `skip_separable_floor=True,
+skip_convex_lift=True`, and the sign-dependence the probe saw for `x²`/`x⁴` was
+entirely the extra separable-floor row `s ≥ 0` — a row the incremental path never
+regenerates and never sees. Under the flags the structure actually uses, the row
+count is (re-probe: `p ∈ {2,3,4}` × boxes `[-2,3]`, `[1,3]`, `[-3,-1]`):
+
+| power | spanning `[-2,3]` | positive `[1,3]` | negative `[-3,-1]` |
+|---|---|---|---|
+| `x²` | **4** | 4 | 4 |
+| `x⁴` | **4** | 4 | 4 |
+| `x³` | **2** | 4 | 4 |
+
+So the sign-regime hazard is **odd powers only**: `f'' = p(p-1)x^(p-2) ≥ 0` for even
+`p` on all of ℝ, hence one convexity, hence the same secant + 3-tangent envelope in
+every regime; an odd power is S-shaped across zero and the cold build swaps to
+`_emit_odd_power_hull`'s 2 facets — a facet-*count* change, which is what a fixed
+sparsity pattern genuinely cannot express. The gate is therefore
+`root_sign == 0 and p odd`, not `root_sign == 0`.
+
+Two generalizations were prerequisites, both now pinned by
+`python/tests/test_861_monomial_span_zero.py`:
+- **Aux enclosure.** `_monomial_aux_bounds` assumed monotonicity (endpoint
+  `min`/`max`), which on a straddling box floors `x²` at `min(l²,u²) > 0` and cuts
+  off the true point `x=0` — latent-unsound, unreachable only because of the gate.
+  It now reproduces `Interval.__pow__` exactly (exact square image for `p=2`,
+  repeated interval multiplication for `p≥3`), which is what the cold build takes
+  its aux bound from. Matching rather than tightening is the point: a tighter aux
+  bound is a *different* relaxation, and this path must be bound-neutral.
+- **Validation comparison.** `_validate`'s literal row-set equality could not
+  validate a *pinned* box (`lb==ub`, reached whenever integer branching fixes a
+  variable): the cold build emits no 1-D envelope rows at zero width while the fixed
+  pattern must fill its four reserved rows with the tangents/secant collapsed at the
+  pinned point. Those rows are exactly tight, i.e. vacuous over the box, so
+  `_rowset` now drops rows whose maximum over the column box already satisfies them.
+  Dropping a row that cannot cut the box provably leaves the polytope unchanged, so
+  the gate stays an exact polytope-identity test — it just stops requiring that two
+  identical polytopes be spelled with the same redundant rows. (This also *closes* a
+  pre-existing blind spot: the degenerate-box case was argued sound in a comment and
+  never actually validated, for sign-definite roots either.)
+
+*Measured (2026-07-26).* In-repo corpus panel (66 `.nl`, structure admission + root
+LP bound, flag OFF vs ON): **17 already-admitted instances, 0 root-bound drift, 0
+regressed to declined, 1 newly admitted (`st_miqp5`)** — which then solves to
+`-333.8888902720728`, `gap_certified=True`, `node_count=1`, incumbent independently
+feasibility-verified, identical to the pre-change result. On the ball_mk2_30 *class*
+(n integers straddling zero, one sign-mixed row, minimize) `solve_lp_spatial_bb(...,
+require_incremental=True)` went from returning `None` (n=10 and n=30) to
+`status='optimal', objective=0.0, bound=0.0, gap=0.0`. Bound-neutrality was checked
+directly: patched LP value vs the same-flag cold build over 62 (model, box) pairs on
+straddling boxes — max |Δ| `3.8e-15`, 0 drifts — and the incremental bound never
+exceeded the richer cold path.
+
+*Residual.* An **odd** power whose root box straddles zero is still declined
+(`ok=False` → the trusted cold build). Closing it needs a fixed row count across the
+2-facet/4-row switch, i.e. a change to the cold build's emission, not to the patch —
+out of scope for #861 and not worth the churn on the trusted path.
+
 > **STOP / ESCALATED (2026-07-02, §0.4 + §0.6) — Phase 1's bound-neutrality
 > premise is falsified; needs a maintainer decision before any T1.2 code lands.**
 >

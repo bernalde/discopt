@@ -236,9 +236,12 @@ def solve_lp_spatial_bb(
     McCormick structure cannot be built. Set it when the caller has a *bounded* budget
     and wants a primal: without that structure the engine has no cuts, no feasibility
     pump, and rebuilds the whole relaxation per node. Measured on ball_mk2_30 at a
-    21 s budget, where the structure legitimately declines (``monomial x_0^2: root box
-    spans zero``), the cold path spent 61 s on the *root* LP alone — 0 nodes, no
-    incumbent, 2.91x over budget. Declining costs nothing there and cannot overrun.
+    21 s budget, back when its ``x_0**2`` monomial still declined for spanning a sign
+    change, the cold path spent 61 s on the *root* LP alone — 0 nodes, no incumbent,
+    2.91x over budget. Declining costs nothing there and cannot overrun. (#861 has
+    since admitted even powers on a straddling root, so ball_mk2_30 takes the fast
+    path; an ODD power on a straddling root still declines and this guard still
+    applies to it.)
 
     ``root_cut_rounds`` enables GMI + complemented-MIR separation at the root (cuts
     inherited by all nodes). Default 0 (off): with discopt's current Python-level

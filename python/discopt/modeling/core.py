@@ -83,9 +83,12 @@ def _lp_spatial_fallback_enabled() -> bool:
     enough that a single one runs past the top-of-loop deadline poll. On tln5 at a
     21 s budget: 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) versus 13158 nodes in
     21.0 s (1.00x, slowest node 0.04 s) once the engine passes its own deadline.
-    ball_mk2_30 declines the structure for a genuine structural reason (``monomial
-    x_0^2: root box spans zero``); there the fallback now refuses to run at all
-    (``require_incremental``) rather than spend 61 s on a single root LP for nothing.
+    A model whose structure declines for a genuine structural reason — e.g. an odd
+    power over a root box straddling zero, whose envelope changes facet count across
+    the sign change — makes the fallback refuse to run at all
+    (``require_incremental``) rather than spend a whole reserve on a single root LP
+    for nothing; measured at 61 s against a 21 s reserve on ball_mk2_30 back when its
+    ``x_0**2`` monomial also declined (#861 has since admitted the even powers).
 
     **Known cost.** The incumbents are *worse* than the ones the degraded cold path
     happened to report (tln4 19.6 vs 8.7, tln5 32.8 vs 15.1) — its slower, full-
@@ -4158,12 +4161,15 @@ class Model:
                     #
                     # require_incremental=True: without the incremental McCormick
                     # structure the engine has no cuts, no feasibility pump, and
-                    # rebuilds the relaxation per node. On ball_mk2_30 — where the
-                    # structure legitimately declines (``monomial x_0^2: root box
-                    # spans zero``) — that cold path spent 61 s on the ROOT LP alone
-                    # against a 21 s reserve: 0 nodes, no incumbent, 2.91x over
-                    # budget. It cannot produce a primal inside a fallback-sized
-                    # budget, so declining costs no gain and removes the overrun.
+                    # rebuilds the relaxation per node. Measured on ball_mk2_30 while
+                    # its monomial still declined, that cold path spent 61 s on the
+                    # ROOT LP alone against a 21 s reserve: 0 nodes, no incumbent,
+                    # 2.91x over budget. It cannot produce a primal inside a
+                    # fallback-sized budget, so declining costs no gain and removes
+                    # the overrun. (ball_mk2_30 itself now MAPS — #861 narrowed the
+                    # monomial gate to odd powers on a straddling root — so it takes
+                    # the incremental path here; the reasoning stands for whatever
+                    # still declines.)
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,

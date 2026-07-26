@@ -18,9 +18,13 @@ trusted per-node builder. The incremental path can therefore never change a resu
 only its speed.
 
 Scope: the box-dependent terms it regenerates are bilinear products ``w=x_i*x_j``
-(4 McCormick rows) and integer squares ``s=x_i**2`` (2 endpoint tangents + 1
-secant, matching an empty ``DiscretizationState``). Any other lifted term (trilinear,
-univariate, fractional power, piecewise) makes validation fail -> fallback.
+(4 McCormick rows), integer powers ``s=x_i**p`` (secant + 3 tangents, matching an
+empty ``DiscretizationState``) and affine squares ``w=(c*x_j+d)**2``. A monomial is
+mapped on any box when ``p`` is even (convex on all of R) and on a sign-definite box
+when ``p`` is odd; an odd power whose ROOT box straddles zero is declined, because
+there the envelope's facet *count* changes with the node's sign regime. Any other
+lifted term (trilinear, univariate, fractional power, piecewise) makes validation
+fail -> fallback.
 """
 
 from __future__ import annotations
@@ -93,19 +97,29 @@ def _square_aux_bounds(li, ui):
 
 
 def _monomial_rows(li, ui, p):
-    """The 4 envelope rows for ``s = x**p`` over a *sign-definite* box ``[li,ui]``
-    (secant + tangents at ``li``, the midpoint, and ``ui``), each
-    ``(coeff_on_x, coeff_on_s, rhs)`` of an ``... <= rhs`` row. Generalizes
-    :func:`_square_rows` (p=2) to any integer power ``p >= 2``.
+    """The 4 envelope rows for ``s = x**p`` over ``[li,ui]`` (secant + tangents at
+    ``li``, the midpoint, and ``ui``), each ``(coeff_on_x, coeff_on_s, rhs)`` of an
+    ``... <= rhs`` row. Generalizes :func:`_square_rows` (p=2) to any integer power
+    ``p >= 2``.
 
-    On a sign-definite box ``x**p`` is monotone and single-convexity: convex when
-    ``p`` is even or ``li >= 0``; concave when ``p`` is odd and ``ui <= 0``. In the
-    convex case the three tangents underestimate and the secant overestimates; in
-    the concave case the roles flip. Matches the uniform engine's ``_emit_1d``
-    envelope exactly — which underestimates a convex atom with tangents at both
-    endpoints AND the box midpoint (a tighter, 3-tangent hull), so the closed-form
-    patch must emit the same midpoint tangent to reproduce the cold build
-    row-for-row (validated).
+    Validity domain. ``x**p`` has *single* curvature — hence a secant/tangent
+    envelope — on:
+
+    * any finite box when ``p`` is EVEN (``f'' = p(p-1)x**(p-2) >= 0`` everywhere,
+      so the atom is convex on all of R including boxes that straddle zero); or
+    * a sign-definite box when ``p`` is odd (convex for ``li >= 0``, concave for
+      ``ui <= 0``).
+
+    In the convex case the three tangents underestimate and the secant
+    overestimates; in the concave case the roles flip. On a sign-STRADDLING box with
+    ODD ``p`` the atom is S-shaped and neither branch is valid — the caller must not
+    reach here (``_build_structure`` declines that monomial; the cold build emits a
+    different, 2-facet hull there instead).
+
+    Matches the uniform engine's ``_emit_1d`` envelope exactly — which underestimates
+    a convex atom with tangents at both endpoints AND the box midpoint (a tighter,
+    3-tangent hull), so the closed-form patch must emit the same midpoint tangent to
+    reproduce the cold build row-for-row (validated).
     """
     mid = 0.5 * (li + ui)
     fl, fm, fu = li**p, mid**p, ui**p
@@ -135,9 +149,38 @@ def _monomial_rows(li, ui, p):
 
 
 def _monomial_aux_bounds(li, ui, p):
-    """min/max of ``x**p`` over a sign-definite ``[li,ui]`` (monotone there)."""
-    a, b = li**p, ui**p
-    return (a, b) if a <= b else (b, a)
+    """Enclosure of ``x**p`` over ``[li,ui]``, matching the cold build's aux column.
+
+    The cold build takes this bound from ``evaluate_interval``, i.e. from
+    ``Interval.__pow__``, so this closed form must reproduce *that* — not merely a
+    sound enclosure — or the incremental rows describe a different polytope than the
+    path they must be bound-neutral against (``_validate`` compares aux bounds too).
+    ``Interval.__pow__`` is:
+
+    * ``p == 2``: the exact square image ``[0, max(li^2,ui^2)]`` when the box
+      straddles zero, else ``[min, max]`` of the endpoint squares;
+    * ``p >= 3``: repeated interval MULTIPLICATION by ``[li,ui]`` (``p-1`` times),
+      whose corner min/max is reproduced below. That is deliberately *looser* than
+      the exact image on a straddling box (e.g. ``x**4`` over ``[-2,3]`` encloses
+      ``[-54, 81]``, not ``[0, 81]``) — matching it exactly is what keeps the fast
+      path bound-NEUTRAL. Do not "tighten" this: a tighter aux bound here is a
+      different relaxation, which is precisely what the incremental path may not be.
+
+    The old form (``min/max`` of the two endpoint powers) was correct only on a
+    sign-definite box, where ``x**p`` is monotone; it was UNSOUND on a straddling box
+    for even ``p`` (it would floor ``x**2`` at ``min(li^2,ui^2) > 0`` and cut off the
+    true point ``x=0``). That was unreachable while every monomial was gated to a
+    sign-definite root box, and is the reason the bound had to be generalized before
+    the gate could be relaxed (#861). ``test_monomial_aux_bounds_match_interval_pow``
+    pins the parity with ``Interval.__pow__`` across powers and sign regimes.
+    """
+    if p == 2:
+        return _square_aux_bounds(li, ui)
+    lo, hi = li, ui
+    for _ in range(p - 1):
+        corners = (lo * li, lo * ui, hi * li, hi * ui)
+        lo, hi = min(corners), max(corners)
+    return lo, hi
 
 
 def _affine_square_rows(coeff, const, li, ui):
@@ -248,12 +291,15 @@ class IncrementalMcCormickLP:
 
     def _build_structure(self):
         n = len(self.model._variables)
-        # Per-variable ROOT sign regime (cert:T1.2). A monomial ``x**p`` has a
-        # box-*sign*-dependent row structure (3 rows on a sign-definite box, 4/2
-        # when the box strictly spans zero), so it can be patched only when the
-        # variable's root box is sign-definite — which branching preserves, since
-        # it only shrinks boxes. ``+1`` = ``lb>=0``, ``-1`` = ``ub<=0``, ``0`` =
-        # spans zero (any monomial on such a var is unmappable below).
+        # Per-variable ROOT sign regime (cert:T1.2). ``+1`` = ``lb>=0``, ``-1`` =
+        # ``ub<=0``, ``0`` = spans zero. Branching only shrinks boxes, so a
+        # sign-definite root sign holds at every node of the subtree; a spanning root
+        # reaches BOTH regimes below it. An ODD-power monomial's envelope changes
+        # *shape* across that split — 4 secant/tangent rows on a sign-definite box vs
+        # the 2-facet S-hull on a straddling one — which a fixed sparsity pattern
+        # cannot express, so those stay unmappable (#861). An EVEN power is convex on
+        # all of R, so its envelope is the same 4 rows in every regime and it is
+        # mapped regardless of root sign.
         root_lb = np.array([float(np.min(v.lb)) for v in self.model._variables])
         root_ub = np.array([float(np.max(v.ub)) for v in self.model._variables])
         self._root_sign = np.where(root_lb >= 0.0, 1, np.where(root_ub <= 0.0, -1, 0))
@@ -326,11 +372,19 @@ class IncrementalMcCormickLP:
             if len(rows) != 4:
                 raise ValueError(f"bilinear ({i},{j}) -> {len(rows)} rows, expected 4")
             self.bilin_rows[(i, j, a)] = rows
-        # monomial x_i**p, any p >= 2, gated on a sign-definite root box.
+        # monomial x_i**p, any p >= 2. Only an ODD power needs a sign-definite root
+        # box (see the ``_root_sign`` note above); an even power is convex on all of
+        # R and keeps its 4-row envelope across a sign change, so it is admitted on a
+        # straddling root too — the case that used to decline the whole structure on
+        # sign-mixed integer QCQPs (#861).
         self.mono_rows = {}
         for (i, p), a in self.monomial.items():
-            if self._root_sign[i] == 0:
-                raise ValueError(f"monomial x_{i}^{p}: root box spans zero (unmappable)")
+            if self._root_sign[i] == 0 and p % 2 == 1:
+                raise ValueError(
+                    f"monomial x_{i}^{p}: odd power on a root box spanning zero "
+                    "(the envelope switches between the 4-row secant/tangent hull and "
+                    "the 2-facet S-hull, which the fixed row pattern cannot express)"
+                )
             rows = [int(k) for k in _rows_with_col(a) if _support(k) <= {i, a}]
             if len(rows) != 4:
                 raise ValueError(f"monomial x_{i}^{p} -> {len(rows)} rows, expected 4")
@@ -443,7 +497,7 @@ class IncrementalMcCormickLP:
     # -- soundness gate ---------------------------------------------------- #
 
     @staticmethod
-    def _rowset(A, b):
+    def _rowset(A, b, bounds=None):
         """Canonical hashable representation of the polytope's rows (order-free).
 
         Sparse-native (O(nnz), never densified): each row is the sorted tuple of its
@@ -451,13 +505,49 @@ class IncrementalMcCormickLP:
         to 0 are dropped, so an explicit structural zero (the fixed-pattern ``_patch``
         can leave a zeroed target entry) compares equal to its absence in the cold
         build — the two matrices match iff they encode the same polytope.
+
+        ``bounds`` (the ``(ncol,2)`` column box) additionally drops rows that are
+        **vacuous over that box**: ``max_{x in box} a·x <= rhs``, i.e. the row cuts
+        off nothing the bounds do not already exclude. Removing such a row provably
+        leaves the feasible set unchanged, so the comparison stays an exact
+        polytope-identity test — it just stops demanding that two identical polytopes
+        be spelled with the same redundant rows. This is what lets a *pinned* box
+        (``lb==ub``, reached whenever integer branching fixes a variable) validate:
+        the cold build emits no 1-D envelope rows at zero width (``_emit_1d`` bails
+        under ``_MIN_WIDTH``) and pins the aux via its ``[f(v),f(v)]`` bound, while
+        the fixed-pattern ``_patch`` must write *something* into its four reserved
+        rows and writes the tangents/secant collapsed at ``v`` — which are exactly
+        tight there, hence vacuous, hence dropped here. Any row that genuinely cuts
+        the box survives on both sides and a real mismatch is still caught.
         """
         M = sp.csr_matrix(A)
         M.sort_indices()
         indptr, indices, data = M.indptr, M.indices, M.data
         b = np.asarray(b, dtype=np.float64).ravel()
+        vacuous = None
+        if bounds is not None:
+            # Row maximum over the box, VECTORIZED over all nonzeros at once (this
+            # runs on the whole lift — up to ~172k nnz on qap — twice per validation
+            # box, so a per-row numpy call would re-introduce the #654 pre-B&B
+            # overrun). Each term contributes its larger endpoint product; an exact
+            # zero coefficient contributes nothing (guarding ``0 * inf -> nan`` on an
+            # unbounded column). A non-finite maximum leaves the row in place, which
+            # is the conservative direction: an undroppable row can only cause a
+            # (sound) mismatch, never a false match.
+            bnd = np.asarray(bounds, dtype=np.float64)
+            col_lo, col_hi = bnd[:, 0], bnd[:, 1]
+            contrib = np.where(
+                data == 0.0, 0.0, np.maximum(data * col_lo[indices], data * col_hi[indices])
+            )
+            row_max = np.asarray(
+                sp.csr_matrix((contrib, indices, indptr), shape=M.shape).sum(axis=1)
+            ).ravel()
+            slack = 1e-9 * (1.0 + np.abs(b) + np.abs(row_max))
+            vacuous = np.isfinite(row_max) & (row_max <= b + slack)
         out = []
         for k in range(M.shape[0]):
+            if vacuous is not None and vacuous[k]:
+                continue
             entries = tuple(
                 (int(indices[t]), rv)
                 for t in range(indptr[k], indptr[k + 1])
@@ -488,12 +578,15 @@ class IncrementalMcCormickLP:
         Every box is a *reachable* B&B sub-box of the root: branching only shrinks a
         box, so a var that is sign-definite at the root (``_root_sign != 0``) keeps
         that sign — a positive var never gets ``lb<0``, a negative var never gets
-        ``ub>0``. A **spanning** var (``_root_sign==0``), however, carries no
-        monomial (gated out in :meth:`_build_structure`) and its real nodes DO carry
-        negative / zero-spanning bounds, so the boxes below deliberately drive those
-        vars through negative-lb, zero-spanning (``lb<0<ub``), mixed-sign and
-        degenerate (``lb==ub``) regimes — exactly the sign regimes that dominate
-        real nodes and that the earlier ``lb>=0``-only set never exercised (C-21).
+        ``ub>0``. A **spanning** var (``_root_sign==0``) carries only even-power
+        monomials (odd ones are gated out in :meth:`_build_structure`) and its real
+        nodes DO carry negative / zero-spanning bounds, so the boxes below
+        deliberately drive those vars through negative-lb, zero-spanning
+        (``lb<0<ub``), mixed-sign and degenerate (``lb==ub``) regimes — exactly the
+        sign regimes that dominate real nodes and that the earlier ``lb>=0``-only set
+        never exercised (C-21). Since #861 those same boxes are what proves an
+        even-power envelope on a straddling box reproduces the cold build: the
+        ``span``/``span_wide`` trials put ``lb<0<ub`` on every spanning var.
         """
         # Per trial, ``kind`` says how each spanning var sits relative to zero;
         # sign-definite vars follow their root sign with a varying width/offset.
@@ -561,12 +654,19 @@ class IncrementalMcCormickLP:
                 regimes.add(self._box_sign_regime(float(lb[i]), float(ub[i])))
             Ap, bp, bdp = self._patch(lb, ub)
             Af, bf, bdf, _, _, _ = self._full_build(lb, ub)
-            if Ap.shape != Af.shape:
-                raise ValueError("shape mismatch")
-            if self._rowset(Ap, bp) != self._rowset(Af, bf):
-                raise ValueError("row-set mismatch")
+            if Ap.shape[1] != Af.shape[1]:
+                raise ValueError("column-count mismatch")
+            # Bounds first: the row comparison drops box-vacuous rows, so the two
+            # boxes must be known equal before that filter can be trusted to mean
+            # the same thing on both sides.
             if not np.allclose(bdp, bdf, atol=1e-6, rtol=1e-6):
                 raise ValueError("bounds mismatch")
+            # Row COUNTS may legitimately differ (a pinned variable's envelope is 4
+            # vacuous rows on the patched side and no rows at all on the cold side),
+            # so identity is decided by the box-filtered row sets, which is the exact
+            # polytope test — see :meth:`_rowset`.
+            if self._rowset(Ap, bp, bdp) != self._rowset(Af, bf, bdf):
+                raise ValueError("row-set mismatch")
         self._validated_regimes = frozenset(regimes)
         self.ok = True
 
