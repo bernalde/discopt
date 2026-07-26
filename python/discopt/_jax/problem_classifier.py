@@ -105,6 +105,19 @@ def classify_problem(model: Model) -> ProblemClass:
     return ProblemClass.MINLP if has_integer else ProblemClass.NLP
 
 
+# Dense-Q budget for QP extraction (#863). Above this the extractor emits a sparse
+# Q instead: a wide model with a narrow objective (watercontamination0202 is 106,711
+# variables whose objective touches 101) cannot hold (n, n) float64 at all -- that
+# is 91 GB. 256 MB corresponds to n ~= 5,657.
+_QP_DENSE_Q_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _sp_issparse(x) -> bool:
+    import scipy.sparse as _sp
+
+    return bool(_sp.issparse(x))
+
+
 class LPData(NamedTuple):
     """Standard-form LP data: min c'x + d s.t. A_eq x = b_eq, x_l <= x <= x_u."""
 
@@ -153,13 +166,15 @@ def dense_Q(Q) -> np.ndarray:
             return np.asarray(Q.toarray(), dtype=np.float64)
     except ImportError:  # pragma: no cover - scipy is a hard dependency
         pass
-    arr = np.asarray(Q, dtype=np.float64)
+    # Inspect BEFORE coercing to float64: np.asarray(obj_array, dtype=float) raises
+    # a bare ValueError, which hides what actually went wrong.
+    arr = np.asarray(Q)
     if arr.dtype == object or arr.ndim != 2:
         raise TypeError(
             f"QPData.Q densified to dtype={arr.dtype} ndim={arr.ndim}; a sparse "
             "matrix probably reached np.asarray without going through dense_Q()"
         )
-    return arr
+    return np.asarray(arr, dtype=np.float64)
 
 
 class QuadraticConstraintData(NamedTuple):
@@ -864,8 +879,14 @@ def extract_qp_data_algebraic(model: Model) -> QPData:
 
     if n_slack > 0:
         n_total = n_orig + n_slack
-        Q_full = np.zeros((n_total, n_total), dtype=np.float64)
-        Q_full[:n_orig, :n_orig] = Q
+        import scipy.sparse as _sp
+
+        if _sp.issparse(Q):
+            # Pad sparsely: densifying here would defeat the whole point (#863).
+            Q_full = _sp.block_diag((Q, _sp.csr_matrix((n_slack, n_slack))), format="csr")
+        else:
+            Q_full = np.zeros((n_total, n_total), dtype=np.float64)
+            Q_full[:n_orig, :n_orig] = Q
         c_full = np.concatenate([c_vec, np.zeros(n_slack, dtype=np.float64)])
     else:
         Q_full = Q
@@ -1073,57 +1094,69 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
         ej[j] = -1.0
         f_neg_ej[j] = repr_.evaluate_objective(ej)
 
-    # Q diagonal: Q[j,j] = f(e_j) + f(-e_j) - 2*d
-    Q = np.zeros((n_orig, n_orig), dtype=np.float64)
-    for j in range(n_orig):
-        Q[j, j] = f_ej[j] + f_neg_ej[j] - 2 * d
+    # Q diagonal: Q[j,j] = f(e_j) + f(-e_j) - 2*d  (kept 1-D; see the note below on
+    # why the dense (n, n) is not materialised until the very end)
+    diag = f_ej + f_neg_ej - 2 * d
 
     # Q off-diagonal: Q[i,j] = f(e_i+e_j) - f(e_i) - f(e_j) + d
     #
-    # Restricted to the objective's SUPPORT (#863). A variable that does not appear
-    # in the objective at all has f(e_j) == f(-e_j) == d, so every product involving
-    # it is identically zero and probing that pair is pure waste. Sweeping all pairs
-    # is O(n^2) probes, each allocating an O(n) probe vector — on
-    # ``watercontamination0202`` (n = 106,711) that is 5.69e9 probes, measured to
-    # extrapolate to ~32 hours–178 days, and it is why the solve blew past its
-    # ``time_limit`` by >8x without ever reaching a solver.
+    # Restricted to the objective's SUPPORT (#863). A variable absent from the
+    # objective has f(e_j) == f(-e_j) == d and a zero diagonal, so every product
+    # involving it is identically zero and probing that pair is pure waste. The
+    # support is free -- the O(n) diagonal probes above already identify it.
     #
-    # The support is free: ``f_ej`` / ``f_neg_ej`` are already computed above in O(n).
-    # That instance's objective touches just 101 of its 106,711 variables, so this
-    # takes the pair count from 5.69e9 to ~5.1e3.
-    support = [j for j in range(n_orig) if f_ej[j] != d or f_neg_ej[j] != d or Q[j, j] != 0.0]
+    # ``watercontamination0202`` is 106,711 variables whose objective touches 101;
+    # the unrestricted sweep issues 5.69e9 probes to discover ~1e4 possibly-nonzero
+    # entries, and a dense (n, n) Q there is 91 GB.
+    support = [j for j in range(n_orig) if f_ej[j] != d or f_neg_ej[j] != d or diag[j] != 0.0]
+    off_i: list[int] = []
+    off_j: list[int] = []
+    off_v: list[float] = []
     for _si, i in enumerate(support):
         for j in support[_si + 1 :]:
             eij = np.zeros(n_orig, dtype=np.float64)
             eij[i] = 1.0
             eij[j] = 1.0
-            f_eij = repr_.evaluate_objective(eij)
-            qij = f_eij - f_ej[i] - f_ej[j] + d
-            Q[i, j] = qij
-            Q[j, i] = qij
+            qij = repr_.evaluate_objective(eij) - f_ej[i] - f_ej[j] + d
+            if qij != 0.0:
+                off_i.append(i)
+                off_j.append(j)
+                off_v.append(float(qij))
+
+    # Materialise Q. Dense while it comfortably fits (bit-identical to the previous
+    # behaviour); sparse beyond that, because a wide model with a narrow objective
+    # cannot hold (n, n) floats at all. ``dense_Q()`` re-densifies for consumers.
+    _dense_ok = (n_orig * n_orig * 8) <= _QP_DENSE_Q_MAX_BYTES
+    if _dense_ok:
+        Q = np.zeros((n_orig, n_orig), dtype=np.float64)
+        np.fill_diagonal(Q, diag)
+        for _i, _j, _v in zip(off_i, off_j, off_v):
+            Q[_i, _j] = _v
+            Q[_j, _i] = _v
+    else:
+        import scipy.sparse as _sp
+
+        rows = list(range(n_orig)) + off_i + off_j
+        cols = list(range(n_orig)) + off_j + off_i
+        vals = list(diag) + off_v + off_v
+        Q = _sp.csr_matrix((vals, (rows, cols)), shape=(n_orig, n_orig))
 
     # Linear coefficients: c_j = f(e_j) - d - 0.5*Q[j,j]
-    c_vec = np.zeros(n_orig, dtype=np.float64)
-    for j in range(n_orig):
-        c_vec[j] = f_ej[j] - d - 0.5 * Q[j, j]
+    c_vec = f_ej - d - 0.5 * diag
 
     # --- Verify the probes actually recovered the objective (#866) ---
     # Every formula above is an exact identity in real arithmetic but a difference
-    # of nearly-equal floats in practice: ``Q[j,j] = f(e_j) + f(-e_j) - 2d``
+    # of nearly-equal floats in practice: ``diag[j] = f(e_j) + f(-e_j) - 2d``
     # cancels catastrophically once the constant term dwarfs the quadratic
     # coefficient. On ``min (x - 1e10)**2`` (d = 1e20, ulp(1e20) ~ 16384) the unit
-    # probes lose the ``+1`` entirely and this returns **Q = 0** — the objective
-    # silently becomes linear. That produced a CERTIFIED optimum of -9e20 for a
-    # sum of squares (issue #866): a false optimum, the worst error class
+    # probes lose the ``+1`` entirely and this returns **Q = 0** -- the objective
+    # silently becomes linear. That produced a CERTIFIED optimum of -9e20 for a sum
+    # of squares (issue #866): a false optimum, the worst error class
     # (CLAUDE.md §1), on the default path.
     #
     # So do not trust the probes: re-evaluate the recovered quadratic against the
     # model's own objective at a few scale-aware points and raise if it disagrees.
-    # Raising hands the dispatcher on to the next extractor — the autodiff path
-    # recovers Q = 2, c = -2e10 exactly here — so a bad extraction degrades to a
-    # slower-but-correct one instead of a wrong answer.
-    # Probe near the box's own magnitude: a unit probe cannot expose the
-    # cancellation on a model whose interesting scale is 1e10.
+    # Raising hands the dispatcher on to the next extractor.
     _probe_scale = 1.0
     for _v in getattr(model, "_variables", []):
         for _b in (getattr(_v, "lb", None), getattr(_v, "ub", None)):
@@ -1136,11 +1169,11 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
     _rng = np.random.default_rng(0)
     for _k in range(3):
         _pt = (_rng.random(n_orig) * 2.0 - 1.0) * _probe_scale
-        _recovered = 0.5 * float(_pt @ Q @ _pt) + float(c_vec @ _pt) + d
-        # Reuse the SAME evaluator the probes above used, so the cross-check is
-        # always available. (An earlier draft reached for ``model._nl_repr``, which
-        # is absent for API-built models, and the check silently skipped itself —
-        # the very failure mode this guard exists to catch.)
+        _recovered = 0.5 * float(_pt @ (Q @ _pt)) + float(c_vec @ _pt) + d
+        # Reuse the SAME evaluator the probes used, so the cross-check is always
+        # available. (An earlier draft reached for ``model._nl_repr``, absent for
+        # API-built models, and the check silently skipped itself -- the very
+        # failure mode it exists to catch.)
         _truth = float(repr_.evaluate_objective(_pt))
         if not np.isfinite(_recovered) or not np.isfinite(_truth):
             continue
@@ -1157,8 +1190,14 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
 
     if n_slack > 0:
         n_total = n_orig + n_slack
-        Q_full = np.zeros((n_total, n_total), dtype=np.float64)
-        Q_full[:n_orig, :n_orig] = Q
+        import scipy.sparse as _sp
+
+        if _sp.issparse(Q):
+            # Pad sparsely: densifying here would defeat the whole point (#863).
+            Q_full = _sp.block_diag((Q, _sp.csr_matrix((n_slack, n_slack))), format="csr")
+        else:
+            Q_full = np.zeros((n_total, n_total), dtype=np.float64)
+            Q_full[:n_orig, :n_orig] = Q
         c_full = np.concatenate([c_vec, np.zeros(n_slack, dtype=np.float64)])
     else:
         Q_full = Q
@@ -1177,7 +1216,10 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
         d = -d
 
     return QPData(
-        Q=np.asarray(Q_full),  # type: ignore[arg-type]
+        # Preserve sparsity: np.asarray() on a sparse matrix silently yields a
+        # 0-d object array rather than raising, which would smuggle garbage into
+        # every consumer (#863). Consumers densify via dense_Q().
+        Q=Q_full if _sp_issparse(Q_full) else np.asarray(Q_full),  # type: ignore[arg-type]
         c=np.asarray(c_full),  # type: ignore[arg-type]
         A_eq=lp_data.A_eq,
         b_eq=lp_data.b_eq,
