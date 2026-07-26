@@ -1060,6 +1060,50 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
     for j in range(n_orig):
         c_vec[j] = f_ej[j] - d - 0.5 * Q[j, j]
 
+    # --- Verify the probes actually recovered the objective (#866) ---
+    # Every formula above is an exact identity in real arithmetic but a difference
+    # of nearly-equal floats in practice: ``Q[j,j] = f(e_j) + f(-e_j) - 2d``
+    # cancels catastrophically once the constant term dwarfs the quadratic
+    # coefficient. On ``min (x - 1e10)**2`` (d = 1e20, ulp(1e20) ~ 16384) the unit
+    # probes lose the ``+1`` entirely and this returns **Q = 0** — the objective
+    # silently becomes linear. That produced a CERTIFIED optimum of -9e20 for a
+    # sum of squares (issue #866): a false optimum, the worst error class
+    # (CLAUDE.md §1), on the default path.
+    #
+    # So do not trust the probes: re-evaluate the recovered quadratic against the
+    # model's own objective at a few scale-aware points and raise if it disagrees.
+    # Raising hands the dispatcher on to the next extractor — the autodiff path
+    # recovers Q = 2, c = -2e10 exactly here — so a bad extraction degrades to a
+    # slower-but-correct one instead of a wrong answer.
+    # Probe near the box's own magnitude: a unit probe cannot expose the
+    # cancellation on a model whose interesting scale is 1e10.
+    _probe_scale = 1.0
+    for _v in getattr(model, "_variables", []):
+        for _b in (getattr(_v, "lb", None), getattr(_v, "ub", None)):
+            if _b is None:
+                continue
+            _arr = np.asarray(_b, dtype=np.float64).ravel()
+            _fin = _arr[np.isfinite(_arr)]
+            if _fin.size:
+                _probe_scale = max(_probe_scale, min(float(np.max(np.abs(_fin))), 1e12))
+    _rng = np.random.default_rng(0)
+    for _k in range(3):
+        _pt = (_rng.random(n_orig) * 2.0 - 1.0) * _probe_scale
+        _recovered = 0.5 * float(_pt @ Q @ _pt) + float(c_vec @ _pt) + d
+        # Reuse the SAME evaluator the probes above used, so the cross-check is
+        # always available. (An earlier draft reached for ``model._nl_repr``, which
+        # is absent for API-built models, and the check silently skipped itself —
+        # the very failure mode this guard exists to catch.)
+        _truth = float(repr_.evaluate_objective(_pt))
+        if not np.isfinite(_recovered) or not np.isfinite(_truth):
+            continue
+        if abs(_recovered - _truth) > 1e-6 * (1.0 + abs(_truth)):
+            raise _NotQuadraticError(
+                "repr probe extraction did not reproduce the objective "
+                f"(recovered {_recovered!r} vs true {_truth!r}); the probe "
+                "differences cancelled — falling through to a stabler extractor"
+            )
+
     # Extract constraints (same as LP)
     lp_data = _extract_lp_data_from_repr(model)
     n_slack = lp_data.c.shape[0] - n_orig
