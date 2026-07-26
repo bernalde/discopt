@@ -89,7 +89,13 @@ def main():
             losses.append(name)
         if off.get("obj") is not None and on.get("obj") is not None:
             if rel(on["obj"], off["obj"]) > 1e-3:
-                drift.append((name, off["obj"], on["obj"]))
+                # Classify by sense: a drift toward the optimum is an improvement, not
+                # a regression. Reporting the bare magnitude would score a better
+                # incumbent as harm.
+                better = (
+                    on["obj"] > off["obj"] if sense.get(name) == "max" else on["obj"] < off["obj"]
+                )
+                drift.append((name, off["obj"], on["obj"], "better" if better else "WORSE"))
         for key, run in (("off", off), ("on", on)):
             if run.get("obj") is not None and run.get("x_feasible") is False:
                 unsound.append((name, f"{key}: reported incumbent NOT feasible"))
@@ -111,8 +117,8 @@ def main():
     print(f"  cert regressions (True->False): {len(cert_reg)} {cert_reg}")
     print(f"  incumbent-verification failed : {len(ivf)} {ivf}")
     print(f"  objective drift > 1e-3        : {len(drift)}")
-    for n, o, w in drift:
-        print(f"      {n}: {o} -> {w}")
+    for n, o, w, verdict in drift:
+        print(f"      {n}: {o} -> {w}  ({verdict})")
     print(f"  incumbents GAINED             : {len(gains)}")
     for n, o, ok in gains:
         print(f"      {n}: {o} (independently feasible: {ok})")

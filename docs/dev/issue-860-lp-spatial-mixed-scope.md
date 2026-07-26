@@ -1,8 +1,9 @@
 # Issue #860 — widening the LP-per-node engine to mixed-integer and MAXIMIZE models
 
-*Status: implemented. Engine scope widened unconditionally; the default-path
-fallback reserve for the newly in-scope class is behind `DISCOPT_LP_SPATIAL_MIXED`
-(default OFF) pending its graduation panel.*
+*Status: implemented. Engine scope widened unconditionally (Panel A: cert-clean, 33
+newly reachable instances get a verified incumbent). The default-path fallback reserve
+for the newly in-scope class stays behind `DISCOPT_LP_SPATIAL_MIXED`, **default OFF**:
+its graduation panel is cert-clean but not net-positive (§4, Panel B).*
 
 The LP-per-node spatial engine (`_jax/lp_spatial_bb.py`) was gated to **pure-integer,
 MINIMIZE** models. Issue #860 records the consequence: three instances named in #844
@@ -231,7 +232,58 @@ newly in-scope instances — the other 49 take a bit-identical path under either
 setting, since the reserve gate is the flag's only consumer and both gates agree
 there. Graduation needs both bars of CLAUDE.md §5: cert-clean **and** net-positive.
 
-PANEL_B_PLACEHOLDER
+**Verdict: cert-clean, but NOT net-positive. The flag stays default-OFF.**
+
+| bar | result |
+|---|---|
+| certification regressions (`gap_certified` True→False) | **0** |
+| `incumbent_verification_failed` | **0** |
+| unsound bound / false optimality certificate | **0** |
+| objective improved | 1 — `ex1252a` 183660.35 → **149530.99** (minimize; both independently feasible) |
+| incumbents **gained** | 1 — `tspn12` 262.647 (independently feasible) |
+| incumbents **LOST** | **2 — `tls2`, `st_e31`** |
+
+| instance | flag off | flag on |
+|---|---|---|
+| `tspn12` | time_limit, no incumbent (30.6 s) | feasible **262.647** (9.3 s) |
+| `ex1252a` | feasible 183660.35 (24.5 s) | feasible **149530.99** (14.9 s) |
+| `tls2` | feasible **11.30** (20.1 s) | time_limit, **no incumbent** (13.6 s) |
+| `st_e31` | feasible **−2.00** (22.2 s) | time_limit, **no incumbent** (14.8 s) |
+
+Soundness is untouched — the widening cannot produce a bad answer, exactly as Panel A
+showed. What it cannot do is *pay for itself on the default path*: one incumbent
+gained and one improved against two lost. Losing an incumbent is strictly worse than
+improving one that already exists, so the net is negative and the flag does not
+graduate. This is the `DISCOPT_CUT_INHERIT` lesson again (CLAUDE.md §5): sound ≠
+helpful, and a cert-clean but harmful flag stays off with its measurement recorded.
+
+**Mechanism of the two losses**, which is the useful part of the result. The reserve
+hands 35% of the budget to the fallback *before* knowing whether the engine can serve
+the model. On `tls2` and `st_e31` the primary then runs out of time at 65% and returns
+nothing — and the fallback declines anyway, because it passes `require_incremental=True`
+and both models have infinite root boxes, which decline the incremental structure
+(§2.4). The reserve is pure loss there: budget taken from a path that was going to
+succeed, given to a path that never runs.
+
+Do not read the 0.747 wall ratio as a win. The flag-on runs are faster mostly *because*
+they gave up earlier — `tls2` 20.1 s → 13.6 s and `st_e31` 22.2 s → 14.8 s are exactly
+the two instances that stopped producing an answer.
+
+**The concrete follow-up** this points at: make the reserve conditional on the engine
+actually being able to build (probe buildability, or relax `require_incremental` for
+the mixed class now that cold node builds are deadline-bounded per §2.5), so a model
+the fallback will decline never pays for it. That is a separate change with its own
+panel, not a tweak to this one.
+
+### A pre-existing soundness flag, not from this work
+
+Panel B's independent verifier rejects `nvs22`'s reported incumbent at tolerance 1e-5
+under **both** flag settings. It is not caused by the flag, and not by this branch:
+run against the base commit `ac9f5cf` the result is byte-identical — objective
+`6.058219942618198`, `gap_certified=True`, maximum constraint violation
+`2.641e-4` on row 2. That sits above the 1e-5 the panel checks and below the
+deliberately loose 1e-3 of discopt's own final `incumbent_verification_failed` guard,
+so nothing flags it today. Worth its own investigation; out of scope here.
 
 ## 5. Known limits (not addressed here)
 
