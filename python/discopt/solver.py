@@ -24,6 +24,7 @@ import numpy as np
 # nonlinear bound tightening) are imported lazily at their nonlinear-path call
 # sites, so a pure LP/MILP/MIQP solve never pays JAX/XLA cold-start.
 from discopt._jax.model_utils import flat_variable_bounds
+from discopt._jax.problem_classifier import dense_A as _dense_A
 from discopt._jax.problem_classifier import dense_Q as _dense_Q
 
 if TYPE_CHECKING:
@@ -14212,9 +14213,9 @@ def _solve_lp_matrix(
         )
     )
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(lp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(lp_data.A_eq)
     b_eq_full = np.asarray(lp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14474,9 +14475,9 @@ def _solve_qcp_gurobi(
         )
     )
 
-    A_ub = np.asarray(qcp_data.A_ub, dtype=np.float64)
+    A_ub = _dense_A(qcp_data.A_ub)
     b_ub = np.asarray(qcp_data.b_ub, dtype=np.float64)
-    A_eq = np.asarray(qcp_data.A_eq, dtype=np.float64)
+    A_eq = _dense_A(qcp_data.A_eq)
     b_eq = np.asarray(qcp_data.b_eq, dtype=np.float64)
     A_ub_arg = A_ub if A_ub.shape[0] else None
     b_ub_arg = b_ub if b_ub.shape[0] else None
@@ -14653,9 +14654,9 @@ def _solve_qp_matrix(
         )
     )
 
-    n_total = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(qp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(qp_data.A_eq)
     b_eq_full = np.asarray(qp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14842,9 +14843,9 @@ def _solve_milp_gurobi(
         )
     )
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(lp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(lp_data.A_eq)
     b_eq_full = np.asarray(lp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14956,7 +14957,7 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
     state = qp_ipm_solve(
         cast(Any, _dense_Q(qp_data.Q)),
         qp_data.c,
-        qp_data.A_eq,
+        cast(Any, _dense_A(qp_data.A_eq)),
         qp_data.b_eq,
         qp_data.x_l,
         qp_data.x_u,
@@ -15096,7 +15097,7 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
     n_batch = len(batch_lb)
     Q = _dense_Q(qp_data.Q)
     c = np.asarray(qp_data.c, dtype=np.float64)
-    A_eq = np.asarray(qp_data.A_eq, dtype=np.float64)
+    A_eq = _dense_A(qp_data.A_eq)
     b_eq = np.asarray(qp_data.b_eq, dtype=np.float64)
     n_total = int(qp_data.x_l.shape[0])
     n_slack = n_total - n_orig
@@ -15253,10 +15254,11 @@ def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, ti
     # MILP B&B visit enough nodes to bound the tree. It needs the native
     # inequality form, so decompose the slack-expanded standard form back to
     # A_ub/A_eq over the structural columns.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     try:
         A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            np.asarray(lp_data.A_eq, dtype=np.float64),
+            _A_eq_dense,
             np.asarray(lp_data.b_eq, dtype=np.float64),
             n_orig,
             n_slack,
@@ -15333,10 +15335,11 @@ def _solve_node_lp_simplex(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, t
     # Decompose the slack-expanded standard form back to native A_ub/A_eq over
     # the structural columns (the simplex adapter's matrix form), matching
     # _solve_node_lp_pounce so node bounds apply to the structural columns.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     try:
         A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            np.asarray(lp_data.A_eq, dtype=np.float64),
+            _A_eq_dense,
             np.asarray(lp_data.b_eq, dtype=np.float64),
             n_orig,
             n_slack,
@@ -15509,9 +15512,10 @@ def _root_reduced_cost_fixing(lp_data, n_orig, lb, ub, int_offsets, int_sizes, t
     if not POUNCE_AVAILABLE:
         return lb, ub, None
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_total = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, n_total - n_orig
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, n_total - n_orig
     )
     c_m = np.asarray(lp_data.c[:n_orig])
     obj_const = float(lp_data.obj_const)
@@ -15578,7 +15582,7 @@ def _augment_lpdata_with_cover_cuts(lp_data, n_orig: int, cuts):
     original-variable structure is untouched, so the B&B branches exactly as
     before but on a tighter relaxation. Cover cuts are valid, so the optimum
     is preserved (cannot affect ``incorrect_count``)."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15635,7 +15639,7 @@ def _augment_lpdata_with_gomory_cuts(lp_data, coeffs: np.ndarray, rhs: np.ndarra
     numerical error in the refined basis, so a cut can never exclude a true
     integer point (preserving ``incorrect_count == 0``) while still separating
     the fractional vertex."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15710,7 +15714,7 @@ def _separate_gomory_cuts(lp_data, x_vertex, n_orig, int_idx, max_cuts: int = 8)
         from discopt._rust import gomory_cuts_py
     except ImportError:
         return None
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     n_cur = A.shape[1]
     integrality = np.zeros(n_cur, dtype=bool)
@@ -15746,7 +15750,7 @@ def _augment_lpdata_with_mir_cuts(lp_data, coeffs: np.ndarray, rhs: np.ndarray):
     coupling), so the augmented relaxation stays well-conditioned. A small rhs
     relaxation guards against floating-point error in the separation point so a
     cut cannot exclude a true integer point."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15817,7 +15821,7 @@ def _separate_mir_cuts(lp_data, x_vertex, n_orig, int_idx, a_ub_orig, b_ub_orig,
     if res is None:
         return None
     coeffs, rhs = np.asarray(res[0], dtype=np.float64), np.asarray(res[1], dtype=np.float64)
-    n_cur = int(np.asarray(lp_data.A_eq).shape[1])
+    n_cur = int(_dense_A(lp_data.A_eq).shape[1])
     embedded = np.zeros((coeffs.shape[0], n_cur), dtype=np.float64)
     embedded[:, :n_orig] = coeffs[:, :n_orig]
     return embedded[:max_cuts], rhs[:max_cuts]
@@ -15866,7 +15870,7 @@ def _separate_aggregation_mir_cuts(
     if res is None:
         return None
     coeffs, rhs = np.asarray(res[0], dtype=np.float64), np.asarray(res[1], dtype=np.float64)
-    n_cur = int(np.asarray(lp_data.A_eq).shape[1])
+    n_cur = int(_dense_A(lp_data.A_eq).shape[1])
     embedded = np.zeros((coeffs.shape[0], n_cur), dtype=np.float64)
     embedded[:, :n_orig] = coeffs[:, :n_orig]
     return embedded[:max_cuts], rhs[:max_cuts]
@@ -15923,7 +15927,7 @@ def _cut_loop_relaxation_x(lp_data, prefer_pounce: bool):
     try:
         res = _pounce_solve(
             c=np.asarray(lp_data.c, dtype=np.float64),
-            A_eq=np.asarray(lp_data.A_eq, dtype=np.float64),
+            A_eq=_dense_A(lp_data.A_eq),
             b_eq=np.asarray(lp_data.b_eq, dtype=np.float64),
             bounds=list(
                 zip(
@@ -16002,7 +16006,7 @@ def _root_cover_cut_loop(
         try:
             x_vertex = crossover_to_vertex(
                 x_relax,
-                np.asarray(lp_data.A_eq),
+                _dense_A(lp_data.A_eq),
                 np.asarray(lp_data.b_eq),
                 np.asarray(lp_data.c),
                 np.asarray(lp_data.x_l),
@@ -16307,7 +16311,7 @@ def _solve_milp_simplex(
         return None
 
     lp_data = extract_lp_data(model)
-    A = np.ascontiguousarray(lp_data.A_eq, dtype=np.float64)
+    A = np.ascontiguousarray(_dense_A(lp_data.A_eq))
     if A.shape[0] == 0:
         return None  # no constraints — let the default path handle it
     n_orig = sum(v.size for v in model._variables)
@@ -16361,9 +16365,10 @@ def _solve_milp_simplex(
     # Feasibility gate (shared by the return path below and the #698 re-entry
     # adoption test). The row/bound/integrality decomposition is independent of
     # the point, so build it once and close over it.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, n_slack
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, n_slack
     )
     _xl_gate = np.asarray(lp_data.x_l[:n_orig], dtype=np.float64)
     _xu_gate = np.asarray(lp_data.x_u[:n_orig], dtype=np.float64)
@@ -16670,9 +16675,10 @@ def _solve_milp_bb(
     # auxiliary cover rows). The B&B node LP relaxations below use the
     # cover-augmented ``lp_data``; recovery uses ``lp_data_orig`` / these.
     lp_data_orig = lp_data
-    _n_total0 = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    _n_total0 = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, _n_total0 - n_orig
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, _n_total0 - n_orig
     )
     _cut_by_source = {"cover_clique": 0, "gomory": 0, "mir": 0, "aggregation": 0}
     try:
@@ -17290,9 +17296,10 @@ def _solve_miqp_bb(
     # nodes are first re-solved with POUNCE; only unrecoverable ones
     # decertify the gap (mirrors the P0.3 trust-gate + polish-retry).
     _gap_certified = True
-    _n_total0 = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(qp_data.A_eq)
+    _n_total0 = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(qp_data.A_eq), np.asarray(qp_data.b_eq), n_orig, _n_total0 - n_orig
+        _A_eq_dense, np.asarray(qp_data.b_eq), n_orig, _n_total0 - n_orig
     )
     _c_m = np.asarray(qp_data.c[:n_orig])
     _Q_m = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
@@ -17340,7 +17347,7 @@ def _solve_miqp_bb(
         finite_feas = (
             x_full is not None
             and bool(np.all(np.isfinite(x_full)))
-            and _check_lp_solution_feasibility(qp_data.A_eq, qp_data.b_eq, x_full)
+            and _check_lp_solution_feasibility(_A_eq_dense, qp_data.b_eq, x_full)
         )
         if finite_feas:
             # Try first to recover a trusted (KKT) lower bound; if POUNCE
@@ -17466,7 +17473,7 @@ def _solve_miqp_bb(
             if infeasible[i]:
                 # POUNCE Phase-1-certified empty box: a sound infeasibility prune.
                 result_sols[i] = 0.5 * (lb_c + ub_c)
-            elif clean[i] and _check_lp_solution_feasibility(qp_data.A_eq, qp_data.b_eq, x_vals[i]):
+            elif clean[i] and _check_lp_solution_feasibility(_A_eq_dense, qp_data.b_eq, x_vals[i]):
                 # KKT-valid relaxation optimum -> a valid node lower bound.
                 result_lbs[i] = obj_vals[i] + float(qp_data.obj_const)
                 result_sols[i] = x_vals[i, :n_vars]
@@ -17572,9 +17579,9 @@ def _solve_miqp_bb(
         # Recover relaxation duals at the integer-feasible incumbent by
         # re-solving the QP relaxation with integer variables fixed.
         try:
-            n_total = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+            A_eq_full = _dense_A(qp_data.A_eq)
+            n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
             n_slack_local = n_total - n_orig
-            A_eq_full = np.asarray(qp_data.A_eq)
             b_eq_full = np.asarray(qp_data.b_eq)
             A_ub_, b_ub_, A_eq_, b_eq_ = _decompose_eq_slack_form(
                 A_eq_full, b_eq_full, n_orig, n_slack_local

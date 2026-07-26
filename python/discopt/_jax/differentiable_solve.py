@@ -25,6 +25,9 @@ from discopt._jax.problem_classifier import (
     extract_qp_data,
 )
 from discopt._jax.problem_classifier import (
+    dense_A as _dense_A,
+)
+from discopt._jax.problem_classifier import (
     dense_Q as _dense_Q,
 )
 from discopt.modeling.core import Model, Parameter
@@ -116,7 +119,9 @@ def _lp_forward(lp_data) -> tuple[float, np.ndarray]:
     """
     from discopt.solvers.lp_pounce import solve_lp_kkt
 
-    obj, x, *_ = solve_lp_kkt(lp_data.c, lp_data.A_eq, lp_data.b_eq, lp_data.x_l, lp_data.x_u)
+    obj, x, *_ = solve_lp_kkt(
+        lp_data.c, cast(Any, _dense_A(lp_data.A_eq)), lp_data.b_eq, lp_data.x_l, lp_data.x_u
+    )
     return float(obj), np.asarray(x)
 
 
@@ -134,7 +139,7 @@ def _solve_objective(model: Model, problem_class: ProblemClass) -> float | None:
             qp_state = qp_ipm_solve(
                 cast(Any, _dense_Q(qp_data.Q)),
                 qp_data.c,
-                qp_data.A_eq,
+                cast(Any, _dense_A(qp_data.A_eq)),
                 qp_data.b_eq,
                 qp_data.x_l,
                 qp_data.x_u,
@@ -216,7 +221,7 @@ def differentiable_solve(
         qp_state = qp_ipm_solve(
             cast(Any, _dense_Q(qp_data.Q)),
             qp_data.c,
-            qp_data.A_eq,
+            cast(Any, _dense_A(qp_data.A_eq)),
             qp_data.b_eq,
             qp_data.x_l,
             qp_data.x_u,
@@ -250,7 +255,7 @@ def differentiable_solve(
                 qp_relax_state = qp_ipm_solve(
                     cast(Any, _dense_Q(qp_data.Q)),
                     qp_data.c,
-                    qp_data.A_eq,
+                    cast(Any, _dense_A(qp_data.A_eq)),
                     qp_data.b_eq,
                     qp_data.x_l,
                     qp_data.x_u,

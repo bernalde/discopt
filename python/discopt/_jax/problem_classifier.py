@@ -177,6 +177,46 @@ def dense_Q(Q) -> np.ndarray:
     return np.asarray(arr, dtype=np.float64)
 
 
+def dense_A(A) -> np.ndarray:
+    """Materialise a constraint matrix as a dense ``float64`` 2-D array.
+
+    Covers ``LPData.A_eq``, ``QPData.A_eq`` and ``QCPData.A_ub`` / ``A_eq``. Each
+    may be a dense array or a scipy sparse matrix (#863). The dense form is
+    ``(m, n)``: on ``watercontamination0202`` — 106,711 variables, 107,209 rows —
+    that is **91.5 GB**, an equal-sized wall to the 91 GB dense ``Q`` that the same
+    issue removed, and it is why extraction on that instance never returns.
+
+    The sibling of :func:`dense_Q`, and for the same reason. ``np.asarray`` on a
+    scipy sparse matrix does **not** raise — it returns a 0-d object array wrapping
+    the matrix — so a consumer that keeps calling ``np.asarray(lp_data.A_eq)``
+    directly would silently feed garbage into a solver instead of failing. Every
+    consumer must go through this, and it raises loudly (``TypeError`` naming the
+    cause) if it ever yields an object array or a non-2-D result, which is the
+    signature of a missed call site.
+
+    Returns numpy, which is what these fields actually hold at runtime (the module
+    header notes the data classes are *annotated* for the JAX consumers but
+    populated by the JAX-free extractors); the sites that feed ``qp_ipm_solve``
+    cast at that boundary rather than have this function lie about its type.
+    """
+    try:
+        import scipy.sparse as _sp
+
+        if _sp.issparse(A):
+            return np.asarray(A.toarray(), dtype=np.float64)
+    except ImportError:  # pragma: no cover - scipy is a hard dependency
+        pass
+    # Inspect BEFORE coercing to float64: np.asarray(obj_array, dtype=float) raises
+    # a bare ValueError, which hides what actually went wrong.
+    arr = np.asarray(A)
+    if arr.dtype == object or arr.ndim != 2:
+        raise TypeError(
+            f"constraint matrix densified to dtype={arr.dtype} ndim={arr.ndim}; a "
+            "sparse matrix probably reached np.asarray without going through dense_A()"
+        )
+    return np.asarray(arr, dtype=np.float64)
+
+
 class QuadraticConstraintData(NamedTuple):
     """Quadratic row data: 0.5 x'Qx + c'x sense rhs."""
 
