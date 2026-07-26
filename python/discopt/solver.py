@@ -6715,6 +6715,12 @@ def solve_model(
     t_rust_start = time.perf_counter()
     from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
 
+    # Cap the FBBT call at whatever wall time is actually left (#863). This is the
+    # last step before tree creation and it had no escape: on
+    # watercontamination0202 (106,711 vars / 107,209 rows) 20 full sweeps ran
+    # >10 minutes against a 30 s budget. FBBT is anytime, so a cap costs only
+    # tightening: the returned box is looser but valid, and the integer rounding
+    # inside still runs. Same #654 discipline as every other presolve step here.
     lb, ub, root_infeasible, _ = tighten_root_bounds_with_fbbt(
         model,
         lb,
@@ -6722,6 +6728,7 @@ def solve_model(
         int_offsets,
         int_sizes,
         model_repr=_model_repr,
+        time_limit_ms=max(1, int(1000 * _remaining_budget())),
     )
     rust_time += time.perf_counter() - t_rust_start
     if root_infeasible:

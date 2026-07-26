@@ -164,6 +164,68 @@ def test_eliminate_honours_its_budget_on_a_large_instance():
     assert raw["terminated_by"] == "TimeBudget"
 
 
+def test_fbbt_binding_accepts_and_honours_a_time_limit():
+    """``PyModelRepr.fbbt`` had no budget parameter at all, and it is what
+    ``tighten_root_bounds_with_fbbt`` calls immediately before tree creation — the
+    last unguarded step in root setup. On watercontamination0202 it ran >10 minutes
+    against a 30 s solve budget (#863).
+
+    ``time_limit_ms=None`` must stay the default so every other caller is unchanged,
+    and an already-tiny budget must return the untightened (still valid) box.
+    """
+    import numpy as np
+
+    repr_ = _repr_for("4stufen")
+    lb_full, ub_full = repr_.fbbt(max_iter=20, tol=1e-8)
+    lb_none, ub_none = repr_.fbbt(max_iter=20, tol=1e-8, time_limit_ms=None)
+    assert np.array_equal(np.asarray(lb_full), np.asarray(lb_none))
+    assert np.array_equal(np.asarray(ub_full), np.asarray(ub_none))
+
+    # A generous budget must be indistinguishable from no budget.
+    lb_gen, ub_gen = repr_.fbbt(max_iter=20, tol=1e-8, time_limit_ms=600_000)
+    assert np.array_equal(np.asarray(lb_full), np.asarray(lb_gen))
+    assert np.array_equal(np.asarray(ub_full), np.asarray(ub_gen))
+
+    # A tiny budget returns a valid enclosure of the fully-tightened box.
+    lb_tiny, ub_tiny = repr_.fbbt(max_iter=20, tol=1e-8, time_limit_ms=1)
+    assert np.all(np.asarray(lb_tiny) <= np.asarray(lb_full) + 1e-9)
+    assert np.all(np.asarray(ub_tiny) >= np.asarray(ub_full) - 1e-9)
+
+
+def test_fbbt_with_cutoff_binding_accepts_a_time_limit():
+    """Same for the cutoff variant, whose default must also stay unlimited."""
+    import numpy as np
+
+    repr_ = _repr_for("4stufen")
+    a = repr_.fbbt_with_cutoff(20, 1e-8)
+    b = repr_.fbbt_with_cutoff(20, 1e-8, None, 600_000)
+    assert np.array_equal(np.asarray(a[0]), np.asarray(b[0]))
+    assert np.array_equal(np.asarray(a[1]), np.asarray(b[1]))
+
+
+def test_root_bound_tightening_passes_its_budget_through(monkeypatch):
+    """``tighten_root_bounds_with_fbbt`` must forward ``time_limit_ms`` to the
+    binding, and must still do its sound integer rounding when FBBT bails."""
+    import numpy as np
+    from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
+
+    model = dm.from_nl(str(_NL_DIR / "4stufen.nl"))
+    repr_ = _repr_for("4stufen")
+    seen: list[object] = []
+    real = type(repr_).fbbt
+
+    def _spy(self, *a, **k):
+        seen.append(k.get("time_limit_ms", "MISSING"))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(type(repr_), "fbbt", _spy, raising=False)
+    n = sum(v.size for v in model._variables)
+    lb = np.full(n, -1e3)
+    ub = np.full(n, 1e3)
+    tighten_root_bounds_with_fbbt(model, lb, ub, [], [], model_repr=repr_, time_limit_ms=1234)
+    assert seen == [1234], f"budget was not forwarded to the binding: {seen}"
+
+
 def test_full_root_presolve_respects_its_budget():
     """The pipeline as ``solve_model`` invokes it, with every default pass on."""
     from discopt._jax.presolve_pipeline import run_root_presolve
