@@ -255,6 +255,52 @@ def test_maximize_legacy_gate_returns_none():
     assert solve_lp_spatial_bb(m, time_limit=5, mixed=False) is None
 
 
+@pytest.mark.smoke
+def test_maximize_never_overstates_the_optimum():
+    """#860 soundness for the maximize half, against brute force.
+
+    max a*b - 3a s.t. a + b <= 6, a,b integer in [0,5]. The incumbent may never
+    EXCEED the true maximum (that would be a false primal) and the reported bound is
+    an upper bound, so it may never fall BELOW the true maximum."""
+    m = dm.Model("mx3")
+    a = m.integer("a", lb=0, ub=5)
+    b = m.integer("b", lb=0, ub=5)
+    m.maximize(a * b - 3 * a)
+    m.subject_to(a + b <= 6)
+    true_max = max(i * j - 3 * i for i in range(6) for j in range(6) if i + j <= 6)
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    assert r is not None
+    if r.objective is not None:
+        assert r.objective <= true_max + 1e-6, "incumbent beat the true maximum"
+    if r.bound is not None:
+        assert r.bound >= true_max - 1e-6, "upper bound fell below the true maximum"
+    assert r.status == "optimal" and r.objective == pytest.approx(true_max, abs=1e-6)
+
+
+@pytest.mark.smoke
+def test_infinite_root_box_is_accepted_not_declined():
+    """#860: a root box with an infinite endpoint is no longer an outright decline.
+
+    Real MINLPs leave continuous columns unbounded above — 31 of the 71 mixed
+    instances in the in-repo corpus do — and the old all-variables-finite gate made
+    the whole class unreachable. Root OBBT plus the cold builder's own non-finite-row
+    guard handle it; the incremental patch (which has no such guard) declines itself.
+
+    min x + y s.t. x + y >= 6, x*y >= 6; x continuous in [0, inf), y integer in
+    [1,5]. The linear row forces the objective to 6, attained at (3,3) where
+    x*y = 9 >= 6."""
+    m = dm.Model("infbox")
+    x = m.continuous("x", lb=0.0, ub=float("inf"))
+    y = m.integer("y", lb=1, ub=5)
+    m.minimize(x + y)
+    m.subject_to(x + y >= 6)
+    m.subject_to(x * y >= 6)
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    assert r is not None, "an infinite root endpoint must no longer decline the solve"
+    assert r.objective == pytest.approx(6.0, abs=1e-5)
+    assert r.bound is not None and r.bound <= r.objective + 1e-6
+
+
 # --------------------------------------------------------------------------- #
 # correctness: matches brute force exactly, and proves optimality
 # --------------------------------------------------------------------------- #
