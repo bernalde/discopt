@@ -46,6 +46,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+import scipy.sparse as _sp
 
 from discopt.modeling.core import (
     BinaryOp,
@@ -447,12 +448,25 @@ def _quadratic_data(expr: Expression, model: Model):
 
     Uses :func:`problem_classifier._extract_quadratic_coefficients` and
     symmetrises ``Q``. Returns ``None`` if the expression is not degree-2.
+
+    Also returns ``None`` when the extractor hands back a *sparse* ``Q`` (#863).
+    Every consumer of this function is unavoidably dense — ``np.diag(Q)``, boolean
+    row/column masks, ``np.linalg.eigvalsh`` — and each already treats ``None`` as
+    "not extractable as a quadratic form", which is the conservative answer (no
+    curvature claim, so the caller keeps its weaker but valid classification). The
+    sparse arm only triggers above ``_QP_DENSE_Q_MAX_BYTES`` (n > ~5,657), where
+    this analysis was already impractical: it makes three ``(n, n)`` copies in the
+    ``0.5 * (Q + Q.T)`` line alone. Refusing there is strictly better than the old
+    behaviour, which allocated ``(n, n)`` unconditionally — 91 GB on
+    watercontamination0202's 106,711 variables.
     """
     from discopt._jax.problem_classifier import _extract_quadratic_coefficients
 
     try:
         Q, c, const = _extract_quadratic_coefficients(expr, model, _total_scalar_variables(model))
     except Exception:
+        return None
+    if _sp.issparse(Q):
         return None
     Q = 0.5 * (Q + Q.T)
     return Q, np.asarray(c, dtype=np.float64), float(const)

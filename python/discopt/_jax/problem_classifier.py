@@ -491,19 +491,95 @@ def _extract_linear_coefficients_sparse(expr, model: Model, n: int):
     return terms, const
 
 
+def _materialise_Q(terms: dict[tuple[int, int], float], n: int) -> np.ndarray:
+    """Assemble a Hessian from ``{(row, col): value}`` accumulated entries (#863).
+
+    Dense while ``(n, n)`` float64 fits ``_QP_DENSE_Q_MAX_BYTES`` — bit-identical to
+    the ``np.zeros((n, n))`` this replaced, because the dict performs the same
+    ``+=`` additions in the same order starting from the same 0.0 — and scipy CSR
+    beyond it. ``dense_Q()`` re-densifies for consumers.
+
+    The dict is what makes the sparse arm reachable at all. ``np.zeros((n, n))`` is
+    91 GB on ``watercontamination0202`` (106,711 variables); macOS *allows* that
+    allocation because zero pages are mapped lazily, so it does not raise — it just
+    makes the first full read of the array catastrophic. Measured on that instance,
+    a single ``Q @ x`` against the lazily-allocated dense Q (holding 4,017 nonzeros)
+    took **16.0 s**. Accumulating entries instead keeps peak memory at O(nnz), so
+    the dense matrix never has to exist even transiently.
+
+    Mirrors :func:`_materialise_A`, which did the same for the constraint matrix.
+    """
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    if (n * n * 8) <= _QP_DENSE_Q_MAX_BYTES:
+        Q = np.zeros((n, n), dtype=np.float64)
+        for (_i, _j), _v in terms.items():
+            Q[_i, _j] = _v
+        return Q
+    import scipy.sparse as _sp
+
+    if not terms:
+        # csr_matrix((data, (row, col))) needs non-empty index arrays to infer dtype.
+        return cast(np.ndarray, _sp.csr_matrix((n, n), dtype=np.float64))
+    r = np.fromiter((k[0] for k in terms), dtype=np.intp, count=len(terms))
+    c = np.fromiter((k[1] for k in terms), dtype=np.intp, count=len(terms))
+    v = np.fromiter(terms.values(), dtype=np.float64, count=len(terms))
+    # Annotated ndarray because that is what every consumer sees after dense_Q();
+    # the sparse arm is deliberately outside the annotation, exactly as the repr
+    # extractor's producer is (c525f519).
+    return cast(np.ndarray, _sp.csr_matrix((v, (r, c)), shape=(n, n)))
+
+
+def _quadratic_terms_nonempty(terms: dict[tuple[int, int], float], tol: float = 1e-12) -> bool:
+    """``_quadratic_row_has_terms`` on the pre-materialisation accumulator.
+
+    Identical predicate (entries absent from the dict are exactly 0.0 in both arms),
+    but it never needs the matrix, so a QCP row can be classified linear-or-quadratic
+    without materialising anything (#863).
+    """
+    return any(abs(_v) > tol for _v in terms.values())
+
+
 def _extract_quadratic_coefficients(expr, model: Model, n: int):
     """Walk expression tree to extract quadratic and linear coefficients.
 
     Returns (Q, c, constant) where:
-      - Q is (n, n) numpy array (the Hessian: f = 0.5 x'Qx + c'x + const)
+      - Q is the Hessian (f = 0.5 x'Qx + c'x + const): a dense (n, n) numpy array
+        while that fits ``_QP_DENSE_Q_MAX_BYTES``, scipy CSR beyond it (#863) --
+        consumers densify through :func:`dense_Q`
       - c is (n,) numpy array of linear coefficients
       - constant is a float scalar
 
+    Callers that only need the *predicate* "does this have quadratic terms" or the
+    nonzero entries should use :func:`_extract_quadratic_terms` and avoid
+    materialising anything.
+
     Raises _NotQuadraticError if the expression has degree > 2.
     """
-    Q = np.zeros((n, n), dtype=np.float64)
+    terms, c, const = _extract_quadratic_terms(expr, model, n)
+    return _materialise_Q(terms, n), c, const
+
+
+def _extract_quadratic_terms(expr, model: Model, n: int):
+    """As :func:`_extract_quadratic_coefficients`, but keeping the Hessian SPARSE.
+
+    Returns ``(terms, c, constant)`` with ``terms`` a ``{(row, col): value}`` dict in
+    first-touch order. The full-width ``(n, n)`` Hessian was never needed by the
+    walk, only its nonzeros; see :func:`_materialise_Q` for why it must not be
+    allocated on a wide model.
+    """
+    q_terms: dict[tuple[int, int], float] = {}
     c = np.zeros(n, dtype=np.float64)
     const = 0.0
+
+    def _qadd(i: int, j: int, v: float) -> None:
+        # The dense predecessor got this bound check for free from numpy (and, for a
+        # negative index, silently wrote the WRONG cell via numpy wraparound).
+        # _NotQuadraticError rather than IndexError so the dispatcher falls through
+        # to the next extractor exactly as it did on the IndexError before.
+        if not (0 <= i < n and 0 <= j < n):
+            raise _NotQuadraticError(f"Hessian cell ({i}, {j}) outside the model's {n} flat slots")
+        q_terms[(i, j)] = q_terms.get((i, j), 0.0) + v
 
     def _get_var_index(node):
         """Get the flat variable index for a variable-like node, or None."""
@@ -586,10 +662,10 @@ def _extract_quadratic_coefficients(expr, model: Model, n: int):
                 idx_r = _get_var_index(node.right)
                 if idx_l is not None and idx_r is not None:
                     if idx_l == idx_r:
-                        Q[idx_l, idx_r] += 2.0 * scale
+                        _qadd(idx_l, idx_r, 2.0 * scale)
                     else:
-                        Q[idx_l, idx_r] += scale
-                        Q[idx_r, idx_l] += scale
+                        _qadd(idx_l, idx_r, scale)
+                        _qadd(idx_r, idx_l, scale)
                     return
                 # Handle (const * var) * var or var * (const * var):
                 # e.g., (Q[i,j] * x[i]) * x[j] from left-to-right evaluation
@@ -597,19 +673,19 @@ def _extract_quadratic_coefficients(expr, model: Model, n: int):
                 if cv_l is not None and idx_r is not None:
                     cval, idx_l2 = cv_l
                     if idx_l2 == idx_r:
-                        Q[idx_l2, idx_r] += 2.0 * scale * cval
+                        _qadd(idx_l2, idx_r, 2.0 * scale * cval)
                     else:
-                        Q[idx_l2, idx_r] += scale * cval
-                        Q[idx_r, idx_l2] += scale * cval
+                        _qadd(idx_l2, idx_r, scale * cval)
+                        _qadd(idx_r, idx_l2, scale * cval)
                     return
                 cv_r = _try_extract_const_var(node.right, model)
                 if cv_r is not None and idx_l is not None:
                     cval, idx_r2 = cv_r
                     if idx_l == idx_r2:
-                        Q[idx_l, idx_r2] += 2.0 * scale * cval
+                        _qadd(idx_l, idx_r2, 2.0 * scale * cval)
                     else:
-                        Q[idx_l, idx_r2] += scale * cval
-                        Q[idx_r2, idx_l] += scale * cval
+                        _qadd(idx_l, idx_r2, scale * cval)
+                        _qadd(idx_r2, idx_l, scale * cval)
                     return
                 raise _NotQuadraticError("Product of non-simple variable expressions")
             if node.op == "/":
@@ -625,7 +701,7 @@ def _extract_quadratic_coefficients(expr, model: Model, n: int):
                     if abs(pval - 2.0) < 1e-12:
                         idx = _get_var_index(node.left)
                         if idx is not None:
-                            Q[idx, idx] += 2.0 * scale  # x^2 = 0.5 * 2 * x^2
+                            _qadd(idx, idx, 2.0 * scale)  # x^2 = 0.5 * 2 * x^2
                             return
                     if abs(pval - 1.0) < 1e-12:
                         _walk(node.left, scale, allow_array)
@@ -677,7 +753,7 @@ def _extract_quadratic_coefficients(expr, model: Model, n: int):
         raise _NotQuadraticError(f"Unhandled expression type: {type(node).__name__}")
 
     _walk(expr)
-    return Q, c, const
+    return q_terms, c, const
 
 
 def _try_extract_const_var(expr, model: Model):
@@ -962,8 +1038,9 @@ def _extract_qcp_constraints_algebraic(
 
     # COO accumulators rather than lists of dense rows (#863): a row is reduced to
     # its nonzeros as soon as it is produced, so an (m, n_orig) dense stack is never
-    # built. (The dense (n, n) Q that ``_extract_quadratic_coefficients`` returns per
-    # QUADRATIC row is a separate, still-open wall on this path.)
+    # built. The per-QUADRATIC-row Hessian is accumulated sparsely for the same
+    # reason and materialised once, dense or CSR per ``_materialise_Q``'s budget —
+    # a LINEAR row never materialises one at all.
     ub_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
     ub_rhs: list[float] = []
     eq_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
@@ -971,12 +1048,16 @@ def _extract_qcp_constraints_algebraic(
     q_rows: list[QuadraticConstraintData] = []
 
     for con in constraints:
-        Q, c_vec, const = _extract_quadratic_coefficients(con.body, model, n_orig)
+        q_terms, c_vec, const = _extract_quadratic_terms(con.body, model, n_orig)
         rhs = float(con.rhs) - float(const)
-        if _quadratic_row_has_terms(Q):
+        if _quadratic_terms_nonempty(q_terms):
+            Q = _materialise_Q(q_terms, n_orig)
             q_rows.append(
                 QuadraticConstraintData(
-                    Q=np.asarray(Q),  # type: ignore[arg-type]
+                    # Preserve sparsity: np.asarray() on a sparse matrix silently
+                    # yields a 0-d object array rather than raising (#863).
+                    # Consumers densify via dense_Q().
+                    Q=Q if _sp_issparse(Q) else np.asarray(Q),  # type: ignore[arg-type]
                     c=np.asarray(c_vec),  # type: ignore[arg-type]
                     sense=con.sense,
                     rhs=rhs,
@@ -1079,7 +1160,10 @@ def extract_qp_data_algebraic(model: Model) -> QPData:
         obj_const = -obj_const
 
     return QPData(
-        Q=np.asarray(Q_full),  # type: ignore[arg-type]
+        # Preserve sparsity: np.asarray() on a sparse matrix silently yields a 0-d
+        # object array rather than raising, which would smuggle garbage into every
+        # consumer (#863). Consumers densify via dense_Q().
+        Q=Q_full if _sp_issparse(Q_full) else np.asarray(Q_full),  # type: ignore[arg-type]
         c=np.asarray(c_full),  # type: ignore[arg-type]
         A_eq=A_eq,
         b_eq=b_eq,
@@ -1108,7 +1192,8 @@ def extract_qcp_data_algebraic(model: Model) -> QCPData:
         obj_const = -obj_const
 
     return QCPData(
-        Q=np.asarray(Q),  # type: ignore[arg-type]
+        # ``Q`` may now be sparse too (#863) — same np.asarray hazard, same fix.
+        Q=Q if _sp_issparse(Q) else np.asarray(Q),  # type: ignore[arg-type]
         c=np.asarray(c_vec),  # type: ignore[arg-type]
         # Preserve sparsity: np.asarray() on a sparse matrix silently yields a 0-d
         # object array rather than raising, which would smuggle garbage into every

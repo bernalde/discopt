@@ -14483,7 +14483,10 @@ def _quadratic_rows_solution_feasible(x, quadratic_constraints, tol=1e-6) -> boo
         return False
     x_scale = 1.0 + float(np.max(np.abs(x))) if x.size else 1.0
     for row in quadratic_constraints:
-        Q = np.asarray(row.Q, dtype=np.float64)
+        # dense_Q, not np.asarray: a quadratic row's Q may be scipy sparse (#863),
+        # and np.asarray on that silently yields a 0-d object array instead of
+        # raising -- which would make this feasibility check meaningless.
+        Q = _dense_Q(row.Q)
         c = np.asarray(row.c, dtype=np.float64)
         rhs = float(row.rhs)
         value = float(0.5 * x @ Q @ x + c @ x)
