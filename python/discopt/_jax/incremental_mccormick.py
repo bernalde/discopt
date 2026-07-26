@@ -358,7 +358,7 @@ class IncrementalMcCormickLP:
                 lb_p[k], ub_p[k] = -(7.0 + k), -1.0
             else:
                 lb_p[k], ub_p[k] = 1.0, 7.0 + k
-        A, b, bnds, c, info, _ = self._full_build(lb_p, ub_p)  # A is CSR (sparse)
+        A, b, bnds, c, info, _relax_probe = self._full_build(lb_p, ub_p)  # A is CSR (sparse)
         # Decline only genuinely huge structures — now measured by NONZEROS (the
         # sparse footprint), not dense cells. qap's lift is ~172k nnz (trivial);
         # this guards a pathological lift whose sparse `.data` copy per node would
@@ -376,6 +376,16 @@ class IncrementalMcCormickLP:
         self.n = n
         self.ncol = A.shape[1]
         self.c = c
+        # Constant term of the (minimize-equivalent) relaxation objective. The LP
+        # solved here is ``min c·x``, but the relaxation's objective value is
+        # ``c·x + obj_offset`` — the cold path adds it (``MilpRelaxationModel.solve``),
+        # so a bound returned WITHOUT it is not on the same scale as the cold build's,
+        # and is not a valid bound at all when the offset is negative (measured: a
+        # node whose true McCormick optimum is -92 came back as +8 — a dual bound
+        # ABOVE the true optimum, the false-fathom class). Carried here and added
+        # back at every bound-returning exit; ``c_override`` solves (feasibility
+        # pump) are surrogates and deliberately excluded.
+        self.obj_offset = float(getattr(_relax_probe, "_obj_offset", 0.0) or 0.0)
         self.base_A = A  # CSR, sorted indices; product-row VALUES rewritten per node
         self.base_b = b.copy()
         self.base_bounds = bnds.copy()
@@ -485,6 +495,39 @@ class IncrementalMcCormickLP:
             for k in rows:
                 for col in (j, a):
                     self._pos[(k, col)] = _index_of(k, col)
+
+    @property
+    def box_dependent_cols(self) -> frozenset[int]:
+        """Structural columns whose BOUNDS drive a patched envelope row.
+
+        :meth:`_patch` writes closed-form McCormick / secant-tangent coefficients
+        built directly from ``lb[k]``/``ub[k]`` of these columns. An infinite endpoint
+        on one of them produces ``inf``/``nan`` coefficients — silently, since the
+        fixed sparsity pattern has nowhere to drop a row (unlike the cold builder,
+        whose ``_Builder.add_row`` discards any non-finite payload and merely loosens).
+        A caller that may hand this structure a partially infinite box must therefore
+        check these columns first; :meth:`_validate` guarantees the set is complete,
+        because any box-dependent row it did not map makes ``ok`` False.
+        """
+        cols: set[int] = set()
+        for i, j in self.bilinear:
+            cols.update((int(i), int(j)))
+        for i, _p in self.monomial:
+            cols.add(int(i))
+        for j, _a in self.affine_square:
+            cols.add(int(j))
+        return frozenset(cols)
+
+    def box_is_patchable(self, lb, ub) -> bool:
+        """Whether :meth:`_patch` can produce a finite system over ``[lb, ub]``."""
+        cols = self.box_dependent_cols
+        if not cols:
+            return True
+        idx = np.fromiter(cols, dtype=int, count=len(cols))
+        return bool(
+            np.all(np.isfinite(np.asarray(lb, dtype=float)[idx]))
+            and np.all(np.isfinite(np.asarray(ub, dtype=float)[idx]))
+        )
 
     # -- per-node patch ---------------------------------------------------- #
 
@@ -707,7 +750,12 @@ class IncrementalMcCormickLP:
             for i in range(self.n):
                 regimes.add(self._box_sign_regime(float(lb[i]), float(ub[i])))
             Ap, bp, bdp = self._patch(lb, ub)
-            Af, bf, bdf, _, _, _ = self._full_build(lb, ub)
+            # Conflict resolution (#860 x #861): main's validation STRUCTURE — the
+            # vacuity-filtered row sets and the bounds-first ordering, which is what
+            # lets a pinned box validate — plus #860's objective-offset assertion.
+            # Both are needed: dropping main's version would re-break the pinned-box
+            # case, dropping #860's would let a box-dependent offset through.
+            Af, bf, bdf, _, _, relax_f = self._full_build(lb, ub)
             if Ap.shape[1] != Af.shape[1]:
                 raise ValueError("column-count mismatch")
             # Bounds first: the row comparison drops box-vacuous rows, so the two
@@ -721,6 +769,17 @@ class IncrementalMcCormickLP:
             # polytope test — see :meth:`_rowset`.
             if self._rowset(Ap, bp, bdp) != self._rowset(Af, bf, bdf):
                 raise ValueError("row-set mismatch")
+            # The objective constant is captured once (probe box) and added back to
+            # every returned bound, so it must be box-INDEPENDENT for that to be
+            # exact. It is, for every shape the engine lifts (the aux substitution
+            # moves the nonlinear part into columns and leaves the model's own
+            # constant), but assert it here rather than assume: a box-dependent
+            # offset makes ``ok=False`` and the caller falls back to the cold build.
+            off_f = float(getattr(relax_f, "_obj_offset", 0.0) or 0.0)
+            if abs(off_f - self.obj_offset) > 1e-9 * (1.0 + abs(off_f)):
+                raise ValueError(
+                    f"objective offset is box-dependent ({off_f} vs {self.obj_offset})"
+                )
         self._validated_regimes = frozenset(regimes)
         self.ok = True
 
@@ -743,11 +802,17 @@ class IncrementalMcCormickLP:
         return A, b, bounds
 
     def solve_assembled(self, A, b, bounds, in_basis=None, c_override=None):
-        """Solve a pre-assembled LP ``min c·x s.t. A x <= b, bounds``."""
+        """Solve a pre-assembled LP ``min c·x s.t. A x <= b, bounds``.
+
+        The returned value is the RELAXATION's objective, ``c·x + obj_offset`` — the
+        same scale ``MilpRelaxationModel.solve`` reports on the cold path. A
+        ``c_override`` solve is a surrogate (feasibility pump), not a bound, so the
+        offset is not applied to it."""
         from discopt.solvers import SolveStatus
         from discopt.solvers.milp_simplex import solve_lp_warm_std
 
         cobj = self.c if c_override is None else np.asarray(c_override, dtype=np.float64)
+        off = 0.0 if c_override is not None else self.obj_offset
         try:
             result, out_basis = solve_lp_warm_std(
                 cobj, sp.csr_matrix(A), b, bounds, in_basis=in_basis
@@ -756,7 +821,7 @@ class IncrementalMcCormickLP:
             return None, None, None
         if result is None or result.status != SolveStatus.OPTIMAL or result.objective is None:
             return None, None, None
-        return float(result.objective), np.asarray(result.x, dtype=float), out_basis
+        return float(result.objective) + off, np.asarray(result.x, dtype=float), out_basis
 
     def solve_assembled_full(
         self, A, b, bounds, in_basis=None, c_override=None, *, return_cert=False
@@ -788,6 +853,7 @@ class IncrementalMcCormickLP:
         from discopt.solvers.milp_simplex import LpWarmCert, solve_lp_warm_std
 
         cobj = self.c if c_override is None else np.asarray(c_override, dtype=np.float64)
+        off = 0.0 if c_override is not None else self.obj_offset
         _empty = LpWarmCert(safe_bound=None, farkas_certified=False)
 
         def _ret(status, bound, x, out_basis, farkas, cert=_empty):
@@ -807,9 +873,16 @@ class IncrementalMcCormickLP:
             return _ret("infeasible", None, None, None, bool(cert.farkas_certified), cert)
         if result.status != SolveStatus.OPTIMAL or result.bound is None:
             return _ret("other", None, None, None, False)
+        # Shift BOTH the reported bound and the certificate's safe bound onto the
+        # relaxation's own objective scale (``c·x + obj_offset``), so no consumer has
+        # to remember to add the constant back — the cert flows on to DBBT / reduced
+        # costs in ``mccormick_lp`` and would otherwise carry a different origin from
+        # the bound sitting beside it.
+        if off and cert.safe_bound is not None:
+            cert = cert._replace(safe_bound=float(cert.safe_bound) + off)
         return _ret(
             "optimal",
-            float(result.bound),
+            float(result.bound) + off,
             np.asarray(result.x, dtype=float),
             out_basis,
             False,
@@ -819,7 +892,8 @@ class IncrementalMcCormickLP:
     def solve(self, lb, ub, in_basis=None, c_override=None, cut_rows=None):
         """Solve the McCormick LP over [lb,ub] (plus optional cut rows); return
         (bound, x, out_basis) or (None, None, None). Warm-starts from ``in_basis``.
+        The bound is the relaxation objective ``c·x + obj_offset`` (cold-path scale).
         ``c_override`` replaces the objective (feasibility pump) — the returned bound
-        is then the surrogate, not a dual bound."""
+        is then the surrogate, not a dual bound, and carries no offset."""
         A, b, bounds = self.assemble(lb, ub, cut_rows)
         return self.solve_assembled(A, b, bounds, in_basis=in_basis, c_override=c_override)

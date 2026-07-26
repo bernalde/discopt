@@ -212,8 +212,11 @@ leverage, plus a structural multiplier:
 - Root cause is identified in-code: the lifted McCormick LP is **cold-rebuilt from the
   DAG every node** (`_jax/mccormick_lp.py:310-320` — "~half the spatial-B&B wall
   clock"; `_jax/incremental_mccormick.py:1-11`). An incremental, warm-started engine
-  **already exists** (`incremental_mccormick.py`, wired at `mccormick_lp.py:561-563`)
-  but is scope-gated to pure-integer minimize models (`lp_spatial_bb._is_in_scope`).
+  **already exists** (`incremental_mccormick.py`, wired at `mccormick_lp.py:561-563`).
+  *(Superseded: `mccormick_lp`'s probe was un-gated to `ok`-only for any model by
+  cert:T1.3, and `lp_spatial_bb._is_in_scope` was widened to "≥1 integer variable,
+  either sense, any continuous mix" by #860 — see
+  `docs/dev/issue-860-lp-spatial-mixed-scope.md`.)*
 - Secondary, validated: heuristic sites construct `NLPEvaluator(model)` bypassing the
   `_make_evaluator` cache (−22% gear4 wall when routed through it, bound-neutral —
   performance-plan Stage 1).

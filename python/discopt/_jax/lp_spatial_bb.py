@@ -15,18 +15,44 @@ the integer assignment is integral but a lifted product ``w_ij`` disagrees with
 heuristic produces incumbents, verified *exactly* against a ground-truth point
 evaluator (true objective + constraint feasibility) — never the relaxation bound.
 
-**Scope (this step).** Pure-integer models with a MINIMIZE objective. The frontier
-McCormick bound is always a valid lower bound; every incumbent is a genuinely
-feasible point whose reported objective is its true objective, so ``bound <=
-incumbent`` holds unconditionally. Optimality is declared only when the valid dual
-bound (frontier + a floor for nodes the engine cannot branch — see
-``unresolved_lb``) closes the gap: a node whose products are lifted outside this
-engine's ``info`` map (e.g. univariate-square bilinear post-#636) is *not* treated
-as an exact leaf, so a loose relaxation can never masquerade as a proof. Cuts
-(Gomory/MIR) and warm-started incremental LPs are added in later steps;
-``build_milp_relaxation`` is currently rebuilt per node. Returns ``None`` (caller
-falls back to the default path) whenever the model is out of scope or anything
-fails — it can never make a solve unsound.
+**Scope.** Models with at least one integer/binary variable, in either objective
+sense, with any mix of continuous variables (issue #860; the original step was
+pure-integer MINIMIZE only). Three things make the wider scope sound:
+
+* *Sense.* The engine works entirely in **minimize-equivalent** space, and both of
+  its inputs already live there: ``uniform_relax`` negates a MAXIMIZE objective when
+  it builds the LP cost, and ``NLPEvaluator`` negates it when it evaluates a point.
+  So every LP bound is a valid LOWER bound on ``sgn * f``, every verified incumbent
+  is ``sgn * f`` at a feasible point, and nothing inside the loop needs a sign at
+  all. ``sgn`` is applied exactly once, to the reported objective/bound. The
+  ``bound <= incumbent`` invariant therefore holds in min-equivalent space exactly as
+  before, and becomes ``bound >= incumbent`` (a valid upper bound) once reported for
+  a maximize.
+* *Continuous variables.* Branching generalizes: integer variables are branched
+  integrally (``floor``/``ceil``) and spatially on the integer midpoint; continuous
+  variables are bisected at the box midpoint. Both only ever *shrink* a box, so
+  every child's McCormick relaxation stays a valid outer approximation of its
+  subtree. A node whose remaining candidates are all narrower than
+  ``_MIN_BRANCH_WIDTH`` is not branchable and folds into ``unresolved_lb``.
+* *Primal.* An incumbent is never read off the relaxation. Integer coordinates are
+  rounded, continuous coordinates are completed by re-solving the node LP with the
+  integers fixed, and the resulting point is verified *exactly* against a
+  ground-truth evaluator (true objective + constraint feasibility). A completion
+  that is not genuinely feasible is discarded, so ``bound <= incumbent`` cannot be
+  broken by the continuous half.
+
+Optimality is declared only when the valid dual bound (frontier + a floor for nodes
+the engine cannot branch — see ``unresolved_lb``) closes the gap: a node whose
+products are lifted outside this engine's ``info`` map (e.g. univariate-square
+bilinear post-#636) is *not* treated as an exact leaf, so a loose relaxation can
+never masquerade as a proof. Returns ``None`` (caller falls back to the default
+path) whenever the model is out of scope or anything fails — it can never make a
+solve unsound.
+
+Pure-continuous models stay out of scope: the engine's convergence argument is that
+branching the *integers* drives the products exact, and a model with no integer
+variable gives it nothing the default NLP-per-node spatial path does not already do
+better.
 """
 
 from __future__ import annotations
@@ -44,6 +70,13 @@ logger = logging.getLogger(__name__)
 
 _INT_TOL = 1e-6
 _PROD_TOL = 1e-5
+# Narrowest box a variable may still be branched on. Bisecting below this buys no
+# relaxation tightness and only spawns nodes, so a node whose every candidate is
+# this narrow is treated as unbranchable (its bound becomes an ``unresolved_lb``
+# floor, never an optimality proof). Deliberately the SAME threshold as the
+# collapsed-box exactness test below, so the two agree: a variable that cannot be
+# branched any further is exactly one the leaf test counts as collapsed.
+_MIN_BRANCH_WIDTH = 1e-9
 
 
 class LpSpatialResult(NamedTuple):
@@ -55,14 +88,27 @@ class LpSpatialResult(NamedTuple):
     node_count: int
 
 
-def _is_in_scope(model: Model) -> bool:
-    """Pure-integer model with a minimize objective and at least one var."""
-    if model._objective is None or model._objective.sense != ObjectiveSense.MINIMIZE:
+def _is_in_scope(model: Model, *, mixed: bool = False) -> bool:
+    """Model this engine can serve: an objective, at least one integer variable, and
+    only ordinary algebraic rows. Either objective sense; any continuous mix.
+
+    ``mixed=False`` restores the pre-#860 gate (pure-integer, MINIMIZE only) for
+    callers rolling the widening out behind a flag.
+    """
+    if model._objective is None:
         return False
     if not model._variables:
         return False
-    if not all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables):
+    # At least one integer variable: the engine converges by branching the integers
+    # (which drives the lifted products exact). With none, it degenerates to plain
+    # spatial bisection, which the default NLP-per-node path already does.
+    if not any(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables):
         return False
+    if not mixed:
+        if model._objective.sense != ObjectiveSense.MINIMIZE:
+            return False
+        if not all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables):
+            return False
     # Every row must be an ordinary algebraic constraint. A GDP/logical row
     # (``_LogicalConstraint``) carries no ``.body``, and the relaxation builder
     # walks ``.body`` unconditionally -- admitting one raises deep inside the
@@ -70,14 +116,39 @@ def _is_in_scope(model: Model) -> bool:
     return all(hasattr(c, "body") for c in model._constraints)
 
 
-def _relax_bound(model, terms, lb, ub):
-    """McCormick LP over [lb,ub]; return (bound, full_x, info) or None."""
+def _integer_mask(model: Model) -> np.ndarray:
+    """Boolean mask over flat columns: True where the variable is integer/binary."""
+    flags: list[bool] = []
+    for v in model._variables:
+        flags.extend([v.var_type in (VarType.INTEGER, VarType.BINARY)] * int(v.size))
+    return np.array(flags, dtype=bool)
+
+
+def _relax_bound(model, terms, lb, ub, deadline=None):
+    """McCormick LP over [lb,ub]; return (bound, full_x, info) or None.
+
+    ``deadline`` (absolute ``time.perf_counter()``) bounds the two uninterruptible
+    halves of a cold node: the DAG re-walk (``build_deadline``, which stops adding
+    constraint rows and keeps the prefix — a weaker but still valid outer
+    relaxation) and the LP solve itself. Without it a single cold node can outlive
+    the whole engine budget, which the widened scope (#860) makes reachable: the
+    mixed class is served largely by this path, on models an order of magnitude
+    bigger than the pure-integer instances the engine started on."""
     from discopt._jax.discretization import DiscretizationState
     from discopt._jax.milp_relaxation import build_milp_relaxation
 
+    _remaining = None
+    if deadline is not None:
+        _remaining = deadline - time.perf_counter()
+        if _remaining <= 0.0:
+            return None
     try:
         relax, info = build_milp_relaxation(
-            model, terms, DiscretizationState(), bound_override=(lb, ub)
+            model,
+            terms,
+            DiscretizationState(),
+            bound_override=(lb, ub),
+            build_deadline=deadline,
         )
         if not relax._objective_bound_valid:
             return None
@@ -97,7 +168,11 @@ def _relax_bound(model, terms, lb, ub):
         # node. The incremental path already solves a pure LP; this aligns the cold
         # path with it.
         relax._integrality = None
-        res = relax.solve()
+        if _remaining is not None:
+            _remaining = deadline - time.perf_counter()
+            if _remaining <= 0.0:
+                return None
+        res = relax.solve(time_limit=_remaining)
     except Exception:
         return None
     if res is None or res.bound is None or res.x is None:
@@ -105,18 +180,36 @@ def _relax_bound(model, terms, lb, ub):
     return float(res.bound), np.asarray(res.x, dtype=float), info
 
 
-def _worst_product_var(x, info, widths):
+def _spatially_branchable(k, widths, is_int) -> bool:
+    """Can variable ``k`` still be split by a spatial (domain-bisection) branch?
+
+    An integer needs at least two values left (``width >= 1``); a continuous variable
+    needs a finite box wider than ``_MIN_BRANCH_WIDTH``. An infinite width is never
+    branchable — there is no midpoint to bisect at, and the McCormick envelope over
+    such a box is vacuous anyway."""
+    w = widths[k]
+    if not np.isfinite(w):
+        return False
+    return bool(w >= 1.0) if is_int[k] else bool(w > _MIN_BRANCH_WIDTH)
+
+
+def _worst_product_var(x, info, widths, is_int):
     """Branchable variable in the most-violated product (weighted by box width),
-    or None if every lifted product matches its defining product."""
+    or None if every lifted product matches its defining product.
+
+    The weight ``viol * (width + 1)`` prefers a violation sitting on a wide box (more
+    envelope to gain by splitting). For a continuous factor the width can be < 1, so
+    the ``+1`` keeps the score positive and monotone in the violation — the same
+    ordering the pure-integer version had, extended rather than replaced."""
     best, best_var = _PROD_TOL, None
     for (i, j), col in info.get("bilinear", {}).items():
         viol = abs(x[col] - x[i] * x[j])
         for k in (i, j):
-            if widths[k] >= 1 and viol * (widths[k] + 1) > best:
+            if _spatially_branchable(k, widths, is_int) and viol * (widths[k] + 1) > best:
                 best, best_var = viol * (widths[k] + 1), k
     for (i, _p), col in info.get("monomial", {}).items():
         viol = abs(x[col] - x[i] * x[i])
-        if widths[i] >= 1 and viol * (widths[i] + 1) > best:
+        if _spatially_branchable(i, widths, is_int) and viol * (widths[i] + 1) > best:
             best, best_var = viol * (widths[i] + 1), i
     return best_var
 
@@ -229,6 +322,7 @@ def solve_lp_spatial_bb(
     use_obbt: bool = True,
     root_cut_rounds: int = 0,
     require_incremental: bool = False,
+    mixed: bool = False,
 ) -> Optional[LpSpatialResult]:
     """LP-node spatial branch-and-bound. Returns ``None`` if out of scope.
 
@@ -255,19 +349,41 @@ def solve_lp_spatial_bb(
     inherited by all nodes). Default 0 (off): with discopt's current Python-level
     separators the per-round crossover/GMI cost and the larger inherited LP at every
     node outweigh the modest tightening — measured net-negative on nvs17/19/24. The
-    machinery is sound and kept opt-in for when a fast native separator exists."""
-    if not _is_in_scope(model):
+    machinery is sound and kept opt-in for when a fast native separator exists.
+
+    ``mixed`` (#860) admits mixed-integer and MAXIMIZE models; ``False`` is the
+    pre-#860 pure-integer/MINIMIZE gate. **Default False**: the widening is a real
+    capability but it is not net-positive on the default path (CLAUDE.md §5 bar 2 —
+    see ``_lp_spatial_mixed_fallback_enabled``), so both production call sites pass
+    ``mixed=_lp_spatial_mixed_fallback_enabled()`` rather than relying on this
+    default. Defaulting to ``False`` means a *new* call site inherits the
+    conservative gate instead of silently shipping the widening, which is the same
+    reason ``row_scan_is_anytime`` defaults to ``False`` in the tightening rules."""
+    if not _is_in_scope(model, mixed=mixed):
         return None
 
+    from discopt._jax.model_utils import flat_variable_bounds
     from discopt._jax.term_classifier import classify_nonlinear_terms
 
     terms = classify_nonlinear_terms(model)
-    n = len(model._variables)
-    INT = list(range(n))  # scope: all variables integer
-    lb0 = np.array([float(v.lb) for v in model._variables])
-    ub0 = np.array([float(v.ub) for v in model._variables])
-    if not (np.all(np.isfinite(lb0)) and np.all(np.isfinite(ub0))):
-        return None  # unbounded integer box: out of scope for this step
+    lb0, ub0 = flat_variable_bounds(model)
+    lb0 = lb0.astype(float, copy=True)
+    ub0 = ub0.astype(float, copy=True)
+    n = int(lb0.size)
+    is_int = _integer_mask(model)
+    if is_int.size != n:  # defensive: flat layouts must agree
+        return None
+    INT = [i for i in range(n) if is_int[i]]
+    _has_cont = bool(np.any(~is_int))
+    # Minimize-equivalent sign. Both the relaxation builder and ``NLPEvaluator``
+    # already negate a MAXIMIZE objective, so every LP bound below is a valid LOWER
+    # bound on ``sgn * f``, every verified incumbent is ``sgn * f``, and the whole
+    # engine (heap order, incumbent comparison, fathoming, gap) runs unchanged in that
+    # space. ``sgn`` appears in exactly ONE place: the reported objective/bound at the
+    # exit. Applying it anywhere else would double-negate. (``_objective`` is not None
+    # here — ``_is_in_scope`` above rejects a model without one.)
+    _obj = model._objective
+    sgn = -1.0 if (_obj is not None and _obj.sense == ObjectiveSense.MAXIMIZE) else 1.0
 
     t0 = time.perf_counter()
 
@@ -295,7 +411,21 @@ def solve_lp_spatial_bb(
     def _pt_feasible(xr: np.ndarray) -> bool:
         return bool(_check_constraint_feasibility(_ev, xr, _cl, _cu, tol=_FEAS_TOL))
 
-    if use_obbt:
+    # Root box with an infinite endpoint. Pre-#860 this was an immediate decline
+    # ("unbounded integer box: out of scope"). It is the single biggest reason the
+    # engine could not *accept* the mixed class: 31 of the 71 mixed instances in the
+    # in-repo corpus carry at least one infinite bound (real MINLPs leave continuous
+    # columns unbounded above), including the syn/rsyn maximize family this issue
+    # names. It is not, however, a soundness boundary — see the two paths below.
+    _inf_box = not (np.all(np.isfinite(lb0)) and np.all(np.isfinite(ub0)))
+
+    # Root OBBT. Runs when the caller asked for it OR when the box is infinite: on an
+    # unbounded box it is the difference between a bound and nothing at all. Measured
+    # on the two in-repo maximize instances, whose relaxation has NO valid objective
+    # bound over the raw box (``_objective_bound_valid=False``): OBBT finitizes every
+    # infinite upper bound in ~0.2-0.4 s and the McCormick LP then returns a valid
+    # bound (syn05m -1165.78, syn05hfsg -1335.50 minimize-equivalent).
+    if use_obbt or _inf_box:
         try:
             from discopt._jax.obbt import obbt_tighten_root
 
@@ -314,8 +444,17 @@ def solve_lp_spatial_bb(
                 time_limit_per_lp=min(0.5, max(0.05, _obbt_budget / 10.0)),
             )
             if not r.infeasible:
-                lb0 = np.maximum(lb0, np.floor(np.asarray(r.lb) + 1e-9))
-                ub0 = np.minimum(ub0, np.ceil(np.asarray(r.ub) - 1e-9))
+                # Integrality rounding applies to INTEGER columns only. Flooring a
+                # continuous variable's tightened lower bound would push it BELOW the
+                # value OBBT proved (widening, merely wasteful) while ceiling its upper
+                # bound would do the same — but rounding a continuous bound the wrong
+                # way on a narrow box can also erase the tightening entirely. Keep the
+                # exact continuous bounds and round only where integrality permits.
+                _rlb = np.asarray(r.lb, dtype=float)
+                _rub = np.asarray(r.ub, dtype=float)
+                lb0 = np.maximum(lb0, np.where(is_int, np.floor(_rlb + 1e-9), _rlb))
+                ub0 = np.minimum(ub0, np.where(is_int, np.ceil(_rub - 1e-9), _rub))
+                _inf_box = not (np.all(np.isfinite(lb0)) and np.all(np.isfinite(ub0)))
         except Exception as exc:
             # Never let root tightening break the solve -- but never hide it either.
             # A silently-skipped capability is precisely the failure mode that cost
@@ -348,26 +487,49 @@ def solve_lp_spatial_bb(
         _own_deadline = min(_own_deadline, float(_ambient))
 
     _inc = IncrementalMcCormickLP(model, terms, deadline=_own_deadline)
+    # The incremental patch writes closed-form envelope coefficients straight from the
+    # box endpoints, so an infinite bound on a column it patches would inject
+    # ``inf``/``nan`` into the node LP with no row-level guard to catch it (the cold
+    # builder discards such rows and merely loosens). Decline the fast path there and
+    # let the cold build serve the model: sound either way, and it is what lets the
+    # engine accept a partially infinite box at all. Branching only shrinks boxes, so
+    # a root box that is patchable stays patchable at every node.
+    if _inc.ok and not _inc.box_is_patchable(lb0, ub0):
+        logger.debug(
+            "lp_spatial: incremental structure declined on this box (an infinite "
+            "endpoint on a patched product column); using the per-node cold build"
+        )
+        _inc.ok = False
     if require_incremental and not _inc.ok:
         logger.debug(
             "lp_spatial declined: no incremental McCormick structure and the caller "
             "requires it (the per-node cold build cannot serve a bounded budget)"
         )
         return None
+    # ``relax`` returns ``(bound, x, basis, info)``. The product map travels WITH the
+    # solution it describes: on the incremental path the lifted layout is fixed once
+    # and ``info`` is a constant, but the cold path re-runs ``build_milp_relaxation``
+    # at every node and the lift is box-dependent, so a node's column count can differ
+    # from the root's. Reusing the root map against a node's ``x`` indexes past the
+    # end of that node's solution vector (measured on st_e38: root aux column 18 vs a
+    # 17-column node LP -> IndexError, which the caller swallowed as "engine failed"
+    # and silently fell back). A product map is only meaningful for the exact LP it
+    # came from.
     if _inc.ok:
         info = {"bilinear": _inc.bilinear, "monomial": _inc.monomial}
 
         def relax(lb, ub, basis):
-            return _inc.solve(lb, ub, in_basis=basis)
+            b_, x_, bas = _inc.solve(lb, ub, in_basis=basis)
+            return b_, x_, bas, info
     else:
-        _r0 = _relax_bound(model, terms, lb0, ub0)
+        _r0 = _relax_bound(model, terms, lb0, ub0, deadline=t0 + time_limit)
         if _r0 is None:
             return None
         info = _r0[2]
 
         def relax(lb, ub, basis):
-            c = _relax_bound(model, terms, lb, ub)
-            return (c[0], c[1], None) if c is not None else (None, None, None)
+            c = _relax_bound(model, terms, lb, ub, deadline=t0 + time_limit)
+            return (c[0], c[1], None, c[2]) if c is not None else (None, None, None, None)
 
     # Branch-and-cut: separate integer cuts (GMI + complemented-MIR, product aux
     # vars marked integer) at each node and re-solve, tightening the node bound
@@ -381,7 +543,11 @@ def solve_lp_spatial_bb(
     def node_relax(lb, ub, basis, inherited, rounds):
         """Solve the node LP with inherited cuts, then run ``rounds`` of cut
         separation (add only bound-improving cuts), returning
-        ``(bound, x, basis, cuts, verdict)``.
+        ``(bound, x, basis, cuts, verdict, info)``.
+
+        ``info`` is the product map of the LP that produced ``x`` — see the note on
+        ``relax`` above; it is carried through the frontier so the spatial-branching
+        test always reads the map belonging to the solution in hand.
 
         ``verdict`` distinguishes the two very different reasons a node LP can come
         back with no bound, which the caller MUST NOT conflate:
@@ -397,18 +563,19 @@ def solve_lp_spatial_bb(
           must fold such a node into ``unresolved_lb`` instead.
         """
         if not cut_enabled:
-            b_, x_, bas = relax(lb, ub, basis)
+            b_, x_, bas, info_ = relax(lb, ub, basis)
             # Cold path: ``_relax_bound`` collapses every failure mode into ``None``
             # and cannot prove infeasibility, so the only sound reading is
             # "unresolved". This is conservative in the safe direction — it can cost
             # an optimality certificate, never create a false one.
-            return b_, x_, bas, (), ("optimal" if b_ is not None else "unresolved")
+            verdict = "optimal" if b_ is not None else "unresolved"
+            return b_, x_, bas, (), verdict, info_
         cuts = list(inherited)
         A, b, bounds = _inc.assemble(lb, ub, cuts)
         _st, b_, x_, bas, _farkas = _inc.solve_assembled_full(A, b, bounds, in_basis=basis)
         if b_ is None:
             _verdict = "fathom" if (_st == "infeasible" and _farkas) else "unresolved"
-            return None, None, None, tuple(cuts), _verdict
+            return None, None, None, tuple(cuts), _verdict, info
         for _r in range(rounds):
             if len(cuts) >= _MAX_INHERITED_CUTS:
                 break
@@ -424,9 +591,9 @@ def solve_lp_spatial_bb(
             b_, x_, bas = nb, nx, nbas
             if not improved:
                 break
-        return b_, x_, bas, tuple(cuts), "optimal"
+        return b_, x_, bas, tuple(cuts), "optimal", info
 
-    root_b, root_x, root_basis, root_cuts, _root_verdict = node_relax(
+    root_b, root_x, root_basis, root_cuts, _root_verdict, root_info = node_relax(
         lb0, ub0, None, (), root_cut_rounds
     )
     if root_b is None:
@@ -434,8 +601,11 @@ def solve_lp_spatial_bb(
 
     inc_val = float("inf")
     inc_x: Optional[np.ndarray] = None
-    # frontier entries: (bound, tiebreak, lb, ub, x, warm_basis, inherited_cuts)
-    heap = [(root_b, 0, lb0, ub0, root_x, root_basis, root_cuts)]
+    # frontier entries:
+    #   (bound, tiebreak, lb, ub, x, warm_basis, inherited_cuts, info)
+    # ``info`` is the product map of the LP that produced this node's ``x`` — see
+    # ``relax``; it must travel with the solution, not be read from the root.
+    heap = [(root_b, 0, lb0, ub0, root_x, root_basis, root_cuts, root_info)]
     counter = 1
     nodes = 0
 
@@ -480,22 +650,64 @@ def solve_lp_spatial_bb(
             psi_u[i] = (psi_u[i] * cnt_u[i] + gain) / (cnt_u[i] + 1)
             cnt_u[i] += 1
 
+    def _round_integers(xhat):
+        """Integer coordinates rounded, continuous coordinates untouched, clipped to
+        the root box. Rounding a CONTINUOUS coordinate would be wrong twice over: it
+        is not required to be integral, and moving it off the LP value throws away the
+        only continuous information the node has."""
+        xr = np.asarray(xhat, dtype=float).copy()
+        xr[is_int] = np.round(xr[is_int])
+        return np.minimum(np.maximum(xr, lb0), ub0)
+
     def verify(xhat):
-        """Exact objective at the rounded integer point, or None if infeasible.
+        """Exact minimize-equivalent objective at the candidate point, or None if it
+        is not feasible.
 
         Ground truth only: evaluates the true objective and checks constraint
         feasibility with the point evaluator (never the McCormick relaxation bound,
         which is not exact once a product is lifted outside ``info`` -- see the
         verifier note above). Guarantees any accepted incumbent is a genuinely
         feasible point whose reported objective is its true objective, so the
-        frontier's valid lower bound can never exceed it."""
-        xr = np.minimum(np.maximum(np.round(xhat), lb0), ub0)
+        frontier's valid lower bound can never exceed it.
+
+        The value is MINIMIZE-EQUIVALENT, the same space every LP bound here lives in:
+        ``NLPEvaluator`` already negates a MAXIMIZE objective (``_negate``), exactly as
+        the relaxation builder negates the LP cost, so the two agree without any
+        further adjustment. ``sgn`` is applied once, at the exit."""
+        xr = _round_integers(xhat)
         if not _pt_feasible(xr):
             return None
         try:
             return float(_ev.evaluate_objective(xr)), xr
         except Exception:
             return None
+
+    def complete(lb_c, ub_c, xhat):
+        """Mixed-integer primal: fix the integers at their rounded values, re-solve the
+        node LP for the continuous coordinates, and verify the completed point.
+
+        This is the mixed generalization of the pure-integer engine's collapsed-box
+        primal. On a pure-integer model fixing the integers collapses the box to a
+        point and this degenerates to :func:`verify`; with continuous variables
+        present, the collapse leaves an LP whose optimum supplies them. That LP is
+        still a *relaxation* of the continuous restriction, so its point is only a
+        candidate -- which is exactly why the result goes through ``verify`` and is
+        discarded unless the ground-truth evaluator accepts it."""
+        xr = _round_integers(xhat)
+        lo, hi = np.asarray(lb_c, float).copy(), np.asarray(ub_c, float).copy()
+        # Only fix integers the node box still admits; a rounded value outside it
+        # would make the child box empty and the LP trivially infeasible.
+        fix = is_int & (xr >= lo - 1e-9) & (xr <= hi + 1e-9)
+        lo[fix] = xr[fix]
+        hi[fix] = xr[fix]
+        if np.any(lo > hi + 1e-9):
+            return None
+        _b, xx, _bas, _inf = relax(lo, hi, None)
+        if xx is None:
+            return None
+        xc = np.asarray(xx[:n], dtype=float).copy()
+        xc[fix] = xr[fix]
+        return verify(xc)
 
     def dive(lb_d, ub_d):
         """Fix-and-dive: repeatedly fix the most-fractional free integer to its
@@ -508,11 +720,15 @@ def solve_lp_spatial_bb(
             # the engine can blow past ``time_limit`` by an order of magnitude.
             if (time.perf_counter() - t0) >= time_limit:
                 return None
-            b_, xx, _bas = relax(lo, hi, None)
+            b_, xx, _bas, _inf = relax(lo, hi, None)
             if b_ is None:
                 return None
             free = [(abs(xx[i] - round(xx[i])), i) for i in INT if hi[i] - lo[i] > 0.5]
             if not free:
+                # Every integer is fixed. On a pure-integer model the box is now a
+                # single point and ``xx`` IS that point; with continuous variables it
+                # is the LP's continuous completion of the fixed integer assignment.
+                # Either way the candidate is verified exactly, never trusted.
                 return verify(xx[:n])
             _, bi = max(free)
             v = min(max(round(xx[bi]), lo[bi]), hi[bi])
@@ -524,11 +740,19 @@ def solve_lp_spatial_bb(
         relaxation and rounding, each step re-solving the McCormick LP with a linear
         objective that pushes it toward the current rounded point, until the rounded
         integers are feasible (verified by the collapsed box). Finds incumbents where
-        one-shot rounding / diving fail (e.g. nvs19/24)."""
+        one-shot rounding / diving fail (e.g. nvs19/24).
+
+        On a mixed model the pump acts on the INTEGER coordinates only -- those are the
+        ones that have to be rounded to something. The continuous coordinates carry no
+        rounding distance to close, and pushing them toward a rounded value would fight
+        the LP for no reason; they are left to the relaxation, and the candidate point
+        goes through :func:`complete` so they are re-solved against the fixed integer
+        assignment before verification."""
         if not _inc.ok:
             return None
         x = np.asarray(x_seed, dtype=float)
         xhat = np.minimum(np.maximum(np.round(x[:n]), lb), ub)
+        xhat[~is_int] = np.minimum(np.maximum(x[:n][~is_int], lb[~is_int]), ub[~is_int])
         seen: set = set()
         for _ in range(max_iter):
             # Same deadline poll as ``dive``: one LP per iteration, run at the root
@@ -536,22 +760,29 @@ def solve_lp_spatial_bb(
             if (time.perf_counter() - t0) >= time_limit:
                 return None
             h = verify(xhat)
+            if h is None and _has_cont:
+                h = complete(lb, ub, xhat)
             if h is not None:
                 return h
-            key = tuple(xhat.tolist())
-            if key in seen:  # cycle -> perturb the most-fractional coordinates
-                order = np.argsort(-np.abs(x[:n] - xhat))
-                for j in order[: max(1, n // 4)]:
+            key = tuple(np.asarray(xhat)[is_int].tolist())
+            if key in seen:  # cycle -> perturb the most-fractional integer coordinates
+                frac = np.where(is_int, np.abs(x[:n] - xhat), -np.inf)
+                for j in np.argsort(-frac)[: max(1, len(INT) // 4)]:
+                    if not is_int[j]:
+                        continue
                     step = 1.0 if x[j] > xhat[j] else -1.0
                     xhat[j] = min(max(xhat[j] + step, lb[j]), ub[j])
             seen.add(key)
             c_fp = np.zeros(_inc.ncol)
-            c_fp[:n] = np.where(x[:n] > xhat, 1.0, -1.0)  # minimize -> pull x to xhat
+            # minimize -> pull the integer coordinates toward xhat; leave the
+            # continuous ones with zero cost so the LP places them freely.
+            c_fp[:n] = np.where(is_int, np.where(x[:n] > xhat, 1.0, -1.0), 0.0)
             _b, x_, _bas = _inc.solve(lb, ub, c_override=c_fp)
             if x_ is None:
                 return None
             x = x_
             xhat = np.minimum(np.maximum(np.round(x[:n]), lb), ub)
+            xhat[~is_int] = np.minimum(np.maximum(x[:n][~is_int], lb[~is_int]), ub[~is_int])
         return None
 
     def consider(cand):
@@ -570,9 +801,11 @@ def solve_lp_spatial_bb(
         nonlocal counter, unresolved_lb
         if np.any(lb > ub + 1e-9):
             return None  # empty integer box: genuinely nothing here, safe to drop
-        b_, x_, basis_, cuts_, verdict = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
+        b_, x_, basis_, cuts_, verdict, info_ = node_relax(
+            lb, ub, parent_basis, parent_cuts, rounds
+        )
         if b_ is not None and b_ < inc_val - 1e-9:
-            heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_))
+            heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_, info_))
             counter += 1
         elif b_ is None and verdict != "fathom":
             # The child's relaxation gave no certified verdict, so its subtree is NOT
@@ -586,7 +819,13 @@ def solve_lp_spatial_bb(
         return b_
 
     # seed an incumbent: root dive (cheap) then a root feasibility pump (catches
-    # cases diving misses). Both are rate-limited below so they never dominate.
+    # cases diving misses). Both are rate-limited below so they never dominate. On a
+    # mixed model the one-shot continuous completion of the root LP point goes first:
+    # it costs a single LP and, measured over the in-repo corpus, is on its own enough
+    # on 13 of the 46 mixed instances whose root relaxation is bounded (#860 entry
+    # experiment) -- before any diving, pumping or branching.
+    if _has_cont:
+        consider(complete(lb0, ub0, root_x[:n]))
     consider(dive(lb0, ub0))
     consider(feasibility_pump(lb0, ub0, root_x))
 
@@ -601,7 +840,7 @@ def solve_lp_spatial_bb(
         if (time.perf_counter() - t0) >= time_limit or nodes >= max_nodes:
             status = "time_limit"
             break
-        bound, _, lb, ub, x, basis, ncuts = heapq.heappop(heap)
+        bound, _, lb, ub, x, basis, ncuts, ninfo = heapq.heappop(heap)
         nodes += 1
         # Global lower bound = smallest frontier bound (this popped node, best-first)
         # capped by any unresolved-node floor. Fathoming/gap tests use this, never the
@@ -613,9 +852,12 @@ def solve_lp_spatial_bb(
         if inc_x is not None and abs(inc_val - glb) <= gap_tolerance * (1 + abs(inc_val)):
             status = "optimal"
             break
-        # primal: cheap one-shot rounding every node; dive / pump rate-limited so
-        # they never dominate the node throughput (the earlier every-node bug).
+        # primal: cheap one-shot rounding every node; the continuous completion (one
+        # extra LP, mixed models only) and dive / pump rate-limited so they never
+        # dominate the node throughput (the earlier every-node bug).
         consider(verify(x[:n]))
+        if _has_cont and nodes % 16 == 0:
+            consider(complete(lb, ub, x[:n]))
         if nodes % 64 == 0:
             consider(dive(lb, ub))
         if nodes % 512 == 0:
@@ -641,19 +883,34 @@ def solve_lp_spatial_bb(
         # returns None even though the relaxation is NOT tight, so "no branchable
         # product" is NOT a proof that ``bound`` is exact here. Record a verified
         # incumbent (exact objective, never the loose ``bound``); the node is a true,
-        # fathomable leaf only when the integer box is fully fixed (a single point,
-        # where every nonlinear term is determined). Otherwise it is unresolved: keep
-        # its valid lower bound as a global-bound floor so optimality is never claimed
-        # over branching the engine could not perform.
-        bv = _worst_product_var(x, info, ub - lb)
+        # fathomable leaf only when the box is fully fixed (a single point, where every
+        # nonlinear term is determined). Otherwise it is unresolved: keep its valid
+        # lower bound as a global-bound floor so optimality is never claimed over
+        # branching the engine could not perform. The collapse test spans EVERY
+        # variable, continuous ones included -- a mixed node with a live continuous
+        # dimension is never an exact leaf, however tight its products look.
+        bv = _worst_product_var(x, ninfo, ub - lb, is_int)
         if bv is None:
             consider(verify(x[:n]))
-            if not bool(np.all(ub[:n] - lb[:n] <= 1e-9)):
+            if _has_cont:
+                consider(complete(lb, ub, x[:n]))
+            if not bool(np.all(ub[:n] - lb[:n] <= _MIN_BRANCH_WIDTH)):
                 unresolved_lb = min(unresolved_lb, bound)
             continue
-        mid = np.floor((lb[bv] + ub[bv]) / 2)
-        child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
-        child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound)
+        if is_int[bv]:
+            # Integer domain split: [lb, mid] and [mid+1, ub] partition the integers
+            # in the box exactly, so no integer point is lost.
+            mid = np.floor((lb[bv] + ub[bv]) / 2)
+            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
+            child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound)
+        else:
+            # Continuous bisection: the children SHARE the midpoint, so their union is
+            # the parent box and no feasible point can fall between them. (The integer
+            # split above can use disjoint halves only because there is nothing between
+            # ``mid`` and ``mid+1``.)
+            mid = 0.5 * (lb[bv] + ub[bv])
+            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
+            child(_set(lb, bv, mid), ub, basis, ncuts, _rounds, bound)
     else:
         # Heap exhausted. Optimal only if the unresolved-node floor does not sit below
         # the incumbent (else there is space the engine could not rule out -> feasible
@@ -684,6 +941,16 @@ def solve_lp_spatial_bb(
         gap = abs(obj - gbound) / (1 + abs(obj))
     if status == "time_limit" and inc_x is None:
         obj = None
+    # Back to the model's own objective sense. Everything above is
+    # minimize-equivalent; for a MAXIMIZE model ``gbound`` is a valid lower bound on
+    # ``-f``, hence ``-gbound`` is a valid UPPER bound on ``f``, and the
+    # ``gbound <= inc_val`` invariant established above becomes
+    # ``bound >= objective`` — the maximize form of ``bound`` never crossing the
+    # incumbent. ``gap`` is a ratio of absolute differences and is sign-invariant.
+    if obj is not None:
+        obj = sgn * obj
+    if gbound is not None and np.isfinite(gbound):
+        gbound = sgn * gbound
     return LpSpatialResult(
         status=status,
         objective=obj,
