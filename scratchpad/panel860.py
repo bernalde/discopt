@@ -79,74 +79,91 @@ def verify_point(model, x_flat):
 
 _WORKER_ENGINE = (
     _COMMON
-    + r'''
-path, tl = sys.argv[1], float(sys.argv[2])
-out = {}
-try:
-    m, sgn = load(path)
-    from discopt._jax.lp_spatial_bb import _is_in_scope, solve_lp_spatial_bb
-    out["in_scope"] = bool(_is_in_scope(m))
-    out["in_scope_legacy"] = bool(_is_in_scope(m, mixed=False))
-    if out["in_scope"]:
-        t0 = time.perf_counter()
-        r = solve_lp_spatial_bb(m, time_limit=tl, gap_tolerance=1e-4)
-        out["wall"] = time.perf_counter() - t0
-        out["declined"] = r is None
-        if r is not None:
-            out.update(status=r.status, obj=r.objective, bound=r.bound,
-                       gap=r.gap, nodes=r.node_count)
-            if r.x is not None:
-                ok, trueobj = verify_point(from_nl(path), np.asarray(r.x, float))
-                out["x_feasible"] = ok
-                out["x_true_obj"] = trueobj
-except Exception as e:
-    out["error"] = f"{type(e).__name__}: {str(e)[:120]}"
-print("RESULT" + json.dumps(out))
-'''
+    + r"""
+tl = float(sys.argv[1])
+for path in sys.argv[2:]:
+    out = {"path": path}
+    try:
+        m, sgn = load(path)
+        from discopt._jax.lp_spatial_bb import _is_in_scope, solve_lp_spatial_bb
+        out["in_scope"] = bool(_is_in_scope(m))
+        out["in_scope_legacy"] = bool(_is_in_scope(m, mixed=False))
+        if out["in_scope"]:
+            t0 = time.perf_counter()
+            r = solve_lp_spatial_bb(m, time_limit=tl, gap_tolerance=1e-4)
+            out["wall"] = time.perf_counter() - t0
+            out["declined"] = r is None
+            if r is not None:
+                out.update(status=r.status, obj=r.objective, bound=r.bound,
+                           gap=r.gap, nodes=r.node_count)
+                if r.x is not None:
+                    ok, trueobj = verify_point(from_nl(path), np.asarray(r.x, float))
+                    out["x_feasible"] = ok
+                    out["x_true_obj"] = trueobj
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    print("RESULT" + json.dumps(out), flush=True)
+"""
 )
 
 _WORKER_SOLVE = (
     _COMMON
-    + r'''
-path, tl, flag = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+    + r"""
+tl, flag = float(sys.argv[1]), sys.argv[2]
 os.environ["DISCOPT_LP_SPATIAL_MIXED"] = flag
-out = {}
-try:
-    m, sgn = load(path)
-    t0 = time.perf_counter()
-    r = m.solve(time_limit=tl)
-    out.update(wall=time.perf_counter() - t0, status=r.status, obj=r.objective,
-               bound=r.bound, gapc=bool(getattr(r, "gap_certified", False)),
-               nodes=getattr(r, "node_count", None),
-               ivf=bool(getattr(r, "incumbent_verification_failed", False)))
-    if r.x is not None:
-        names = [v.name for v in m._variables]
-        flat = np.concatenate([np.atleast_1d(np.asarray(r.x[k], float)).ravel() for k in names])
-        ok, trueobj = verify_point(from_nl(path), flat)
-        out["x_feasible"] = ok
-        out["x_true_obj"] = trueobj
-except Exception as e:
-    out["error"] = f"{type(e).__name__}: {str(e)[:120]}"
-print("RESULT" + json.dumps(out))
-'''
+for path in sys.argv[3:]:
+    out = {"path": path}
+    try:
+        m, sgn = load(path)
+        t0 = time.perf_counter()
+        r = m.solve(time_limit=tl)
+        out.update(wall=time.perf_counter() - t0, status=r.status, obj=r.objective,
+                   bound=r.bound, gapc=bool(getattr(r, "gap_certified", False)),
+                   nodes=getattr(r, "node_count", None),
+                   ivf=bool(getattr(r, "incumbent_verification_failed", False)))
+        if r.x is not None:
+            names = [v.name for v in m._variables]
+            flat = np.concatenate([np.atleast_1d(np.asarray(r.x[k], float)).ravel() for k in names])
+            ok, trueobj = verify_point(from_nl(path), flat)
+            out["x_feasible"] = ok
+            out["x_true_obj"] = trueobj
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    print("RESULT" + json.dumps(out), flush=True)
+"""
 )
 
 
-def _run(worker, args, timeout):
+def _run_batch(worker, prefix, paths, timeout):
+    """Run a BATCH of instances in one interpreter and return {path: result}.
+
+    One process per solve is the cleanest isolation, but the fixed startup cost
+    (JAX import + parse + evaluator build) dominated at ~2.3 min per instance
+    against ~1 s of actual solving, which made the panel a 10-hour run. Batching
+    amortizes it; the batch is kept small so a crash or a memory leak costs only
+    that batch, and every instance still builds a FRESH model.
+    """
+    out = {p: {"error": "no_result"} for p in paths}
     try:
-        p = subprocess.run(
-            [sys.executable, "-c", worker, *args],
+        proc = subprocess.run(
+            [sys.executable, "-c", worker, *prefix, *paths],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=_ROOT,
         )
-        for ln in p.stdout.splitlines():
+        for ln in proc.stdout.splitlines():
             if ln.startswith("RESULT"):
-                return json.loads(ln[6:])
-        return {"error": "no_result", "stderr": p.stderr[-300:]}
+                r = json.loads(ln[6:])
+                out[r.pop("path")] = r
+        for p in paths:
+            if out[p].get("error") == "no_result":
+                out[p]["stderr"] = proc.stderr[-300:]
     except subprocess.TimeoutExpired:
-        return {"error": "harness_timeout"}
+        for p in paths:
+            if out[p].get("error") == "no_result":
+                out[p] = {"error": "harness_timeout"}
+    return out
 
 
 def instances():
@@ -167,22 +184,32 @@ def main():
     ap.add_argument("--panel", default="AB")
     ap.add_argument("--out", default="scratchpad/panel860_results.json")
     ap.add_argument("--only", default="")
+    ap.add_argument("--batch", type=int, default=6)
     a = ap.parse_args()
     only = set(a.only.split(",")) if a.only else None
-    hard = a.tl + 180.0
     rows = {}
-    inst = instances()
-    for i, (name, path) in enumerate(inst, 1):
-        if only and name not in only:
-            continue
-        row = {"name": name}
+    inst = [(n, p) for n, p in instances() if not only or n in only]
+    done = 0
+    for s0 in range(0, len(inst), a.batch):
+        chunk = inst[s0 : s0 + a.batch]
+        paths = [p for _n, p in chunk]
+        hard = a.tl * len(chunk) + 240.0
+        eng = off = on = {}
         if "A" in a.panel:
-            row["engine"] = _run(_WORKER_ENGINE, [path, str(a.tl)], hard)
+            eng = _run_batch(_WORKER_ENGINE, [str(a.tl)], paths, hard)
         if "B" in a.panel:
-            row["off"] = _run(_WORKER_SOLVE, [path, str(a.tl), "0"], hard)
-            row["on"] = _run(_WORKER_SOLVE, [path, str(a.tl), "1"], hard)
-        rows[name] = row
-        print(f"[{i}/{len(inst)}] {json.dumps(row)}", flush=True)
+            off = _run_batch(_WORKER_SOLVE, [str(a.tl), "0"], paths, hard)
+            on = _run_batch(_WORKER_SOLVE, [str(a.tl), "1"], paths, hard)
+        for name, path in chunk:
+            row = {"name": name}
+            if "A" in a.panel:
+                row["engine"] = eng.get(path, {"error": "missing"})
+            if "B" in a.panel:
+                row["off"] = off.get(path, {"error": "missing"})
+                row["on"] = on.get(path, {"error": "missing"})
+            rows[name] = row
+            done += 1
+            print(f"[{done}/{len(inst)}] {json.dumps(row)}", flush=True)
         with open(os.path.join(_ROOT, a.out), "w") as fh:
             json.dump(rows, fh, indent=1)
     print("done")
