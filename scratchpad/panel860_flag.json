@@ -1,0 +1,558 @@
+{
+ "4stufen": {
+  "name": "4stufen",
+  "off": {
+   "wall": 21.49394614599987,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 20282.05073873644,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 14.550240193999798,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 20282.05073873644,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ },
+ "alan": {
+  "name": "alan",
+  "off": {
+   "wall": 0.06342785900005765,
+   "status": "optimal",
+   "obj": 2.9249999983013426,
+   "bound": 2.9249999983013426,
+   "gapc": true,
+   "nodes": 21,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.9249999983013426
+  },
+  "on": {
+   "wall": 0.06320307199985109,
+   "status": "optimal",
+   "obj": 2.9249999983013426,
+   "bound": 2.9249999983013426,
+   "gapc": true,
+   "nodes": 21,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.9249999983013426
+  }
+ },
+ "bchoco06": {
+  "name": "bchoco06",
+  "off": {
+   "wall": 21.38688005200038,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 0.9999775725261241,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 14.782666265999978,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 0.9999775725261241,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ },
+ "bchoco07": {
+  "name": "bchoco07",
+  "off": {
+   "wall": 23.45472825500019,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 1.000000000000286,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 16.88670159200001,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 1.000000000000286,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ },
+ "bchoco08": {
+  "name": "bchoco08",
+  "off": {
+   "wall": 29.71788483599994,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 1.000000000002788,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 20.14030541000011,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 1.000000000002788,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  }
+ },
+ "beuster": {
+  "name": "beuster",
+  "off": {
+   "wall": 22.508043083999837,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 6395.108328059316,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 15.420123824999791,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 6395.108328059316,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ },
+ "casctanks": {
+  "name": "casctanks",
+  "off": {
+   "wall": 26.439481547000014,
+   "status": "time_limit",
+   "obj": null,
+   "bound": -102.48025587887132,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  },
+  "on": {
+   "wall": 19.887885589000234,
+   "status": "time_limit",
+   "obj": null,
+   "bound": -102.4802558788684,
+   "gapc": false,
+   "nodes": 1,
+   "ivf": false
+  }
+ },
+ "clay0303hfsg": {
+  "name": "clay0303hfsg",
+  "off": {
+   "wall": 20.66571704199987,
+   "status": "time_limit",
+   "obj": null,
+   "bound": null,
+   "gapc": false,
+   "nodes": 15,
+   "ivf": false
+  },
+  "on": {
+   "wall": 15.117893442999957,
+   "status": "time_limit",
+   "obj": null,
+   "bound": null,
+   "gapc": false,
+   "nodes": 63,
+   "ivf": false
+  }
+ },
+ "contvar": {
+  "name": "contvar",
+  "off": {
+   "wall": 24.78055820999998,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 183430.50053431175,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  },
+  "on": {
+   "wall": 19.536510317999728,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 183430.50053431175,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  }
+ },
+ "cvxnonsep_nsig30": {
+  "name": "cvxnonsep_nsig30",
+  "off": {
+   "wall": 9.651454275000106,
+   "status": "optimal",
+   "obj": 130.6287111692529,
+   "bound": 130.61841392487688,
+   "gapc": true,
+   "nodes": 165,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 130.6287111692529
+  },
+  "on": {
+   "wall": 8.302841627999896,
+   "status": "optimal",
+   "obj": 130.6287111692529,
+   "bound": 130.61841392487688,
+   "gapc": true,
+   "nodes": 165,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 130.6287111692529
+  }
+ },
+ "cvxnonsep_psig40r": {
+  "name": "cvxnonsep_psig40r",
+  "off": {
+   "wall": 12.46529766599997,
+   "status": "optimal",
+   "obj": 86.54527995164959,
+   "bound": 86.53873600363832,
+   "gapc": true,
+   "nodes": 95,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 86.54527995164959
+  },
+  "on": {
+   "wall": 10.597759826000129,
+   "status": "optimal",
+   "obj": 86.54527995164959,
+   "bound": 86.53873600363832,
+   "gapc": true,
+   "nodes": 95,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 86.54527995164959
+  }
+ },
+ "ex1221": {
+  "name": "ex1221",
+  "off": {
+   "wall": 0.8962982420002845,
+   "status": "optimal",
+   "obj": 7.667180068813135,
+   "bound": 7.667180068813077,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 7.667180068813135
+  },
+  "on": {
+   "wall": 0.6951870019997841,
+   "status": "optimal",
+   "obj": 7.667180068813135,
+   "bound": 7.667180068813077,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 7.667180068813135
+  }
+ },
+ "ex1222": {
+  "name": "ex1222",
+  "off": {
+   "wall": 1.1242379780001102,
+   "status": "optimal",
+   "obj": 1.0765430833322625,
+   "bound": 1.0765430463031964,
+   "gapc": true,
+   "nodes": 1,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 1.0765430833322625
+  },
+  "on": {
+   "wall": 0.9876379410002301,
+   "status": "optimal",
+   "obj": 1.0765430833322625,
+   "bound": 1.0765430463031964,
+   "gapc": true,
+   "nodes": 1,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 1.0765430833322625
+  }
+ },
+ "ex1224": {
+  "name": "ex1224",
+  "off": {
+   "wall": 4.174198986999727,
+   "status": "optimal",
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000166,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -0.9434704942820806
+  },
+  "on": {
+   "wall": 2.7403194849998727,
+   "status": "optimal",
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000166,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -0.9434704942820806
+  }
+ },
+ "ex1225": {
+  "name": "ex1225",
+  "off": {
+   "wall": 2.6760348620000514,
+   "status": "optimal",
+   "obj": 30.999999913557566,
+   "bound": 30.999999913557566,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 30.999999913557566
+  },
+  "on": {
+   "wall": 2.4321912300001713,
+   "status": "optimal",
+   "obj": 30.999999913557566,
+   "bound": 30.999999913557566,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 30.999999913557566
+  }
+ },
+ "ex1226": {
+  "name": "ex1226",
+  "off": {
+   "wall": 0.9533949980000216,
+   "status": "optimal",
+   "obj": -17.000000003887443,
+   "bound": -17.000000003887443,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -17.000000003887443
+  },
+  "on": {
+   "wall": 0.7550612790000741,
+   "status": "optimal",
+   "obj": -17.000000003887443,
+   "bound": -17.000000003887443,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -17.000000003887443
+  }
+ },
+ "fac2": {
+  "name": "fac2",
+  "off": {
+   "wall": 13.777910224999687,
+   "status": "optimal",
+   "obj": 331837497.8394821,
+   "bound": 331837497.54563797,
+   "gapc": true,
+   "nodes": 39,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 331837497.8394821
+  },
+  "on": {
+   "wall": 12.882336553999721,
+   "status": "optimal",
+   "obj": 331837497.8394821,
+   "bound": 331837497.54563797,
+   "gapc": true,
+   "nodes": 39,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 331837497.8394821
+  }
+ },
+ "flay02m": {
+  "name": "flay02m",
+  "off": {
+   "wall": 0.8132819960001143,
+   "status": "optimal",
+   "obj": 37.947331863834606,
+   "bound": 37.94733180456953,
+   "gapc": true,
+   "nodes": 7,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 37.947331863834606
+  },
+  "on": {
+   "wall": 0.5829486960001304,
+   "status": "optimal",
+   "obj": 37.947331863834606,
+   "bound": 37.94733180456953,
+   "gapc": true,
+   "nodes": 7,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 37.947331863834606
+  }
+ },
+ "flay03m": {
+  "name": "flay03m",
+  "off": {
+   "wall": 13.59788596999988,
+   "status": "optimal",
+   "obj": 48.98979479383543,
+   "bound": 48.98979470823039,
+   "gapc": true,
+   "nodes": 107,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 48.98979479383543
+  },
+  "on": {
+   "wall": 13.133137556999827,
+   "status": "optimal",
+   "obj": 48.98979479383543,
+   "bound": 48.98979470823039,
+   "gapc": true,
+   "nodes": 107,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 48.98979479383543
+  }
+ },
+ "gbd": {
+  "name": "gbd",
+  "off": {
+   "wall": 0.022194132000095124,
+   "status": "optimal",
+   "obj": 2.199999982504936,
+   "bound": 2.199999982504936,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.199999982504936
+  },
+  "on": {
+   "wall": 0.021801627000058943,
+   "status": "optimal",
+   "obj": 2.199999982504936,
+   "bound": 2.199999982504936,
+   "gapc": true,
+   "nodes": 3,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": 2.199999982504936
+  }
+ },
+ "gkocis": {
+  "name": "gkocis",
+  "off": {
+   "wall": 1.6931554639995738,
+   "status": "optimal",
+   "obj": -1.9230987798770212,
+   "bound": -1.9230988280923489,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -1.9230987798770212
+  },
+  "on": {
+   "wall": 1.1862340229999973,
+   "status": "optimal",
+   "obj": -1.9230987798770212,
+   "bound": -1.9230988280923489,
+   "gapc": true,
+   "nodes": 5,
+   "ivf": false,
+   "x_feasible": true,
+   "x_true_obj": -1.9230987798770212
+  }
+ },
+ "hda": {
+  "name": "hda",
+  "off": {
+   "wall": 27.75454013100034,
+   "status": "time_limit",
+   "obj": null,
+   "bound": -141960.28628545807,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  },
+  "on": {
+   "wall": 24.54702392099989,
+   "status": "time_limit",
+   "obj": null,
+   "bound": -64473.44240243703,
+   "gapc": false,
+   "nodes": 1,
+   "ivf": false
+  }
+ },
+ "heatexch_gen1": {
+  "name": "heatexch_gen1",
+  "off": {
+   "wall": 30.36552632899975,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 38183.5317460179,
+   "gapc": false,
+   "nodes": 3,
+   "ivf": false
+  },
+  "on": {
+   "wall": 14.118221387000176,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 38183.5317460179,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ },
+ "heatexch_gen2": {
+  "name": "heatexch_gen2",
+  "off": {
+   "wall": 21.760829244999968,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 555767.7902857271,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  },
+  "on": {
+   "wall": 14.032863816999907,
+   "status": "time_limit",
+   "obj": null,
+   "bound": 555767.7902857271,
+   "gapc": false,
+   "nodes": 7,
+   "ivf": false
+  }
+ }
+}

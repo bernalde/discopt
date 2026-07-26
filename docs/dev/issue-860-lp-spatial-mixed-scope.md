@@ -181,23 +181,57 @@ Regressions: `test_incremental_mccormick_node.py::test_incremental_node_bound_in
 
 ## 4. Verification
 
-See the PR description for the panel numbers
-(`scratchpad/panel860.py`, results in `scratchpad/panel860_results.json`).
+Harness `scratchpad/panel860.py`, scoring `scratchpad/panel860_analyze.py`, 20 s
+budget, one fresh model per instance.
 
-Panel A — engine soundness on the widened class, over every in-repo instance now in
-scope. Checks that need no external oracle: every reported incumbent independently
-re-verified feasible with its objective re-evaluated; `bound ≤ objective` for a
+### Panel A — engine soundness on the widened class
+
+Every in-repo instance the engine now accepts (89: the 70 newly in scope plus the 19
+the old gate already served), run through `solve_lp_spatial_bb` directly. The checks
+need no external oracle: every reported incumbent independently re-verified feasible
+with its objective re-evaluated by a fresh evaluator; `bound ≤ objective` for a
 minimize and `bound ≥ objective` for a maximize; the bound never crossing the best
 verified feasible point found by any run of that instance; and no `status="optimal"`
 run beaten by another run's verified incumbent (which would be a false optimality
 certificate).
 
-Panel B — graduation gate for `DISCOPT_LP_SPATIAL_MIXED`, the flag governing whether
-the *default* path reserves 35% of its budget for the #844 no-incumbent fallback on
-mixed / maximize models. That reserve is the sole risk of the widening (an in-scope
-model hands budget to a pass that may find nothing), which is why it is a separate,
-measured decision from the engine's capability. Graduation needs both bars of
-CLAUDE.md §5: cert-clean **and** net-positive.
+| | newly in scope | legacy in scope |
+|---|---|---|
+| instances | 70 | 19 |
+| engine declined | 15 | 0 |
+| errors | **0** | **0** |
+| verified incumbent | **33** | 17 |
+| certified optimal | 12 | 14 |
+| **unsound bounds / incumbents** | **0** | **0** |
+| **false optimality certificates** | **0** | **0** |
+
+**Cert-clean.** 33 instances that the engine previously refused outright now yield a
+verified feasible point, 12 of them with an optimality certificate. The legacy
+pure-integer class is unchanged — nothing declined, nothing lost.
+
+Both maximize instances behave as the soundness argument requires — the reported
+bound is an *upper* bound sitting above the incumbent:
+
+| instance | status | objective | bound | incumbent independently feasible |
+|---|---|---|---|---|
+| `syn05m` | feasible | 837.732 | 868.110 | yes |
+| `syn05hfsg` | feasible | 837.732 | 868.110 | yes |
+
+(`bchoco06/07/08`, the other three maximize instances, decline: their root LP exits at
+`iteration_limit` on an ill-conditioned equilibrated system. A conditioning problem,
+not a scope one.)
+
+### Panel B — graduation gate for `DISCOPT_LP_SPATIAL_MIXED`
+
+The flag governs whether the *default* path reserves 35% of its budget for the #844
+no-incumbent fallback on mixed / maximize models. That reserve is the sole risk of the
+widening (an in-scope model hands budget to a pass that may find nothing), which is
+why it is a separate, measured decision from the engine's capability. Run over the 70
+newly in-scope instances — the other 49 take a bit-identical path under either
+setting, since the reserve gate is the flag's only consumer and both gates agree
+there. Graduation needs both bars of CLAUDE.md §5: cert-clean **and** net-positive.
+
+PANEL_B_PLACEHOLDER
 
 ## 5. Known limits (not addressed here)
 
