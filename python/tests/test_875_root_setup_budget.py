@@ -123,26 +123,48 @@ def test_fix_single_var_equalities_is_flat_in_the_variable_count():
         n_vars=128,000  3.650 s   (3.84x)
 
     i.e. exactly linear in ``n_vars`` — which extrapolates to the ~460 s the issue
-    measured. After: 0.002 s at n_vars=128,000, and flat. The threshold below is
-    deliberately loose (a true O(n) scan grows ~16x across this span) so it measures
-    the complexity class, not the machine.
+    measured. After: 0.001 s at n_vars=32,000 (0.002 s at 128,000), and flat.
+
+    Two assertions, and the ABSOLUTE one is primary. A ratio of two post-fix timings
+    divides ~1 ms by ~1 ms, which on a shared CI runner is noise over noise — one
+    scheduler hiccup flips it. The absolute ceiling has ~250x headroom for the sparse
+    scan and still fails the dense one on a runner 3x slower than the machine these
+    numbers came from, so it measures the implementation rather than the box. The
+    ratio is kept as the complexity-class signal but only evaluated when the baseline
+    is far enough above the timer floor to mean anything.
+
+    ``min`` over repetitions, not mean: the fastest run is the one least polluted by
+    whatever else the machine was doing, which is the whole question here.
     """
     n_eq = 300
+    reps = 3
     walls = {}
     for n_vars in (2_000, 32_000):
-        m = _affine_model(n_vars, n_eq)
-        lb, ub = flat_variable_bounds(m)
-        t0 = time.perf_counter()
-        out_lb, out_ub = _fix_single_var_equalities(m, lb, ub)
-        walls[n_vars] = time.perf_counter() - t0
-        # the pass must still do its job: every pinned variable collapsed to a point
-        pinned = np.flatnonzero(out_lb == out_ub)
-        assert pinned.size >= min(n_eq, n_vars)
-        assert np.all(out_lb[pinned] == 1.0)
+        best = float("inf")
+        for _ in range(reps):
+            m = _affine_model(n_vars, n_eq)
+            lb, ub = flat_variable_bounds(m)
+            t0 = time.perf_counter()
+            out_lb, out_ub = _fix_single_var_equalities(m, lb, ub)
+            best = min(best, time.perf_counter() - t0)
+            # the pass must still do its job: every pinned variable collapsed to a point
+            pinned = np.flatnonzero(out_lb == out_ub)
+            assert pinned.size >= min(n_eq, n_vars)
+            assert np.all(out_lb[pinned] == 1.0)
+        walls[n_vars] = best
 
-    # 16x the variables for the same rows: a dense-per-row scan is ~16x slower.
-    ratio = walls[32_000] / max(walls[2_000], 1e-6)
-    assert ratio < 4.0, f"cost still scales with n_vars (16x vars -> {ratio:.1f}x wall): {walls}"
+    # Primary: dense was 0.851 s here at n_vars=32,000, sparse is ~0.001 s.
+    assert walls[32_000] < 0.25, (
+        f"the scan is still paying O(n_vars) per row: {walls[32_000]:.3f}s at "
+        f"n_vars=32,000 with only {n_eq} rows (dense measured 0.851s, sparse 0.001s)"
+    )
+    # Secondary: 16x the variables for the same rows must not cost 16x the wall.
+    # Skipped when the baseline is at the timer floor, where the quotient is noise.
+    if walls[2_000] > 5e-3:
+        ratio = walls[32_000] / walls[2_000]
+        assert ratio < 4.0, (
+            f"cost still scales with n_vars (16x vars -> {ratio:.1f}x wall): {walls}"
+        )
 
 
 def test_fix_single_var_equalities_still_pins_and_still_refuses():
@@ -164,10 +186,9 @@ def test_fix_single_var_equalities_still_pins_and_still_refuses():
     assert lb[1] == -10.0 and ub[1] == 10.0
 
 
-def test_any_linear_constraint_form_matches_the_list_and_short_circuits():
-    """The RLT applicability probe is a boolean; it must stop at the first hit rather
-    than materialise one dense ``n_vars`` vector per row (91 GB on the issue's
-    instance) only to call ``bool()`` on the list."""
+def test_any_linear_constraint_form_agrees_with_the_list(monkeypatch):
+    """The boolean probe must answer exactly what ``bool(_linear_constraint_forms())``
+    answered, on both a model that has linear factors and one that has none."""
     m = _affine_model(4_000, 200)
     assert _any_linear_constraint_form(m, 4_000) is True
     assert bool(_linear_constraint_forms(m, 4_000)) is True
@@ -180,15 +201,41 @@ def test_any_linear_constraint_form_matches_the_list_and_short_circuits():
     assert _any_linear_constraint_form(nonlinear, 3) is False
     assert bool(_linear_constraint_forms(nonlinear, 3)) is False
 
-    # ...and it is genuinely short-circuiting: on a model whose FIRST row is linear
-    # the boolean probe must not depend on the rest of the list.
-    t0 = time.perf_counter()
-    _any_linear_constraint_form(m, 4_000)
-    short = time.perf_counter() - t0
-    t0 = time.perf_counter()
+
+def test_any_linear_constraint_form_short_circuits(monkeypatch):
+    """Counted, not timed: the probe must linearize ONE row when the first row is
+    linear, rather than every row.
+
+    Counting the linearizations is the actual claim (``bool()`` of a fully
+    materialised list is what this replaced), and unlike a wall-clock comparison it
+    cannot flake on a loaded runner — the failure mode that cost real time on #863
+    and briefly on this branch.
+    """
+    import discopt._jax.milp_relaxation as mr
+
+    calls = []
+    real = mr._linearize_affine_expr_sparse
+
+    def _counting(expr, model, n_vars):
+        calls.append(1)
+        return real(expr, model, n_vars)
+
+    monkeypatch.setattr(mr, "_linearize_affine_expr_sparse", _counting)
+
+    m = _affine_model(4_000, 200)
+    calls.clear()
+    assert _any_linear_constraint_form(m, 4_000) is True
+    short_circuit_calls = len(calls)
+
+    calls.clear()
     _linear_constraint_forms(m, 4_000)
-    full = time.perf_counter() - t0
-    assert short < full
+    full_calls = len(calls)
+
+    assert short_circuit_calls == 1, (
+        f"the boolean probe linearized {short_circuit_calls} rows; it must stop at "
+        f"the first linear one"
+    )
+    assert full_calls == 200, f"expected one linearization per row, got {full_calls}"
 
 
 # --------------------------------------------------------------------------
