@@ -18,7 +18,7 @@
 //!   `nl_lin_cols`/`nl_lin_coeffs`, and `nl_term_ptr` (len n_nl+1) into the term
 //!   arrays.
 //! * per term (len n_terms): `term_coeff`, `term_func` (0=Log,1=Exp,2=Sqrt,
-//!   3=Log1p), `term_arg_const`, `term_arg_ptr` (len n_terms+1) into
+//!   3=Log1p,4=Sqr), `term_arg_const`, `term_arg_ptr` (len n_terms+1) into
 //!   `term_arg_cols`/`term_arg_coeffs`.
 //! * OPTIONAL perspective scale per term (#865), supplied as a group or omitted
 //!   entirely: `term_scale_const` (len n_terms), `term_scale_ptr` (len n_terms+1)
@@ -45,9 +45,10 @@ fn func_from_code(code: i64) -> PyResult<ConvexFunc> {
         1 => ConvexFunc::Exp,
         2 => ConvexFunc::Sqrt,
         3 => ConvexFunc::Log1p,
+        4 => ConvexFunc::Sqr,
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown term_func code {other} (0=Log,1=Exp,2=Sqrt,3=Log1p)"
+                "unknown term_func code {other} (0=Log,1=Exp,2=Sqrt,3=Log1p,4=Sqr)"
             )))
         }
     })

@@ -44,6 +44,28 @@ The release procedure that produces these entries is documented in
   in-repo `.nl` instances the only routing change is `syn05hfsg` being admitted;
   nothing previously routed was lost.
 
+- **Quadratic inner function (`** 2` → `sqr`) for the convex kernel** (`feat`,
+  #865 follow-up, same default-off `DISCOPT_CONVEX_KERNEL` path). `clay*hfsg`'s
+  hull rows are `ε·((x/ε)² − c·x/ε + …)`, i.e. the quadratic perspective `x²/ε`
+  (quadratic-over-linear, jointly convex on `ε > 0`), so they declined only
+  because `_FUNC`/`ConvexFunc` had no `sqr` entry. Adds `ConvexFunc::Sqr` and
+  `_pow_as_sqr`, which composes with the perspective machinery unchanged — a
+  plain `x² ≤ c` row is now routable too. **Only the exponent 2 is admitted**;
+  every other power (odd, fractional, negative, or variable) is nonconvex,
+  domain-restricted, or signomial, and keeps falling back, as does a non-affine
+  base such as `(log x)²`.
+
+  Measured: `clay0303hfsg` goes from *declined* to routed with 36 rows / 72
+  quadratic perspective terms, verified exact (worst relative error 3.7e-13
+  against the pristine model) and convex (worst midpoint violation 0.0). It is
+  the only instance whose routing changes across the 147 in-repo `.nl` files.
+  It does **not** yet certify: at the tree's default `max_sep_rounds=12` its
+  Neumaier–Shcherbina safe bound degrades to `-inf` (raw LP optimum stays finite
+  at `5.5e-12`, and the safe bound is finite at `max_sep_rounds ≤ 4` or with a
+  finite cap on its 72 infinite upper bounds), so the tree returns `exhausted`
+  and `try_convex_solve` falls back. That blocker is in the safe-bounding layer,
+  not the producer, and is tracked separately.
+
 ### Changed
 
 ### Fixed

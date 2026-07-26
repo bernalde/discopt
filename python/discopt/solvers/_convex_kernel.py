@@ -17,8 +17,8 @@ caller keeps the (always-correct) NLP-BB path:
 * every nonlinear constraint decomposes into composite-of-affine form
   ``g(x) = a·x + b + Σ_t coeff_t·func_t(p_t·x + q_t)``;
 * each such term is CONVEX in the constraint's ``≤`` normal form — a convex
-  ``func`` (exp) with ``coeff ≥ 0``, or a concave ``func`` (log/sqrt/log1p) with
-  ``coeff ≤ 0`` (a ``≥`` row is negated to ``≤`` first, flipping every sign);
+  ``func`` (exp, sqr) with ``coeff ≥ 0``, or a concave ``func`` (log/sqrt/log1p)
+  with ``coeff ≤ 0`` (a ``≥`` row is negated to ``≤`` first, flipping every sign);
 * nonlinear EQUALITY constraints are never routed (a nonlinear equality is not a
   convex feasible set).
 
@@ -54,6 +54,11 @@ back exactly as before):
 
 Bounds enter the gate here, so an unbounded/undetermined box is a refusal, not a
 guess.
+
+The inner ``func`` may be a ``** 2`` (see ``_pow_as_sqr``), whose perspective
+``s·(a/s)² = a²/s`` is quadratic-over-linear — the ``clay*hfsg`` hull shape. Only
+the exponent 2 is admitted; every other power (odd, fractional, negative, or
+variable) is nonconvex, domain-restricted, or signomial, and keeps falling back.
 """
 
 from __future__ import annotations
@@ -82,9 +87,13 @@ _FUNC = {
     "log1p": (np.log1p, -1),
     "sqrt": (np.sqrt, -1),
     "exp": (np.exp, +1),
+    # `sqr` has no FunctionCall spelling — it is how a `** 2` node is admitted
+    # (see `_pow_as_sqr`). Its perspective `s·(a/s)² = a²/s` is
+    # quadratic-over-linear, the `clay*hfsg` hull shape.
+    "sqr": (np.square, +1),
 }
 # Rust term_func codes (must match ConvexFunc in convex_kernel.rs).
-_FUNC_CODE = {"log": 0, "exp": 1, "sqrt": 2, "log1p": 3}
+_FUNC_CODE = {"log": 0, "exp": 1, "sqrt": 2, "log1p": 3, "sqr": 4}
 
 
 class NotConvexKernel(Exception):
@@ -183,6 +192,8 @@ def _decompose(node, offsets) -> _Decomp:
             if rc is not None and rc != 0.0:
                 return _decompose(node.left, offsets).scale(1.0 / rc)
             raise NotConvexKernel("division by non-constant")
+        if node.op == "**":
+            return _pow_as_sqr(node, _decompose, offsets)
         raise NotConvexKernel(f"binary {node.op}")
     if isinstance(node, FunctionCall):
         if node.func_name not in _FUNC:
@@ -195,6 +206,29 @@ def _decompose(node, offsets) -> _Decomp:
         d.terms.append(_term(1.0, node.func_name, arg.aff, arg.const))
         return d
     raise NotConvexKernel(f"node {type(node).__name__}")
+
+
+def _pow_as_sqr(node, decompose_fn, offsets) -> _Decomp:
+    """``base ** 2`` → a convex ``sqr`` term over an affine base; else refuse.
+
+    Only the exponent 2 is admitted. Every other power (odd, fractional, negative,
+    or variable) is either nonconvex, domain-restricted, or a signomial — none of
+    which this gate may wave through, so they keep falling back. ``decompose_fn``
+    is the caller's decomposer, so this works unchanged in ratio space: the base of
+    ``(x/s)**2`` decomposes to the ratio ``x/s``, and the surrounding lift turns the
+    term into the perspective ``s·(a/s)² = a²/s``.
+    """
+    e = _as_const(node.right)
+    if e is None:
+        raise NotConvexKernel("variable exponent")
+    if e != 2.0:
+        raise NotConvexKernel(f"power {e:g}")
+    base = decompose_fn(node.left, offsets)
+    if base.terms:
+        raise NotConvexKernel("non-affine power base")
+    d = _Decomp()
+    d.terms.append(_term(1.0, "sqr", base.aff, base.const))
+    return d
 
 
 def _term(coeff, func, arg_aff, arg_const, sc_aff=None, sc_const=0.0) -> dict:
@@ -298,6 +332,8 @@ def _decompose_over(node, s: _Decomp, offsets) -> _Decomp:
                 raise NotConvexKernel("perspective numerator has a constant")
             d.aff = dict(num.aff)
             return d
+        if node.op == "**":
+            return _pow_as_sqr(node, lambda nd, off: _decompose_over(nd, s, off), offsets)
         raise NotConvexKernel(f"binary {node.op}")
     if isinstance(node, FunctionCall):
         if node.func_name not in _FUNC:

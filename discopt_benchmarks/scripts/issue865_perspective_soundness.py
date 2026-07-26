@@ -23,7 +23,13 @@ from discopt._jax.model_utils import flat_variable_bounds  # noqa: E402
 from discopt._jax.nlp_evaluator import NLPEvaluator  # noqa: E402
 from discopt.solvers import _convex_kernel as ck  # noqa: E402
 
-_FUNC_NP = {"log": np.log, "exp": np.exp, "sqrt": np.sqrt, "log1p": np.log1p}
+_FUNC_NP = {
+    "log": np.log,
+    "exp": np.exp,
+    "sqrt": np.sqrt,
+    "log1p": np.log1p,
+    "sqr": np.square,
+}
 
 
 def row_value(d, x):
@@ -81,9 +87,11 @@ def check(name, path, n_pts=400):
         print(f"{name}: NOT ROUTED (skipped)")
         return True
     m, lb, ub, ev, rows = decomps_for(model)
-    if not any(any(t["sc_aff"] is not None for t in d.terms) for _i, _s, d in rows):
-        print(f"{name}: routed but no perspective terms (skipped)")
+    if not rows:
+        print(f"{name}: routed, no nonlinear rows (skipped)")
         return True
+    kinds = sorted({t["func"] for _i, _s, d in rows for t in d.terms})
+    n_persp = sum(1 for _i, _s, d in rows for t in d.terms if t["sc_aff"] is not None)
     rng = np.random.default_rng(12345)
     pts = sample(lb, ub, rng, n_pts)
 
@@ -113,7 +121,7 @@ def check(name, path, n_pts=400):
     ok_cx = worst_cx < 1e-9
 
     print(
-        f"{name}: rows={len(rows)} "
+        f"{name}: rows={len(rows)} persp_terms={n_persp} funcs={kinds} "
         f"exactness worst_rel_err={worst:.3e} {'OK' if ok_exact else 'FAIL'} | "
         f"convexity worst_violation={worst_cx:.3e} {'OK' if ok_cx else 'FAIL'}"
     )

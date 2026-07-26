@@ -38,7 +38,13 @@ _DATA = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl")
 # (see test_issue759_syn05hfsg_bound_sense.py).
 _SYN05HFSG_OPT = 837.7324009
 
-_FUNC_NP = {"log": np.log, "exp": np.exp, "sqrt": np.sqrt, "log1p": np.log1p}
+_FUNC_NP = {
+    "log": np.log,
+    "exp": np.exp,
+    "sqrt": np.sqrt,
+    "log1p": np.log1p,
+    "sqr": np.square,
+}
 
 
 def _scalar(m, expr_fn, name):
@@ -124,7 +130,14 @@ def test_syn05hfsg_certifies_the_true_optimum():
     assert bound >= inc - tol, "certificate invariant: bound ≥ incumbent (max sense)"
 
 
-def test_syn05hfsg_perspective_lift_is_exact_and_convex():
+@pytest.mark.parametrize(
+    ("instance", "func", "n_pts"),
+    [
+        ("syn05hfsg", "log", 120),  # log perspective  −s·ln(a/s)
+        ("clay0303hfsg", "sqr", 40),  # quadratic perspective  s·(a/s)² = a²/s
+    ],
+)
+def test_perspective_lift_is_exact_and_convex(instance, func, n_pts):
     """The two properties the certificate rests on, checked over the box.
 
     Exactness: the marshaled row must equal the PRISTINE model's row pointwise —
@@ -132,13 +145,14 @@ def test_syn05hfsg_perspective_lift_is_exact_and_convex():
     Convexity: the midpoint inequality must hold on every routed row, else the OA
     tangent is not a valid relaxation.
     """
-    model = dm.from_nl(os.path.join(_DATA, "syn05hfsg.nl"))
+    model = dm.from_nl(os.path.join(_DATA, f"{instance}.nl"))
     assert build_convex_spec(model) is not None
     m, lb, ub, ev, rows = _nl_decomps(model)
     assert any(t["sc_aff"] is not None for _i, _s, d in rows for t in d.terms)
+    assert {t["func"] for _i, _s, d in rows for t in d.terms} == {func}
 
     rng = np.random.default_rng(12345)
-    X = _box_sample(lb, ub, rng, 120)
+    X = _box_sample(lb, ub, rng, n_pts)
     for x in X:
         g = np.asarray(ev.evaluate_constraints(x), float)
         for i, sign, d in rows:
@@ -148,7 +162,7 @@ def test_syn05hfsg_perspective_lift_is_exact_and_convex():
                     f"row {i}: marshaled {got} != model {ref}"
                 )
 
-    A, B = _box_sample(lb, ub, rng, 120), _box_sample(lb, ub, rng, 120)
+    A, B = _box_sample(lb, ub, rng, n_pts), _box_sample(lb, ub, rng, n_pts)
     for a, b in zip(A, B):
         for lam in (0.25, 0.5, 0.75):
             mid = lam * a + (1 - lam) * b
@@ -159,6 +173,88 @@ def test_syn05hfsg_perspective_lift_is_exact_and_convex():
                 assert gm - (lam * ga + (1 - lam) * gb) <= 1e-9 * max(1.0, abs(gm)), (
                     f"row {i} is not convex at lambda={lam}"
                 )
+
+
+# ── quadratic inner function: `** 2` → sqr (#865 follow-up) ───────────────────
+
+
+def test_clay0303hfsg_is_routed_with_quadratic_perspectives():
+    """`clay*hfsg`'s hull rows are `ε·((x/ε)² − c·x/ε + …)`, i.e. the quadratic
+    perspective `x²/ε`. They were declined before `sqr` existed."""
+    m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
+    spec = build_convex_spec(m)
+    assert spec is not None, "clay0303hfsg's quadratic perspective rows must be routed"
+    assert set(spec["term_func"].tolist()) == {_ck._FUNC_CODE["sqr"]}
+    # every one of its 72 terms is a perspective (carries a nonzero scale)
+    assert int(np.count_nonzero(spec["term_scale_const"])) == len(spec["term_coeff"]) == 72
+
+
+def test_plain_square_row_is_routed_and_certified():
+    """A plain (non-perspective) `x² ≤ c` row is convex and must certify.
+
+    max x + k  s.t.  x² ≤ 4 (→ x ≤ 2),  k ≤ x,  x∈[0,10], k∈{0..3} int.
+    Optimum: x = 2, k = 2 → 4.
+    """
+    m = dm.Model()
+    x = m.continuous("x", lb=0.0, ub=10.0)
+    k = m.integer("k", lb=0, ub=3)
+    _scalar(m, lambda: x**2 <= 4.0, "sq")
+    _scalar(m, lambda: k - x <= 0, "kx")
+    m.maximize(x + k)
+
+    spec = build_convex_spec(m)
+    assert spec is not None
+    assert set(spec["term_func"].tolist()) == {_ck._FUNC_CODE["sqr"]}
+    assert np.all(spec["term_scale_const"] == 0.0)  # plain, not a perspective
+
+    r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=30.0)
+    assert r["status"] == "optimal"
+    assert abs(r["incumbent"] - 4.0) < 1e-3, f"incumbent {r['incumbent']} != 4"
+    assert r["bound"] >= 4.0 - 1e-6, "sound: dual bound never below the true optimum"
+
+
+def test_wrong_curvature_square_falls_back():
+    """`x² ≥ 1` → its ≤-normal form is `−x² + 1 ≤ 0`, a CONCAVE term → nonconvex
+    feasible set → must fall back."""
+    m = dm.Model()
+    x = m.continuous("x", lb=0.0, ub=5.0)
+    z = m.binary("z")
+    _scalar(m, lambda: x**2 >= 1.0, "sqge")
+    m.maximize(x + z)
+    assert build_convex_spec(m) is None
+
+
+@pytest.mark.parametrize("exponent", [3, 4, 0.5, 1.5, -1, -2])
+def test_only_exponent_two_is_admitted(exponent):
+    """Every other power is nonconvex, domain-restricted, or signomial — the gate
+    must keep refusing them rather than wave them through with `sqr`."""
+    m = dm.Model()
+    x = m.continuous("x", lb=0.5, ub=5.0)
+    z = m.binary("z")
+    _scalar(m, lambda: x**exponent <= 4.0, "pow")
+    m.maximize(x + z)
+    assert build_convex_spec(m) is None, f"exponent {exponent} must not be routed"
+
+
+def test_variable_exponent_falls_back():
+    m = dm.Model()
+    x = m.continuous("x", lb=0.5, ub=5.0)
+    y = m.continuous("y", lb=1.0, ub=3.0)
+    z = m.binary("z")
+    _scalar(m, lambda: x**y <= 4.0, "varpow")
+    m.maximize(x + y + z)
+    assert build_convex_spec(m) is None
+
+
+def test_square_of_nonaffine_base_falls_back():
+    """`(log x)² ≤ c` — the base is not affine, so the composite is not a `sqr` of
+    an affine form and its convexity is not established by this gate."""
+    m = dm.Model()
+    x = m.continuous("x", lb=1.0, ub=5.0)
+    z = m.binary("z")
+    _scalar(m, lambda: dm.log(x) ** 2 <= 4.0, "logsq")
+    m.maximize(x + z)
+    assert build_convex_spec(m) is None
 
 
 # ── soundness gates ───────────────────────────────────────────────────────────

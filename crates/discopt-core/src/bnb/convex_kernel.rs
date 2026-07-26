@@ -53,6 +53,9 @@ pub enum ConvexFunc {
     Sqrt,
     /// `ln(1 + t)` (concave).
     Log1p,
+    /// `t²` (convex). Its perspective `s·(a/s)² = a²/s` is quadratic-over-linear,
+    /// jointly convex on `s > 0` — the `clay*hfsg` hull shape.
+    Sqr,
 }
 
 impl ConvexFunc {
@@ -64,6 +67,7 @@ impl ConvexFunc {
             ConvexFunc::Exp => t.exp(),
             ConvexFunc::Sqrt => t.sqrt(),
             ConvexFunc::Log1p => t.ln_1p(),
+            ConvexFunc::Sqr => t * t,
         }
     }
 
@@ -81,6 +85,7 @@ impl ConvexFunc {
                 (s, 0.5 / s)
             }
             ConvexFunc::Log1p => (t.ln_1p(), 1.0 / (1.0 + t)),
+            ConvexFunc::Sqr => (t * t, 2.0 * t),
         }
     }
 }
@@ -2299,5 +2304,94 @@ mod tests {
         let g = row.gradient_dense(&x, N);
         assert!((g[0] - (-0.3)).abs() < 1e-15);
         assert!((g[2] - 1.0).abs() < 1e-15);
+    }
+
+    /// The `clay*hfsg` row shape: the quadratic perspective `s·(a/s)² = a²/s`
+    /// (quadratic-over-linear), with `a = x0`, `s = 0.001 + 0.999·x2`.
+    fn sqr_perspective_row() -> ConvexRow {
+        ConvexRow {
+            lin: Affine {
+                cols: vec![1],
+                coeffs: vec![-35.0],
+                cst: 0.0,
+            },
+            terms: vec![CompositeTerm {
+                coeff: 1.0,
+                func: ConvexFunc::Sqr,
+                arg: Affine {
+                    cols: vec![0],
+                    coeffs: vec![1.0],
+                    cst: 0.0,
+                },
+                scale: Some(Affine {
+                    cols: vec![2],
+                    coeffs: vec![0.999],
+                    cst: 0.001,
+                }),
+            }],
+            rhs: 0.0,
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_is_quadratic_over_linear() {
+        let row = sqr_perspective_row();
+        for x in [[3.0, 0.5, 1.0, 0.0], [2.0, 1.0, 0.4, 0.0], [0.25, 0.1, 0.001, 0.0]] {
+            let s = 0.001 + 0.999 * x[2];
+            let expect = -35.0 * x[1] + x[0] * x[0] / s;
+            assert!(
+                (row.value(&x) - expect).abs() <= 1e-9 * expect.abs().max(1.0),
+                "value {} != a^2/s {expect}",
+                row.value(&x)
+            );
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_gradient_matches_finite_difference() {
+        let row = sqr_perspective_row();
+        for x in [[3.0, 0.5, 1.0, 0.0], [2.0, 1.0, 0.4, 0.0], [0.5, 0.1, 0.2, 0.0]] {
+            let g = row.gradient_dense(&x, N);
+            for j in 0..N {
+                let h = 1e-7;
+                let (mut xp, mut xm) = (x, x);
+                xp[j] += h;
+                xm[j] -= h;
+                let fd = (row.value(&xp) - row.value(&xm)) / (2.0 * h);
+                assert!((g[j] - fd).abs() < 1e-3, "col {j}: {} vs fd {fd}", g[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_oa_tangent_underestimates_everywhere() {
+        // a²/s is jointly convex on s > 0, so its tangent must lie below the row
+        // everywhere in the box — the soundness property the OA relaxation needs.
+        let row = sqr_perspective_row();
+        let xbar = [1.5, 0.4, 0.55, 0.0];
+        let cut = row.oa_tangent(&xbar).expect("finite tangent");
+        for i in 0..14 {
+            for k in 0..14 {
+                let x = [0.05 + 0.5 * (i as f64), 0.4, 0.001 + 0.07 * (k as f64), 0.0];
+                let a_dot_x: f64 = cut
+                    .cols
+                    .iter()
+                    .zip(cut.coeffs.iter())
+                    .map(|(c, a)| a * x[*c])
+                    .sum();
+                assert!(
+                    a_dot_x - cut.rhs <= row.residual(&x) + 1e-9,
+                    "tangent cuts off a feasible point at x={x:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_sqr_value_and_deriv() {
+        assert!((ConvexFunc::Sqr.eval(3.0) - 9.0).abs() < 1e-15);
+        let (f, fp) = ConvexFunc::Sqr.eval_and_deriv(-2.5);
+        assert!((f - 6.25).abs() < 1e-15);
+        assert!((fp - (-5.0)).abs() < 1e-15);
     }
 }
