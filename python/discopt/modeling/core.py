@@ -94,6 +94,17 @@ def _lp_spatial_fallback_enabled() -> bool:
     baseline; against the actual default path all three are gains from *no incumbent*.
     Closing the remaining gap to the reference optima is primal-quality work, not a
     budget bug.
+
+    **Incumbent quality is now measured (#862).** The panel above scored whether an
+    incumbent *exists*, is sound and stays in budget — never how good it is, so
+    nothing would have caught a change that halved incumbent quality. It does now:
+    ``discopt_benchmarks/scripts/issue844_primal_quality_panel.py`` re-runs this exact
+    OFF/ON differential and adds the primal gap to the reference optimum per instance,
+    the corpus aggregate, and quality regressions ON vs OFF. The quality gap itself is
+    still open: see ``docs/dev/lp-node-primal-quality.md`` for the measurement and for
+    the two primal levers it falsified (a rounding flip, and a narrowing dive), whose
+    common root cause is that the McCormick relaxation on this family is ~250x loose
+    at the root, so no rounding-based heuristic reading it can do better.
     """
     import os as _os
 
