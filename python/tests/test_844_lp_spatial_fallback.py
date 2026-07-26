@@ -64,12 +64,23 @@ def _pure_integer_min() -> dm.Model:
 
 
 def _mixed() -> dm.Model:
-    """Out of scope: has a continuous variable."""
+    """Has a continuous variable: out of the fallback's scope while the #860 mixed
+    flag is off (its default), in scope when it is on."""
     m = dm.Model("mixed")
     x = m.integer("x", lb=0, ub=5)
     c = m.continuous("c", lb=0, ub=5)
     m.minimize(3 * x + c)
     m.subject_to(x + c >= 2)
+    return m
+
+
+def _pure_continuous() -> dm.Model:
+    """Out of the engine's scope under EITHER flag: no integer variable at all."""
+    m = dm.Model("pure_cont")
+    a = m.continuous("a", lb=0, ub=5)
+    b = m.continuous("b", lb=0, ub=5)
+    m.minimize(3 * a + b)
+    m.subject_to(a + b >= 2)
     return m
 
 
@@ -99,11 +110,42 @@ def test_solve_with_an_incumbent_is_unchanged(fb, flag):
 
 @pytest.mark.parametrize("flag", ["0", "1"])
 def test_out_of_scope_model_is_unaffected(fb, flag):
-    """A mixed model can never reach the engine, so its result and its full time
-    budget are untouched regardless of the flag. Optimum is 2.0 at x=0, c=2."""
+    """A model with no integer variable can never reach the engine under either
+    flag, so its result and its full time budget are untouched. Optimum 2.0."""
     fb(flag)
+    r = _pure_continuous().solve(time_limit=60)
+    assert r.objective == pytest.approx(2.0, abs=1e-4)
+
+
+@pytest.mark.parametrize("flag", ["0", "1"])
+@pytest.mark.parametrize("mixed", ["0", "1"])
+def test_mixed_model_result_is_unchanged_by_the_860_flag(fb, monkeypatch, flag, mixed):
+    """#860: turning the mixed flag on may change *how* a mixed model is solved (the
+    default path hands 35% of its budget to the fallback) but never *what* it
+    returns. Optimum is 2.0 at x=0, c=2; the dual bound must never cross it."""
+    fb(flag)
+    monkeypatch.setenv("DISCOPT_LP_SPATIAL_MIXED", mixed)
     r = _mixed().solve(time_limit=60)
     assert r.objective == pytest.approx(2.0, abs=1e-4)
+    if r.bound is not None:
+        assert r.bound <= r.objective + 1e-6, "UNSOUND: bound above incumbent"
+
+
+def test_860_mixed_flag_defaults_to_off_and_gates_the_reserve(monkeypatch):
+    """The #860 widening reaches the DEFAULT path only through this flag, which is
+    off until its graduation panel. The engine's own gate is already widened, so the
+    two must be able to disagree — that separation is the point of the flag."""
+    from discopt._jax.lp_spatial_bb import _is_in_scope
+    from discopt.modeling.core import _lp_spatial_mixed_fallback_enabled
+
+    monkeypatch.delenv("DISCOPT_LP_SPATIAL_MIXED", raising=False)
+    assert _lp_spatial_mixed_fallback_enabled() is False
+    monkeypatch.setenv("DISCOPT_LP_SPATIAL_MIXED", "1")
+    assert _lp_spatial_mixed_fallback_enabled() is True
+
+    m = _mixed()
+    assert _is_in_scope(m) is True  # engine: widened unconditionally
+    assert _is_in_scope(m, mixed=False) is False  # reserve gate while the flag is off
 
 
 def test_fallback_never_breaks_a_solve(fb):

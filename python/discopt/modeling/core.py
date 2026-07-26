@@ -4208,11 +4208,22 @@ class Model:
                     result.objective = _fb.objective
                     result.x = _unpack_solution(self, np.asarray(_fb.x))
                     # Keep the TIGHTER of the two dual bounds and never claim a
-                    # certificate the fallback did not actually prove.
+                    # certificate the fallback did not actually prove. Which one is
+                    # tighter depends on the sense: for a minimize the dual bound is a
+                    # LOWER bound (larger is tighter), for a maximize it is an UPPER
+                    # bound (smaller is tighter) — #860, now that the engine serves
+                    # maximize models. Taking ``max`` unconditionally would still be
+                    # sound (both are valid upper bounds) but would keep the looser one.
                     if _fb.bound is not None:
-                        result.bound = (
-                            _fb.bound if result.bound is None else max(result.bound, _fb.bound)
-                        )
+                        if result.bound is None:
+                            result.bound = _fb.bound
+                        elif (
+                            self._objective is not None
+                            and self._objective.sense == ObjectiveSense.MAXIMIZE
+                        ):
+                            result.bound = min(result.bound, _fb.bound)
+                        else:
+                            result.bound = max(result.bound, _fb.bound)
                     result.gap = _fb.gap
                     result.gap_certified = _fb.status == "optimal"
                     result.node_count = (result.node_count or 0) + _fb.node_count
