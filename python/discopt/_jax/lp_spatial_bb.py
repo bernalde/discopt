@@ -363,8 +363,10 @@ def solve_lp_spatial_bb(
     # bound on ``sgn * f``, every verified incumbent is ``sgn * f``, and the whole
     # engine (heap order, incumbent comparison, fathoming, gap) runs unchanged in that
     # space. ``sgn`` appears in exactly ONE place: the reported objective/bound at the
-    # exit. Applying it anywhere else would double-negate.
-    sgn = -1.0 if model._objective.sense == ObjectiveSense.MAXIMIZE else 1.0
+    # exit. Applying it anywhere else would double-negate. (``_objective`` is not None
+    # here — ``_is_in_scope`` above rejects a model without one.)
+    _obj = model._objective
+    sgn = -1.0 if (_obj is not None and _obj.sense == ObjectiveSense.MAXIMIZE) else 1.0
 
     t0 = time.perf_counter()
 
