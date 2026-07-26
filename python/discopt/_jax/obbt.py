@@ -407,10 +407,8 @@ def _extract_linear_constraints(
     n_vars = sum(v.size for v in model._variables)
 
     def _compute_var_offset(var: Variable) -> int:
-        offset = 0
-        for v in model._variables[: var._index]:
-            offset += v.size
-        return offset
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return model._flat_var_offset(var)
 
     def _extract_coeffs(
         expr: Expression,
@@ -587,10 +585,8 @@ def _extract_linear_objective(
     )
 
     def _compute_var_offset(var: Variable) -> int:
-        offset = 0
-        for v in model._variables[: var._index]:
-            offset += v.size
-        return offset
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return model._flat_var_offset(var)
 
     def _extract(expr: Expression) -> Optional[tuple[dict[int, float], float]]:
         if isinstance(expr, Constant):
@@ -1410,10 +1406,8 @@ def _scalar_flat_index(expr, model) -> Optional[int]:
     from discopt.modeling.core import IndexExpression, Variable
 
     def _offset(var) -> int:
-        off = 0
-        for v in model._variables[: var._index]:
-            off += v.size
-        return off
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return int(model._flat_var_offset(var))
 
     if isinstance(expr, Variable) and expr.size == 1:
         return _offset(expr)
@@ -1446,10 +1440,8 @@ def _flat_indices(expr, model) -> set:
     )
 
     def _offset(var) -> int:
-        off = 0
-        for v in model._variables[: var._index]:
-            off += v.size
-        return off
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return int(model._flat_var_offset(var))
 
     out: set = set()
 

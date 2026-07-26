@@ -17,14 +17,14 @@
 //! Every wrapper is a pure function of `(model, bounds)`; no RNG,
 //! no unsorted-iteration sources. See `tests/presolve_determinism.rs`.
 
-use super::aggregate::aggregate_variables;
+use super::aggregate::aggregate_variables_until;
 use super::cliques::extract_cliques;
 use super::coefficient_strengthening::coefficient_strengthening;
 use super::delta::{count_tightened, Implication as DeltaImpl, PresolveDelta, VarAggregation};
 use super::duality::{reduced_cost_fixing, ReducedCostInfo};
-use super::eliminate::eliminate_variables;
+use super::eliminate::eliminate_variables_until;
 use super::factorable_elim::factorable_eliminate_until;
-use super::fbbt::{fbbt_with_cutoff, Interval};
+use super::fbbt::{fbbt_with_cutoff_until, Interval};
 use super::fbbt_fp::{fbbt_fixed_point, FbbtFpOptions};
 use super::implied_bounds::propagate_implied_bounds;
 use super::pass::{PassCategory, PresolveContext, PresolvePass};
@@ -33,7 +33,7 @@ use super::probing::probe_binary_vars_until;
 use super::reduction_constraints::detect_reduction_constraints;
 use super::redundancy::detect_row_redundancy;
 use super::scaling::compute_equilibration;
-use super::simplify::simplify;
+use super::simplify::simplify_until;
 
 // ─────────────────────────────────────────────────────────────────
 // FBBT
@@ -69,8 +69,17 @@ impl PresolvePass for FbbtPass {
     }
     fn run(&mut self, ctx: &mut PresolveContext) -> PresolveDelta {
         let before = ctx.bounds.clone();
-        let new_bounds =
-            fbbt_with_cutoff(&ctx.model, self.max_iter, self.tol, self.incumbent_bound);
+        // `_until`: `max_iter` full sweeps over every constraint, with the
+        // orchestrator's budget checked only between passes, made this pass overrun a
+        // 7.5 s budget by >12x on watercontamination0202 (#863). FBBT is anytime, so
+        // bailing yields a valid looser box.
+        let new_bounds = fbbt_with_cutoff_until(
+            &ctx.model,
+            self.max_iter,
+            self.tol,
+            self.incumbent_bound,
+            ctx.deadline,
+        );
         // Intersect with the orchestrator's running bounds — the kernel
         // ignores the caller's current state and re-derives from the
         // model's declared bounds, so we have to fold in any prior
@@ -107,7 +116,11 @@ impl PresolvePass for SimplifyPass {
     }
     fn run(&mut self, ctx: &mut PresolveContext) -> PresolveDelta {
         let before = ctx.bounds.clone();
-        let result = simplify(&ctx.model, &mut ctx.bounds);
+        // `_until`: the big-M and redundancy scans run a forward_propagate per
+        // constraint, and the orchestrator's budget is checked only between passes.
+        // >90 s against a 7.5 s budget on watercontamination0202 (#863). Bailing
+        // records fewer strengthenings / removals, never wrong ones.
+        let result = simplify_until(&ctx.model, &mut ctx.bounds, ctx.deadline);
         let mut delta = PresolveDelta::empty("simplify", ctx.iter);
         delta.bounds_tightened = count_tightened(&before, &ctx.bounds);
         delta.var_bounds_after = Some(ctx.bounds.clone());
@@ -187,7 +200,12 @@ impl PresolvePass for EliminatePass {
     }
     fn run(&mut self, ctx: &mut PresolveContext) -> PresolveDelta {
         let n_constr_before = ctx.model.constraints.len();
-        let (new_model, stats) = eliminate_variables(&ctx.model);
+        // `_until`, not the deadline-less form: the orchestrator only checks its time
+        // budget BETWEEN passes, and this pass's fixed-point loop fixes one variable
+        // per outer iteration while re-scanning every candidate against every
+        // constraint. On watercontamination0202 it ran >90 s against a 7.5 s budget
+        // (#863). Bailing early performs fewer sound eliminations, never wrong ones.
+        let (new_model, stats) = eliminate_variables_until(&ctx.model, ctx.deadline);
         let n_constr_after = new_model.constraints.len();
         ctx.model = new_model;
         // resync_bounds_after_rewrite is called by the orchestrator.
@@ -237,7 +255,10 @@ impl PresolvePass for AggregatePass {
     fn run(&mut self, ctx: &mut PresolveContext) -> PresolveDelta {
         let n_constr_before = ctx.model.constraints.len();
         let n_vars_before = ctx.model.variables.len();
-        let (new_model, stats) = aggregate_variables(&ctx.model);
+        // `_until`: same reason as EliminatePass -- the orchestrator's time check is
+        // between passes only, and this fixed-point loop rescans every constraint per
+        // aggregation. >90 s against a 7.5 s budget on watercontamination0202 (#863).
+        let (new_model, stats) = aggregate_variables_until(&ctx.model, ctx.deadline);
         let n_constr_after = new_model.constraints.len();
         let n_vars_after = new_model.variables.len();
         ctx.model = new_model;
