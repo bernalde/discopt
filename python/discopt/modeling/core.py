@@ -123,17 +123,39 @@ def _lp_spatial_fallback_enabled() -> bool:
 
 
 def _lp_spatial_mixed_fallback_enabled() -> bool:
-    """#860: extend the #844 no-incumbent fallback's *scope gate* to mixed-integer and
-    MAXIMIZE models.
+    """#860: extend the LP-per-node engine's *scope gate* to mixed-integer and MAXIMIZE
+    models.
 
-    The engine itself serves those models unconditionally since #860 (see
-    ``lp_spatial_bb._is_in_scope``); this flag governs only whether the DEFAULT path
-    reserves budget for the fallback on them. That reserve is the sole risk of the
-    widening — an in-scope model hands 35% of its budget to a pass that may find
-    nothing — so it is a separate, measurable decision from the engine's capability.
+    Governs **both** production entry points, so the widening is entirely opt-in:
 
-    **Default OFF** — it ran its graduation panel and did NOT graduate. Opt in with
-    ``DISCOPT_LP_SPATIAL_MIXED=1``.
+    * ``solve(lp_spatial=True)`` (``solver.py``) — whether the engine accepts a mixed
+      or maximize model at all; and
+    * the #844 no-incumbent fallback (below) — whether the DEFAULT path reserves 35% of
+      its budget for the fallback on such a model.
+
+    The engine's ``mixed`` parameter and ``_is_in_scope``'s keyword both default to
+    ``False`` as well, so a *new* call site inherits the pre-#860 gate rather than
+    silently shipping the widening.
+
+    **Default OFF** — it ran its graduation panel and did NOT graduate, on *both*
+    counts. Opt in with ``DISCOPT_LP_SPATIAL_MIXED=1``.
+
+    On the public ``lp_spatial=True`` path the loss is direct. ``gear4`` is mixed (4
+    integer, 2 continuous with infinite upper bounds), so it is admitted only under the
+    widening; at a 25 s budget:
+
+    ==============  ============================================
+    gate            result
+    ==============  ============================================
+    pre-#860        ``optimal``, 1.6434284641, certified, 3 nodes
+    widened         ``time_limit``, 17.514, uncertified, 2673 nodes
+    ==============  ============================================
+
+    The engine accepts a model the default path already certified in 3 nodes, then
+    spends the entire budget to return an incumbent ~10.7x worse with no certificate.
+    It is *sound* — the bound never crosses the oracle, and the false certificate seen
+    there earlier was the LP-presolve sentinel bug fixed in #877, not this widening —
+    but shipping it by default would be trading a certificate for a worse incumbent.
 
     **Graduation panel** (20 s budget, 70 newly in-scope in-repo instances, off vs on;
     the other 49 take a bit-identical path since this gate is the flag's only

@@ -88,7 +88,7 @@ class LpSpatialResult(NamedTuple):
     node_count: int
 
 
-def _is_in_scope(model: Model, *, mixed: bool = True) -> bool:
+def _is_in_scope(model: Model, *, mixed: bool = False) -> bool:
     """Model this engine can serve: an objective, at least one integer variable, and
     only ordinary algebraic rows. Either objective sense; any continuous mix.
 
@@ -322,7 +322,7 @@ def solve_lp_spatial_bb(
     use_obbt: bool = True,
     root_cut_rounds: int = 0,
     require_incremental: bool = False,
-    mixed: bool = True,
+    mixed: bool = False,
 ) -> Optional[LpSpatialResult]:
     """LP-node spatial branch-and-bound. Returns ``None`` if out of scope.
 
@@ -351,8 +351,14 @@ def solve_lp_spatial_bb(
     node outweigh the modest tightening — measured net-negative on nvs17/19/24. The
     machinery is sound and kept opt-in for when a fast native separator exists.
 
-    ``mixed`` (default True, #860) admits mixed-integer and MAXIMIZE models. Pass
-    ``False`` for the pre-#860 pure-integer/MINIMIZE gate."""
+    ``mixed`` (#860) admits mixed-integer and MAXIMIZE models; ``False`` is the
+    pre-#860 pure-integer/MINIMIZE gate. **Default False**: the widening is a real
+    capability but it is not net-positive on the default path (CLAUDE.md §5 bar 2 —
+    see ``_lp_spatial_mixed_fallback_enabled``), so both production call sites pass
+    ``mixed=_lp_spatial_mixed_fallback_enabled()`` rather than relying on this
+    default. Defaulting to ``False`` means a *new* call site inherits the
+    conservative gate instead of silently shipping the widening, which is the same
+    reason ``row_scan_is_anytime`` defaults to ``False`` in the tightening rules."""
     if not _is_in_scope(model, mixed=mixed):
         return None
 

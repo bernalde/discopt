@@ -200,7 +200,7 @@ def test_mixed_integer_in_scope_and_correct():
     """#860: a mixed continuous/integer model is IN scope and must certify the true
     optimum. Before #860 the engine declined it outright (``_is_in_scope`` required
     every variable to be integer), so the whole class was unreachable."""
-    r = solve_lp_spatial_bb(_mixed_model(), time_limit=20, gap_tolerance=1e-6)
+    r = solve_lp_spatial_bb(_mixed_model(), time_limit=20, gap_tolerance=1e-6, mixed=True)
     assert r is not None
     assert r.objective == pytest.approx(4.0, abs=1e-5)
     assert r.bound is not None and r.bound <= r.objective + 1e-6
@@ -238,7 +238,7 @@ def test_maximize_bound_is_a_valid_upper_bound():
     b = m.integer("b", lb=0, ub=5)
     m.maximize(a + b)
     m.subject_to(a * b <= 6)
-    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6, mixed=True)
     assert r is not None
     assert r.objective is not None and r.objective <= 6.0 + 1e-6
     assert r.bound is not None and r.bound >= r.objective - 1e-6
@@ -269,7 +269,7 @@ def test_maximize_never_overstates_the_optimum():
     m.maximize(a * b - 3 * a)
     m.subject_to(a + b <= 6)
     true_max = max(i * j - 3 * i for i in range(6) for j in range(6) if i + j <= 6)
-    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6, mixed=True)
     assert r is not None
     if r.objective is not None:
         assert r.objective <= true_max + 1e-6, "incumbent beat the true maximum"
@@ -296,7 +296,7 @@ def test_infinite_root_box_is_accepted_not_declined():
     m.minimize(x + y)
     m.subject_to(x + y >= 6)
     m.subject_to(x * y >= 6)
-    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6, mixed=True)
     assert r is not None, "an infinite root endpoint must no longer decline the solve"
     assert r.objective == pytest.approx(6.0, abs=1e-5)
     assert r.bound is not None and r.bound <= r.objective + 1e-6
@@ -317,7 +317,7 @@ def test_cold_path_product_map_travels_with_its_solution():
     path = os.path.join(_DATA_NL, "st_e38.nl")
     if not os.path.exists(path):
         pytest.skip("st_e38 not vendored")
-    r = solve_lp_spatial_bb(dm.from_nl(path), time_limit=20)
+    r = solve_lp_spatial_bb(dm.from_nl(path), time_limit=20, mixed=True)
     assert r is not None, "engine must not decline (an IndexError here is the bug)"
     if r.objective is not None:
         assert r.bound is not None and r.bound <= r.objective + 1e-6
