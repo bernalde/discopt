@@ -37,7 +37,7 @@ quality with the panel still green.
 - `discopt_benchmarks/scripts/issue844_primal_quality_panel.py` — the #844 gate,
   byte-for-byte, plus the quality axis.
 
-Two design rules are load-bearing and are pinned by tests:
+Three design rules are load-bearing and are pinned by tests:
 
 1. **Unscored is never reported as clean.** A missing incumbent or a missing oracle
    yields `None`, counted in `unscored`, never folded in as gap 0 (which would show a
@@ -46,11 +46,50 @@ Two design rules are load-bearing and are pinned by tests:
 2. **Quality never absorbs soundness.** An incumbent *below* the reference optimum of
    a minimize is not a poor incumbent, it is a correctness failure (CLAUDE.md §1);
    `is_false_primal` scores it separately and the existing hard gate keeps it.
+3. **An exact answer never scores as the worst answer.** Berthold's rule uses exact
+   equality, which saturates to gap 1.0 whenever the reference optimum is exactly 0
+   and the incumbent is a float. The panel's first run hit this on `gear` (optimum 0,
+   incumbent 2.9e-07) and `st_test1` (optimum 0, incumbent −1.6e-08) and reported the
+   corpus mean as **0.10 instead of 0.00004** — on two instances discopt had solved to
+   numerical exactness. `primal_gap` therefore compares against an absolute tolerance
+   (repo-wide `abs=1e-6`) before the sign rule. A metric that flags an exact solution
+   as maximally bad would train a reader to discount the signal the panel exists to
+   raise.
 
 The panel's verdict is deliberately **unchanged** by default. #862 asks for the
 measurement first, and tightening a graduation bar on the same commit that first
 measures the thing would retroactively fail a flag graduated honestly under the bar
 of its day. `--gate-quality` opts into failing on quality regressions.
+
+### First run (vendored corpus, 20 s, `results/issue862/quality_panel_vendored_20s.json`)
+
+| arm | incumbents | scored | unscored | mean gap | median | worst |
+|---|---|---|---|---|---|---|
+| OFF | 23/24 | 20 | 4 | 0.00004 | 0.0 | 0.00073 (nvs19) |
+| ON  | 22/24 | 20 | 4 | 0.00004 | 0.0 | 0.00073 (nvs19) |
+
+No quality regressions ON vs OFF. Incumbent quality on this corpus is **not** the
+problem — 19 of 20 scored instances are at gap 0 and the worst is 7.3e-4. The
+tln-scale gaps in the issue's table are not reproducible here; that needs the
+MINLPLib snapshot (§2).
+
+**The run did surface two things the 8-instance #844 case list could not**, both
+caught by the *existing* gate rather than the new axis:
+
+- **`nvs23` loses its incumbent with the flag ON** (OFF −1124.8, ON none) —
+  `lost_incumbents=1`. This is the structural cost of the fallback's design: it
+  reserves 35% of the budget up front, so the primary path gets 13 s of a 20 s budget
+  instead of 20 s. Here the primary needed the full budget, and the fallback engine
+  did not find a replacement. The reserve is unconditional, so any instance whose
+  primary incumbent arrives in the last 35% of its budget can lose it.
+- **`nvs24` overshoots its budget 2.08x** (41.6 s against 20 s) — the same overshoot
+  class #844 believed it had closed.
+
+Neither is an incumbent-*quality* finding, and neither is fixed here; they are
+recorded because the panel found them on its first run and they are more serious than
+the gap it was built to measure. `nvs23` in particular is a candidate follow-up: the
+reserve should arguably be conditional on the primary having stalled, not taken up
+front.
 
 ---
 
@@ -66,10 +105,14 @@ At a 10 s budget the engine splits cleanly into three groups:
 
 | group | instances | outcome |
 |---|---|---|
-| certifies | nvs03, nvs10, nvs11, nvs12, st_miqp1/2/3, st_test1 | primal gap **0**, 4–98 nodes |
+| certifies | nvs03, nvs10, nvs11, nvs12, st_miqp1, st_miqp2, st_test1 | primal gap **0**, 4–98 nodes |
 | declines | gear, nvs04, nvs06, nvs07, nvs09, nvs16, prob03 | no incremental structure → fallback correctly refuses |
 | **fails the primal** | **nvs17, nvs19, nvs24** | **no incumbent at all** after 1100–2100 nodes |
 | loose | st_testgr3 | −20.533 vs −20.59, primal gap 0.0028 |
+
+(The full-solve panel in §1 measures `Model.solve()`, where the default path supplies
+nvs17's and nvs19's incumbents. This section isolates the *engine*, which is where the
+primal weakness lives.)
 
 So the vendored corpus reproduces the *class* — the LP-node engine's primal side is
 weak — but in a sharper form than tln's: on `nvs17/19/24`, the family the engine was
@@ -173,9 +216,19 @@ can now score whether they moved incumbent quality at all.
 
 ## 6. Status
 
-- (1) **done** — quality is measured, tested, and wired into the #844 panel.
+- (1) **done** — quality is measured, tested, wired into the #844 panel, and run.
 - (2) **open** — investigated, two levers falsified and recorded, root cause
   identified as relaxation tightness rather than heuristic tuning. No fix ships:
   neither candidate met the net-positive bar, and shipping a measured-negative
   change would violate CLAUDE.md §5. Re-running the panel against `tln4/5/6` on a
-  machine with the MINLPLib snapshot is the next step, and now costs one command.
+  machine with the MINLPLib snapshot is the next step, and now costs one command:
+
+  ```bash
+  python discopt_benchmarks/scripts/issue844_primal_quality_panel.py \
+      --corpus ~/Dropbox/projects/discopt-minlp-benchmark/minlplib/nl \
+      --instances tln4,tln5,tln6 --time-limit 60
+  ```
+
+- **New, not part of #862's ask** — the panel's first run found `nvs23` losing an
+  incumbent to the fallback's unconditional 35% budget reserve, and `nvs24`
+  overshooting 2.08x. Both are worth their own issue; see §1.

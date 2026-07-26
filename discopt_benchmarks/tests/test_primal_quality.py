@@ -49,8 +49,28 @@ class TestPrimalGap:
     def test_straddling_zero_saturates_rather_than_exploding(self):
         # A plain relative error would flip sign or divide by ~0 here.
         assert primal_gap(5.0, -5.0) == 1.0
-        assert primal_gap(3.0, 0.0) == 1.0
         assert primal_gap(0.0, -2.0) == 1.0
+
+    def test_numerically_exact_solution_at_a_zero_optimum_scores_zero(self):
+        """Berthold's exact ``p == o`` saturates to 1.0 here — the maximum gap — on
+        instances discopt solved to numerical exactness. The first #862 panel run hit
+        this on gear (2.9e-07) and st_test1 (-1.6e-08) and reported the corpus mean as
+        0.10 instead of ~0. At a zero optimum no relative measure is defined, so the
+        comparison has to be absolute."""
+        assert primal_gap(2.860864189286471e-07, 0.0) == 0.0
+        assert primal_gap(-1.6495994490692313e-08, 0.0) == 0.0
+
+    def test_a_genuinely_bad_incumbent_at_a_zero_optimum_still_saturates(self):
+        # The tolerance must not become a blanket excuse for a zero optimum.
+        assert primal_gap(3.0, 0.0) == 1.0
+        assert primal_gap(-0.5, 0.0) == 1.0
+
+    def test_absolute_tolerance_is_tunable_and_defaults_to_the_repo_value(self):
+        assert primal_gap(1e-5, 0.0) == 1.0  # outside the default 1e-6
+        assert primal_gap(1e-5, 0.0, atol=1e-4) == 0.0
+
+    def test_tolerance_applies_away_from_zero_too(self):
+        assert primal_gap(-1100.4000000001, -1100.4) == 0.0
 
     def test_missing_incumbent_or_oracle_is_none_not_zero(self):
         # The load-bearing distinction: "unscored" must never read as "perfect".

@@ -42,8 +42,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+# Repo-wide absolute numerical tolerance (conftest.py: abs=1e-6). Used to decide
+# when an incumbent has *reached* the reference optimum, which matters most at a
+# reference optimum of exactly zero -- see ``primal_gap``.
+_ABS_TOL = 1e-6
 
-def primal_gap(objective: float | None, optimum: float | None) -> float | None:
+
+def primal_gap(
+    objective: float | None, optimum: float | None, atol: float = _ABS_TOL
+) -> float | None:
     """MIPLIB primal gap of an incumbent against a reference optimum, in ``[0, 1]``.
 
     ``None`` when there is no incumbent or no reference value — "unscored" is a
@@ -53,7 +60,7 @@ def primal_gap(objective: float | None, optimum: float | None) -> float | None:
 
     Definition (Berthold 2006), for incumbent ``p`` and reference ``o``::
 
-        0                             if p == o
+        0                             if |p - o| <= atol
         1                             if sign(p) != sign(o), or exactly one is 0
         |p - o| / max(|p|, |o|)       otherwise
 
@@ -61,13 +68,26 @@ def primal_gap(objective: float | None, optimum: float | None) -> float | None:
     straddle zero, which is where a plain relative error blows up or changes sign.
     It is sense-independent: it measures distance, and which direction counts as
     "worse" is :func:`is_false_primal`'s job.
+
+    ``atol`` is why the first branch is a tolerance rather than Berthold's exact
+    ``p == o``, and it is not cosmetic. Berthold's rule was written for objectives
+    that are integral or comfortably away from zero; against a reference optimum of
+    *exactly* zero, a floating-point incumbent lands on the "exactly one is 0" branch
+    and saturates at 1.0 — the maximum possible gap. The first run of the #862 panel
+    scored ``gear`` (optimum 0, incumbent 2.9e-07) and ``st_test1`` (optimum 0,
+    incumbent -1.6e-08) as maximally bad and dragged the corpus mean from ~0 to 0.10,
+    on two instances discopt had solved to numerical exactness. A metric that reports
+    an exact solution as the worst possible outcome is worse than no metric: it would
+    train a reader to discount the very signal the panel exists to raise. At a zero
+    optimum no relative measure is defined, so an absolute tolerance is the only
+    meaningful comparison; it defaults to the repo-wide ``abs=1e-6`` (``conftest.py``).
     """
     if objective is None or optimum is None:
         return None
     p, o = float(objective), float(optimum)
     if not (math.isfinite(p) and math.isfinite(o)):
         return None
-    if p == o:
+    if abs(p - o) <= atol:
         return 0.0
     if p * o < 0.0 or (p == 0.0) != (o == 0.0):
         return 1.0

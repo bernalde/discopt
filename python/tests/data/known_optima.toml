@@ -60,123 +60,131 @@ note = "discopt produces no dual bound today (sound decline, bound=None); record
 
 # ── LP-node engine scope (issue #862) — the vendored pure-integer MINIMIZE
 # instances the LP-per-node spatial engine (``_jax/lp_spatial_bb.py``) serves, and
-# therefore the corpus on which the #844 fallback's *incumbent quality* is scored
-# by ``discopt_benchmarks/scripts/issue844_primal_quality_panel.py``.
+# therefore the corpus on which the #844 fallback's *incumbent quality* is scored by
+# ``discopt_benchmarks/scripts/issue844_primal_quality_panel.py``.
 #
 # Values are not new: each is an oracle already carried in this repo, consolidated
 # here so the panel reads one registry instead of an 18th private ``OPT = {...}``
 # dict. ``source`` records the in-repo constant it was taken from; all trace back to
-# minlplib.solu. ``status`` is the LP-node engine's own outcome at a 10 s fallback
-# budget (use_obbt=False, require_incremental=True), measured 2026-07-26 — it is the
-# baseline the quality metric protects, not a claim about the default solve path.
+# minlplib.solu.
+#
+# ``status`` follows this file's existing convention — what a full ``Model.solve()``
+# does today — and is the measured outcome of the #862 panel at a 20 s budget with
+# DISCOPT_LP_SPATIAL_FALLBACK on (results/issue862/quality_panel_vendored_20s.json,
+# 2026-07-26). It is NOT a statement about the LP-node engine in isolation; for that,
+# and for why nvs17/19/24 defeat its primal heuristics, see
+# docs/dev/lp-node-primal-quality.md.
+#
+# nvs18, nvs23 and prob02 are in scope for the engine but no in-repo source records
+# an optimum for them, so they are deliberately absent: the panel reports them as
+# UNSCORED rather than scoring them against a guess.
 
 [gear]
 optimum = 0.0
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_declines"
-note = "Unconstrained; the incremental McCormick structure declines, so the fallback refuses rather than run the cold path."
+status = "certifies"
+note = "Optimum is exactly 0; the incumbent lands at 2.9e-07, which is why primal_gap needs an absolute tolerance rather than Berthold's exact equality."
 
 [nvs03]
 optimum = 16.0
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_certifies"
-note = "LP-node engine certifies in 8 nodes."
+status = "certifies"
 
 [nvs04]
 optimum = 0.72
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_declines"
+status = "certifies"
 
 [nvs06]
 optimum = 1.77031250
 source = "MINLPLib (perf/panel.py PANEL oracle)"
-status = "lp_node_declines"
+status = "certifies"
 
 [nvs07]
 optimum = 4.0
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_declines"
+status = "certifies"
 
 [nvs09]
 optimum = -43.13433692
 source = "MINLPLib =opt= (scripts/decomp1_cert_effort_analyze.py ORACLE)"
-status = "lp_node_declines"
+status = "certifies"
 
 [nvs10]
 optimum = -310.80
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [nvs11]
 optimum = -431.0
 source = "MINLPLib =opt= (python/tests/test_root_relaxation_surfacing.py _ORACLE)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [nvs12]
 optimum = -481.20
 source = "MINLPLib (perf/panel.py PANEL oracle)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [nvs13]
 optimum = -585.2
 source = "MINLPLib (docs/dev/data/cert-optima.json)"
-status = "lp_node_out_of_scope"
-note = "Not reached by the LP-node engine at a fallback budget; recorded for completeness."
+status = "certifies"
 
 [nvs15]
 optimum = 1.0
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_feasible"
-note = "Finds the optimum but does not certify it within the budget."
+status = "certifies"
 
 [nvs16]
 optimum = 0.70312500
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_declines"
+status = "certifies"
 
 [nvs17]
 optimum = -1100.4
 source = "MINLPLib (perf/panel.py PANEL oracle)"
-status = "lp_node_no_incumbent"
-note = "The engine's flagship family. At a 10 s fallback budget it returns NO incumbent after ~2000 nodes: every dive dies on a Farkas-proven infeasible LP and no rounded LP point is ever feasible. See docs/dev/lp-node-primal-quality.md."
+status = "feasible"
+note = "Finds the optimum exactly but does not certify it in 20 s. The LP-node engine alone finds NO incumbent here — see docs/dev/lp-node-primal-quality.md."
 
 [nvs19]
 optimum = -1098.4
 source = "MINLPLib =opt= (scripts/decomp1_cert_effort_analyze.py ORACLE)"
-status = "lp_node_no_incumbent"
+status = "feasible"
+note = "Incumbent -1097.6 at 20 s: primal gap 7.3e-4, the largest scored gap on the vendored corpus."
 
 [nvs24]
 optimum = -1033.2
 source = "MINLPLib (discopt_benchmarks/scripts/cut1_cmir_oracle_injection.py OPT)"
-status = "lp_node_no_incumbent"
+status = "no_incumbent"
+note = "No incumbent from either arm at 20 s, and the only budget overshoot on the corpus (41.6 s, 2.08x)."
 
 [prob03]
 optimum = 10.0
 source = "MINLPLib (benchmarks/problems/minlp_problems.py _KNOWN_OPTIMA)"
-status = "lp_node_declines"
+status = "certifies"
 
 [st_miqp1]
 optimum = 281.0
 source = "MINLPLib (discopt_benchmarks/scripts/t21_root_loop_replay.py ORACLE)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [st_miqp2]
 optimum = 2.0
 source = "MINLPLib (discopt_benchmarks/scripts/t21_root_loop_replay.py ORACLE)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [st_miqp3]
 optimum = -6.0
 source = "MINLPLib (docs/dev/data/cert-optima.json)"
-status = "lp_node_certifies"
+status = "certifies"
 
 [st_test1]
 optimum = 0.0
 source = "MINLPLib (discopt_benchmarks/scripts/t21_root_loop_replay.py ORACLE)"
-status = "lp_node_certifies"
+status = "certifies"
+note = "Optimum is exactly 0; the incumbent lands at -1.6e-08 (see gear)."
 
 [st_testgr3]
 optimum = -20.59
 source = "MINLPLib (discopt_benchmarks/scripts/t21_root_loop_replay.py ORACLE)"
-status = "lp_node_feasible"
-note = "Incumbent -20.533 at a 10 s budget: primal gap 0.0028, the only nonzero scored gap on the vendored corpus."
+status = "certifies"
