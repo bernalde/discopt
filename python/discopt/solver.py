@@ -24,6 +24,7 @@ import numpy as np
 # nonlinear bound tightening) are imported lazily at their nonlinear-path call
 # sites, so a pure LP/MILP/MIQP solve never pays JAX/XLA cold-start.
 from discopt._jax.model_utils import flat_variable_bounds
+from discopt._jax.problem_classifier import dense_Q as _dense_Q
 
 if TYPE_CHECKING:
     from discopt._jax.nlp_evaluator import NLPEvaluator
@@ -6009,7 +6010,7 @@ def solve_model(
             pcls = classify_problem(model)
             if pcls in (ProblemClass.QP, ProblemClass.MIQP):
                 qp = extract_qp_data(model)
-                Q_qf = 0.5 * np.asarray(qp.Q, dtype=np.float64)
+                Q_qf = 0.5 * _dense_Q(qp.Q)
                 b_qf = np.asarray(qp.c, dtype=np.float64)
                 qf = QuadraticForm(Q=Q_qf, b=b_qf, c=float(qp.obj_const))
                 x_lo = np.asarray(qp.x_l, dtype=np.float64)
@@ -14671,7 +14672,7 @@ def _solve_qp_matrix(
         integrality = int_arr
 
     # Q matrix: only the original variable part (no slacks)
-    Q_orig = np.asarray(qp_data.Q[:n_orig, :n_orig])
+    Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
     c_orig = np.asarray(qp_data.c[:n_orig])
 
     try:
@@ -14953,7 +14954,7 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
     t_jax_start = time.perf_counter()
     qp_data = extract_qp_data(model)
     state = qp_ipm_solve(
-        qp_data.Q,
+        cast(Any, _dense_Q(qp_data.Q)),
         qp_data.c,
         qp_data.A_eq,
         qp_data.b_eq,
@@ -15093,7 +15094,7 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
     callback path if ``solve_qp_batch`` is unavailable or the wave raises.
     """
     n_batch = len(batch_lb)
-    Q = np.asarray(qp_data.Q, dtype=np.float64)
+    Q = _dense_Q(qp_data.Q)
     c = np.asarray(qp_data.c, dtype=np.float64)
     A_eq = np.asarray(qp_data.A_eq, dtype=np.float64)
     b_eq = np.asarray(qp_data.b_eq, dtype=np.float64)
@@ -17294,7 +17295,7 @@ def _solve_miqp_bb(
         np.asarray(qp_data.A_eq), np.asarray(qp_data.b_eq), n_orig, _n_total0 - n_orig
     )
     _c_m = np.asarray(qp_data.c[:n_orig])
-    _Q_m = np.asarray(qp_data.Q[:n_orig, :n_orig])
+    _Q_m = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
 
     def _maybe_inject_snapped(x_row, node_lb_i, node_ub_i):
         # Purification (increment 3): near-integral interior points become
@@ -17578,7 +17579,7 @@ def _solve_miqp_bb(
             A_ub_, b_ub_, A_eq_, b_eq_ = _decompose_eq_slack_form(
                 A_eq_full, b_eq_full, n_orig, n_slack_local
             )
-            Q_orig = np.asarray(qp_data.Q[:n_orig, :n_orig])
+            Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
             constraint_duals, bound_duals_lower, bound_duals_upper = _mip_recover_relaxation_duals(
                 model,
                 lp_data=qp_data,

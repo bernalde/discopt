@@ -128,6 +128,40 @@ class QPData(NamedTuple):
     obj_const: float = 0.0  # constant term in objective
 
 
+def dense_Q(Q) -> np.ndarray:
+    """Materialise a ``QPData.Q`` as a dense ``float64`` array.
+
+    ``Q`` may be a dense array or a scipy sparse matrix (#863: a wide model with a
+    narrow objective — ``watercontamination0202`` is 106,711 variables whose
+    objective touches 101 — cannot hold a dense ``(n, n)`` ``Q``; that is 91 GB).
+
+    Returns numpy, which is what these fields actually hold at runtime (the module
+    header notes ``QPData`` is *annotated* for the JAX IPM consumers but populated
+    by the JAX-free extractors). The four call sites that feed ``qp_ipm_solve``
+    cast at the boundary rather than have this function lie about its type.
+
+    Every consumer must go through this rather than calling ``np.asarray`` on ``Q``
+    directly. ``np.asarray`` on a scipy sparse matrix does **not** raise — it
+    returns a 0-d object array wrapping the matrix — so a missed call site would
+    silently feed garbage into a solver instead of failing loudly. That is the whole
+    reason this helper exists.
+    """
+    try:
+        import scipy.sparse as _sp
+
+        if _sp.issparse(Q):
+            return np.asarray(Q.toarray(), dtype=np.float64)
+    except ImportError:  # pragma: no cover - scipy is a hard dependency
+        pass
+    arr = np.asarray(Q, dtype=np.float64)
+    if arr.dtype == object or arr.ndim != 2:
+        raise TypeError(
+            f"QPData.Q densified to dtype={arr.dtype} ndim={arr.ndim}; a sparse "
+            "matrix probably reached np.asarray without going through dense_Q()"
+        )
+    return arr
+
+
 class QuadraticConstraintData(NamedTuple):
     """Quadratic row data: 0.5 x'Qx + c'x sense rhs."""
 
