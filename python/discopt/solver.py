@@ -3305,7 +3305,44 @@ def _format_bad_bound_entries(
     return bad_vars
 
 
-def _check_finite_bounds(model: Model) -> None:
+def _declared_box_tightening(model: Model):
+    """Run ``tighten_nonlinear_bounds`` **once** on the model's declared box.
+
+    Returns ``(tightened_lb, tightened_ub, stats)``, or ``None`` when the pass
+    raised (both consumers below degrade to "no information", exactly as they did
+    when each caught the exception itself).
+
+    Why this exists (#863): ``_check_finite_bounds`` and
+    ``_detect_nonlinear_bound_infeasibility`` are called back-to-back in
+    ``solve_model`` on an *unmodified* model, and each ran the whole pass over the
+    same ``flat_variable_bounds(model)`` box. Measured on
+    ``watercontamination0202`` (106,711 vars / 107,209 rows), instrumenting both
+    calls: identical inputs, and outputs bit-identical in ``tightened_lb``,
+    ``tightened_ub`` **and** ``stats`` (n_tightened = 37,016, rules =
+    ``defined_variable_forward``, ``separable_quadratic_upper_bound``) — 39.98 s
+    then 39.78 s, i.e. the second call was 40 s of pure waste out of a 30 s budget.
+
+    Sharing the result is sound because the pass does not mutate the model: it
+    copies the input box (``tighten_nonlinear_bounds`` opens with ``.copy()`` on
+    both arrays) and every rule reads the model through the memoized
+    ``_cached_flat_metadata``. The measurement above is the empirical check on that
+    reading, and ``test_863_shared_declared_box_tightening.py`` keeps it honest.
+
+    This never runs the pass more often than before:
+    ``_detect_nonlinear_bound_infeasibility`` always needed it, so one call is the
+    floor, and ``_check_finite_bounds``'s conditional need is a subset of that.
+    """
+    raw_lb, raw_ub = flat_variable_bounds(model)
+    try:
+        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+
+        return tighten_nonlinear_bounds(model, raw_lb, raw_ub)
+    except Exception as exc:
+        logger.debug("Nonlinear bound tightening on the declared box failed: %s", exc)
+        return None
+
+
+def _check_finite_bounds(model: Model, tightening=None) -> None:
     """Warn if any variable has very large or infinite declared bounds.
 
     Interior point methods use barrier terms that require reasonably sized
@@ -3314,6 +3351,11 @@ def _check_finite_bounds(model: Model) -> None:
     objectives or reports iteration_limit. Nonlinear tightening is consumed by
     some solver paths, but this warning remains conservative because not every
     path applies the tightened box to the actual NLP solve.
+
+    ``tightening`` is an already-computed :func:`_declared_box_tightening` result,
+    shared with ``_detect_nonlinear_bound_infeasibility`` so the pass runs once per
+    solve rather than twice (#863). ``None`` means "not supplied" and the pass is
+    run here, preserving the standalone behaviour this helper had.
     """
     raw_lb, raw_ub = flat_variable_bounds(model)
     raw_bad_vars = _format_bad_bound_entries(model, raw_lb, raw_ub)
@@ -3321,10 +3363,10 @@ def _check_finite_bounds(model: Model) -> None:
         return
 
     tightening_note = ""
-    try:
-        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
-
-        _tightened_lb, _tightened_ub, bt_stats = tighten_nonlinear_bounds(model, raw_lb, raw_ub)
+    if tightening is None:
+        tightening = _declared_box_tightening(model)
+    if tightening is not None:
+        _tightened_lb, _tightened_ub, bt_stats = tightening
         if bt_stats.infeasible:
             logger.info(
                 "Nonlinear tightening proved infeasibility before large-bound warning: %s",
@@ -3336,8 +3378,6 @@ def _check_finite_bounds(model: Model) -> None:
                 f" Nonlinear tightening can adjust {bt_stats.n_tightened} bounds"
                 f" via {', '.join(bt_stats.applied_rules)}."
             )
-    except Exception as exc:
-        logger.debug("Skipping nonlinear tightening before large-bound warning: %s", exc)
 
     bad_vars = raw_bad_vars
     if bad_vars:
@@ -3354,16 +3394,17 @@ def _check_finite_bounds(model: Model) -> None:
         )
 
 
-def _detect_nonlinear_bound_infeasibility(model: Model) -> Optional[str]:
-    """Return a nonlinear bound-tightening infeasibility proof when available."""
-    flat_lb, flat_ub = flat_variable_bounds(model)
-    try:
-        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+def _detect_nonlinear_bound_infeasibility(model: Model, tightening=None) -> Optional[str]:
+    """Return a nonlinear bound-tightening infeasibility proof when available.
 
-        _tightened_lb, _tightened_ub, stats = tighten_nonlinear_bounds(model, flat_lb, flat_ub)
-    except Exception as exc:
-        logger.debug("Skipping nonlinear infeasibility precheck after error: %s", exc)
+    ``tightening`` is an already-computed :func:`_declared_box_tightening` result,
+    shared with ``_check_finite_bounds`` (#863); ``None`` runs the pass here.
+    """
+    if tightening is None:
+        tightening = _declared_box_tightening(model)
+    if tightening is None:
         return None
+    _tightened_lb, _tightened_ub, stats = tightening
     if stats.infeasible:
         return stats.infeasibility_reason or "nonlinear bound tightening proved infeasibility"
     return None
@@ -6137,8 +6178,13 @@ def solve_model(
     # --- Check for very large variable bounds ---
     # All solver paths (LP IPM, QP IPM, NLP) use barrier methods that
     # struggle with bounds beyond ~1e15. Check once before any dispatch.
-    _check_finite_bounds(model)
-    nonlinear_infeasibility = _detect_nonlinear_bound_infeasibility(model)
+    # Both of these consume the SAME nonlinear tightening of the SAME declared box
+    # on an unmodified model, so run it once and share it (#863): measured on
+    # watercontamination0202 the second run was 39.78 s of bit-identical repeat work
+    # against a 30 s budget. See _declared_box_tightening.
+    _declared_tightening = _declared_box_tightening(model)
+    _check_finite_bounds(model, _declared_tightening)
+    nonlinear_infeasibility = _detect_nonlinear_bound_infeasibility(model, _declared_tightening)
     if nonlinear_infeasibility is not None:
         logger.info(
             "Nonlinear bound tightening proved model infeasible: %s", nonlinear_infeasibility
