@@ -67,6 +67,32 @@ def _ball_mk2_class(n: int = 30):
     return m
 
 
+def _ball_mk2_real(n: int = 30):
+    """Faithful reconstruction of MINLPLib's ``ball_mk2_30`` — the instance #861 was
+    actually filed against:
+
+        min  -Σ xᵢ      s.t.  Σ (xᵢ² - 0.995825·xᵢ) ≤ 0,   xᵢ ∈ {-1,0,1}
+
+    This is NOT the same problem as :func:`_ball_mk2_class`, and the difference is the
+    point. Every term ``x² - 0.995825x`` is ≥ 0 at an integer ``x`` with equality only
+    at ``x=0``, so the origin is the *only* feasible integer point and the optimum is
+    0.0 (matching ``minlplib.solu``) — but the objective ``-Σ xᵢ`` pulls the
+    relaxation the other way, to fractional ``xᵢ ≈ 0.995825`` where the shell is
+    slack. That is the "thin shell": the LP optimum is nowhere near the integer one,
+    which is what makes the primal hard here and trivial in ``_ball_mk2_class``
+    (whose optimum sits at the origin and is found by the root LP).
+
+    Reconstructing it matters because ``_ball_mk2_class`` alone cannot detect the real
+    failure — the #727 RLT lesson in CLAUDE.md: a mechanism validated only on a
+    synthetic proxy can be a no-op on the real class.
+    """
+    m = dm.Model("ball_mk2_real")
+    xs = [m.integer(f"x{i}", lb=-1, ub=1) for i in range(n)]
+    m.minimize(-sum(xs))
+    m.subject_to(sum(x * x - 0.995825 * x for x in xs) <= 0.0)
+    return m
+
+
 def _structure(model):
     return IncrementalMcCormickLP(model, classify_nonlinear_terms(model))
 
@@ -103,9 +129,29 @@ def test_odd_power_monomial_still_declines_on_a_root_box_spanning_zero(p):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("p", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("p", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize(
-    "box", [(-2.0, 3.0), (1.0, 3.0), (-3.0, -1.0), (0.0, 2.5), (-2.5, 0.0), (-1.5, -1.5)]
+    "box",
+    [
+        (-2.0, 3.0),
+        (1.0, 3.0),
+        (-3.0, -1.0),
+        (0.0, 2.5),
+        (-2.5, 0.0),
+        (-1.5, -1.5),
+        # Half-infinite and doubly-infinite boxes. These are where a hand-rolled
+        # closed form diverges from Interval: `0 * ±inf` is NaN in IEEE, and
+        # Interval's per-step outward rounding turns an exact 0 endpoint into a
+        # denormal that then multiplies to ±inf rather than to a NaN-to-zero corner.
+        # `_monomial_aux_bounds` delegates here rather than reproducing it.
+        (-np.inf, 0.0),
+        (0.0, np.inf),
+        (-np.inf, np.inf),
+        (-np.inf, -1.0),
+        (1.0, np.inf),
+        (-2.0, np.inf),
+        (-np.inf, 2.0),
+    ],
 )
 def test_monomial_aux_bounds_match_interval_pow(p, box):
     """``_monomial_aux_bounds`` must reproduce the enclosure the COLD build takes from
@@ -117,8 +163,52 @@ def test_monomial_aux_bounds_match_interval_pow(p, box):
     lo, hi = box
     ref = Interval.from_bounds(np.array([lo]), np.array([hi])) ** p
     got = _monomial_aux_bounds(lo, hi, p)
-    assert got[0] == pytest.approx(float(ref.lo[0]), rel=1e-9, abs=1e-9)
-    assert got[1] == pytest.approx(float(ref.hi[0]), rel=1e-9, abs=1e-9)
+    assert not any(g != g for g in got), f"NaN enclosure on {box}, p={p}: {got}"
+    for g, t in zip(got, (float(ref.lo[0]), float(ref.hi[0]))):
+        if g == t:  # covers the ±inf endpoints, which approx() cannot compare
+            continue
+        assert g == pytest.approx(t, rel=1e-9, abs=1e-9)
+
+
+@pytest.mark.parametrize("p", [3, 4, 5, 6])
+def test_unbounded_box_puts_no_nan_anywhere_in_the_node_lp(p):
+    """Regression for the NaN family on an unbounded box (caught in review of this
+    PR): ``(nan, nan)`` from the ``p >= 3`` aux enclosure, and NaN coefficients from
+    the envelope rows.
+
+    The variable below is sign-DEFINITE (``ub <= 0`` → ``_root_sign = -1``), so the
+    structure was admitted before *and* after #861 and all six validation boxes are
+    finite — the gate never sees the unbounded node box. NaN reaching the LP is worse
+    than a loose bound: every comparison against it is ``False``, so ``NaN <=
+    incumbent`` can silently disable fathoming. Assert on the WHOLE assembled LP, not
+    just the aux bounds — the aux fix alone left 4 NaNs in ``A``/``b``.
+    """
+    m = dm.Model("halfinf")
+    x = m.integer("x", lb=-np.inf, ub=0)
+    y = m.integer("y", lb=-5, ub=0)
+    m.minimize(x**p + y**p)
+    m.subject_to(x + y >= -8)
+    inc = _structure(m)
+    assert inc.ok
+    A, b, bounds = inc.assemble(np.array([-np.inf, -5.0]), np.array([0.0, 0.0]))
+    assert not np.isnan(bounds).any(), f"NaN in aux bounds for p={p}: {bounds}"
+    assert not np.isnan(A.data).any(), f"NaN in constraint matrix for p={p}"
+    assert not np.isnan(b).any(), f"NaN in rhs for p={p}"
+
+
+@pytest.mark.parametrize("p", [2, 3, 4])
+def test_unbounded_box_envelope_matches_the_cold_build_emptiness(p):
+    """On a non-finite box the cold build emits NO envelope rows (``_emit_1d`` bails
+    under ``_finite``), leaving the aux interval bound as the entire relaxation. The
+    fixed-pattern patch cannot delete rows, so it must fill them with VACUOUS ones —
+    which describes the same polytope. Pins that they carry no coefficients at all."""
+    from discopt._jax.incremental_mccormick import _monomial_rows
+
+    for box in [(-np.inf, 0.0), (0.0, np.inf), (-np.inf, np.inf), (1.0, np.inf)]:
+        rows = _monomial_rows(box[0], box[1], p)
+        assert len(rows) == 4
+        for cx, cs, rhs in rows:
+            assert (cx, cs, rhs) == (0.0, 0.0, 0.0), f"non-vacuous row on {box}: {rows}"
 
 
 def test_even_power_aux_floor_admits_the_origin_on_a_straddling_box():
@@ -143,6 +233,7 @@ def test_spanning_monomial_envelope_cuts_no_feasible_point(p):
     inc = _structure(_monomial_model(p, -2, 2))
     assert inc.ok
     boxes = [(-2.0, 2.0), (-2.0, 0.0), (0.0, 2.0), (-1.0, 1.0), (1.0, 1.0), (-2.0, -2.0)]
+    checked = 0
     for lo, hi in boxes:
         lb = np.full(inc.n, lo)
         ub = np.full(inc.n, hi)
@@ -162,6 +253,10 @@ def test_spanning_monomial_envelope_cuts_no_feasible_point(p):
                         elif col == a:
                             lhs += float(A.data[t]) * s
                     assert lhs <= float(b[k]) + 1e-9, f"row {k} cuts x={v} (p={pw})"
+                    checked += 1
+    # Guard against the loops silently emptying (a changed mono_rows key, a box list
+    # that stops admitting): 6 boxes x 3 monomials x 9 samples x 4 rows.
+    assert checked == 648, f"expected 648 row assertions, executed {checked}"
 
 
 @pytest.mark.parametrize("p", [2, 4])
@@ -195,6 +290,7 @@ def test_spanning_monomial_bound_never_exceeds_the_box_optimum(p):
     model = _monomial_model(p, lo, hi, n=n)
     inc = _structure(model)
     assert inc.ok
+    compared = 0
     for box in [(-2, 2), (-2, 0), (0, 2), (-1, 1)]:
         lb = np.full(n, float(box[0]))
         ub = np.full(n, float(box[1]))
@@ -209,6 +305,12 @@ def test_spanning_monomial_bound_never_exceeds_the_box_optimum(p):
                 true = obj if true is None else min(true, obj)
         if true is not None:
             assert bound <= true + 1e-6, f"bound {bound} above box optimum {true}"
+            compared += 1
+    # Without this the test degrades to a no-op if every LP returns None or every box
+    # turns out infeasible (the sibling bound-neutrality test guards the same way).
+    assert compared == 4, (
+        f"expected 4 boxes compared against a brute-forced optimum, got {compared}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -256,3 +358,61 @@ def test_ball_mk2_class_is_admitted_and_solved_under_require_incremental(n):
     assert result.status == "optimal"
     assert result.objective == pytest.approx(0.0, abs=1e-6)
     assert result.bound <= result.objective + 1e-6  # certificate invariant
+
+
+def test_real_ball_mk2_30_relaxation_is_admitted():
+    """The REAL instance's relaxation coverage — the gap #861 reports — is closed.
+
+    Fails before the change (``monomial x_0^2: root box spans zero (unmappable)``
+    → ``ok=False``), passes after, with all 30 monomials mapped.
+    """
+    inc = _structure(_ball_mk2_real(30))
+    assert inc.ok, "the real ball_mk2_30 relaxation still cannot be built"
+    assert len(inc.monomial) == 30
+    assert all(inc._root_sign[i] == 0 for (i, _p) in inc.monomial), "expected straddling roots"
+
+
+def test_real_ball_mk2_30_bound_is_sound_and_no_false_certificate():
+    """On the real instance the engine now produces a *bound* where it previously
+    produced nothing — and that bound must never cross the 0.0 oracle
+    (``minlplib.solu``).
+
+    Deliberately NOT asserted: that an incumbent is found. It is not, at any budget
+    tried (see ``test_real_ball_mk2_30_still_finds_no_incumbent``), so #861's stated
+    symptom is only partly addressed — this PR closes the relaxation-coverage half.
+    The assertions below are written to keep holding if a later primal fix lands.
+    """
+    result = solve_lp_spatial_bb(_ball_mk2_real(30), time_limit=20.0, require_incremental=True)
+    assert result is not None, "engine declines the real ball_mk2_30"
+    assert result.bound is not None
+    assert result.bound <= 0.0 + 1e-6, f"dual bound {result.bound} crossed the 0.0 oracle"
+    if result.objective is not None:
+        # If a primal ever appears it must be feasible-valued and certificate-consistent.
+        assert result.objective >= 0.0 - 1e-6, "incumbent below the true optimum"
+        assert result.bound <= result.objective + 1e-6
+
+
+@pytest.mark.slow
+def test_real_ball_mk2_30_still_finds_no_incumbent():
+    """Pins the RESIDUAL so it cannot be mistaken for fixed, and so the day it stops
+    being true someone is told.
+
+    Admitting the model was necessary but not sufficient: the relaxation now builds
+    and the engine explores thousands of nodes inside its budget, but the thin shell
+    means no node LP rounds to the origin, so ``objective`` stays ``None`` — #861's
+    "returns no incumbent" persists. Measured on this reconstruction: 791 nodes /
+    bound -27.88 at a 20 s budget, 12236 nodes / bound -26.89 at 60 s, both budgets
+    honoured. That is primal work (the #844 family), not relaxation coverage.
+
+    XFAIL-shaped on purpose: it PASSES while the residual exists and XPASSes loudly
+    if a primal fix lands, at which point delete it and assert the optimum instead.
+    """
+    result = solve_lp_spatial_bb(_ball_mk2_real(30), time_limit=20.0, require_incremental=True)
+    assert result is not None
+    if result.objective is not None:  # pragma: no cover - the day this fires, celebrate
+        pytest.fail(
+            f"ball_mk2_30 now yields an incumbent ({result.objective}) — the #861 "
+            "residual is closed; replace this test with an optimality assertion."
+        )
+    assert result.status == "time_limit"
+    assert result.node_count > 0, "admitted but explored no nodes — budget spent elsewhere"

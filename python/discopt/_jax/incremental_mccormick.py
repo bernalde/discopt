@@ -30,6 +30,7 @@ fail -> fallback.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 import numpy as np
@@ -121,6 +122,22 @@ def _monomial_rows(li, ui, p):
     3-tangent hull), so the closed-form patch must emit the same midpoint tangent to
     reproduce the cold build row-for-row (validated).
     """
+    # Unbounded box: there is no secant and no finite tangent point, and evaluating
+    # the formulae anyway yields NaN coefficients (``inf - inf`` in the tangent
+    # intercept, ``0 * inf`` in the slope) that flow straight into ``A``/``b``. NaN in
+    # an LP row is strictly worse than a missing row — comparisons against it are all
+    # False, so it can silently disable fathoming rather than merely loosen a bound.
+    # Emit four VACUOUS rows (``0 <= 0``) instead, which is exactly what the cold
+    # build's polytope is here: ``_emit_1d`` bails on ``not _finite(lo, hi)`` and
+    # emits no envelope rows at all, leaving the aux interval bound as the whole
+    # relaxation. So this makes the patch AGREE with the cold build on a box where it
+    # previously disagreed, and ``_rowset``'s vacuity filter drops these rows on the
+    # patched side exactly as the cold side has none. (Latent on main too, and not
+    # reachable from the newly-admitted class — every validation box is finite — but
+    # it is the same non-finite-endpoint defect as the aux enclosure below, found by
+    # the regression test written for it.)
+    if not (math.isfinite(li) and math.isfinite(ui)):
+        return [(0.0, 0.0, 0.0)] * 4
     mid = 0.5 * (li + ui)
     fl, fm, fu = li**p, mid**p, ui**p
     dfl, dfm, dfu = p * li ** (p - 1), p * mid ** (p - 1), p * ui ** (p - 1)
@@ -166,14 +183,42 @@ def _monomial_aux_bounds(li, ui, p):
       path bound-NEUTRAL. Do not "tighten" this: a tighter aux bound here is a
       different relaxation, which is precisely what the incremental path may not be.
 
+    A NON-FINITE endpoint delegates to ``Interval.__pow__`` itself rather than being
+    reproduced here, because the closed form below cannot match it there. Two ways it
+    diverges, both load-bearing:
+
+    * ``0 * ±inf`` is ``NaN`` in IEEE and a bare ``min``/``max`` propagates it,
+      collapsing the enclosure to ``[NaN, NaN]``. That is worse than a wide bound: it
+      reaches the LP, and ``NaN <= incumbent`` is always ``False``, so it can
+      silently disable fathoming. ``Interval.__mul__`` maps that corner to 0 (C-36 /
+      #723).
+    * ``Interval`` outward-rounds after *every* step, and on an unbounded box that
+      changes the answer rather than the last ulp: ``[0,inf]**2`` rounds its lower
+      end to ``-5e-324``, which at the next multiply gives ``-inf`` instead of a
+      NaN-to-zero corner — so ``[0,inf]**3`` is ``[-inf, inf]``, not ``[0, inf]``.
+      Reporting the tighter one would make the patched aux TIGHTER than the cold
+      build, which this function's whole contract forbids.
+
+    Delegating costs ~65 us versus ~2 us for the loop, so it is confined to the
+    non-finite case; a finite box (every real node box, and every box the corpus
+    exercises) keeps the fast path, where the loop reproduces ``Interval.__pow__``
+    to well within the comparison tolerance (its per-step rounding is a 1-ulp
+    effect there, not a change of value).
+
     The old form (``min/max`` of the two endpoint powers) was correct only on a
     sign-definite box, where ``x**p`` is monotone; it was UNSOUND on a straddling box
     for even ``p`` (it would floor ``x**2`` at ``min(li^2,ui^2) > 0`` and cut off the
     true point ``x=0``). That was unreachable while every monomial was gated to a
     sign-definite root box, and is the reason the bound had to be generalized before
     the gate could be relaxed (#861). ``test_monomial_aux_bounds_match_interval_pow``
-    pins the parity with ``Interval.__pow__`` across powers and sign regimes.
+    pins the parity with ``Interval.__pow__`` across powers and sign regimes,
+    half-infinite and doubly-infinite boxes included.
     """
+    if not (math.isfinite(li) and math.isfinite(ui)):
+        from discopt._jax.convexity.interval import Interval
+
+        enc = Interval.from_bounds(np.float64(li), np.float64(ui)) ** int(p)
+        return float(enc.lo), float(enc.hi)
     if p == 2:
         return _square_aux_bounds(li, ui)
     lo, hi = li, ui
@@ -542,6 +587,15 @@ class IncrementalMcCormickLP:
             row_max = np.asarray(
                 sp.csr_matrix((contrib, indices, indptr), shape=M.shape).sum(axis=1)
             ).ravel()
+            # The slack exists only to absorb the last-ulp difference between a row
+            # built by the patch and the same row built by the cold build; it is NOT
+            # meant to forgive a row that genuinely cuts. Measured over 22 admitted
+            # models x 132 validation boxes, the worst amount by which a DROPPED row
+            # actually cut its box was 7.1e-15 — i.e. the tolerance runs ~6 orders of
+            # magnitude above anything the corpus exercises. If that margin ever
+            # closes, this is the number to re-measure: the relative form would
+            # tolerate a ~1-unit cut on a row whose maximum is ~1e9, so a future
+            # large-coefficient lift is where it would first matter.
             slack = 1e-9 * (1.0 + np.abs(b) + np.abs(row_max))
             vacuous = np.isfinite(row_max) & (row_max <= b + slack)
         out = []

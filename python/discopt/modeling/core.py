@@ -88,7 +88,9 @@ def _lp_spatial_fallback_enabled() -> bool:
     the sign change — makes the fallback refuse to run at all
     (``require_incremental``) rather than spend a whole reserve on a single root LP
     for nothing; measured at 61 s against a 21 s reserve on ball_mk2_30 back when its
-    ``x_0**2`` monomial also declined (#861 has since admitted the even powers).
+    ``x_0**2`` monomial also declined. #861 has since admitted the even powers, so
+    ball_mk2_30 now runs this path and produces a sound bound but still no incumbent —
+    the remaining gap there is primal, not relaxation coverage.
 
     **Known cost.** The incumbents are *worse* than the ones the degraded cold path
     happened to report (tln4 19.6 vs 8.7, tln5 32.8 vs 15.1) — its slower, full-
@@ -4166,10 +4168,13 @@ class Model:
                     # ROOT LP alone against a 21 s reserve: 0 nodes, no incumbent,
                     # 2.91x over budget. It cannot produce a primal inside a
                     # fallback-sized budget, so declining costs no gain and removes
-                    # the overrun. (ball_mk2_30 itself now MAPS — #861 narrowed the
-                    # monomial gate to odd powers on a straddling root — so it takes
-                    # the incremental path here; the reasoning stands for whatever
-                    # still declines.)
+                    # the overrun. ball_mk2_30 itself now MAPS (#861 narrowed the
+                    # monomial gate to odd powers on a straddling root) and so takes
+                    # the incremental path here — but measured, it still returns no
+                    # incumbent, just a sound bound, having spent the reserve. The
+                    # guard's premise ("the structure builds" ⇒ "this path can find a
+                    # primal") is a proxy, and #861 widened the gap between the two;
+                    # closing it is primal work (#844), not a predicate change.
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,

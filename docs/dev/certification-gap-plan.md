@@ -1760,10 +1760,42 @@ directly: patched LP value vs the same-flag cold build over 62 (model, box) pair
 straddling boxes — max |Δ| `3.8e-15`, 0 drifts — and the incremental bound never
 exceeded the richer cold path.
 
-*Residual.* An **odd** power whose root box straddles zero is still declined
-(`ok=False` → the trusted cold build). Closing it needs a fixed row count across the
-2-facet/4-row switch, i.e. a change to the cold build's emission, not to the patch —
-out of scope for #861 and not worth the churn on the trusted path.
+*Residual (revised after review of PR #873 — the real instance, not the proxy).*
+Two things remain, and the first was found only by running the **real**
+`ball_mk2_30` rather than the synthetic class probe (the #727 lesson again):
+
+1. **Admission is necessary but NOT sufficient on ball_mk2_30.** With the structure
+   admitted the engine now produces a sound dual bound where it previously produced
+   nothing — but it still returns **no incumbent**: `objective=None`, bound −24.90,
+   208,067 nodes at a 300 s budget (−25.89 / 79,843 nodes at 120 s), budget honoured
+   in both. The issue's premise "the primal is not the problem; admitting the model
+   is" is therefore **falsified**: the thin shell means no node LP rounds to the
+   origin. #861's relaxation-coverage half is closed; its stated symptom is not. The
+   remainder is primal work (the #844 family). A faithful reconstruction —
+   `min -Σxᵢ s.t. Σ(xᵢ² − 0.995825xᵢ) ≤ 0`, `xᵢ ∈ {−1,0,1}` — is pinned in
+   `test_861_monomial_span_zero.py` and reproduces this exactly; the earlier synthetic
+   probe could not, because its optimum sits at the origin and the root LP finds it.
+   *Side effect worth tracking:* ball_mk2_30 previously declined in 0.5 s under
+   `require_incremental` (#858) and now consumes the whole fallback reserve for no
+   primal. The guard's predicate ("the structure builds") is a proxy for "this path
+   can produce a primal", and widening admission widened the gap between them.
+2. An **odd** power whose root box straddles zero is still declined (`ok=False` → the
+   trusted cold build). Closing it needs a fixed row count across the 2-facet/4-row
+   switch, i.e. a change to the cold build's emission, not to the patch — out of
+   scope for #861 and not worth the churn on the trusted path.
+
+*Also fixed under review (non-finite endpoints).* The `p >= 3` closed form returned
+`(NaN, NaN)` on an unbounded box (`0 * ±inf`), and `_monomial_rows` put NaN
+coefficients into `A`/`b` there. Both are reachable on a **sign-definite** root
+(`[-inf, 0]` carrying `x**4`), i.e. on models admitted before *and* after #861, and
+the validation gate never sees them because all six validation boxes are finite. NaN
+in an LP is worse than a loose bound — every comparison against it is `False`, so
+`NaN <= incumbent` can silently disable fathoming. The enclosure now delegates to
+`Interval.__pow__` when an endpoint is non-finite (the closed form cannot match it
+there: `Interval` outward-rounds per step, so `[0,inf]**3` is `[-inf,inf]`, and
+claiming the tighter `[0,inf]` would make the patched aux tighter than the cold
+build), and the envelope emits four vacuous rows — which is exactly the cold build's
+polytope, since `_emit_1d` bails under `_finite` and emits nothing.
 
 > **STOP / ESCALATED (2026-07-02, §0.4 + §0.6) — Phase 1's bound-neutrality
 > premise is falsified; needs a maintainer decision before any T1.2 code lands.**

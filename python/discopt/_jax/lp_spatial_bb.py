@@ -238,10 +238,18 @@ def solve_lp_spatial_bb(
     pump, and rebuilds the whole relaxation per node. Measured on ball_mk2_30 at a
     21 s budget, back when its ``x_0**2`` monomial still declined for spanning a sign
     change, the cold path spent 61 s on the *root* LP alone — 0 nodes, no incumbent,
-    2.91x over budget. Declining costs nothing there and cannot overrun. (#861 has
-    since admitted even powers on a straddling root, so ball_mk2_30 takes the fast
-    path; an ODD power on a straddling root still declines and this guard still
-    applies to it.)
+    2.91x over budget. Declining costs nothing there and cannot overrun.
+
+    #861 has since admitted even powers on a straddling root, so ball_mk2_30 itself
+    now passes this guard and runs the fast path — and, measured, still returns NO
+    incumbent (objective ``None``, sound bound, 208k nodes, budget honoured). So for
+    that instance the guard no longer buys the early decline it was added for: it
+    spends the reserve instead of skipping it. That is a real trade — a sound dual
+    bound where there was nothing, in exchange for a fallback that no longer exits in
+    0.5 s — and it is a *primal* gap (the #844 family), not something this predicate
+    can detect: "the structure builds" is only a proxy for "this path can produce a
+    primal", and #861 widened the gap between the two. An ODD power on a straddling
+    root still declines here, which is the case the guard now mainly serves.
 
     ``root_cut_rounds`` enables GMI + complemented-MIR separation at the root (cuts
     inherited by all nodes). Default 0 (off): with discopt's current Python-level
