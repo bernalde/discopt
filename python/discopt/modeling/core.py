@@ -106,6 +106,31 @@ def _lp_spatial_fallback_enabled() -> bool:
     )
 
 
+def _lp_spatial_mixed_fallback_enabled() -> bool:
+    """#860: extend the #844 no-incumbent fallback's *scope gate* to mixed-integer and
+    MAXIMIZE models.
+
+    The engine itself serves those models unconditionally since #860 (see
+    ``lp_spatial_bb._is_in_scope``); this flag governs only whether the DEFAULT path
+    reserves budget for the fallback on them. That reserve is the sole risk of the
+    widening — an in-scope model hands 35% of its budget to a pass that may find
+    nothing — so it is a separate, measurable decision from the engine's capability.
+
+    **Default OFF**; opt in with ``DISCOPT_LP_SPATIAL_MIXED=1``. Graduation requires
+    the corpus-wide differential panel of CLAUDE.md §5 (cert-clean AND net-positive)
+    over the mixed class, not just the absence of harm.
+    """
+    import os as _os
+
+    return _os.environ.get("DISCOPT_LP_SPATIAL_MIXED", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+        "off",
+    )
+
+
 if TYPE_CHECKING:
     from discopt.modeling.indexed import IndexedParam, IndexedVar
     from discopt.modeling.sets import _SetBase
@@ -4040,7 +4065,8 @@ class Model:
         # self-terminate within ``time_limit + ε`` instead of running to
         # XLA convergence after Python's budget is gone (issue #80).
         # #844: reserve a slice of the budget for the LP-per-node fallback below, but
-        # ONLY for models that engine can serve (pure-integer, minimize). Safe because
+        # ONLY for models that engine can serve (pure-integer, minimize; plus mixed /
+        # maximize when the #860 flag is on). Safe because
         # the instances at risk certify almost instantly -- nvs04 in 0.2 s, nvs06 in
         # 0.3 s of a 40 s budget -- so they finish long before the reduced primary
         # budget binds, while the instances this targets (tln4/tln5) burn 100% of the
@@ -4062,7 +4088,11 @@ class Model:
             try:
                 from discopt._jax.lp_spatial_bb import _is_in_scope
 
-                if _is_in_scope(self):
+                # #860: the engine now also serves mixed-integer and MAXIMIZE models,
+                # but whether the DEFAULT path should hand them 35% of its budget is a
+                # separate, panel-gated decision — hence the flag rather than the
+                # engine's own (already widened) gate.
+                if _is_in_scope(self, mixed=_lp_spatial_mixed_fallback_enabled()):
                     _fb_reserve = 0.35 * time_limit
                     # NOTE: scope is checked here, but whether the engine can actually
                     # build its incremental structure is only known once it runs (see

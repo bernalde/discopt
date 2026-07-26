@@ -181,25 +181,78 @@ def test_no_false_optimum_on_dense_integer_quadratic():
 # --------------------------------------------------------------------------- #
 
 
-def test_out_of_scope_continuous_returns_none():
-    """A model with a continuous variable is out of scope -> None (caller falls
-    back). The collapsed-box exactness argument needs every var integer."""
+def _mixed_model():
+    """min x + y s.t. x*y >= 4, x continuous in [0,5], y integer in [0,5].
+
+    Brute force over the integer y: y=2 -> x=2 (4.0); y=3 -> x=4/3 (4.333);
+    y=4 -> x=1 (5.0); y=5 -> x=0.8 (5.8). Global optimum 4.0 at (2, 2)."""
     m = dm.Model("c")
+    m.continuous("x", lb=0, ub=5)
+    m.integer("y", lb=0, ub=5)
+    m.minimize(m._variables[0] + m._variables[1])
+    m.subject_to(m._variables[0] * m._variables[1] >= 4)
+    return m
+
+
+@pytest.mark.smoke
+def test_mixed_integer_in_scope_and_correct():
+    """#860: a mixed continuous/integer model is IN scope and must certify the true
+    optimum. Before #860 the engine declined it outright (``_is_in_scope`` required
+    every variable to be integer), so the whole class was unreachable."""
+    r = solve_lp_spatial_bb(_mixed_model(), time_limit=20, gap_tolerance=1e-6)
+    assert r is not None
+    assert r.objective == pytest.approx(4.0, abs=1e-5)
+    assert r.bound is not None and r.bound <= r.objective + 1e-6
+
+
+@pytest.mark.smoke
+def test_legacy_gate_still_declines_mixed():
+    """``mixed=False`` restores the pre-#860 pure-integer/MINIMIZE gate, so a caller
+    can roll the widening out behind a flag without a second code path."""
+    assert solve_lp_spatial_bb(_mixed_model(), time_limit=5, mixed=False) is None
+
+
+@pytest.mark.smoke
+def test_pure_continuous_stays_out_of_scope():
+    """No integer variable -> None. The engine converges by branching the integers;
+    with none it is plain spatial bisection, which the default path already does."""
+    m = dm.Model("cc")
     x = m.continuous("x", lb=0, ub=5)
-    y = m.integer("y", lb=0, ub=5)
+    y = m.continuous("y", lb=0, ub=5)
     m.minimize(x + y)
     m.subject_to(x * y >= 4)
     assert solve_lp_spatial_bb(m, time_limit=5) is None
 
 
-def test_out_of_scope_maximize_returns_none():
-    """The McCormick relaxation bound is only a valid *lower* bound for minimize."""
+@pytest.mark.smoke
+def test_maximize_bound_is_a_valid_upper_bound():
+    """#860: a MAXIMIZE model is in scope. The engine runs in minimize-equivalent
+    space, so the reported bound must come back as a valid UPPER bound (``bound >=
+    objective``) and the incumbent must not exceed the true optimum.
+
+    max a + b s.t. a*b <= 6, a,b integer in [0,5]: (5,1)->6, (1,5)->6, (2,3)->5,
+    (5,0)->5, (0,5)->5. Optimum 6."""
     m = dm.Model("mx")
     a = m.integer("a", lb=0, ub=5)
     b = m.integer("b", lb=0, ub=5)
     m.maximize(a + b)
     m.subject_to(a * b <= 6)
-    assert solve_lp_spatial_bb(m, time_limit=5) is None
+    r = solve_lp_spatial_bb(m, time_limit=20, gap_tolerance=1e-6)
+    assert r is not None
+    assert r.objective is not None and r.objective <= 6.0 + 1e-6
+    assert r.bound is not None and r.bound >= r.objective - 1e-6
+    assert r.objective == pytest.approx(6.0, abs=1e-5)
+
+
+@pytest.mark.smoke
+def test_maximize_legacy_gate_returns_none():
+    """The pre-#860 gate declined maximize outright; ``mixed=False`` keeps that."""
+    m = dm.Model("mx2")
+    a = m.integer("a", lb=0, ub=5)
+    b = m.integer("b", lb=0, ub=5)
+    m.maximize(a + b)
+    m.subject_to(a * b <= 6)
+    assert solve_lp_spatial_bb(m, time_limit=5, mixed=False) is None
 
 
 # --------------------------------------------------------------------------- #

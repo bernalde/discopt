@@ -4638,7 +4638,11 @@ def solve_model(
     # branches on integers/products and runs a feasibility-pump primal, closing
     # nvs17 to proven optimality. Opt-in via ``solve(lp_spatial=True)``; returns
     # ``None`` (falls through to the default path, no behavior change) for any model
-    # out of its scope (non-pure-integer, maximize, unbounded box) or on any error.
+    # out of its scope or on any error. Since #860 the scope is "at least one integer
+    # variable, either objective sense, any continuous mix" — mixed-integer and
+    # maximize models are served in minimize-equivalent space, and a partially
+    # infinite root box is accepted (root OBBT finitizes it; the cold builder drops
+    # any row it cannot make finite).
     if kwargs.get("lp_spatial", False):
         try:
             from discopt._jax.lp_spatial_bb import solve_lp_spatial_bb
