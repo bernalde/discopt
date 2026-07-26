@@ -68,9 +68,17 @@ class TestCertifiedGapRequiresFiniteBound:
         assert r.gap_certified is True
         assert r.bound == pytest.approx(31.0)
 
-    def test_finite_zero_bound_is_a_valid_certificate(self):
+    def test_finite_zero_bound_survives_the_guard(self):
         # bound == 0.0 is finite (a weak but sound lower bound, e.g. ex1252):
-        # the guard must NOT mistake a falsy-but-finite value for "no bound".
+        # the guard must NOT mistake a falsy-but-finite value for "no bound" and
+        # clear it. That is what this test is for, and the surviving ``bound`` is
+        # the assertion that checks it.
+        #
+        # ``gap_certified`` is a separate question and is False here for a reason
+        # unrelated to the bound: there is no incumbent, so no gap was ever formed
+        # and none can be certified (#875 added that second-end check; this case
+        # used to report a certified gap with ``objective=None, gap=inf``). The
+        # companion case with an incumbent is below.
         r = SolveResult(
             status="time_limit",
             objective=None,
@@ -78,8 +86,23 @@ class TestCertifiedGapRequiresFiniteBound:
             gap=float("inf"),
             gap_certified=True,
         )
+        assert r.bound == pytest.approx(0.0), "a falsy-but-finite bound must not be cleared"
+        assert r.gap_certified is False
+        assert r.gap is None
+
+    def test_finite_zero_bound_is_a_valid_certificate_with_an_incumbent(self):
+        # The same falsy-but-finite bound, now with both ends of a gap present:
+        # certification stands.
+        r = SolveResult(
+            status="time_limit",
+            objective=5.0,
+            bound=0.0,
+            gap=1.0,
+            gap_certified=True,
+        )
         assert r.gap_certified is True
         assert r.bound == pytest.approx(0.0)
+        assert r.gap == pytest.approx(1.0)
 
     def test_infeasibility_certificate_is_exempt(self):
         # An infeasibility certificate certifies infeasibility, not a gap, and

@@ -953,6 +953,15 @@ def _extract_constraints_algebraic(model: Model, n_orig: int):
 
 
 def _quadratic_row_has_terms(Q: np.ndarray, tol: float = 1e-12) -> bool:
+    """True when ``Q`` holds a nonzero entry above ``tol``.
+
+    Sparse-aware (#875): ``np.abs`` on a scipy sparse matrix returns a sparse matrix,
+    and ``np.any`` on one does not mean what it does on an ndarray — the stored
+    values are the only candidates, so test those directly. Explicit zeros can be
+    stored, hence the ``> tol`` test rather than ``nnz``.
+    """
+    if _sp_issparse(Q):
+        return bool(np.any(np.abs(Q.data) > tol))
     return bool(np.any(np.abs(Q) > tol))
 
 
@@ -1512,7 +1521,34 @@ def _extract_qp_data_from_repr(model: Model) -> QPData:
 
 
 def _extract_quadratic_coefficients_from_values(evaluate, n_vars: int):
-    """Extract 0.5*x'Q*x + c'x + d from a quadratic scalar evaluator."""
+    """Extract 0.5*x'Q*x + c'x + d from a quadratic scalar evaluator.
+
+    Same probe identities as :func:`_extract_qp_data_from_repr`:
+      - ``d = f(0)``
+      - ``Q[j,j] = f(e_j) + f(-e_j) - 2d``
+      - ``Q[i,j] = f(e_i+e_j) - f(e_i) - f(e_j) + d``  (``i != j``)
+      - ``c_j = f(e_j) - d - 0.5*Q[j,j]``
+
+    and now the same two #863 economies, which this (the QCP/QCQP probe path) was
+    left out of because ``watercontamination0202`` does not route here — #868
+    declined to widen speculatively, and #875 closes the gap rather than leave two
+    extractors of one shape with two different cost profiles:
+
+      * **Off-diagonal probing is restricted to the evaluator's support.** A variable
+        absent from this row has ``f(e_j) == f(-e_j) == d`` and a zero diagonal, so
+        every product involving it is identically zero. The support falls out of the
+        ``O(n)`` diagonal probes already taken, so the restriction is free, and it
+        takes the pair sweep from ``O(n^2)`` probes to ``O(|support|^2)``.
+      * **Q is materialised through :func:`_materialise_Q`** — dense while ``(n, n)``
+        float64 fits the budget (bit-identical to the ``np.zeros((n, n))`` it
+        replaces, same entries written into the same zeros), scipy CSR beyond it. A
+        dense ``(n, n)`` is 91 GB at ``n = 106,711``, and this function was called
+        once per constraint.
+
+    Both are pure cost reductions: the entries not probed are provably zero, and an
+    entry absent from the accumulator densifies back to the 0.0 the dense array
+    already held.
+    """
 
     x_zero = np.zeros(n_vars, dtype=np.float64)
     d = float(evaluate(x_zero))
@@ -1526,23 +1562,26 @@ def _extract_quadratic_coefficients_from_values(evaluate, n_vars: int):
         ej[j] = -1.0
         f_neg_ej[j] = float(evaluate(ej))
 
-    Q = np.zeros((n_vars, n_vars), dtype=np.float64)
-    for j in range(n_vars):
-        Q[j, j] = f_ej[j] + f_neg_ej[j] - 2.0 * d
+    diag = f_ej + f_neg_ej - 2.0 * d
 
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
+    terms: dict[tuple[int, int], float] = {}
+    for j in range(n_vars):
+        if diag[j] != 0.0:
+            terms[(j, j)] = float(diag[j])
+
+    support = [j for j in range(n_vars) if f_ej[j] != d or f_neg_ej[j] != d or diag[j] != 0.0]
+    for _si, i in enumerate(support):
+        for j in support[_si + 1 :]:
             eij = np.zeros(n_vars, dtype=np.float64)
             eij[i] = 1.0
             eij[j] = 1.0
-            f_eij = float(evaluate(eij))
-            qij = f_eij - f_ej[i] - f_ej[j] + d
-            Q[i, j] = qij
-            Q[j, i] = qij
+            qij = float(evaluate(eij)) - f_ej[i] - f_ej[j] + d
+            if qij != 0.0:
+                terms[(i, j)] = qij
+                terms[(j, i)] = qij
 
-    c_vec = np.zeros(n_vars, dtype=np.float64)
-    for j in range(n_vars):
-        c_vec[j] = f_ej[j] - d - 0.5 * Q[j, j]
+    Q = _materialise_Q(terms, n_vars)
+    c_vec = f_ej - d - 0.5 * diag
 
     return Q, c_vec, d
 
@@ -1578,7 +1617,9 @@ def _extract_qcp_data_from_repr(model: Model) -> QCPData:
         if _quadratic_row_has_terms(row_Q):
             q_rows.append(
                 QuadraticConstraintData(
-                    Q=np.asarray(row_Q),  # type: ignore[arg-type]
+                    # Preserve sparsity (see dense_Q / #863): np.asarray() on a scipy
+                    # sparse matrix returns a 0-d object array instead of raising.
+                    Q=row_Q if _sp_issparse(row_Q) else np.asarray(row_Q),  # type: ignore[arg-type]
                     c=np.asarray(row_c),  # type: ignore[arg-type]
                     sense=sense,
                     rhs=rhs,
@@ -1607,7 +1648,8 @@ def _extract_qcp_data_from_repr(model: Model) -> QCPData:
         obj_const = -obj_const
 
     return QCPData(
-        Q=np.asarray(Q),  # type: ignore[arg-type]
+        # Preserve sparsity (see dense_Q / #863, #875).
+        Q=Q if _sp_issparse(Q) else np.asarray(Q),  # type: ignore[arg-type]
         c=np.asarray(c_vec),  # type: ignore[arg-type]
         # Preserve sparsity (see dense_A / #863).
         A_ub=A_ub if _sp_issparse(A_ub) else np.asarray(A_ub),  # type: ignore[arg-type]

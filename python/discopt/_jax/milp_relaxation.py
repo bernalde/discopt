@@ -1237,22 +1237,73 @@ def _linear_constraint_forms(model: Model, n_vars: int) -> list[tuple[np.ndarray
     ``-g <= 0``. Nonlinear constraint bodies are skipped (they have no affine
     form). These are the factors level-1 RLT multiplies by variable bound
     factors to generate valid product cuts.
+
+    Callers that only need to know *whether* any such factor exists must use
+    :func:`_any_linear_constraint_form` instead — materializing the dense arrays to
+    take ``bool(...)`` of the list is ``O(n_constraints * n_vars)`` in both time and
+    memory (issue #875).
     """
     forms: list[tuple[np.ndarray, float]] = []
     for constraint in model._constraints:
-        try:
-            coeff, const = _linearize_affine_expr(constraint.body, model, n_vars)
-        except ValueError:
-            continue  # nonlinear body — not an affine factor
-        if not (np.all(np.isfinite(coeff)) and np.isfinite(const)):
-            continue
         sense = constraint.sense
+        if sense not in ("<=", "=="):
+            continue  # no form is emitted below; skip the linearization entirely
+        terms = _linear_form_terms(constraint.body, model, n_vars)
+        if terms is None:
+            continue
+        coeff = np.zeros(n_vars, dtype=np.float64)
+        for j, c in terms[0].items():
+            coeff[j] = c
+        const = terms[1]
         if sense == "<=":
-            forms.append((coeff, float(const)))
-        elif sense == "==":
-            forms.append((coeff, float(const)))
-            forms.append((-coeff, -float(const)))
+            forms.append((coeff, const))
+        else:
+            forms.append((coeff, const))
+            forms.append((-coeff, -const))
     return forms
+
+
+def _linear_form_terms(
+    body: Expression, model: Model, n_vars: int
+) -> Optional[tuple[dict[int, float], float]]:
+    """Sparse ``(terms, const)`` for a linear constraint body, or ``None``.
+
+    ``None`` means "not an affine factor": either the body is nonlinear (the
+    linearizer refuses) or a coefficient/constant is non-finite. Shared by
+    :func:`_linear_constraint_forms` and :func:`_any_linear_constraint_form` so both
+    apply the same acceptance test.
+    """
+    try:
+        terms, const = _linearize_affine_expr_sparse(body, model, n_vars)
+    except ValueError:
+        return None  # nonlinear body — not an affine factor
+    if not np.isfinite(const):
+        return None
+    for j, c in terms.items():
+        # The dense form raised IndexError (uncaught) on an out-of-range index and
+        # dropped a non-finite coefficient; keep the drop, and treat an unindexable
+        # coefficient the same way rather than writing outside the array.
+        if not (0 <= j < n_vars) or not np.isfinite(c):
+            return None
+    return terms, float(const)
+
+
+def _any_linear_constraint_form(model: Model, n_vars: int) -> bool:
+    """True when the model has at least one linear constraint factor for RLT.
+
+    Short-circuits on the first hit, and never allocates an ``n_vars`` array.
+    ``bool(_linear_constraint_forms(model, n_vars))`` answers the same question but
+    linearizes every row into a dense vector first and *keeps them all* — on
+    ``watercontamination0202`` (106,711 vars / 107,209 rows) that is ~91 GB of
+    coefficient arrays to compute one boolean, and it sits in the
+    ``MccormickLPRelaxer`` constructor on the pre-B&B root path (issue #875).
+    """
+    for constraint in model._constraints:
+        if constraint.sense not in ("<=", "=="):
+            continue
+        if _linear_form_terms(constraint.body, model, n_vars) is not None:
+            return True
+    return False
 
 
 # A quadratic constraint factor for level-1 RLT (issue #15, Phase 2): the body
@@ -1317,14 +1368,33 @@ def _quadratic_constraint_forms(model: Model, n_vars: int) -> list[_QuadForm]:
     return forms
 
 
-def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple[np.ndarray, float]:
-    """Linearize an affine expression over original variables.
+def _linearize_affine_expr_sparse(
+    expr: Expression, model: Model, n_vars: int
+) -> tuple[dict[int, float], float]:
+    """Sparse core of :func:`_linearize_affine_expr`: ``({flat_index: coeff}, const)``.
 
-    Raises ValueError when the expression contains nonlinear structure: only
-    affine arguments are soundly supported here, since any nonlinear structure
-    is relaxed by the uniform engine's atom envelopes rather than linearized.
+    Same recognition rules and same ``ValueError`` refusals as the dense wrapper —
+    only the accumulator differs. Callers that just need the *support* of an affine
+    body (how many variables it touches, and which) should use this: the dense
+    wrapper costs ``O(n_vars)`` per call to allocate and zero its array, so scanning
+    every constraint through it is ``O(n_constraints * n_vars)`` no matter how sparse
+    the bodies are.
+
+    Measured (issue #875, ``watercontamination0202``: 106,711 vars / 107,209 rows):
+    ``_fix_single_var_equalities`` — a scan whose bodies have a SINGLE leaf each —
+    spent ~460 s of a 30 s solve budget entirely in that dense allocation plus the
+    caller's Python walk over all 106,711 entries. The synthetic scaling probe is
+    exactly linear in ``n_vars`` at a fixed constraint count (0.068 s at n=2,000 →
+    3.650 s at n=128,000 for 400 rows), which is the signature of the dense array
+    rather than of the bodies.
+
+    Keys are the flat original-variable indices; a key is emitted only for a
+    variable the body actually references, so the dict size is ``O(body leaves)``.
+    Indices are NOT range-checked here (the dense wrapper's array indexing is what
+    enforces ``n_vars``); a sparse caller that indexes arrays with them must bound
+    them itself.
     """
-    coeff = np.zeros(n_vars, dtype=np.float64)
+    coeff: dict[int, float] = {}
     const_acc: list[float] = [0.0]
 
     def visit(e: Expression, scale: float) -> None:
@@ -1335,7 +1405,7 @@ def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple
         if isinstance(e, Variable):
             offset = _compute_var_offset(e, model)
             if e.size == 1:
-                coeff[offset] += scale
+                coeff[offset] = coeff.get(offset, 0.0) + scale
                 return
             raise ValueError(f"Cannot use array variable as scalar affine argument: {e}")
 
@@ -1343,7 +1413,7 @@ def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple
             flat = _get_flat_index(e, model)
             if flat is None:
                 raise ValueError(f"Cannot linearize IndexExpression: {e}")
-            coeff[flat] += scale
+            coeff[flat] = coeff.get(flat, 0.0) + scale
             return
 
         if isinstance(e, UnaryOp) and e.op == "neg":
@@ -1388,7 +1458,7 @@ def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple
             if isinstance(op, Variable):
                 offset = _compute_var_offset(op, model)
                 for k in range(op.size):
-                    coeff[offset + k] += scale
+                    coeff[offset + k] = coeff.get(offset + k, 0.0) + scale
                 return
             visit(op, scale)
             return
@@ -1402,6 +1472,26 @@ def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple
 
     visit(expr, 1.0)
     return coeff, const_acc[0]
+
+
+def _linearize_affine_expr(expr: Expression, model: Model, n_vars: int) -> tuple[np.ndarray, float]:
+    """Linearize an affine expression over original variables.
+
+    Raises ValueError when the expression contains nonlinear structure: only
+    affine arguments are soundly supported here, since any nonlinear structure
+    is relaxed by the uniform engine's atom envelopes rather than linearized.
+
+    Dense view of :func:`_linearize_affine_expr_sparse` — identical coefficients,
+    identical constant, identical refusals, and (as before) an ``IndexError`` from
+    the array store when a body references a flat index at or beyond ``n_vars``.
+    Prefer the sparse core in any per-constraint scan: this allocates and zeroes an
+    ``n_vars`` array per call (issue #875).
+    """
+    terms, const = _linearize_affine_expr_sparse(expr, model, n_vars)
+    coeff = np.zeros(n_vars, dtype=np.float64)
+    for j, c in terms.items():
+        coeff[j] = c
+    return coeff, const
 
 
 def _match_scaled_constant_division(
@@ -1545,16 +1635,19 @@ def _extract_positive_product(
         # positive monomial factor. A nonzero constant or >1 variable breaks the
         # monomial form (reject); a non-positive coefficient breaks the log lift.
         try:
-            aff_coeffs, aff_const = _linearize_affine_expr(e, model, n_orig)
+            # Sparse: this runs per factor of every monomial body, and the dense
+            # form allocated an ``n_orig`` array plus a Python walk over it just to
+            # count the nonzeros (#875).
+            aff_terms, aff_const = _linearize_affine_expr_sparse(e, model, n_orig)
         except ValueError:
             return False
         if abs(float(aff_const)) > 1e-12:
             return False
-        nz = [(j, float(c)) for j, c in enumerate(aff_coeffs) if abs(float(c)) > 0.0]
+        nz = [(j, c) for j, c in aff_terms.items() if abs(c) > 0.0]
         if len(nz) != 1:
             return False
         j, c = nz[0]
-        if j >= n_orig or c <= 0.0:
+        if j < 0 or j >= n_orig or c <= 0.0:
             return False
         lo = float(flat_lb[j])
         if not (lo > 1e-9) or not np.isfinite(lo):
@@ -2285,18 +2378,25 @@ def _integer_affine_cos_lower_bound(
     """Return exact lower bound for scale*cos(integer-affine expr) on a small box."""
     if not isinstance(expr, FunctionCall) or expr.func_name != "cos" or len(expr.args) != 1:
         return None
+    n_vars = len(flat_lb)
     try:
-        coeff, const = _linearize_affine_expr(expr.args[0], model, len(flat_lb))
+        terms, const = _linearize_affine_expr_sparse(expr.args[0], model, n_vars)
     except ValueError:
         return None
 
     flat_types = _flat_variable_types(model)
     entries: list[tuple[float, range]] = []
     n_values = 1
-    for var_idx, c_i in enumerate(coeff):
-        c = float(c_i)
+    # Ascending index order, matching the dense ``enumerate(coeff)`` walk this
+    # replaces — the enumeration below is over a cartesian product, so the entry
+    # order is not observable in the result, but keeping it makes the two forms
+    # trivially comparable. Sparse: the dense walk was O(n_vars) per call (#875).
+    for var_idx in sorted(terms):
+        c = terms[var_idx]
         if abs(c) <= 1e-12:
             continue
+        if not (0 <= var_idx < n_vars):
+            return None  # unindexable support: the dense form raised here
         values = _integer_domain_values(var_idx, flat_types, flat_lb, flat_ub)
         if values is None:
             return None
@@ -2325,16 +2425,24 @@ def _scaled_affine_lower_bound(
     flat_lb: np.ndarray,
     flat_ub: np.ndarray,
 ) -> Optional[float]:
+    n_vars = len(flat_lb)
     try:
-        coeff, const = _linearize_affine_expr(expr, model, len(flat_lb))
+        terms, const = _linearize_affine_expr_sparse(expr, model, n_vars)
     except ValueError:
         return None
     want_lower = scale >= 0.0
     bound = float(const)
-    for c_i, lb_i, ub_i in zip(coeff, flat_lb, flat_ub):
-        c = float(c_i)
+    # Sparse walk over the body's support; the dense form zipped all ``n_vars``
+    # coefficients against the box on every call (#875). Ascending index order keeps
+    # the floating-point accumulation identical to the dense walk's.
+    for var_idx in sorted(terms):
+        c = terms[var_idx]
         if abs(c) <= 1e-12:
             continue
+        if not (0 <= var_idx < n_vars):
+            return None  # unindexable support: the dense form raised here
+        lb_i = flat_lb[var_idx]
+        ub_i = flat_ub[var_idx]
         chosen = float(lb_i) if (c >= 0.0) == want_lower else float(ub_i)
         if not _is_effectively_finite(chosen):
             return None

@@ -158,9 +158,12 @@ def test_solve_runs_the_declared_box_pass_once(monkeypatch):
     real = _solver._declared_box_tightening
     calls: list[int] = []
 
-    def _counting(model):
+    # ``*a, **kw`` rather than ``(model)``: ``solve_model`` now also passes the pass's
+    # ``deadline`` (#875), and a fixed-arity spy would turn a plumbing change into a
+    # TypeError inside the solve rather than a count mismatch here.
+    def _counting(*a, **kw):
         calls.append(1)
-        return real(model)
+        return real(*a, **kw)
 
     monkeypatch.setattr(_solver, "_declared_box_tightening", _counting)
     with pytest.warns(UserWarning, match="very large or infinite declared bounds"):

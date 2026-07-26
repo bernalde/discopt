@@ -3315,12 +3315,19 @@ def _format_bad_bound_entries(
     return bad_vars
 
 
-def _declared_box_tightening(model: Model):
+def _declared_box_tightening(model: Model, deadline: Optional[float] = None):
     """Run ``tighten_nonlinear_bounds`` **once** on the model's declared box.
 
     Returns ``(tightened_lb, tightened_ub, stats)``, or ``None`` when the pass
     raised (both consumers below degrade to "no information", exactly as they did
     when each caught the exception itself).
+
+    ``deadline`` (an absolute ``time.perf_counter()``) bounds the pass; ``None``
+    leaves it unbudgeted, which is what a standalone caller outside ``solve_model``
+    gets. Sharing the result (#863) halved this phase but did not bound it: the
+    remaining single call still cost ~27 s against a 30 s ``time_limit`` on
+    ``watercontamination0202``, because the pass had no budget parameter at all
+    (#875). A truncated pass returns a looser — never wrong — box.
 
     Why this exists (#863): ``_check_finite_bounds`` and
     ``_detect_nonlinear_bound_infeasibility`` are called back-to-back in
@@ -3346,7 +3353,7 @@ def _declared_box_tightening(model: Model):
     try:
         from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 
-        return tighten_nonlinear_bounds(model, raw_lb, raw_ub)
+        return tighten_nonlinear_bounds(model, raw_lb, raw_ub, deadline=deadline)
     except Exception as exc:
         logger.debug("Nonlinear bound tightening on the declared box failed: %s", exc)
         return None
@@ -3585,6 +3592,16 @@ def _classify_model_convexity(
     overrun that budget it is abandoned and the model is reported as
     convexity-unknown, which routes to the sound spatial Branch and Bound. This
     keeps a tight ``time_limit`` from being blown by classification alone.
+
+    That per-call budget alone does not bound the *solve*, because the memo is keyed
+    to a model object and a reformulation produces a new one: each classification
+    then gets a fresh ``0.2 * time_limit``, and they add up (#875 measured two runs
+    at 14.7 s under a 30 s ``time_limit`` on ``watercontamination0202``, after which
+    half the budget was already gone). So the deadline is additionally clamped to the
+    absolute ``model._solve_deadline`` — classification, however many times it runs,
+    can never on its own carry the solve past ``time_limit``. Hitting the clamp is
+    sound: an abandoned classification reports convexity-unknown, which is the
+    conservative verdict that routes to spatial Branch and Bound.
     """
     cached = getattr(model, "_convexity_classification_cache", None)
     if cached is not None:
@@ -3596,6 +3613,9 @@ def _classify_model_convexity(
     # solve_model (e.g. on a model produced by factorable reformulation).
     budget = getattr(model, "_convexity_time_budget", 15.0)
     deadline = (time.perf_counter() + budget) if budget else None
+    solve_deadline = getattr(model, "_solve_deadline", None)
+    if solve_deadline is not None:
+        deadline = solve_deadline if deadline is None else min(deadline, float(solve_deadline))
     result: tuple[bool, bool, list[bool] | None]
     try:
         from discopt._jax.convexity import classify_model as _classify_convexity
@@ -3718,7 +3738,7 @@ def _apply_auto_cut_policy(model: "Model", relaxer) -> None:
     ``_psd_cuts`` / ``_rlt_cuts`` flags; purely a performance choice — every cut
     family is sound, so this never affects correctness.
     """
-    from discopt._jax.milp_relaxation import _linear_constraint_forms
+    from discopt._jax.milp_relaxation import _any_linear_constraint_form
 
     try:
         n = sum(v.size for v in model._variables)
@@ -3727,7 +3747,7 @@ def _apply_auto_cut_policy(model: "Model", relaxer) -> None:
         # product structure is sparse, past the raw variable-count gate.
         if n > _AUTO_CUTS_MAX_VARS and not _rlt_sparse_admit(model, n):
             return  # size gate: leave cuts off
-        has_linear_constraints = bool(_linear_constraint_forms(model, n))
+        has_linear_constraints = _any_linear_constraint_form(model, n)
         if has_linear_constraints:
             relaxer._rlt_cuts = True
             relaxer._psd_cuts = False
@@ -5475,11 +5495,18 @@ def solve_model(
         # to one period, and clamp log/sqrt arguments to their natural domain so
         # the local NLP never wanders into the undefined region (issue #265's
         # false-infeasible from a free log argument).
+        # Budgeted like the other root-setup passes (#875): both rules walk every
+        # constraint body, and this runs before a single node exists.
+        # ``PeriodicVariableBoundRule`` is not row-anytime (its conclusion rests on a
+        # variable being absent elsewhere), so the budget can only decline to start
+        # it — never truncate it — which is exactly what keeps the reduction sound.
+        _per_budget_s = min(min(max(0.05 * float(time_limit), 1.0), 10.0), _remaining_budget())
         _per_lb, _per_ub, _per_stats = tighten_nonlinear_bounds(
             model,
             _origin_lb_chk,
             _origin_ub_chk,
             rules=(PeriodicVariableBoundRule(), FunctionDomainBoundRule()),
+            deadline=time.perf_counter() + _per_budget_s,
         )
         if _per_stats.n_tightened > 0:
             from discopt.solvers.amp import _apply_flat_bounds_to_model
@@ -5570,6 +5597,10 @@ def solve_model(
                     model = _bml
                     model._convexity_classification_cache = None
                     model._convexity_time_budget = _convexity_time_budget
+                    # Carry the absolute deadline onto the reformulated model too,
+                    # or its classification (and the engines that read this stash)
+                    # would run against no wall clamp at all (#654 / #875).
+                    model._solve_deadline = _solve_t0 + float(time_limit)
                     # Route like the integer-bilinear reform: skip the (slow,
                     # redundant) FBBT root presolve on the lifted rows and use
                     # the monolithic Rust simplex MILP engine, unless the
@@ -6199,7 +6230,15 @@ def solve_model(
     # on an unmodified model, so run it once and share it (#863): measured on
     # watercontamination0202 the second run was 39.78 s of bit-identical repeat work
     # against a 30 s budget. See _declared_box_tightening.
-    _declared_tightening = _declared_box_tightening(model)
+    #
+    # #875: sharing halved the phase but left it unbounded — the surviving call was
+    # still ~27 s of a 30 s time_limit, because the pass had no budget parameter.
+    # Same shape as the root presolve budget below: a share of ``time_limit``,
+    # clamped to what is actually left. Truncation only weakens the box.
+    _nbt_budget_s = min(min(max(0.15 * float(time_limit), 2.0), 30.0), _remaining_budget())
+    _declared_tightening = _declared_box_tightening(
+        model, deadline=time.perf_counter() + _nbt_budget_s
+    )
     _check_finite_bounds(model, _declared_tightening)
     nonlinear_infeasibility = _detect_nonlinear_bound_infeasibility(model, _declared_tightening)
     if nonlinear_infeasibility is not None:
@@ -14580,7 +14619,11 @@ def _solve_qcp_gurobi(
         integrality = int_arr
 
     result = _gurobi_solve_qcp(
-        Q=np.asarray(qcp_data.Q[:n_orig, :n_orig]),
+        # ``_dense_Q``, not ``np.asarray``: the QCP extractor may now emit a scipy
+        # sparse Q (#875, matching the QP extractor since #863), and ``np.asarray``
+        # on one returns a 0-d object array rather than raising — it would smuggle
+        # garbage into the Gurobi call instead of failing loudly.
+        Q=_dense_Q(qcp_data.Q)[:n_orig, :n_orig],
         c=np.asarray(qcp_data.c[:n_orig]),
         A_ub=A_ub_arg,
         b_ub=b_ub_arg,
