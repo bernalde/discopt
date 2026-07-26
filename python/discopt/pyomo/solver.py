@@ -11,6 +11,7 @@ Importing this module registers the solver, so it activates via the
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from typing import Any
@@ -18,6 +19,8 @@ from typing import Any
 from pyomo.opt import OptSolver, SolverFactory, SolverResults
 
 from . import _mapping, _writer
+
+logger = logging.getLogger(__name__)
 
 
 @SolverFactory.register("discopt", doc="discopt hybrid MINLP solver (in-process)")
@@ -155,8 +158,8 @@ class DiscoptSolver(OptSolver):
             results.solver.statistics.branch_and_bound.number_of_nodes = int(
                 getattr(result, "node_count", 0) or 0
             )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - a missing node count never fails a solve
+            logger.debug("node-count statistic not recorded: %s: %s", type(exc).__name__, exc)
 
         results.problem.name = getattr(model, "name", "unknown")
         results.problem.number_of_variables = len(cols)
@@ -210,7 +213,10 @@ class DiscoptSolver(OptSolver):
             try:
                 var, expr = item
                 var.set_value(pyo_value(expr), skip_validation=True)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - one failed back-substitution is not fatal
+                logger.debug(
+                    "eliminated variable not back-substituted: %s: %s", type(exc).__name__, exc
+                )
                 continue
 
     @staticmethod
@@ -240,8 +246,10 @@ class DiscoptSolver(OptSolver):
             for obj in model.component_data_objects(Objective, active=True):
                 setattr(results.problem, field, pyo_value(obj.expr))
                 break
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - a constant objective is reported unset
+            logger.debug(
+                "trivial-model objective value not recorded: %s: %s", type(exc).__name__, exc
+            )
         return results
 
     def _error_results(self, model, message: str) -> SolverResults:

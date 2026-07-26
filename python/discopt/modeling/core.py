@@ -1884,8 +1884,14 @@ class SolveResult:
         if llm:
             try:
                 return self._explain_with_llm(model)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - falls back to the template explanation
+                import logging as _logging
+
+                _logging.getLogger("discopt.llm").debug(
+                    "LLM explanation unavailable, using the template: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
         if self._explanation:
             return self._explanation
         return (
@@ -3935,8 +3941,12 @@ class Model:
                     import logging
 
                     logging.getLogger("discopt.llm").info("Pre-solve: %s", w)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - advisory only, never blocks solving
+                import logging as _logging
+
+                _logging.getLogger("discopt.llm").debug(
+                    "pre-solve LLM analysis skipped: %s: %s", type(exc).__name__, exc
+                )
 
         if stream:
             return self._solve_streaming(
@@ -4232,8 +4242,12 @@ class Model:
         if llm:
             try:
                 result._explanation = result._explain_with_llm()
-            except Exception:
-                pass
+            except Exception as _exp_exc:  # noqa: BLE001 - advisory only, never blocks solving
+                _logging.getLogger("discopt.llm").debug(
+                    "post-solve LLM explanation skipped: %s: %s",
+                    type(_exp_exc).__name__,
+                    _exp_exc,
+                )
 
         if validate and result.x is not None:
             try:

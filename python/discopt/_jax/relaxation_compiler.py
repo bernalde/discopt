@@ -9,6 +9,7 @@ jax.vmap.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 import jax.numpy as jnp
@@ -71,6 +72,8 @@ from discopt.modeling.core import (
     Variable,
 )
 from discopt.solver_tuning import current as _tuning
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_var_offset(var: Variable, model: Model) -> int:
@@ -1035,9 +1038,16 @@ def _compile_relax_node(
                                 return _oa_fn(mid, cv_a, cc_a)
 
                             return fn
-                        except Exception:
-                            # Fall through to McCormick on any OA failure.
-                            pass
+                        except Exception as exc:  # noqa: BLE001 - McCormick is the safe fallback
+                            # Fall through to McCormick on any OA failure. Logged
+                            # because a silently-skipped OA relaxation is measured
+                            # as "OA is no better than McCormick".
+                            logger.debug(
+                                "OA relaxation for %s unavailable, using McCormick: %s: %s",
+                                name,
+                                type(exc).__name__,
+                                exc,
+                            )
 
             # Prefer the TM2014 (multivariate McCormick) composition rule when
             # available — it is sound at non-degenerate inner intervals, where

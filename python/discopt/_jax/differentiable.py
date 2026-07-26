@@ -21,6 +21,7 @@ use cyipopt instead.
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple, Optional
 
 import jax
@@ -43,6 +44,8 @@ from discopt.modeling.core import (
     UnaryOp,
     Variable,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Parametric DAG compiler
@@ -601,8 +604,11 @@ def _compute_sensitivity_at_solution(
         if nlp_solver == "ipm":
             try:
                 nlp_result = _dispatch_nlp_solve("pounce", evaluator, x0, opts)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - the IPM status below is raised instead
+                # Exactly the #844 shape: swallowing this makes the POUNCE fallback
+                # an invisible no-op, and the RuntimeError below then reports the
+                # IPM's status as if the fallback had been tried and failed.
+                logger.debug("POUNCE sensitivity fallback failed: %s: %s", type(exc).__name__, exc)
         if nlp_result.status != SolveStatus.OPTIMAL:
             raise RuntimeError(f"Sensitivity NLP solve did not converge: {nlp_result.status.value}")
 

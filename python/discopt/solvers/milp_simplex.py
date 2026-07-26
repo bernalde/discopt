@@ -17,12 +17,15 @@ can fall back.
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple, Optional, Union, cast
 
 import numpy as np
 import scipy.sparse as sp
 
 from discopt.solvers import MILPResult, SolveStatus
+
+logger = logging.getLogger(__name__)
 
 
 class SimplexBackendUnavailable(RuntimeError):
@@ -410,7 +413,10 @@ def _refined_safe_bound_regularized(
             _status, _x, _obj, _iters, _cs, _bv, dual, _ray = solve_lp_warm_csc_py(
                 c_c, m, n + m, indptr, indices, data, b_reg, lb_c, ub_c, None, None
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - the next perturbation is tried instead
+            logger.debug(
+                "dual-bound refinement LP failed at tau=%g: %s: %s", tau, type(exc).__name__, exc
+            )
             continue
         if dual is None or not np.size(dual):
             continue

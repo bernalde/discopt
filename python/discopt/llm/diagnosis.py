@@ -217,8 +217,8 @@ def _llm_diagnose(
         )
         if raw and raw.strip():
             return raw.strip()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - LLM commentary is advisory, never required
+        logger.debug("LLM infeasibility diagnosis unavailable: %s: %s", type(exc).__name__, exc)
     return None
 
 

@@ -2121,12 +2121,13 @@ def _cached_structural_linear_mask(evaluator, m):
     try:
         sizes = getattr(evaluator, "_constraint_flat_sizes", None)
         mask = _structural_linear_row_mask(evaluator._model, sizes, m)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - callers fall back to numeric classification
+        logger.debug("structural linear-row mask unavailable: %s: %s", type(exc).__name__, exc)
         mask = None
     try:
         evaluator._structural_linear_mask_cache = (m, mask)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - memoization is optional, the mask is recomputed
+        logger.debug("structural linear-row mask not memoized: %s: %s", type(exc).__name__, exc)
     return mask
 
 
@@ -2272,7 +2273,12 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
         try:
             J = evaluator.evaluate_jacobian(mid)  # (m, n)
             g = evaluator.evaluate_constraints(mid)  # (m,)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
+            logger.debug(
+                "linear-row FBBT stopped, Jacobian evaluation failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             break
 
         for j in range(m):
@@ -3144,8 +3150,12 @@ def _strong_branch_lp(
             # => J @ x <= J @ x0 - g(x0)
             A_ub = J
             b_ub = J @ solution - g_vals
-    except Exception:
-        pass  # Proceed without constraints (just variable bounds)
+    except Exception as exc:  # noqa: BLE001 - proceed with variable bounds only
+        logger.debug(
+            "linearized constraints unavailable for the pseudocost LP: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     bounds_list = [(float(node_lb[j]), float(node_ub[j])) for j in range(n_vars)]
 
@@ -3563,8 +3573,8 @@ def _classify_model_convexity(
         result = (False, False, None)
     try:
         model._convexity_classification_cache = result
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - caching is optional, classification is redone
+        logger.debug("convexity classification not cached: %s: %s", type(exc).__name__, exc)
     return result
 
 
@@ -5898,8 +5908,15 @@ def solve_model(
 
         _builder = getattr(model, "_builder", None)
         _model_repr = model_to_repr(model, _builder)
-    except Exception:
-        pass  # FBBT bindings unavailable; skip
+    except Exception as exc:  # noqa: BLE001 - the solve proceeds without Rust FBBT
+        # Capability-disabling and high-value: no ``ModelRepr`` means no FBBT,
+        # no root presolve and no in-tree propagation. A silent skip here is
+        # exactly how "presolve doesn't help" becomes a fake measurement.
+        logger.debug(
+            "Rust model repr unavailable — FBBT/presolve disabled: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     # --- Root presolve: M10 variable elimination + (opt-in) M4+M5
     # polynomial reformulation, then FBBT for bound propagation.
@@ -7047,8 +7064,11 @@ def solve_model(
         from discopt._jax.convexity import refresh_convex_mask as _refresh_mask_import
 
         _refresh_mask = _refresh_mask_import
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - the root mask is then used verbatim
+        # Capability-disabling: with no per-node refresh the solver keeps the root
+        # convexity mask for the whole tree. A silent skip here makes a measurement
+        # of per-node refresh meaningless.
+        logger.debug("per-node convexity refresh unavailable: %s: %s", type(exc).__name__, exc)
 
     # Enable nonconvex spatial branching so integer-feasible nodes are not
     # prematurely fathomed.  The NLP local optimum at such a node may not
@@ -13302,8 +13322,10 @@ def _solve_node_nlp(
                             x=x_mid,
                             objective=_INFEASIBILITY_SENTINEL,
                         )
-            except Exception:
-                pass  # If evaluation fails, fall through to NLP solver
+            except Exception as exc:  # noqa: BLE001 - falls through to the NLP solver
+                logger.debug(
+                    "fixed-box infeasibility probe skipped: %s: %s", type(exc).__name__, exc
+                )
 
     if nlp_solver in ("pounce", "ipm", "sparse_ipm"):
         # "ipm"/"sparse_ipm" are deprecated aliases — the JAX IPM is retired as a

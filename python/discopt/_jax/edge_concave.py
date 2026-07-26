@@ -31,11 +31,14 @@ a vertex-hull "underestimator" that cuts off true points, so detection
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from itertools import product
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _separation_lp_solver():
@@ -116,7 +119,11 @@ def collect_edge_concave_quadratics(model, *, max_factors: int = 12) -> list[Edg
     for body in bodies:
         try:
             poly = _expr_to_polynomial(distribute_products(body), model)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - a body we cannot polynomialize is skipped
+            # Capability-disabling: every skipped body is an edge-concave block the
+            # relaxation never gets, so "edge-concave found nothing" can be an
+            # artifact of the extractor rather than of the model.
+            logger.debug("edge-concave polynomialization failed: %s: %s", type(exc).__name__, exc)
             continue
         if poly is None:
             continue

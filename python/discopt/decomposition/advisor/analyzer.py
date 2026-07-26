@@ -14,12 +14,15 @@ not which method to use. Mapping structure to methods is candidate generation
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from discopt.decomposition.graph import kernels
 from discopt.decomposition.graph.base import ModelGraph
 from discopt.decomposition.structure import detect_decomposition
 from discopt.modeling.core import VarType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,14 +116,18 @@ def _model_is_nonlinear(model) -> bool:
     """
     try:
         from discopt._jax.gdp_reformulate import _is_linear
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - classical Benders is the safe default
+        logger.debug(
+            "linearity predicate unavailable, not offering GBD: %s: %s", type(exc).__name__, exc
+        )
         return False
     for c in model._constraints:
         body = getattr(c, "body", None)
         try:
             if body is not None and not _is_linear(body):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - conservatively treat the row as linear
+            logger.debug("linearity check raised on a body: %s: %s", type(exc).__name__, exc)
             continue
     return False
 

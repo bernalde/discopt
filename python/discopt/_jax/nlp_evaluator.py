@@ -16,6 +16,7 @@ NMPC-style closed-loop workloads.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import jax
@@ -29,6 +30,8 @@ from discopt._jax.dag_compiler import (
     compile_objective_params,
 )
 from discopt.modeling.core import Constraint, Model, ObjectiveSense
+
+logger = logging.getLogger(__name__)
 
 # Above this many dense Jacobian entries (m * n), ``evaluate_jacobian`` routes
 # through the sparse coloring path instead of compiling the dense
@@ -770,8 +773,11 @@ class NLPEvaluator:
                     # make_sparse_jac_fn expects fn(x); the legacy single-arg
                     # wrapper reads current parameter values on each call.
                     self._sparse_jac_fn = make_sparse_jac_fn(self._cons_fn, pattern, colors, seed)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - falls back to the dense Jacobian
+                # Capability-disabling: without this the evaluator is dense on a
+                # problem that was measured as sparse, so a sparsity benchmark
+                # silently measures the dense path.
+                logger.debug("sparse Jacobian setup failed: %s: %s", type(exc).__name__, exc)
         return self._sparse_jac_fn is not None
 
     def evaluate_jacobian(self, x: np.ndarray) -> np.ndarray:
@@ -976,8 +982,12 @@ class NLPEvaluator:
                     from discopt._jax.sparsity import should_use_sparse
 
                     self._use_compressed_cache = should_use_sparse(pattern)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - defaults to dense-then-project
+                    logger.debug(
+                        "compressed-evaluation decision unavailable: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
         return self._use_compressed_cache
 
     def jacobian_structure(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1042,8 +1052,8 @@ class NLPEvaluator:
                 self._sparse_jac_values_fn = make_sparse_jac_values_fn(
                     self._cons_fn_jit, pattern, colors, seed
                 )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - falls back to the dense Jacobian
+            logger.debug("sparse Jacobian-values setup failed: %s: %s", type(exc).__name__, exc)
         return self._sparse_jac_values_fn
 
     def evaluate_hessian_values(

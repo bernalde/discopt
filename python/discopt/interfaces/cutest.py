@@ -15,10 +15,13 @@ See https://jfowkes.github.io/pycutest/ for setup instructions.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import pycutest  # type: ignore[import-untyped]
@@ -505,8 +508,15 @@ def list_cutest_problems(
                 if max_m is not None and m > max_m:
                     continue
                 filtered.append(name)
-            except Exception:
-                # Skip problems we can't query
+            except Exception as exc:  # noqa: BLE001 - an unqueryable problem is filtered out
+                # Logged: silently dropping problems shrinks a benchmark set
+                # without any record that the set is smaller than it looks.
+                logger.debug(
+                    "CUTEst problem %s not queryable, excluded: %s: %s",
+                    name,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
         problems = filtered
 

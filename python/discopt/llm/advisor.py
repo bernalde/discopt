@@ -187,8 +187,8 @@ def _analyze_structure(model: Model) -> dict:
         from discopt._jax.problem_classifier import classify_problem
 
         problem_class = classify_problem(model)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - the advisor degrades to an unclassified model
+        logger.debug("problem classification unavailable: %s: %s", type(exc).__name__, exc)
 
     return {
         "n_variables": n_vars,
@@ -294,8 +294,8 @@ def _llm_augment(
         result = json.loads(raw)
         if isinstance(result, dict):
             return result
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - LLM suggestions are advisory, never required
+        logger.debug("LLM parameter suggestion unusable: %s: %s", type(exc).__name__, exc)
     return None
 
 

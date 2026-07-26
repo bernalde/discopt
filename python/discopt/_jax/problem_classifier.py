@@ -8,6 +8,7 @@ to classify problems, then extracts standard-form data using the JAX DAG compile
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -39,6 +40,8 @@ from discopt.modeling.core import (
     Variable,
     VarType,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ProblemClass(Enum):
@@ -86,8 +89,15 @@ def classify_problem(model: Model) -> ProblemClass:
             )
         else:
             all_constraints_quadratic = all_constraints_linear
-    except (ImportError, Exception):
-        # Rust bindings unavailable — fall back to NLP/MINLP
+    except Exception as exc:  # noqa: BLE001 - NLP/MINLP is the always-valid fallback class
+        # Not merely an optimization: misrouting an LP/QP to the MINLP path is the
+        # difference between the fast family and full spatial B&B, so a silent
+        # degradation here reads as "the fast family didn't trigger".
+        logger.debug(
+            "Rust structure detection unavailable, classifying as NLP/MINLP: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return ProblemClass.MINLP if has_integer else ProblemClass.NLP
 
     if all_constraints_linear:
@@ -1270,13 +1280,15 @@ def extract_lp_data(model: Model) -> LPData:
     if _builder is not None:
         try:
             return _extract_lp_data_from_repr(model)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - falls through to the algebraic extractor
+            # Each rung of this ladder is a *fast path*: a silent fall-through
+            # turns "the repr extractor is slow" into an unexplained measurement.
+            logger.debug("LP repr extraction (builder) failed: %s: %s", type(exc).__name__, exc)
 
     try:
         return extract_lp_data_algebraic(model)
-    except (_NotLinearError, Exception):
-        pass
+    except Exception as exc:  # noqa: BLE001 - falls through to the repr/autodiff extractors
+        logger.debug("LP algebraic extraction failed: %s: %s", type(exc).__name__, exc)
 
     # Fast numeric repr probe before the expensive autodiff fallback. The Rust
     # ``ModelRepr`` evaluates fine without a ``_builder`` (same as
@@ -1285,8 +1297,12 @@ def extract_lp_data(model: Model) -> LPData:
     # path (orders of magnitude faster on small instances; see #330).
     try:
         return _extract_lp_data_from_repr(model)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - falls through to the autodiff extractor
+        logger.debug(
+            "LP repr extraction (probe) failed, falling back to autodiff: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     return _extract_lp_data_autodiff(model)
 
@@ -1412,13 +1428,15 @@ def extract_qp_data(model: Model) -> QPData:
     if _builder is not None:
         try:
             return _extract_qp_data_from_repr(model)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - falls through to the algebraic extractor
+            # See the LP ladder above: a silent fall-through here is how a fast
+            # path disappears without any evidence that it did.
+            logger.debug("QP repr extraction (builder) failed: %s: %s", type(exc).__name__, exc)
 
     try:
         return extract_qp_data_algebraic(model)
-    except (_NotQuadraticError, _NotLinearError, Exception):
-        pass
+    except Exception as exc:  # noqa: BLE001 - falls through to the repr/autodiff extractors
+        logger.debug("QP algebraic extraction failed: %s: %s", type(exc).__name__, exc)
 
     # Fast numeric repr probe before the expensive autodiff fallback. The Rust
     # ``ModelRepr`` evaluates fine without a ``_builder`` (same as
@@ -1427,8 +1445,12 @@ def extract_qp_data(model: Model) -> QPData:
     # path (orders of magnitude faster on small instances; see #330).
     try:
         return _extract_qp_data_from_repr(model)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - falls through to the autodiff extractor
+        logger.debug(
+            "QP repr extraction (probe) failed, falling back to autodiff: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     return _extract_qp_data_autodiff(model)
 
@@ -1439,8 +1461,8 @@ def extract_qcp_data(model: Model) -> QCPData:
     if _builder is not None:
         try:
             return _extract_qcp_data_from_repr(model)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - falls through to the algebraic extractor
+            logger.debug("QCP repr extraction failed: %s: %s", type(exc).__name__, exc)
 
     return extract_qcp_data_algebraic(model)
 

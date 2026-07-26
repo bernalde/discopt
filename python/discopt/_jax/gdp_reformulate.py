@@ -10,6 +10,8 @@ original model is returned unchanged (zero overhead).
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from discopt.modeling.core import (
@@ -39,6 +41,8 @@ from discopt.modeling.core import (
     _SOSConstraint,
     _wrap,
 )
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_BIG_M = 1e4
 
@@ -372,8 +376,15 @@ def _compute_big_m_lp(
             if result.status == SolveStatus.OPTIMAL and result.objective is not None:
                 val = -result.objective if maximize else result.objective
                 return float(val) + offset
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - the caller falls back to the default big-M
+            # Capability-disabling: without this LP bound the disjunction gets the
+            # loose default big-M, which reads as "tightened big-M doesn't help".
+            logger.debug(
+                "big-M LP bound (%s) failed: %s: %s",
+                "max" if maximize else "min",
+                type(exc).__name__,
+                exc,
+            )
         return None
 
     if constraint.sense == "<=":

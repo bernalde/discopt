@@ -43,6 +43,7 @@ convex families without regressing soundness.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import numpy as np
@@ -64,6 +65,8 @@ from discopt.modeling.core import (
 )
 
 from .lattice import Curvature
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
 # Local utilities (ported with minor adaptation from bernalde/discopt
@@ -95,8 +98,16 @@ def clear_declared_box_cache(model: Model) -> None:
     try:
         if hasattr(model, _DECLARED_BOX_CACHE_ATTR):
             delattr(model, _DECLARED_BOX_CACHE_ATTR)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - invalidation must never break a classification
+        # The catch stays blind on purpose (a model with a custom ``__delattr__``
+        # must not break a solve; see test_clear_cache_swallows_delattr_failure),
+        # but it is no longer silent: a failed invalidation leaves the box cache
+        # STALE, so the recognizers keep classifying against pre-presolve bounds.
+        logger.debug(
+            "declared-box cache NOT invalidated — it is now stale: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _total_scalar_variables(model: Model) -> int:
@@ -277,8 +288,8 @@ def _box_bounds(model: Model) -> tuple[np.ndarray, np.ndarray]:
         lo_arr, hi_arr = np.concatenate(los), np.concatenate(his)
     try:
         setattr(model, _DECLARED_BOX_CACHE_ATTR, (int(lo_arr.size), lo_arr, hi_arr))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - memoization is optional, the box is rebuilt
+        logger.debug("declared box not memoized: %s: %s", type(exc).__name__, exc)
     return lo_arr, hi_arr
 
 
@@ -1042,7 +1053,12 @@ def classify_fractional_epigraph_constraint(
 
         try:
             coeff_vec, coeff_const = _extract_linear_coefficients(coeff_expr, model, n)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - this constraint keeps its UNKNOWN verdict
+            logger.debug(
+                "fractional-epigraph coefficient extraction failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             continue
 
         nonzero_coeff = np.flatnonzero(np.abs(coeff_vec) > 1e-10)
