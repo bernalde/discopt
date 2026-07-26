@@ -4036,7 +4036,19 @@ class Model:
         # budget binds, while the instances this targets (tln4/tln5) burn 100% of the
         # budget and still return nothing. Out-of-scope models keep the full budget.
         _fb_reserve = 0.0
-        if _lp_spatial_fallback_enabled() and not kwargs.get("lp_spatial", False):
+        if (
+            _lp_spatial_fallback_enabled()
+            and not kwargs.get("lp_spatial", False)
+            # An explicitly chosen backend keeps the caller's FULL budget. Reserving
+            # from ``solve(solver="gurobi", time_limit=8)`` forwarded only 5.2 s,
+            # silently shrinking a limit the user stated outright — and an external
+            # MILP/QP backend has no use for this fallback anyway.
+            and solver is None
+            # The engine branches on integer PRODUCTS in constraint rows; a box-only
+            # model gives it nothing to work with, and the primary solves such a
+            # model directly.
+            and self._constraints
+        ):
             try:
                 from discopt._jax.lp_spatial_bb import _is_in_scope
 

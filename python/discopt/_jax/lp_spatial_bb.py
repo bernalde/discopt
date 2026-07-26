@@ -61,7 +61,13 @@ def _is_in_scope(model: Model) -> bool:
         return False
     if not model._variables:
         return False
-    return all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables)
+    if not all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables):
+        return False
+    # Every row must be an ordinary algebraic constraint. A GDP/logical row
+    # (``_LogicalConstraint``) carries no ``.body``, and the relaxation builder
+    # walks ``.body`` unconditionally -- admitting one raises deep inside the
+    # engine instead of being declined here.
+    return all(hasattr(c, "body") for c in model._constraints)
 
 
 def _relax_bound(model, terms, lb, ub):
