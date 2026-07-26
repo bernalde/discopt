@@ -132,9 +132,19 @@ def test_mixed_model_result_is_unchanged_by_the_860_flag(fb, monkeypatch, flag, 
 
 
 def test_860_mixed_flag_defaults_to_off_and_gates_the_reserve(monkeypatch):
-    """The #860 widening reaches the DEFAULT path only through this flag, which is
-    off until its graduation panel. The engine's own gate is already widened, so the
-    two must be able to disagree — that separation is the point of the flag."""
+    """The #860 widening reaches the default path only through this flag, which is off
+    until its graduation panel.
+
+    Updated with the flag's scope, not loosened. This test previously asserted
+    ``_is_in_scope(m) is True`` with the comment "engine: widened unconditionally",
+    because the flag then governed only the fallback's 35% budget reserve while the
+    engine gate was always widened. The #860 review moved the engine gate behind the
+    same flag — the widening is sound but not net-positive on the default path (see
+    ``_lp_spatial_mixed_fallback_enabled``, and ``test_860_mixed_gate_is_opt_in``) —
+    so the *default* is now the conservative gate at both entry points. The
+    substantive assertion, that ``mixed=False`` declines a mixed model, is unchanged
+    and is now also what the default does.
+    """
     from discopt._jax.lp_spatial_bb import _is_in_scope
     from discopt.modeling.core import _lp_spatial_mixed_fallback_enabled
 
@@ -144,8 +154,9 @@ def test_860_mixed_flag_defaults_to_off_and_gates_the_reserve(monkeypatch):
     assert _lp_spatial_mixed_fallback_enabled() is True
 
     m = _mixed()
-    assert _is_in_scope(m) is True  # engine: widened unconditionally
-    assert _is_in_scope(m, mixed=False) is False  # reserve gate while the flag is off
+    assert _is_in_scope(m, mixed=True) is True  # capability, on request
+    assert _is_in_scope(m, mixed=False) is False  # pre-#860 gate
+    assert _is_in_scope(m) is False  # default is now the conservative gate
 
 
 def test_fallback_never_breaks_a_solve(fb):

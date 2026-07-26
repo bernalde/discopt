@@ -127,16 +127,23 @@ def test_both_production_call_sites_pass_the_flag():
 
 
 def test_flag_helper_defaults_off(monkeypatch):
-    """``DISCOPT_LP_SPATIAL_MIXED`` unset means OFF, and ``1`` turns it on."""
-    import importlib
+    """``DISCOPT_LP_SPATIAL_MIXED`` unset means OFF, and ``1`` turns it on.
 
-    import discopt.solver_tuning as st
+    Deliberately does NOT ``importlib.reload`` anything. The helper reads
+    ``os.environ`` directly with no caching, so a reload buys nothing — and reloading
+    ``solver_tuning`` mid-session replaces the ``SolverTuning`` class object, after
+    which unrelated ``isinstance(..., SolverTuning)`` assertions elsewhere in the same
+    worker fail. A first draft of this test did exactly that and broke
+    ``test_result_io`` and ``test_solve_daemon`` in CI.
+    """
     from discopt.modeling.core import _lp_spatial_mixed_fallback_enabled
 
     monkeypatch.delenv("DISCOPT_LP_SPATIAL_MIXED", raising=False)
-    importlib.reload(st)
     assert _lp_spatial_mixed_fallback_enabled() is False, "the widening must default OFF"
 
     monkeypatch.setenv("DISCOPT_LP_SPATIAL_MIXED", "1")
-    importlib.reload(st)
     assert _lp_spatial_mixed_fallback_enabled() is True, "the opt-in must work"
+
+    # "0" and other falsy spellings stay off — the helper's own contract.
+    monkeypatch.setenv("DISCOPT_LP_SPATIAL_MIXED", "0")
+    assert _lp_spatial_mixed_fallback_enabled() is False
