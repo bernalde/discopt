@@ -4088,6 +4088,29 @@ class Model:
         finally:
             if _debug_guard is not None:
                 _debug_guard.__exit__(None, None, None)
+            # Drop the wall-clock deadline ``solve_model`` stashes on the model
+            # (#654). It is written in four places there and cleared in none, so
+            # once the solve returns the stash holds a timestamp already in the
+            # PAST — and any later consumer reading it sees a permanently expired
+            # budget.
+            #
+            # Not hypothetical: it silently switched off ``IncrementalMcCormickLP``'s
+            # structure build for anything running after a solve (the #844
+            # no-incumbent fallback, which by construction runs once the primary has
+            # spent its budget). The engine degraded to its slow cold path and the
+            # symptom read as a *measurement* rather than as a capability turning
+            # itself off.
+            #
+            # Cleared here, in the ``finally`` that already runs the moment
+            # ``solve_model`` returns, so every later step in this method sees a
+            # clean model. Note this covers the ``Model.solve`` path; a direct
+            # ``solve_model(...)`` call still leaves its stash behind, and consumers
+            # that may run after one should pass an explicit deadline rather than
+            # read the ambient stash.
+            try:
+                del self._solve_deadline
+            except AttributeError:
+                pass
 
         # --- No-incumbent fallback to the LP-per-node spatial engine (#844) ---
         # A class of pure-integer MINLPs (tln4/tln5/tln6, ball_mk2_30) returns NO
