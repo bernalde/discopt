@@ -392,7 +392,7 @@ pub fn solve_convex_node_py<'py>(
     term_scale_const=None, term_scale_ptr=None, term_scale_cols=None, term_scale_coeffs=None,
     max_nodes=100_000, gap_tol=1e-4, int_tol=1e-5, oa_tol=1e-6,
     max_oa_rounds=60, max_sep_rounds=12, fbbt_rounds=20,
-    initial_incumbent=None, time_limit_s=None,
+    initial_incumbent=None, time_limit_s=None, dominated_cols=false,
 ))]
 pub fn solve_convex_tree_py<'py>(
     py: Python<'py>,
@@ -436,6 +436,7 @@ pub fn solve_convex_tree_py<'py>(
     fbbt_rounds: usize,
     initial_incumbent: Option<f64>,
     time_limit_s: Option<f64>,
+    dominated_cols: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let arrays = SpecArrays {
         n,
@@ -480,6 +481,7 @@ pub fn solve_convex_tree_py<'py>(
         fbbt_rounds,
         deadline: time_limit_s.map(|s| Instant::now() + Duration::from_secs_f64(s.max(0.0))),
         initial_incumbent,
+        dominated_cols,
     };
     let opts = SimplexOptions {
         expel_zero_artificials: true,
@@ -607,6 +609,7 @@ pub fn convex_warmlp_probe_py<'py>(
         fbbt_rounds,
         deadline: None,
         initial_incumbent,
+        dominated_cols: false,
     };
     let opts = SimplexOptions {
         expel_zero_artificials: true,

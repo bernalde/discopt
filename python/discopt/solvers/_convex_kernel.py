@@ -629,6 +629,17 @@ def convex_kernel_enabled() -> bool:
     return os.environ.get("DISCOPT_CONVEX_KERNEL", "0") not in ("0", "", "false", "False")
 
 
+def dominated_cols_enabled() -> bool:
+    """`DISCOPT_CVX_DOMINATED_COLS` opt-in (default-OFF, #871).
+
+    Gates the dominated-cost-column upper bound. Unlike FBBT this is an
+    OPTIMALITY-based reduction (it keeps an optimal solution, not every feasible
+    point — see ``ConvexKernelSpec::tighten_dominated_columns``), so it carries its
+    own flag on top of the kernel's own default-off gate.
+    """
+    return os.environ.get("DISCOPT_CVX_DOMINATED_COLS", "0") not in ("0", "", "false", "False")
+
+
 def solve_convex_tree(spec: dict, *, time_limit_s: Optional[float] = None, **cfg) -> dict:
     """Run the native convex kernel on a marshaled `spec` (from build_convex_spec)."""
     import discopt._rust as _rust
@@ -643,6 +654,7 @@ def solve_convex_tree(spec: dict, *, time_limit_s: Optional[float] = None, **cfg
         fbbt_rounds=cfg.get("fbbt_rounds", 20),
         initial_incumbent=cfg.get("initial_incumbent", None),
         time_limit_s=time_limit_s,
+        dominated_cols=cfg.get("dominated_cols", dominated_cols_enabled()),
     )
     result: dict = dict(_rust.solve_convex_tree_py(**spec, **params))
     return result

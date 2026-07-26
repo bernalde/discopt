@@ -757,6 +757,10 @@ pub struct ConvexTreeConfig {
     pub deadline: Option<std::time::Instant>,
     /// Optional known-feasible incumbent objective (model sense) to seed pruning.
     pub initial_incumbent: Option<f64>,
+    /// Apply the DOMINATED-COLUMN upper bound (`tighten_dominated_columns`) after
+    /// each node's FBBT. Default-off (`DISCOPT_CVX_DOMINATED_COLS`): unlike FBBT it
+    /// is an OPTIMALITY-based reduction, so it ships behind its own flag.
+    pub dominated_cols: bool,
 }
 
 impl Default for ConvexTreeConfig {
@@ -769,6 +773,7 @@ impl Default for ConvexTreeConfig {
             max_oa_rounds: 60,
             max_sep_rounds: 12,
             fbbt_rounds: 20,
+            dominated_cols: false,
             deadline: None,
             initial_incumbent: None,
         }
@@ -933,6 +938,118 @@ impl ConvexKernelSpec {
         true
     }
 
+    /// Give a finite upper bound to each **dominated cost column** — a column that
+    /// is unbounded above and that the problem only ever pushes DOWN (#871).
+    ///
+    /// FBBT cannot close such a column: it is bounded from below only. `clay0303hfsg`
+    /// has six (its fixed-charge cost variables `x81..x86`, objective coefficients
+    /// 300/240/100/…), and an infinite `ub` meeting a roundoff-negative reduced cost
+    /// is exactly what makes the Neumaier–Shcherbina safe bound decline — so the node
+    /// returns no certified bound and the tree stalls at the root.
+    ///
+    /// ## Why the bound is valid (this is an OPTIMALITY argument, not FBBT)
+    ///
+    /// A column `j` qualifies only when ALL of these hold:
+    ///
+    /// * `hi[j]` is `+∞`;
+    /// * its coefficient in the MINIMIZED objective is `> 0` — raising `x_j` strictly
+    ///   costs more;
+    /// * it appears in NO equality row and in NO nonlinear row — so the only thing
+    ///   that can constrain it is a `≤` row;
+    /// * every `≤` row containing it has `a_ij < 0`, i.e. reads `x_j ≥ (rest − rhs)/(−a_ij)`
+    ///   — the row only ever bounds `x_j` from BELOW;
+    /// * each such row's remaining max-activity over the box is finite.
+    ///
+    /// Then set `U_j = max(lo[j], max_i (maxact_rest_i − rhs_i)/(−a_ij))`. For ANY
+    /// feasible point of this node with `x_j > U_j`, lowering `x_j` to `U_j` keeps
+    /// every row satisfied (`U_j` is the largest value the rows can require of `x_j`
+    /// anywhere in the box) and strictly lowers the objective. So an optimal solution
+    /// with `x_j ≤ U_j` always exists: adding `x_j ≤ U_j` leaves the node's optimal
+    /// VALUE unchanged, for the LP relaxation and for the node's true subproblem
+    /// alike. The dual bound therefore stays valid and fathoming stays correct.
+    ///
+    /// Note this differs from FBBT in kind: FBBT keeps every feasible point, this
+    /// keeps only an optimal one. That is why it is flagged separately
+    /// (`ConvexTreeConfig::dominated_cols`, default-off) rather than folded into
+    /// `propagate_fbbt`. Any incumbent it admits is still genuinely feasible (the
+    /// reduction only ever DROPS feasible points, never adds any).
+    pub fn tighten_dominated_columns(&self, lo: &[f64], hi: &mut [f64]) -> bool {
+        let cand: Vec<usize> = (0..self.n)
+            .filter(|&j| hi[j].is_infinite() && hi[j] > 0.0)
+            .collect();
+        if cand.is_empty() {
+            return false;
+        }
+        // Structural disqualifiers: any appearance in an equality or nonlinear row
+        // means the "only pushed down" argument does not hold.
+        let mut blocked = vec![false; self.n];
+        for row in &self.eq_rows {
+            for &c in &row.cols {
+                blocked[c] = true;
+            }
+        }
+        for row in &self.nl_rows {
+            for &c in &row.lin.cols {
+                blocked[c] = true;
+            }
+            for t in &row.terms {
+                for &c in &t.arg.cols {
+                    blocked[c] = true;
+                }
+                if let Some(s) = &t.scale {
+                    for &c in &s.cols {
+                        blocked[c] = true;
+                    }
+                }
+            }
+        }
+        // The kernel minimizes `sense·c`, so this is the coefficient that matters.
+        let sense = if self.sense_max { -1.0 } else { 1.0 };
+        let mut changed = false;
+        for j in cand {
+            if blocked[j] || sense * self.c[j] <= 0.0 || !lo[j].is_finite() {
+                continue;
+            }
+            let mut ub = lo[j];
+            let mut ok = true;
+            for row in &self.le_rows {
+                let Some(pos) = row.cols.iter().position(|&c| c == j) else {
+                    continue;
+                };
+                let aj = row.coeffs[pos];
+                if aj >= 0.0 {
+                    ok = false; // this row can bound x_j from ABOVE — argument fails
+                    break;
+                }
+                // max activity of the rest of the row over the box
+                let mut maxact = 0.0;
+                for (kpos, &k) in row.cols.iter().enumerate() {
+                    if kpos == pos {
+                        continue;
+                    }
+                    let ak = row.coeffs[kpos];
+                    let v = if ak > 0.0 { hi[k] } else { lo[k] };
+                    if !v.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                    maxact += ak * v;
+                }
+                if !ok {
+                    break;
+                }
+                ub = ub.max((maxact - row.rhs) / (-aj));
+            }
+            if ok && ub.is_finite() {
+                // Relative safety margin: the bound must never sit BELOW the value an
+                // optimal solution needs, so round it outward past accumulated roundoff.
+                hi[j] = ub + 1e-9 * (1.0 + ub.abs());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Is `x` integer-integral on all integer columns AND OA-tight (every convex
     /// row satisfied to `oa_tol`)? Such an LP vertex is genuinely feasible → a
     /// valid incumbent (the minimal LP-NLP-BB primal; K3 adds NLP/rounding).
@@ -1034,6 +1151,14 @@ impl ConvexKernelSpec {
         // and, unlike the frontier max, it never drops below the true optimum when
         // a late (tolerance-feasible) incumbent is accepted. `+= frontier` at the end.
         let mut leaf_dual_sense = f64::NEG_INFINITY;
+        // A node that leaves the tree WITHOUT either a certified dual bound or a
+        // proof that its box is empty has had its subtree silently discarded — the
+        // frontier draining afterwards proves nothing. Certifying optimality on such
+        // a run would be a FALSE CERTIFICATE (observed on clay0303hfsg: every node
+        // dropped `numerical`, no leaf dual was ever recorded, yet the tree reported
+        // `optimal` with the incumbent's own objective standing in for the dual
+        // bound and the incumbent itself clamped to ±inf). Poison the certificate.
+        let mut uncertified_drop = false;
 
         while let Some(node) = heap.pop() {
             // Global dual bound = best (largest sense·bound) still on the frontier,
@@ -1048,8 +1173,12 @@ impl ConvexKernelSpec {
             // Gap check: if the best remaining dual has closed onto the incumbent,
             // the whole tree is certified.
             if inc_sense > worse
+                && !uncertified_drop
                 && global_dual_sense <= inc_sense + config.gap_tol * inc_sense.abs().max(1.0)
             {
+                // Gap closed on the frontier. This certifies the WHOLE problem only
+                // if no subtree was silently discarded — an uncertified drop leaves a
+                // region with no bound at all, so a closed frontier gap proves nothing.
                 status = ConvexTreeStatus::Optimal;
                 break;
             }
@@ -1080,6 +1209,15 @@ impl ConvexKernelSpec {
             if !self.propagate_fbbt(&mut lo, &mut hi, config.fbbt_rounds) {
                 continue; // empty box → fathom
             }
+            // Optimality-based: close any dominated cost column FBBT cannot reach, so
+            // the node's NS safe bound certifies instead of declining on an infinite
+            // structural bound (#871). Re-propagate, since a new finite `ub` feeds FBBT.
+            if config.dominated_cols
+                && self.tighten_dominated_columns(&lo, &mut hi)
+                && !self.propagate_fbbt(&mut lo, &mut hi, config.fbbt_rounds)
+            {
+                continue;
+            }
 
             // Node relaxation: the shared persistent LP (warm tangent pool +
             // node-local cuts — W2) when DISCOPT_CVX_NATIVELP is on, else today's
@@ -1099,7 +1237,13 @@ impl ConvexKernelSpec {
                         w.age_and_gc(opts.tol.max(1e-7), NATIVELP_POOL_CAP, NATIVELP_MAX_AGE);
                         res
                     }
-                    None => continue, // infeasible child → fathom
+                    None => {
+                        // Warm solve gave up: it does not distinguish "proven
+                        // infeasible" from "numerically failed", so this subtree is
+                        // not certified as explored.
+                        uncertified_drop = true;
+                        continue;
+                    }
                 }
             } else {
                 self.solve_node_cut(
@@ -1112,7 +1256,13 @@ impl ConvexKernelSpec {
                 )
             };
             if r.status != LpStatus::Optimal {
-                continue; // infeasible/unbounded region → skip
+                // A PROVEN-infeasible node is a legitimate fathom — its subtree is
+                // genuinely empty. Unbounded / numerical / iteration-limit is NOT:
+                // the subtree is simply unexplored, so the certificate is poisoned.
+                if r.status != LpStatus::Infeasible {
+                    uncertified_drop = true;
+                }
+                continue;
             }
             // Node dual in the sense convention, floored by the parent (rigorous:
             // a child's bound can only be ≤ the parent's in sense convention).
@@ -1193,8 +1343,13 @@ impl ConvexKernelSpec {
             }
         }
 
-        if heap.is_empty() && status == ConvexTreeStatus::Exhausted && inc_sense > worse {
-            // Frontier drained with an incumbent: fully certified.
+        if heap.is_empty()
+            && status == ConvexTreeStatus::Exhausted
+            && inc_sense > worse
+            && !uncertified_drop
+        {
+            // Frontier drained with an incumbent AND every node accounted for:
+            // fully certified. With `uncertified_drop` the drain proves nothing.
             status = ConvexTreeStatus::Optimal;
         }
         // Reported dual bound = max over all tree leaves (fathomed/incumbent) AND
@@ -1211,13 +1366,20 @@ impl ConvexKernelSpec {
         // to the dual bound so the certificate stays consistent (bound ≥ incumbent
         // for max / ≤ for min); the incumbent POINT is still returned.
         let incumbent = if inc_sense > worse {
-            Some(sense * inc_sense.min(dual_sense))
+            // Clamp ONLY against a finite dual: `min`-ing against an infinite
+            // `dual_sense` would report ±inf as the incumbent objective even though
+            // the incumbent POINT is a perfectly ordinary feasible vector.
+            Some(sense * if dual_sense.is_finite() { inc_sense.min(dual_sense) } else { inc_sense })
         } else {
             None
         };
         let bound = if dual_sense.is_finite() {
             sense * dual_sense
-        } else if inc_sense > worse {
+        } else if inc_sense > worse && !uncertified_drop {
+            // No leaf produced a finite dual, but every node was accounted for, so
+            // the incumbent itself is the tight bound. With `uncertified_drop` that
+            // reasoning does not hold — report "no bound" rather than pass the
+            // incumbent's own objective off as a dual bound.
             sense * inc_sense
         } else {
             sense * f64::INFINITY
@@ -2393,5 +2555,131 @@ mod tests {
         let (f, fp) = ConvexFunc::Sqr.eval_and_deriv(-2.5);
         assert!((f - 6.25).abs() < 1e-15);
         assert!((fp - (-5.0)).abs() < 1e-15);
+    }
+
+
+    // ── dominated-column upper bound (#871) ───────────────────────────────────
+
+    /// `min 5·x1` with `x1 >= x0`, `x0 in [0,10]`, `x1 in [0, inf)`. `x1` is a pure
+    /// cost column bounded only from BELOW, so FBBT cannot close it — but raising it
+    /// only costs more, so an optimum exists at `x1 <= 10`.
+    fn dominated_spec() -> ConvexKernelSpec {
+        ConvexKernelSpec {
+            n: 3,
+            c: vec![0.0, 5.0, 0.0],
+            sense_max: false,
+            integrality: vec![false, false, false],
+            lb: vec![0.0, 0.0, 0.0],
+            ub: vec![10.0, f64::INFINITY, 4.0],
+            le_rows: vec![LinRow {
+                cols: vec![1, 0],
+                coeffs: vec![-1.0, 1.0], // −x1 + x0 ≤ 0  ⟺  x1 ≥ x0
+                rhs: 0.0,
+            }],
+            eq_rows: vec![],
+            nl_rows: vec![],
+        }
+    }
+
+    #[test]
+    fn dominated_column_gets_a_valid_finite_bound() {
+        let spec = dominated_spec();
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        assert!(spec.tighten_dominated_columns(&lo, &mut hi));
+        // x1 ≥ x0 and x0 ≤ 10, so 10 is the largest value the rows can ever demand.
+        assert!(hi[1].is_finite(), "dominated column must become bounded");
+        assert!(hi[1] >= 10.0, "bound {} must not cut off the optimum", hi[1]);
+        assert!(hi[1] < 10.0 + 1e-6, "bound {} is needlessly loose", hi[1]);
+        assert_eq!(hi[0], 10.0, "other columns untouched");
+        assert_eq!(hi[2], 4.0);
+    }
+
+    #[test]
+    fn dominated_rule_declines_when_the_cost_pushes_the_column_up() {
+        // c1 < 0 in a minimization: raising x1 IMPROVES the objective, so there is
+        // no argument that an optimum sits at its lower bound.
+        let mut spec = dominated_spec();
+        spec.c[1] = -5.0;
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
+    }
+
+    #[test]
+    fn dominated_rule_declines_on_an_equality_row() {
+        let mut spec = dominated_spec();
+        spec.eq_rows.push(LinRow {
+            cols: vec![1, 2],
+            coeffs: vec![1.0, 1.0],
+            rhs: 3.0,
+        });
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
+    }
+
+    #[test]
+    fn dominated_rule_declines_on_a_nonlinear_appearance() {
+        let mut spec = dominated_spec();
+        spec.nl_rows.push(ConvexRow {
+            lin: Affine::default(),
+            terms: vec![CompositeTerm {
+                coeff: 1.0,
+                func: ConvexFunc::Exp,
+                arg: Affine {
+                    cols: vec![1],
+                    coeffs: vec![1.0],
+                    cst: 0.0,
+                },
+                scale: None,
+            }],
+            rhs: 5.0,
+        });
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
+    }
+
+    #[test]
+    fn dominated_rule_declines_when_a_row_bounds_the_column_from_above() {
+        // `+x1` in a ≤ row means the row can push x1 DOWN, so the "only bounded from
+        // below" premise fails and the rule must not fire.
+        let mut spec = dominated_spec();
+        spec.le_rows.push(LinRow {
+            cols: vec![1],
+            coeffs: vec![1.0],
+            rhs: 7.0,
+        });
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
+    }
+
+    #[test]
+    fn dominated_bound_preserves_the_lp_optimum() {
+        // The whole justification: adding `x1 ≤ U` must not change the optimal VALUE.
+        let spec = dominated_spec();
+        let lo = spec.lb.clone();
+        let mut hi = spec.ub.clone();
+        let opts = SimplexOptions::default();
+        // Unbounded-above box: solve with a large explicit cap as the reference.
+        let mut ref_hi = hi.clone();
+        ref_hi[1] = 1e6;
+        let before = spec.solve_node(&lo, &ref_hi, 1e-6, 60, &opts);
+        spec.tighten_dominated_columns(&lo, &mut hi);
+        let after = spec.solve_node(&lo, &hi, 1e-6, 60, &opts);
+        assert_eq!(before.status, LpStatus::Optimal);
+        assert_eq!(after.status, LpStatus::Optimal);
+        assert!(
+            (before.bound - after.bound).abs() <= 1e-9 * before.bound.abs().max(1.0),
+            "optimal value changed: {} -> {}",
+            before.bound,
+            after.bound
+        );
     }
 }
