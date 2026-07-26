@@ -32,12 +32,15 @@ fails — it can never make a solve unsound.
 from __future__ import annotations
 
 import heapq
+import logging
 import time
 from typing import NamedTuple, Optional
 
 import numpy as np
 
 from discopt.modeling.core import Model, ObjectiveSense, VarType
+
+logger = logging.getLogger(__name__)
 
 _INT_TOL = 1e-6
 _PROD_TOL = 1e-5
@@ -58,7 +61,13 @@ def _is_in_scope(model: Model) -> bool:
         return False
     if not model._variables:
         return False
-    return all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables)
+    if not all(v.var_type in (VarType.INTEGER, VarType.BINARY) for v in model._variables):
+        return False
+    # Every row must be an ordinary algebraic constraint. A GDP/logical row
+    # (``_LogicalConstraint``) carries no ``.body``, and the relaxation builder
+    # walks ``.body`` unconditionally -- admitting one raises deep inside the
+    # engine instead of being declined here.
+    return all(hasattr(c, "body") for c in model._constraints)
 
 
 def _relax_bound(model, terms, lb, ub):
@@ -72,6 +81,22 @@ def _relax_bound(model, terms, lb, ub):
         )
         if not relax._objective_bound_valid:
             return None
+        # Solve the LP RELAXATION, not the MILP. ``build_milp_relaxation`` hands back
+        # a model that still carries integrality (30 integer columns on ball_mk2_30,
+        # 48 on tln6), so ``solve()`` was running a full branch-and-bound at every
+        # node of *this* engine's own branch-and-bound -- duplicating the integer
+        # branching the engine exists to perform. Measured: 32.85 s -> 0.00 s on
+        # ball_mk2_30 (21,220x) and 4.24 s -> 0.00 s on tln6 (2,340x).
+        #
+        # Sound: dropping integrality only enlarges the feasible set, so the LP
+        # optimum is <= the MILP optimum and remains a valid lower bound for a
+        # minimize (verified on both instances: -29.88 <= -24.90 and 3.22 <= 4.60).
+        # The bound is weaker per node, which is precisely the trade this engine is
+        # built to make -- it recovers the tightness by branching on the integers
+        # itself, which is what the module docstring means by "one LP, no NLP" per
+        # node. The incremental path already solves a pure LP; this aligns the cold
+        # path with it.
+        relax._integrality = None
         res = relax.solve()
     except Exception:
         return None
@@ -157,14 +182,14 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
                 # feasible region, never removing a feasible point.
                 margin = 1e-7 * (1.0 + float(np.abs(row).sum()))
                 cuts.append((row, -float(gc[1][i]) + margin))
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial GMI separation skipped: %s: %s", type(exc).__name__, exc)
     # complemented-MIR (multi-row aggregation)
     try:
         mc = separate_cmir(A, b, x, lb, ub, is_int, max_cuts=max_cuts)
         cuts.extend(mc)
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial c-MIR separation skipped: %s: %s", type(exc).__name__, exc)
     # Native Marchand–Wolsey aggregation c-MIR (cert:P3). DEFAULT-OFF, gated by
     # DISCOPT_CMIR_AGGREGATION. Pairs <= rows with nonnegative weights to cancel a
     # column, then applies the native Rust complemented MIR to the aggregate —
@@ -190,8 +215,8 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
                 acoef, arhs = np.asarray(res[0]), np.asarray(res[1])
                 for i in range(min(acoef.shape[0], max_cuts)):
                     cuts.append((acoef[i][:ncol], float(arhs[i])))
-    except Exception:
-        pass
+    except Exception as exc:  # cuts are optional: a missing cut is always safe
+        logger.debug("lp_spatial aggregated cuts skipped: %s: %s", type(exc).__name__, exc)
     return cuts
 
 
@@ -203,8 +228,17 @@ def solve_lp_spatial_bb(
     max_nodes: int = 500_000,
     use_obbt: bool = True,
     root_cut_rounds: int = 0,
+    require_incremental: bool = False,
 ) -> Optional[LpSpatialResult]:
     """LP-node spatial branch-and-bound. Returns ``None`` if out of scope.
+
+    ``require_incremental`` declines the solve (returns ``None``) when the incremental
+    McCormick structure cannot be built. Set it when the caller has a *bounded* budget
+    and wants a primal: without that structure the engine has no cuts, no feasibility
+    pump, and rebuilds the whole relaxation per node. Measured on ball_mk2_30 at a
+    21 s budget, where the structure legitimately declines (``monomial x_0^2: root box
+    spans zero``), the cold path spent 61 s on the *root* LP alone — 0 nodes, no
+    incumbent, 2.91x over budget. Declining costs nothing there and cannot overrun.
 
     ``root_cut_rounds`` enables GMI + complemented-MIR separation at the root (cuts
     inherited by all nodes). Default 0 (off): with discopt's current Python-level
@@ -254,12 +288,29 @@ def solve_lp_spatial_bb(
         try:
             from discopt._jax.obbt import obbt_tighten_root
 
-            r = obbt_tighten_root(model, lb0, ub0, rounds=5, time_limit_per_lp=0.5)
+            # Budget the root OBBT against the caller's deadline. Without this it
+            # runs |vars| x 2 x rounds LPs at up to time_limit_per_lp each, entirely
+            # outside time_limit -- on ball_mk2_30 (30 integers) that alone is up to
+            # 150 s against a 30 s budget. Cap it at a third of the remaining time so
+            # the node loop always gets the majority of the budget.
+            _obbt_budget = max(0.0, time_limit - (time.perf_counter() - t0)) / 3.0
+            r = obbt_tighten_root(
+                model,
+                lb0,
+                ub0,
+                rounds=5,
+                deadline=time.perf_counter() + _obbt_budget,
+                time_limit_per_lp=min(0.5, max(0.05, _obbt_budget / 10.0)),
+            )
             if not r.infeasible:
                 lb0 = np.maximum(lb0, np.floor(np.asarray(r.lb) + 1e-9))
                 ub0 = np.minimum(ub0, np.ceil(np.asarray(r.ub) - 1e-9))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never let root tightening break the solve -- but never hide it either.
+            # A silently-skipped capability is precisely the failure mode that cost
+            # #844 several wrong conclusions (a swallowed TypeError made a whole
+            # fallback an invisible no-op).
+            logger.debug("lp_spatial root OBBT skipped: %s: %s", type(exc).__name__, exc)
 
     # Fast path: incremental McCormick LP (structure built once, box-dependent rows
     # patched per node, warm-started). Guarded by its own validation against
@@ -268,7 +319,30 @@ def solve_lp_spatial_bb(
     # branching (the no-cut-SCIP regime).
     from discopt._jax.incremental_mccormick import IncrementalMcCormickLP
 
-    _inc = IncrementalMcCormickLP(model, terms)
+    # Budget the structure build against THIS engine's deadline, not whatever
+    # ``model._solve_deadline`` a previous ``solve_model`` left behind. That stash is
+    # written once per solve and never cleared, so when this engine runs as the #844
+    # no-incumbent fallback -- i.e. *after* a primary solve that used its whole budget
+    # -- the ambient deadline is already in the PAST and the incremental structure
+    # declined to build at all (``ok=False``). The engine then silently degraded to
+    # the trusted-but-~30x-slower per-node cold build, which also disables cuts and
+    # the feasibility pump, and whose nodes are slow enough that a single one runs
+    # past the top-of-loop deadline poll. Measured on tln5 at a 21 s budget: ok=False
+    # gave 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) where ok=True gives 12643
+    # nodes in 21.0 s (1.00x, slowest node 0.04 s). Take the tighter of the two when
+    # an enclosing deadline is still live, so the #654 guard is never weakened.
+    _own_deadline = t0 + time_limit
+    _ambient = getattr(model, "_solve_deadline", None)
+    if _ambient is not None and float(_ambient) > t0:
+        _own_deadline = min(_own_deadline, float(_ambient))
+
+    _inc = IncrementalMcCormickLP(model, terms, deadline=_own_deadline)
+    if require_incremental and not _inc.ok:
+        logger.debug(
+            "lp_spatial declined: no incremental McCormick structure and the caller "
+            "requires it (the per-node cold build cannot serve a bounded budget)"
+        )
+        return None
     if _inc.ok:
         info = {"bilinear": _inc.bilinear, "monomial": _inc.monomial}
 
@@ -296,15 +370,34 @@ def solve_lp_spatial_bb(
     def node_relax(lb, ub, basis, inherited, rounds):
         """Solve the node LP with inherited cuts, then run ``rounds`` of cut
         separation (add only bound-improving cuts), returning
-        (bound, x, basis, cuts)."""
+        ``(bound, x, basis, cuts, verdict)``.
+
+        ``verdict`` distinguishes the two very different reasons a node LP can come
+        back with no bound, which the caller MUST NOT conflate:
+
+        * ``"fathom"`` — the LP feasible set over this box is provably empty, proven
+          by a verified Farkas dual ray. Since the McCormick polytope is a valid
+          outer approximation, an empty relaxation means the subtree contains no
+          feasible point: dropping it is rigorous.
+        * ``"unresolved"`` — no certified verdict (numerical failure, time limit, or
+          an ``infeasible`` claim without a Farkas proof). The subtree is **not**
+          ruled out, so silently dropping it would remove live space from the search
+          and a later heap exhaustion could certify optimality over it. The caller
+          must fold such a node into ``unresolved_lb`` instead.
+        """
         if not cut_enabled:
             b_, x_, bas = relax(lb, ub, basis)
-            return b_, x_, bas, ()
+            # Cold path: ``_relax_bound`` collapses every failure mode into ``None``
+            # and cannot prove infeasibility, so the only sound reading is
+            # "unresolved". This is conservative in the safe direction — it can cost
+            # an optimality certificate, never create a false one.
+            return b_, x_, bas, (), ("optimal" if b_ is not None else "unresolved")
         cuts = list(inherited)
         A, b, bounds = _inc.assemble(lb, ub, cuts)
-        b_, x_, bas = _inc.solve_assembled(A, b, bounds, in_basis=basis)
+        _st, b_, x_, bas, _farkas = _inc.solve_assembled_full(A, b, bounds, in_basis=basis)
         if b_ is None:
-            return None, None, None, tuple(cuts)
+            _verdict = "fathom" if (_st == "infeasible" and _farkas) else "unresolved"
+            return None, None, None, tuple(cuts), _verdict
         for _r in range(rounds):
             if len(cuts) >= _MAX_INHERITED_CUTS:
                 break
@@ -320,9 +413,11 @@ def solve_lp_spatial_bb(
             b_, x_, bas = nb, nx, nbas
             if not improved:
                 break
-        return b_, x_, bas, tuple(cuts)
+        return b_, x_, bas, tuple(cuts), "optimal"
 
-    root_b, root_x, root_basis, root_cuts = node_relax(lb0, ub0, None, (), root_cut_rounds)
+    root_b, root_x, root_basis, root_cuts, _root_verdict = node_relax(
+        lb0, ub0, None, (), root_cut_rounds
+    )
     if root_b is None:
         return None
 
@@ -397,6 +492,11 @@ def solve_lp_spatial_bb(
         the collapsed box) or the LP turns infeasible. Cheap, found nvs17's primal."""
         lo, hi = lb_d.copy(), ub_d.copy()
         for _ in range(2 * n + 2):
+            # Poll the deadline: this loop solves an LP per iteration (2n+2 of them)
+            # and is invoked at the root AND at every node, so without a check here
+            # the engine can blow past ``time_limit`` by an order of magnitude.
+            if (time.perf_counter() - t0) >= time_limit:
+                return None
             b_, xx, _bas = relax(lo, hi, None)
             if b_ is None:
                 return None
@@ -420,6 +520,10 @@ def solve_lp_spatial_bb(
         xhat = np.minimum(np.maximum(np.round(x[:n]), lb), ub)
         seen: set = set()
         for _ in range(max_iter):
+            # Same deadline poll as ``dive``: one LP per iteration, run at the root
+            # and at every node.
+            if (time.perf_counter() - t0) >= time_limit:
+                return None
             h = verify(xhat)
             if h is not None:
                 return h
@@ -444,16 +548,30 @@ def solve_lp_spatial_bb(
         if cand is not None and cand[0] < inc_val:
             inc_val, inc_x = cand[0], cand[1].copy()
 
-    def child(lb, ub, parent_basis, parent_cuts, rounds):
+    def child(lb, ub, parent_basis, parent_cuts, rounds, parent_bound):
         """Solve a child node (inheriting parent cuts, separating ``rounds`` more);
-        push if promising. Returns its bound (or None)."""
-        nonlocal counter
+        push if promising. Returns its bound (or None).
+
+        ``parent_bound`` is a valid lower bound for this child (its box is contained
+        in the parent's), and is what gets recorded if the child's own relaxation
+        cannot be resolved -- see below.
+        """
+        nonlocal counter, unresolved_lb
         if np.any(lb > ub + 1e-9):
-            return None
-        b_, x_, basis_, cuts_ = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
+            return None  # empty integer box: genuinely nothing here, safe to drop
+        b_, x_, basis_, cuts_, verdict = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
         if b_ is not None and b_ < inc_val - 1e-9:
             heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_))
             counter += 1
+        elif b_ is None and verdict != "fathom":
+            # The child's relaxation gave no certified verdict, so its subtree is NOT
+            # ruled out. Dropping it silently (the pre-#844 behaviour) removes live
+            # space from the search, and a later heap exhaustion would then declare
+            # "optimal" over a region the engine never examined -- a false optimality
+            # certificate (CLAUDE.md §1). Record the parent's bound, which is a valid
+            # lower bound over the child's box, so the global bound can never close
+            # above unexamined space.
+            unresolved_lb = min(unresolved_lb, parent_bound)
         return b_
 
     # seed an incumbent: root dive (cheap) then a root feasibility pump (catches
@@ -501,8 +619,8 @@ def solve_lp_spatial_bb(
         if bi is not None:
             fd = x[bi] - np.floor(x[bi])
             fu = np.ceil(x[bi]) - x[bi]
-            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds)
-            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds)
+            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds, bound)
+            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds, bound)
             _update_pc(bi, "d", bound, bd, fd)
             _update_pc(bi, "u", bound, bu, fu)
             continue
@@ -523,8 +641,8 @@ def solve_lp_spatial_bb(
                 unresolved_lb = min(unresolved_lb, bound)
             continue
         mid = np.floor((lb[bv] + ub[bv]) / 2)
-        child(lb, _set(ub, bv, mid), basis, ncuts, _rounds)
-        child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds)
+        child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
+        child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound)
     else:
         # Heap exhausted. Optimal only if the unresolved-node floor does not sit below
         # the incumbent (else there is space the engine could not rule out -> feasible

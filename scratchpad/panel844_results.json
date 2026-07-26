@@ -1,0 +1,1580 @@
+[
+ {
+  "name": "4stufen",
+  "off": {
+   "obj": null,
+   "bound": 21601.18397827762,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 31,
+   "wall": 41.77239991701208,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 21601.18397827762,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 31,
+   "wall": 41.85672020900529,
+   "ivf": false
+  },
+  "opt": 116329.6706
+ },
+ {
+  "name": "alan",
+  "off": {
+   "obj": 2.924999998301341,
+   "bound": 2.924999998301341,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 21,
+   "wall": 0.43959458405151963,
+   "ivf": false
+  },
+  "on": {
+   "obj": 2.924999998301341,
+   "bound": 2.924999998301341,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 21,
+   "wall": 0.31430499989073724,
+   "ivf": false
+  },
+  "opt": 2.925
+ },
+ {
+  "name": "bchoco06",
+  "off": {
+   "obj": null,
+   "bound": 0.9999887833654022,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 44.2735045410227,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 0.9999887833654022,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 42.28477104206104,
+   "ivf": false
+  },
+  "opt": null
+ },
+ {
+  "name": "bchoco07",
+  "off": {
+   "obj": null,
+   "bound": 1.000000000000228,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 51.91673566692043,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 1.000000000000228,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 48.94759420794435,
+   "ivf": false
+  },
+  "opt": null
+ },
+ {
+  "name": "bchoco08",
+  "off": {
+   "obj": null,
+   "bound": 1.0000000000038425,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 51.87755712494254,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 1.0000000000038425,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 51.834937958046794,
+   "ivf": false
+  },
+  "opt": null
+ },
+ {
+  "name": "beuster",
+  "off": {
+   "obj": null,
+   "bound": 19528.515991168097,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 31,
+   "wall": 40.976006209035404,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 19528.515991168097,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 31,
+   "wall": 40.97442208300345,
+   "ivf": false
+  },
+  "opt": 116329.6706
+ },
+ {
+  "name": "casctanks",
+  "off": {
+   "obj": null,
+   "bound": 2.9571233120014577,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 95,
+   "wall": 44.940244082943536,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 2.9571233120014577,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 95,
+   "wall": 45.301964708953165,
+   "ivf": false
+  },
+  "opt": 9.163479388
+ },
+ {
+  "name": "chance",
+  "off": {
+   "obj": 29.894378154271102,
+   "bound": 29.894378154271102,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 0,
+   "wall": 0.5331482500769198,
+   "ivf": false
+  },
+  "on": {
+   "obj": 29.894378154271102,
+   "bound": 29.894378154271102,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 0,
+   "wall": 0.4559601249638945,
+   "ivf": false
+  },
+  "opt": 29.89437816
+ },
+ {
+  "name": "clay0303hfsg",
+  "off": {
+   "obj": 26669.10955143198,
+   "bound": 26669.109513572792,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 443,
+   "wall": 30.83785066602286,
+   "ivf": false
+  },
+  "on": {
+   "obj": 26669.10955143198,
+   "bound": 26669.109513572792,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 443,
+   "wall": 31.133113791933283,
+   "ivf": false
+  },
+  "opt": 26669.10957
+ },
+ {
+  "name": "contvar",
+  "off": {
+   "obj": 809149.8119727827,
+   "bound": 183632.76598245982,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 7,
+   "wall": 41.329688958008774,
+   "ivf": false
+  },
+  "on": {
+   "obj": 809149.8119727827,
+   "bound": 183632.76598245982,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 7,
+   "wall": 41.31839399994351,
+   "ivf": false
+  },
+  "opt": 809149.8272
+ },
+ {
+  "name": "cvxnonsep_nsig30",
+  "off": {
+   "obj": 130.62871116925294,
+   "bound": 130.61841392487688,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 165,
+   "wall": 2.080261208000593,
+   "ivf": false
+  },
+  "on": {
+   "obj": 130.62871116925294,
+   "bound": 130.61841392487688,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 165,
+   "wall": 2.0797734999796376,
+   "ivf": false
+  },
+  "opt": 130.6287126
+ },
+ {
+  "name": "cvxnonsep_psig30",
+  "off": {
+   "obj": 78.9988543529429,
+   "bound": 78.99179874365787,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 89,
+   "wall": 1.0633697080193087,
+   "ivf": false
+  },
+  "on": {
+   "obj": 78.9988543529429,
+   "bound": 78.99179874365787,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 89,
+   "wall": 1.050759791978635,
+   "ivf": false
+  },
+  "opt": 78.99885434
+ },
+ {
+  "name": "cvxnonsep_psig40r",
+  "off": {
+   "obj": 86.54527995164958,
+   "bound": 86.53873600363832,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 95,
+   "wall": 3.086986583075486,
+   "ivf": false
+  },
+  "on": {
+   "obj": 86.54527995164958,
+   "bound": 86.53873600363832,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 95,
+   "wall": 3.105158415972255,
+   "ivf": false
+  },
+  "opt": 86.5451047
+ },
+ {
+  "name": "dispatch",
+  "off": {
+   "obj": 3155.28792669897,
+   "bound": 3155.28790421789,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.8839763749856502,
+   "ivf": false
+  },
+  "on": {
+   "obj": 3155.28792669897,
+   "bound": 3155.28790421789,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.7990929580992088,
+   "ivf": false
+  },
+  "opt": 3155.287927
+ },
+ {
+  "name": "ex1221",
+  "off": {
+   "obj": 7.667180068813135,
+   "bound": 7.667180068813077,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.7790218329755589,
+   "ivf": false
+  },
+  "on": {
+   "obj": 7.667180068813135,
+   "bound": 7.667180068813077,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.7646690839901567,
+   "ivf": false
+  },
+  "opt": 7.667180069
+ },
+ {
+  "name": "ex1222",
+  "off": {
+   "obj": 1.0765430833322625,
+   "bound": 1.0765430463031964,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.5306594589492306,
+   "ivf": false
+  },
+  "on": {
+   "obj": 1.0765430833322625,
+   "bound": 1.0765430463031964,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.5282651250017807,
+   "ivf": false
+  },
+  "opt": 1.076543083
+ },
+ {
+  "name": "ex1224",
+  "off": {
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000164,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.6069868329213932,
+   "ivf": false
+  },
+  "on": {
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000164,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.6049429579870775,
+   "ivf": false
+  },
+  "opt": -0.9434705
+ },
+ {
+  "name": "ex1225",
+  "off": {
+   "obj": 30.999999913557566,
+   "bound": 30.999999913557566,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.0388615420088172,
+   "ivf": false
+  },
+  "on": {
+   "obj": 30.999999913557566,
+   "bound": 30.999999913557566,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.0412790830014274,
+   "ivf": false
+  },
+  "opt": 31.0
+ },
+ {
+  "name": "ex1226",
+  "off": {
+   "obj": -17.000000003887443,
+   "bound": -17.000000003887443,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.6300225839950144,
+   "ivf": false
+  },
+  "on": {
+   "obj": -17.000000003887443,
+   "bound": -17.000000003887443,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.6348867500200868,
+   "ivf": false
+  },
+  "opt": -17.0
+ },
+ {
+  "name": "ex14_1_9",
+  "off": {
+   "obj": -1.9775220540513224e-16,
+   "bound": -1.9775220540513224e-16,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 0.5145132499746978,
+   "ivf": false
+  },
+  "on": {
+   "obj": -1.9775220540513224e-16,
+   "bound": -1.9775220540513224e-16,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 0.5115867500426248,
+   "ivf": false
+  },
+  "opt": -0.0
+ },
+ {
+  "name": "fac2",
+  "off": {
+   "obj": 331837497.8394821,
+   "bound": 331837497.54563797,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 39,
+   "wall": 4.071408957941458,
+   "ivf": false
+  },
+  "on": {
+   "obj": 331837497.8394821,
+   "bound": 331837497.54563797,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 39,
+   "wall": 4.13669545808807,
+   "ivf": false
+  },
+  "opt": 331837498.2
+ },
+ {
+  "name": "flay02m",
+  "off": {
+   "obj": 37.947331863834606,
+   "bound": 37.94733180456953,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 7,
+   "wall": 0.6485908339964226,
+   "ivf": false
+  },
+  "on": {
+   "obj": 37.947331863834606,
+   "bound": 37.94733180456953,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 7,
+   "wall": 0.5798127090092748,
+   "ivf": false
+  },
+  "opt": 37.94733192
+ },
+ {
+  "name": "flay03m",
+  "off": {
+   "obj": 48.98979479383543,
+   "bound": 48.98979470823028,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 107,
+   "wall": 5.308333666063845,
+   "ivf": false
+  },
+  "on": {
+   "obj": 48.98979479383543,
+   "bound": 48.98979470823028,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 107,
+   "wall": 5.667892041965388,
+   "ivf": false
+  },
+  "opt": 48.98979486
+ },
+ {
+  "name": "gbd",
+  "off": {
+   "obj": 2.199999982504936,
+   "bound": 2.199999982504936,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.17048308299854398,
+   "ivf": false
+  },
+  "on": {
+   "obj": 2.199999982504936,
+   "bound": 2.199999982504936,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.14440537500195205,
+   "ivf": false
+  },
+  "opt": 2.2
+ },
+ {
+  "name": "gkocis",
+  "off": {
+   "obj": -1.9230987798770212,
+   "bound": -1.9230988280923489,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.0036971250083297,
+   "ivf": false
+  },
+  "on": {
+   "obj": -1.9230987798770212,
+   "bound": -1.9230988280923489,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.9159597909310833,
+   "ivf": false
+  },
+  "opt": -1.923098738
+ },
+ {
+  "name": "hda",
+  "off": {
+   "obj": null,
+   "bound": -64473.44240160173,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 7,
+   "wall": 47.02637312503066,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": -64473.44240160173,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 7,
+   "wall": 47.02504683297593,
+   "ivf": false
+  },
+  "opt": -5964.534084
+ },
+ {
+  "name": "heatexch_gen1",
+  "off": {
+   "obj": 191909.78915825902,
+   "bound": 95491.071428387,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 79,
+   "wall": 41.02061512507498,
+   "ivf": false
+  },
+  "on": {
+   "obj": 191909.78915825902,
+   "bound": 95491.071428387,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 83,
+   "wall": 41.021676875068806,
+   "ivf": false
+  },
+  "opt": 154895.933
+ },
+ {
+  "name": "heatexch_gen2",
+  "off": {
+   "obj": 824551.3266797881,
+   "bound": 558512.8882203752,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 23,
+   "wall": 40.77712604193948,
+   "ivf": false
+  },
+  "on": {
+   "obj": 824551.3266797881,
+   "bound": 558512.8882203752,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 25,
+   "wall": 40.799746125005186,
+   "ivf": false
+  },
+  "opt": 635838.8464
+ },
+ {
+  "name": "heatexch_gen3",
+  "off": {
+   "obj": null,
+   "bound": null,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 15,
+   "wall": 41.69667504099198,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": null,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 15,
+   "wall": 41.73836079100147,
+   "ivf": false
+  },
+  "opt": 64843.69761
+ },
+ {
+  "name": "m3",
+  "off": {
+   "obj": 37.799999669978845,
+   "bound": 37.79999951039202,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 47,
+   "wall": 2.360501499962993,
+   "ivf": false
+  },
+  "on": {
+   "obj": 37.799999669978845,
+   "bound": 37.79999951039202,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 47,
+   "wall": 2.2209795829840004,
+   "ivf": false
+  },
+  "opt": 37.8
+ },
+ {
+  "name": "nvs01",
+  "off": {
+   "obj": 12.46966882156821,
+   "bound": 12.46966882156821,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.9646515420172364,
+   "ivf": false
+  },
+  "on": {
+   "obj": 12.46966882156821,
+   "bound": 12.46966882156821,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.9572564590489492,
+   "ivf": false
+  },
+  "opt": 12.46966882
+ },
+ {
+  "name": "nvs02",
+  "off": {
+   "obj": 5.96418452307,
+   "bound": 5.96418452307,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 337,
+   "wall": 0.5738975830608979,
+   "ivf": false
+  },
+  "on": {
+   "obj": 5.96418452307,
+   "bound": 5.96418452307,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 337,
+   "wall": 0.573167791008018,
+   "ivf": false
+  },
+  "opt": 5.964184523
+ },
+ {
+  "name": "nvs03",
+  "off": {
+   "obj": 16.0,
+   "bound": 15.99999972676511,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.4769349170383066,
+   "ivf": false
+  },
+  "on": {
+   "obj": 16.0,
+   "bound": 16.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.29394929204136133,
+   "ivf": false
+  },
+  "opt": 16.0
+ },
+ {
+  "name": "nvs04",
+  "off": {
+   "obj": 0.720000000000006,
+   "bound": 0.7199999999999773,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.5265435830224305,
+   "ivf": false
+  },
+  "on": {
+   "obj": 629942182.12,
+   "bound": -5e-324,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 0.2829023329541087,
+   "ivf": false
+  },
+  "opt": 0.72
+ },
+ {
+  "name": "nvs05",
+  "off": {
+   "obj": 5.470934126405679,
+   "bound": 5.470647318008123,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 283,
+   "wall": 36.79869145806879,
+   "ivf": false
+  },
+  "on": {
+   "obj": 5.470934126405679,
+   "bound": 5.470647318008123,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 283,
+   "wall": 37.171680041006766,
+   "ivf": false
+  },
+  "opt": 5.470934108
+ },
+ {
+  "name": "nvs06",
+  "off": {
+   "obj": 1.7703125,
+   "bound": 1.7703124999999627,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.8201192090054974,
+   "ivf": false
+  },
+  "on": {
+   "obj": 2.3,
+   "bound": 1.5000000126250785,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 0.3326467080041766,
+   "ivf": false
+  },
+  "opt": 1.7703125
+ },
+ {
+  "name": "nvs07",
+  "off": {
+   "obj": 4.0,
+   "bound": 4.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.2961374999722466,
+   "ivf": false
+  },
+  "on": {
+   "obj": 4.0,
+   "bound": 4.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.3137512080138549,
+   "ivf": false
+  },
+  "opt": 4.0
+ },
+ {
+  "name": "nvs08",
+  "off": {
+   "obj": 23.449727347139827,
+   "bound": 23.44972734516655,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.7832701250445098,
+   "ivf": false
+  },
+  "on": {
+   "obj": 23.449727347139827,
+   "bound": 23.44972734516655,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.7787154999095947,
+   "ivf": false
+  },
+  "opt": 23.44972735
+ },
+ {
+  "name": "nvs09",
+  "off": {
+   "obj": -43.134336918035295,
+   "bound": -43.13433691803662,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 2.5073442918946967,
+   "ivf": false
+  },
+  "on": {
+   "obj": -28.521258960959145,
+   "bound": -47.55654360415477,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 0.8925996250472963,
+   "ivf": false
+  },
+  "opt": -43.13433692
+ },
+ {
+  "name": "nvs10",
+  "off": {
+   "obj": -310.7999999999999,
+   "bound": -310.7999999999999,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.32515833305660635,
+   "ivf": false
+  },
+  "on": {
+   "obj": -310.80000000000007,
+   "bound": -310.80000000000007,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 0.29536008299328387,
+   "ivf": false
+  },
+  "opt": -310.8
+ },
+ {
+  "name": "nvs11",
+  "off": {
+   "obj": -430.99999999999966,
+   "bound": -430.99999999999966,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 55,
+   "wall": 0.5148072500014678,
+   "ivf": false
+  },
+  "on": {
+   "obj": -431.00000000000006,
+   "bound": -431.00000000000006,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 23,
+   "wall": 0.3210541249718517,
+   "ivf": false
+  },
+  "opt": -431.0
+ },
+ {
+  "name": "nvs12",
+  "off": {
+   "obj": -481.20000000000005,
+   "bound": -481.20000000000005,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 231,
+   "wall": 1.036664666957222,
+   "ivf": false
+  },
+  "on": {
+   "obj": -481.20000000000005,
+   "bound": -481.20000000000005,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 53,
+   "wall": 0.3750448329374194,
+   "ivf": false
+  },
+  "opt": -481.2
+ },
+ {
+  "name": "nvs13",
+  "off": {
+   "obj": -585.2,
+   "bound": -585.2000000002046,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 19,
+   "wall": 2.472723082988523,
+   "ivf": false
+  },
+  "on": {
+   "obj": -585.2,
+   "bound": -585.2,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 223,
+   "wall": 0.5470559999812394,
+   "ivf": false
+  },
+  "opt": -585.2
+ },
+ {
+  "name": "nvs14",
+  "off": {
+   "obj": -40358.15476929996,
+   "bound": -40358.15476929999,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 223,
+   "wall": 0.5703431249130517,
+   "ivf": false
+  },
+  "on": {
+   "obj": -40358.15476929996,
+   "bound": -40358.15476929999,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 223,
+   "wall": 0.5559147089952603,
+   "ivf": false
+  },
+  "opt": -40358.15477
+ },
+ {
+  "name": "nvs15",
+  "off": {
+   "obj": 1.0,
+   "bound": 1.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 7,
+   "wall": 0.05546341696754098,
+   "ivf": false
+  },
+  "on": {
+   "obj": 1.0,
+   "bound": -8.0,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 18,
+   "wall": 0.2892419999698177,
+   "ivf": false
+  },
+  "opt": 1.0
+ },
+ {
+  "name": "nvs21",
+  "off": {
+   "obj": -5.684782628025259,
+   "bound": -5.684782628025259,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 1.9196506250882521,
+   "ivf": false
+  },
+  "on": {
+   "obj": -5.684782628025259,
+   "bound": -5.684782628025259,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 1.861841749981977,
+   "ivf": false
+  },
+  "opt": -5.6847825
+ },
+ {
+  "name": "oaer",
+  "off": {
+   "obj": -1.9230984998848466,
+   "bound": -1.923098601139822,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.8212857079925016,
+   "ivf": false
+  },
+  "on": {
+   "obj": -1.9230984998848466,
+   "bound": -1.923098601139822,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.8369599999859929,
+   "ivf": false
+  },
+  "opt": -1.923098514
+ },
+ {
+  "name": "st_e11",
+  "off": {
+   "obj": 189.31162974131917,
+   "bound": 189.31162968661766,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 27,
+   "wall": 1.5325402499875054,
+   "ivf": false
+  },
+  "on": {
+   "obj": 189.31162974131917,
+   "bound": 189.31162968661766,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 27,
+   "wall": 1.5176086669089273,
+   "ivf": false
+  },
+  "opt": 189.3116297
+ },
+ {
+  "name": "st_e13",
+  "off": {
+   "obj": 2.0000003463351197,
+   "bound": 1.9999999825187809,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.5425867920275778,
+   "ivf": false
+  },
+  "on": {
+   "obj": 2.0000003463351197,
+   "bound": 1.9999999825187809,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.5409151670755818,
+   "ivf": false
+  },
+  "opt": 2.0
+ },
+ {
+  "name": "st_e29",
+  "off": {
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000164,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.685177915962413,
+   "ivf": false
+  },
+  "on": {
+   "obj": -0.9434704942820806,
+   "bound": -0.9434705000000164,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 5,
+   "wall": 1.5998601670144126,
+   "ivf": false
+  },
+  "opt": -0.9434705
+ },
+ {
+  "name": "st_e36",
+  "off": {
+   "obj": -245.99999999999997,
+   "bound": -246.00000000170442,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 85,
+   "wall": 3.46542133402545,
+   "ivf": false
+  },
+  "on": {
+   "obj": -245.99999999999997,
+   "bound": -246.00000000170442,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 85,
+   "wall": 3.4706985839875415,
+   "ivf": false
+  },
+  "opt": -246.0
+ },
+ {
+  "name": "st_e38",
+  "off": {
+   "obj": 7197.727116826533,
+   "bound": 7197.727116826533,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.6691484999610111,
+   "ivf": false
+  },
+  "on": {
+   "obj": 7197.727116826533,
+   "bound": 7197.727116826533,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.6675671660341322,
+   "ivf": false
+  },
+  "opt": 7197.727149
+ },
+ {
+  "name": "st_miqp1",
+  "off": {
+   "obj": 280.9999999906497,
+   "bound": 280.9999999906497,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 15,
+   "wall": 0.14436699997168034,
+   "ivf": false
+  },
+  "on": {
+   "obj": 281.0,
+   "bound": 281.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 2,
+   "wall": 0.28373012505471706,
+   "ivf": false
+  },
+  "opt": 281.0
+ },
+ {
+  "name": "st_miqp2",
+  "off": {
+   "obj": 2.0,
+   "bound": 2.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 9,
+   "wall": 0.1422318749828264,
+   "ivf": false
+  },
+  "on": {
+   "obj": 2.0,
+   "bound": 2.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 12,
+   "wall": 0.28297058399766684,
+   "ivf": false
+  },
+  "opt": 2.0
+ },
+ {
+  "name": "st_miqp3",
+  "off": {
+   "obj": -6.0,
+   "bound": -6.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.13413266697898507,
+   "ivf": false
+  },
+  "on": {
+   "obj": -6.0,
+   "bound": -6.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.27445795899257064,
+   "ivf": false
+  },
+  "opt": -6.0
+ },
+ {
+  "name": "st_miqp4",
+  "off": {
+   "obj": -4574.000004423649,
+   "bound": -4574.000004423649,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.14187912503257394,
+   "ivf": false
+  },
+  "on": {
+   "obj": -4574.000004423649,
+   "bound": -4574.000004423649,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 3,
+   "wall": 0.14104725001379848,
+   "ivf": false
+  },
+  "opt": -4574.0
+ },
+ {
+  "name": "st_miqp5",
+  "off": {
+   "obj": -333.8888902488093,
+   "bound": -333.8888902488093,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.14244591596070677,
+   "ivf": false
+  },
+  "on": {
+   "obj": -333.8888902488093,
+   "bound": -333.8888902488093,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 1,
+   "wall": 0.14398812490981072,
+   "ivf": false
+  },
+  "opt": -333.8888889
+ },
+ {
+  "name": "st_test1",
+  "off": {
+   "obj": -1.6495994490692313e-08,
+   "bound": -1.6495994490692313e-08,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 15,
+   "wall": 0.14405387500301003,
+   "ivf": false
+  },
+  "on": {
+   "obj": 0.0,
+   "bound": 0.0,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 7,
+   "wall": 0.2868572910083458,
+   "ivf": false
+  },
+  "opt": 0.0
+ },
+ {
+  "name": "st_testgr3",
+  "off": {
+   "obj": -20.59,
+   "bound": -20.59070709795548,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 549,
+   "wall": 0.21219145797658712,
+   "ivf": false
+  },
+  "on": {
+   "obj": -20.590000000000003,
+   "bound": -20.591621428571433,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 264,
+   "wall": 0.6228046249598265,
+   "ivf": false
+  },
+  "opt": -20.59
+ },
+ {
+  "name": "syn05hfsg",
+  "off": {
+   "obj": 837.732412391107,
+   "bound": 837.732412391107,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 185,
+   "wall": 5.458993250038475,
+   "ivf": false
+  },
+  "on": {
+   "obj": 837.732412391107,
+   "bound": 837.732412391107,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 185,
+   "wall": 5.540020042099059,
+   "ivf": false
+  },
+  "opt": 837.7324009
+ },
+ {
+  "name": "tanksize",
+  "off": {
+   "obj": 1.2686437614652872,
+   "bound": 1.0765835181321979,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 255,
+   "wall": 40.41667475004215,
+   "ivf": false
+  },
+  "on": {
+   "obj": 1.2686437614652872,
+   "bound": 1.0764153314056981,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 233,
+   "wall": 40.45851004100405,
+   "ivf": false
+  },
+  "opt": 1.268643754
+ },
+ {
+  "name": "tls2",
+  "off": {
+   "obj": 11.299999856725538,
+   "bound": 2.0999999901667694,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 317,
+   "wall": 42.11443662503734,
+   "ivf": false
+  },
+  "on": {
+   "obj": 11.299999856725538,
+   "bound": 2.0999999901667694,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 317,
+   "wall": 41.235196458990686,
+   "ivf": false
+  },
+  "opt": 5.3
+ },
+ {
+  "name": "tspn05",
+  "off": {
+   "obj": 191.25520768494238,
+   "bound": 191.25510622528546,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 51,
+   "wall": 12.872477749944665,
+   "ivf": false
+  },
+  "on": {
+   "obj": 191.25520768494238,
+   "bound": 191.25510622528546,
+   "status": "optimal",
+   "gapc": true,
+   "nodes": 51,
+   "wall": 11.99818887503352,
+   "ivf": false
+  },
+  "opt": 191.2552078
+ },
+ {
+  "name": "tspn08",
+  "off": {
+   "obj": 290.56685374735457,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 12.615597541909665,
+   "ivf": false
+  },
+  "on": {
+   "obj": 290.56685374735457,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 12.03533158393111,
+   "ivf": false
+  },
+  "opt": 290.5668539
+ },
+ {
+  "name": "tspn10",
+  "off": {
+   "obj": 225.1260713973292,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 12.657408916042186,
+   "ivf": false
+  },
+  "on": {
+   "obj": 225.1260713973292,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 13.089882457978092,
+   "ivf": false
+  },
+  "opt": 225.1260716
+ },
+ {
+  "name": "tspn12",
+  "off": {
+   "obj": 262.64739525060224,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 9.0595016250154,
+   "ivf": false
+  },
+  "on": {
+   "obj": 262.64739525060224,
+   "bound": null,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 1,
+   "wall": 9.01880133303348,
+   "ivf": false
+  },
+  "opt": 262.6473957
+ },
+ {
+  "name": "tln4",
+  "off": {
+   "obj": null,
+   "bound": 1.7285714285714286,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 27967,
+   "wall": 40.68274545902386,
+   "ivf": false
+  },
+  "on": {
+   "obj": 13.299999999999999,
+   "bound": 5.974557522123895,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 31234,
+   "wall": 40.69519300002139,
+   "ivf": false
+  },
+  "opt": 8.3
+ },
+ {
+  "name": "tln5",
+  "off": {
+   "obj": null,
+   "bound": 2.1571428571428575,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 16159,
+   "wall": 40.71882241603453,
+   "ivf": false
+  },
+  "on": {
+   "obj": 12.9,
+   "bound": 6.592063492063485,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 21301,
+   "wall": 40.71527283301111,
+   "ivf": false
+  },
+  "opt": 10.3
+ },
+ {
+  "name": "tln6",
+  "off": {
+   "obj": null,
+   "bound": 2.3,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 8287,
+   "wall": 40.79286525002681,
+   "ivf": false
+  },
+  "on": {
+   "obj": 50.5,
+   "bound": 7.440665957172343,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 14119,
+   "wall": 40.726625208044425,
+   "ivf": false
+  },
+  "opt": 15.3
+ },
+ {
+  "name": "ball_mk2_30",
+  "off": {
+   "obj": null,
+   "bound": null,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 21317,
+   "wall": 40.62114112498239,
+   "ivf": false
+  },
+  "on": {
+   "error": "harness_timeout"
+  },
+  "opt": 0.0
+ },
+ {
+  "name": "gastrans040",
+  "off": {
+   "obj": null,
+   "bound": 0.0,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 15,
+   "wall": 42.13612749997992,
+   "ivf": false
+  },
+  "on": {
+   "obj": null,
+   "bound": 0.0,
+   "status": "time_limit",
+   "gapc": false,
+   "nodes": 15,
+   "wall": 42.04090158303734,
+   "ivf": false
+  },
+  "opt": 0.0
+ },
+ {
+  "name": "portfol_robust050_34",
+  "off": {
+   "obj": -0.07207562233649352,
+   "bound": -0.10606560122161082,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 43.89444512501359,
+   "ivf": false
+  },
+  "on": {
+   "obj": -0.07207562233281743,
+   "bound": -0.10606560122161082,
+   "status": "feasible",
+   "gapc": false,
+   "nodes": 3,
+   "wall": 43.93064137501642,
+   "ivf": false
+  },
+  "opt": -0.072075526
+ }
+]
