@@ -37,7 +37,7 @@ quality with the panel still green.
 - `discopt_benchmarks/scripts/issue844_primal_quality_panel.py` — the #844 gate,
   byte-for-byte, plus the quality axis.
 
-Three design rules are load-bearing and are pinned by tests:
+Four design rules are load-bearing and are pinned by tests:
 
 1. **Unscored is never reported as clean.** A missing incumbent or a missing oracle
    yields `None`, counted in `unscored`, never folded in as gap 0 (which would show a
@@ -45,8 +45,21 @@ Three design rules are load-bearing and are pinned by tests:
    would let a change that trades incumbents for quality look neutral).
 2. **Quality never absorbs soundness.** An incumbent *below* the reference optimum of
    a minimize is not a poor incumbent, it is a correctness failure (CLAUDE.md §1);
-   `is_false_primal` scores it separately and the existing hard gate keeps it.
-3. **An exact answer never scores as the worst answer.** Berthold's rule uses exact
+   `is_false_primal` scores it separately, the existing hard gate keeps it, and its
+   gap is **excluded from the aggregate**. That last part was a review finding, not
+   the original design: `primal_gap` is symmetric, so a false primal scores *better*
+   than an honest incumbent the same distance away (min, opt 10: honest 12 → 0.167,
+   false 9 → 0.100). Folding it into `mean_gap` let a soundness failure read as a
+   quality improvement.
+3. **The objective sense is required, never assumed.** Also a review finding, and the
+   one defect here that could have made the metric lie. The `.nl` reader does *not*
+   normalize to MINIMIZE — `syn05m`, `syn05hfsg` and `bchoco06/07/08` are vendored
+   and load as MAXIMIZE — so the original `sense="min"` default would have reported a
+   perfectly sound maximize incumbent as a **correctness violation**, and a 10%-worse
+   one as *better than optimal*. `sense` is now required everywhere and an
+   unrecognised value raises. A silently wrong metric is worse than no metric,
+   because it launders regressions as passes.
+4. **An exact answer never scores as the worst answer.** Berthold's rule uses exact
    equality, which saturates to gap 1.0 whenever the reference optimum is exactly 0
    and the incumbent is a float. The panel's first run hit this on `gear` (optimum 0,
    incumbent 2.9e-07) and `st_test1` (optimum 0, incumbent −1.6e-08) and reported the
