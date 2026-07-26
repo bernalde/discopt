@@ -489,11 +489,21 @@ def solve_lp_spatial_bb(
             "requires it (the per-node cold build cannot serve a bounded budget)"
         )
         return None
+    # ``relax`` returns ``(bound, x, basis, info)``. The product map travels WITH the
+    # solution it describes: on the incremental path the lifted layout is fixed once
+    # and ``info`` is a constant, but the cold path re-runs ``build_milp_relaxation``
+    # at every node and the lift is box-dependent, so a node's column count can differ
+    # from the root's. Reusing the root map against a node's ``x`` indexes past the
+    # end of that node's solution vector (measured on st_e38: root aux column 18 vs a
+    # 17-column node LP -> IndexError, which the caller swallowed as "engine failed"
+    # and silently fell back). A product map is only meaningful for the exact LP it
+    # came from.
     if _inc.ok:
         info = {"bilinear": _inc.bilinear, "monomial": _inc.monomial}
 
         def relax(lb, ub, basis):
-            return _inc.solve(lb, ub, in_basis=basis)
+            b_, x_, bas = _inc.solve(lb, ub, in_basis=basis)
+            return b_, x_, bas, info
     else:
         _r0 = _relax_bound(model, terms, lb0, ub0, deadline=t0 + time_limit)
         if _r0 is None:
@@ -502,7 +512,7 @@ def solve_lp_spatial_bb(
 
         def relax(lb, ub, basis):
             c = _relax_bound(model, terms, lb, ub, deadline=t0 + time_limit)
-            return (c[0], c[1], None) if c is not None else (None, None, None)
+            return (c[0], c[1], None, c[2]) if c is not None else (None, None, None, None)
 
     # Branch-and-cut: separate integer cuts (GMI + complemented-MIR, product aux
     # vars marked integer) at each node and re-solve, tightening the node bound
@@ -516,7 +526,11 @@ def solve_lp_spatial_bb(
     def node_relax(lb, ub, basis, inherited, rounds):
         """Solve the node LP with inherited cuts, then run ``rounds`` of cut
         separation (add only bound-improving cuts), returning
-        ``(bound, x, basis, cuts, verdict)``.
+        ``(bound, x, basis, cuts, verdict, info)``.
+
+        ``info`` is the product map of the LP that produced ``x`` — see the note on
+        ``relax`` above; it is carried through the frontier so the spatial-branching
+        test always reads the map belonging to the solution in hand.
 
         ``verdict`` distinguishes the two very different reasons a node LP can come
         back with no bound, which the caller MUST NOT conflate:
@@ -532,18 +546,19 @@ def solve_lp_spatial_bb(
           must fold such a node into ``unresolved_lb`` instead.
         """
         if not cut_enabled:
-            b_, x_, bas = relax(lb, ub, basis)
+            b_, x_, bas, info_ = relax(lb, ub, basis)
             # Cold path: ``_relax_bound`` collapses every failure mode into ``None``
             # and cannot prove infeasibility, so the only sound reading is
             # "unresolved". This is conservative in the safe direction — it can cost
             # an optimality certificate, never create a false one.
-            return b_, x_, bas, (), ("optimal" if b_ is not None else "unresolved")
+            verdict = "optimal" if b_ is not None else "unresolved"
+            return b_, x_, bas, (), verdict, info_
         cuts = list(inherited)
         A, b, bounds = _inc.assemble(lb, ub, cuts)
         _st, b_, x_, bas, _farkas = _inc.solve_assembled_full(A, b, bounds, in_basis=basis)
         if b_ is None:
             _verdict = "fathom" if (_st == "infeasible" and _farkas) else "unresolved"
-            return None, None, None, tuple(cuts), _verdict
+            return None, None, None, tuple(cuts), _verdict, info
         for _r in range(rounds):
             if len(cuts) >= _MAX_INHERITED_CUTS:
                 break
@@ -559,9 +574,9 @@ def solve_lp_spatial_bb(
             b_, x_, bas = nb, nx, nbas
             if not improved:
                 break
-        return b_, x_, bas, tuple(cuts), "optimal"
+        return b_, x_, bas, tuple(cuts), "optimal", info
 
-    root_b, root_x, root_basis, root_cuts, _root_verdict = node_relax(
+    root_b, root_x, root_basis, root_cuts, _root_verdict, root_info = node_relax(
         lb0, ub0, None, (), root_cut_rounds
     )
     if root_b is None:
@@ -569,8 +584,11 @@ def solve_lp_spatial_bb(
 
     inc_val = float("inf")
     inc_x: Optional[np.ndarray] = None
-    # frontier entries: (bound, tiebreak, lb, ub, x, warm_basis, inherited_cuts)
-    heap = [(root_b, 0, lb0, ub0, root_x, root_basis, root_cuts)]
+    # frontier entries:
+    #   (bound, tiebreak, lb, ub, x, warm_basis, inherited_cuts, info)
+    # ``info`` is the product map of the LP that produced this node's ``x`` — see
+    # ``relax``; it must travel with the solution, not be read from the root.
+    heap = [(root_b, 0, lb0, ub0, root_x, root_basis, root_cuts, root_info)]
     counter = 1
     nodes = 0
 
@@ -667,7 +685,7 @@ def solve_lp_spatial_bb(
         hi[fix] = xr[fix]
         if np.any(lo > hi + 1e-9):
             return None
-        _b, xx, _bas = relax(lo, hi, None)
+        _b, xx, _bas, _inf = relax(lo, hi, None)
         if xx is None:
             return None
         xc = np.asarray(xx[:n], dtype=float).copy()
@@ -685,7 +703,7 @@ def solve_lp_spatial_bb(
             # the engine can blow past ``time_limit`` by an order of magnitude.
             if (time.perf_counter() - t0) >= time_limit:
                 return None
-            b_, xx, _bas = relax(lo, hi, None)
+            b_, xx, _bas, _inf = relax(lo, hi, None)
             if b_ is None:
                 return None
             free = [(abs(xx[i] - round(xx[i])), i) for i in INT if hi[i] - lo[i] > 0.5]
@@ -766,9 +784,11 @@ def solve_lp_spatial_bb(
         nonlocal counter, unresolved_lb
         if np.any(lb > ub + 1e-9):
             return None  # empty integer box: genuinely nothing here, safe to drop
-        b_, x_, basis_, cuts_, verdict = node_relax(lb, ub, parent_basis, parent_cuts, rounds)
+        b_, x_, basis_, cuts_, verdict, info_ = node_relax(
+            lb, ub, parent_basis, parent_cuts, rounds
+        )
         if b_ is not None and b_ < inc_val - 1e-9:
-            heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_))
+            heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_, info_))
             counter += 1
         elif b_ is None and verdict != "fathom":
             # The child's relaxation gave no certified verdict, so its subtree is NOT
@@ -803,7 +823,7 @@ def solve_lp_spatial_bb(
         if (time.perf_counter() - t0) >= time_limit or nodes >= max_nodes:
             status = "time_limit"
             break
-        bound, _, lb, ub, x, basis, ncuts = heapq.heappop(heap)
+        bound, _, lb, ub, x, basis, ncuts, ninfo = heapq.heappop(heap)
         nodes += 1
         # Global lower bound = smallest frontier bound (this popped node, best-first)
         # capped by any unresolved-node floor. Fathoming/gap tests use this, never the
@@ -852,7 +872,7 @@ def solve_lp_spatial_bb(
         # branching the engine could not perform. The collapse test spans EVERY
         # variable, continuous ones included -- a mixed node with a live continuous
         # dimension is never an exact leaf, however tight its products look.
-        bv = _worst_product_var(x, info, ub - lb, is_int)
+        bv = _worst_product_var(x, ninfo, ub - lb, is_int)
         if bv is None:
             consider(verify(x[:n]))
             if _has_cont:

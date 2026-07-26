@@ -15,6 +15,7 @@ import pytest  # noqa: E402
 from discopt._jax.lp_spatial_bb import _separate_node_cuts, solve_lp_spatial_bb  # noqa: E402
 
 _DATA = os.path.join(os.path.dirname(__file__), "data", "minlplib")
+_DATA_NL = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl")
 
 
 def _assemble_node_lp(ux=6, uy=5, uz=4):
@@ -299,6 +300,27 @@ def test_infinite_root_box_is_accepted_not_declined():
     assert r is not None, "an infinite root endpoint must no longer decline the solve"
     assert r.objective == pytest.approx(6.0, abs=1e-5)
     assert r.bound is not None and r.bound <= r.objective + 1e-6
+
+
+@pytest.mark.smoke
+def test_cold_path_product_map_travels_with_its_solution():
+    """Fail-before/pass-after: on the COLD path the lifted layout is rebuilt at every
+    node and is box-dependent, so a node's column count can differ from the root's.
+    Reading the ROOT product map against a node's solution indexed past the end of
+    that vector — on ``st_e38``, root aux column 18 against a 17-column node LP —
+    raising ``IndexError``, which the caller swallowed as "engine failed" and silently
+    fell back to the default path. The map now travels with the solution it
+    describes, so the engine returns a sound result instead of dying.
+
+    (Pre-existing on the cold path; ``st_e38`` reaches it only because #860 brought
+    mixed models into scope.)"""
+    path = os.path.join(_DATA_NL, "st_e38.nl")
+    if not os.path.exists(path):
+        pytest.skip("st_e38 not vendored")
+    r = solve_lp_spatial_bb(dm.from_nl(path), time_limit=20)
+    assert r is not None, "engine must not decline (an IndexError here is the bug)"
+    if r.objective is not None:
+        assert r.bound is not None and r.bound <= r.objective + 1e-6
 
 
 # --------------------------------------------------------------------------- #
