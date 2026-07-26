@@ -9,7 +9,7 @@ to classify problems, then extracts standard-form data using the JAX DAG compile
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import numpy as np
 
@@ -110,6 +110,12 @@ def classify_problem(model: Model) -> ProblemClass:
 # variables whose objective touches 101) cannot hold (n, n) float64 at all -- that
 # is 91 GB. 256 MB corresponds to n ~= 5,657.
 _QP_DENSE_Q_MAX_BYTES = 256 * 1024 * 1024
+
+# Dense-constraint-matrix budget, the exact counterpart for A_eq / A_ub (#863).
+# ``watercontamination0202`` is 107,209 rows x 106,711 columns; (m, n) float64 there
+# is 91.5 GB, an equal-sized wall to the 91 GB dense Q above. Above this budget the
+# extractors emit scipy CSR and consumers densify through ``dense_A()``.
+_DENSE_A_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _sp_issparse(x) -> bool:
@@ -308,10 +314,42 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
       - coefficients is a numpy array of shape (n,) with coefficient for each variable slot
       - constant is a float scalar
 
+    Dense wrapper over :func:`_extract_linear_coefficients_sparse`; bit-identical to
+    it, because the dict accumulates exactly the same additions in the same order
+    starting from the same 0.0. Callers that assemble many rows should use the sparse
+    form directly and never materialise the full-width vector (#863).
+
     Raises _NotLinearError if the expression is not linear.
     """
+    terms, const = _extract_linear_coefficients_sparse(expr, model, n)
     c = np.zeros(n, dtype=np.float64)
+    for _i, _v in terms.items():
+        c[_i] = _v
+    return c, const
+
+
+def _extract_linear_coefficients_sparse(expr, model: Model, n: int):
+    """As :func:`_extract_linear_coefficients`, but keeping the row SPARSE.
+
+    Returns ``(terms, constant)`` where ``terms`` is ``{flat_index: coefficient}``
+    in first-touch order. This is what lets ``_extract_constraints_algebraic``
+    assemble a (107,209 x 106,711) matrix without a 91.5 GB dense intermediate
+    (#863) — the dense full-width row per constraint was never needed, only its
+    nonzeros are.
+
+    Raises _NotLinearError if the expression is not linear.
+    """
+    terms: dict[int, float] = {}
     const = 0.0
+
+    def _add(i: int, v: float) -> None:
+        # The dense predecessor got this bound check for free from numpy (and, for a
+        # negative index, silently wrote the WRONG slot via numpy wraparound).
+        # _NotLinearError rather than IndexError so the dispatcher falls through to
+        # the next extractor exactly as it did on the IndexError before.
+        if not 0 <= i < n:
+            raise _NotLinearError(f"variable slot {i} outside the model's {n} flat slots")
+        terms[i] = terms.get(i, 0.0) + v
 
     def _walk(node, scale=1.0, allow_array=False):
         # ``allow_array`` is True only inside a ``sum(...)`` reduction, where a
@@ -334,11 +372,11 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
         if isinstance(node, Variable):
             offset = _compute_var_offset(node, model)
             if node.size == 1:
-                c[offset] += scale
+                _add(offset, scale)
             elif allow_array:
                 # Inside sum(): sum(scale * x) = scale * Σ x_j (uniform scale).
                 for j in range(node.size):
-                    c[offset + j] += scale
+                    _add(offset + j, scale)
             else:
                 raise _NotLinearError(
                     "Array variable in scalar position (vector-valued body); "
@@ -352,13 +390,13 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
                 offset = _compute_var_offset(var, model)
                 idx = node.index
                 if isinstance(idx, (int, np.integer)):
-                    c[offset + int(idx)] += scale
+                    _add(offset + int(idx), scale)
                 elif (
                     isinstance(idx, tuple)
                     and len(idx) == 1
                     and isinstance(idx[0], (int, np.integer))
                 ):
-                    c[offset + int(idx[0])] += scale
+                    _add(offset + int(idx[0]), scale)
                 else:
                     # Multi-dimensional index: flatten
                     try:
@@ -369,7 +407,7 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
                         # Sliced/partial subscript (vectorized term): this scalar
                         # extractor cannot express it; classify as not-linear.
                         raise _NotLinearError(f"non-scalar index {idx!r} on {var.name}") from None
-                    c[offset + int(flat_idx)] += scale
+                    _add(offset + int(flat_idx), scale)
                 return
             raise _NotLinearError(f"IndexExpression on non-variable: {type(node.base)}")
 
@@ -431,7 +469,7 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
                 # For 1-D mat (dot product), coefficients are mat elements
                 if mat.ndim == 1:
                     for j in range(var.size):
-                        c[offset + j] += scale * float(mat[j])
+                        _add(offset + j, scale * float(mat[j]))
                 elif mat.ndim == 2:
                     # Returns vector; this should be used inside a sum
                     raise _NotLinearError("MatMul returning vector in scalar context")
@@ -442,7 +480,7 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
                 offset = _compute_var_offset(var, model)
                 if mat.ndim == 1:
                     for j in range(var.size):
-                        c[offset + j] += scale * float(mat[j])
+                        _add(offset + j, scale * float(mat[j]))
                     return
                 raise _NotLinearError("MatMul returning vector in scalar context")
             raise _NotLinearError("MatMul between non-trivial expressions")
@@ -450,7 +488,7 @@ def _extract_linear_coefficients(expr, model: Model, n: int):
         raise _NotLinearError(f"Unhandled expression type: {type(node).__name__}")
 
     _walk(expr)
-    return c, const
+    return terms, const
 
 
 def _extract_quadratic_coefficients(expr, model: Model, n: int):
@@ -762,63 +800,64 @@ def _extract_constraints_algebraic(model: Model, n_orig: int):
     """Extract linear constraint data algebraically (shared by LP and QP paths).
 
     Returns (A_eq, b_eq, x_l, x_u, n_slack) where slacks are appended for
-    inequality constraints.
+    inequality constraints. ``A_eq`` is dense while it fits ``_DENSE_A_MAX_BYTES``
+    and scipy CSR beyond it (#863) — consumers densify via ``dense_A()``.
 
     Raises _NotLinearError if any constraint is not linear.
     """
     constraints = [con for con in model._constraints if isinstance(con, Constraint)]
 
-    eq_rows = []
-    eq_rhs = []
-    ineq_rows = []
-    ineq_senses = []
-    ineq_rhs = []
+    eq_terms: list[dict[int, float]] = []
+    eq_rhs: list[float] = []
+    ineq_terms: list[dict[int, float]] = []
+    ineq_senses: list[str] = []
+    ineq_rhs: list[float] = []
 
     for con in constraints:
-        a_row, const = _extract_linear_coefficients(con.body, model, n_orig)
+        # Sparse walk: the dense full-width row per constraint was never needed,
+        # only its nonzeros (#863).
+        terms, const = _extract_linear_coefficients_sparse(con.body, model, n_orig)
         if con.sense == "==":
-            eq_rows.append(a_row)
+            eq_terms.append(terms)
             eq_rhs.append(-const)
         elif con.sense == "<=":
-            ineq_rows.append(a_row)
+            ineq_terms.append(terms)
             ineq_senses.append("le")
             ineq_rhs.append(-const)
         elif con.sense == ">=":
-            ineq_rows.append(a_row)
+            ineq_terms.append(terms)
             ineq_senses.append("ge")
             ineq_rhs.append(-const)
 
-    n_eq = len(eq_rows)
-    n_ineq = len(ineq_rows)
+    n_eq = len(eq_terms)
+    n_ineq = len(ineq_terms)
     n_slack = n_ineq
     n_total = n_orig + n_slack
 
-    A_rows = []
-    b_vals = []
+    # COO triples, not np.stack() of dense (n_total,) rows: that stack is
+    # 107,209 x 106,711 float64 = 91.5 GB on watercontamination0202, and it needs
+    # every row resident simultaneously (#863).
+    coo_rows: list[int] = []
+    coo_cols: list[int] = []
+    coo_vals: list[float] = []
+    b_vals: list[float] = []
 
     for i in range(n_eq):
-        row_full = np.zeros(n_total, dtype=np.float64)
-        row_full[:n_orig] = eq_rows[i]
-        A_rows.append(row_full)
+        _append_row_coo(coo_rows, coo_cols, coo_vals, i, eq_terms[i])
         b_vals.append(eq_rhs[i])
 
     for i in range(n_ineq):
-        row_full = np.zeros(n_total, dtype=np.float64)
-        row_full[:n_orig] = ineq_rows[i]
-        if ineq_senses[i] == "le":
-            row_full[n_orig + i] = 1.0
-        else:
-            row_full[n_orig + i] = -1.0
-        A_rows.append(row_full)
+        r = n_eq + i
+        _append_row_coo(coo_rows, coo_cols, coo_vals, r, ineq_terms[i])
+        # body <= 0 becomes body + s = 0; body >= 0 becomes body - s = 0; s >= 0.
+        coo_rows.append(r)
+        coo_cols.append(n_orig + i)
+        coo_vals.append(1.0 if ineq_senses[i] == "le" else -1.0)
         b_vals.append(ineq_rhs[i])
 
     m_total = n_eq + n_ineq
-    if m_total > 0:
-        A_eq = np.stack(A_rows).astype(np.float64)
-        b_eq = np.array(b_vals, dtype=np.float64)
-    else:
-        A_eq = np.zeros((0, n_total), dtype=np.float64)
-        b_eq = np.zeros(0, dtype=np.float64)
+    A_eq = _materialise_A(coo_rows, coo_cols, coo_vals, m_total, n_total)
+    b_eq = np.array(b_vals, dtype=np.float64)
 
     x_l_orig, x_u_orig = _get_variable_bounds(model)
     x_l = np.concatenate([x_l_orig, np.zeros(n_slack, dtype=np.float64)])
@@ -835,6 +874,84 @@ def _empty_matrix(n_cols: int) -> np.ndarray:
     return np.zeros((0, n_cols), dtype=np.float64)
 
 
+def _materialise_A(
+    rows: list[int], cols: list[int], vals: list[float], m: int, n: int
+) -> np.ndarray:
+    """Assemble a constraint matrix from COO triples (#863).
+
+    Dense while ``(m, n)`` float64 fits ``_DENSE_A_MAX_BYTES`` — bit-identical to the
+    ``np.stack`` of dense full-width rows this replaced — and scipy CSR beyond it,
+    because a model with both many rows and many columns cannot hold ``(m, n)``
+    floats at all: ``watercontamination0202`` is 107,209 x 106,711, which is 91.5 GB.
+    ``dense_A()`` re-densifies for consumers.
+
+    The COO form is what makes the sparse arm reachable at all. ``np.stack`` needs
+    every dense row resident simultaneously; contributing rows as triples keeps peak
+    memory at O(nnz), so the dense matrix never has to exist even transiently.
+
+    Entries absent from the triples are 0.0 in both arms, so dropping explicitly
+    zero coefficients (as ``_append_dense_row_coo`` does) cannot change the
+    densified result.
+    """
+    if m == 0:
+        return _empty_matrix(n)
+    r = np.asarray(rows, dtype=np.intp)
+    c = np.asarray(cols, dtype=np.intp)
+    v = np.asarray(vals, dtype=np.float64)
+    if (m * n * 8) <= _DENSE_A_MAX_BYTES:
+        A = np.zeros((m, n), dtype=np.float64)
+        A[r, c] = v
+        return A
+    import scipy.sparse as _sp
+
+    # Annotated ndarray because that is what every consumer sees after dense_A();
+    # the sparse arm is deliberately outside the annotation, exactly as dense_Q's
+    # producer is (c525f519).
+    return cast(np.ndarray, _sp.csr_matrix((v, (r, c)), shape=(m, n)))
+
+
+def _append_row_coo(
+    rows: list[int], cols: list[int], vals: list[float], r: int, terms: dict[int, float]
+) -> None:
+    """Append row ``r``'s entries from a ``{column: coefficient}`` mapping."""
+    for _j, _v in terms.items():
+        rows.append(r)
+        cols.append(_j)
+        vals.append(_v)
+
+
+def _append_dense_row_coo(
+    rows: list[int], cols: list[int], vals: list[float], r: int, vec: np.ndarray
+) -> None:
+    """Append only the nonzeros of the dense coefficient row ``vec`` as row ``r``.
+
+    For the extractors whose row source is already a dense vector (the repr probe
+    paths, the QCP algebraic walk). Converting each row as it is produced and
+    dropping it holds peak memory at O(nnz) rather than O(m*n).
+
+    ``np.nonzero`` retains NaN/inf (they compare unequal to 0), so the finiteness
+    guard in ``_extract_lp_data_from_repr`` still sees them.
+    """
+    (nz,) = np.nonzero(vec)
+    if nz.size == 0:
+        return
+    rows.extend([r] * int(nz.size))
+    cols.extend(nz.tolist())
+    vals.extend(np.asarray(vec, dtype=np.float64)[nz].tolist())
+
+
+def _all_finite(arr) -> bool:
+    """``np.isfinite(arr).all()`` for a dense array or a scipy sparse matrix.
+
+    Unstored sparse entries are exactly 0.0, which is finite, so checking ``.data``
+    is equivalent to checking the densified matrix — without densifying it.
+    """
+    if _sp_issparse(arr):
+        return bool(np.isfinite(arr.data).all())
+    a = np.asarray(arr)
+    return bool(a.size == 0 or np.isfinite(a).all())
+
+
 def _extract_qcp_constraints_algebraic(
     model: Model,
     n_orig: int,
@@ -843,9 +960,13 @@ def _extract_qcp_constraints_algebraic(
 
     constraints = [con for con in model._constraints if isinstance(con, Constraint)]
 
-    ub_rows: list[np.ndarray] = []
+    # COO accumulators rather than lists of dense rows (#863): a row is reduced to
+    # its nonzeros as soon as it is produced, so an (m, n_orig) dense stack is never
+    # built. (The dense (n, n) Q that ``_extract_quadratic_coefficients`` returns per
+    # QUADRATIC row is a separate, still-open wall on this path.)
+    ub_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
     ub_rhs: list[float] = []
-    eq_rows: list[np.ndarray] = []
+    eq_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
     eq_rhs: list[float] = []
     q_rows: list[QuadraticConstraintData] = []
 
@@ -864,20 +985,20 @@ def _extract_qcp_constraints_algebraic(
             continue
 
         if con.sense == "==":
-            eq_rows.append(c_vec)
+            _append_dense_row_coo(*eq_coo, len(eq_rhs), c_vec)
             eq_rhs.append(rhs)
         elif con.sense == "<=":
-            ub_rows.append(c_vec)
+            _append_dense_row_coo(*ub_coo, len(ub_rhs), c_vec)
             ub_rhs.append(rhs)
         elif con.sense == ">=":
-            ub_rows.append(-c_vec)
+            _append_dense_row_coo(*ub_coo, len(ub_rhs), -c_vec)
             ub_rhs.append(-rhs)
         else:
             raise _NotQuadraticError(f"Unknown constraint sense: {con.sense}")
 
-    A_ub = np.stack(ub_rows).astype(np.float64) if ub_rows else _empty_matrix(n_orig)
+    A_ub = _materialise_A(*ub_coo, len(ub_rhs), n_orig)
     b_ub = np.asarray(ub_rhs, dtype=np.float64)
-    A_eq = np.stack(eq_rows).astype(np.float64) if eq_rows else _empty_matrix(n_orig)
+    A_eq = _materialise_A(*eq_coo, len(eq_rhs), n_orig)
     b_eq = np.asarray(eq_rhs, dtype=np.float64)
     return A_ub, b_ub, A_eq, b_eq, tuple(q_rows)
 
@@ -989,9 +1110,12 @@ def extract_qcp_data_algebraic(model: Model) -> QCPData:
     return QCPData(
         Q=np.asarray(Q),  # type: ignore[arg-type]
         c=np.asarray(c_vec),  # type: ignore[arg-type]
-        A_ub=np.asarray(A_ub),  # type: ignore[arg-type]
+        # Preserve sparsity: np.asarray() on a sparse matrix silently yields a 0-d
+        # object array rather than raising, which would smuggle garbage into every
+        # consumer (#863). Consumers densify via dense_A().
+        A_ub=A_ub if _sp_issparse(A_ub) else np.asarray(A_ub),  # type: ignore[arg-type]
         b_ub=np.asarray(b_ub),  # type: ignore[arg-type]
-        A_eq=np.asarray(A_eq),  # type: ignore[arg-type]
+        A_eq=A_eq if _sp_issparse(A_eq) else np.asarray(A_eq),  # type: ignore[arg-type]
         b_eq=np.asarray(b_eq),  # type: ignore[arg-type]
         quadratic_constraints=q_rows,
         x_l=np.asarray(x_l),  # type: ignore[arg-type]
@@ -1025,12 +1149,18 @@ def _extract_lp_data_from_repr(model: Model) -> LPData:
         ej[j] = 1.0
         c[j] = repr_.evaluate_objective(ej) - obj_at_zero
 
-    # Extract constraint data
-    eq_rows = []
-    eq_rhs = []
-    ineq_rows = []
-    ineq_senses = []
-    ineq_rhs = []
+    # Extract constraint data. Rows are reduced to their nonzeros as soon as they
+    # are probed (#863): retaining n_con dense (n_orig,) vectors and np.stack()ing
+    # them is 91.5 GB on watercontamination0202 and needs every row resident at once.
+    eq_terms: list[dict[int, float]] = []
+    eq_rhs: list[float] = []
+    ineq_terms: list[dict[int, float]] = []
+    ineq_senses: list[str] = []
+    ineq_rhs: list[float] = []
+
+    def _row_terms(vec) -> dict[int, float]:
+        (nz,) = np.nonzero(vec)
+        return {int(j): float(vec[j]) for j in nz}
 
     for i in range(n_con):
         sense = repr_.constraint_sense(i)
@@ -1044,48 +1174,43 @@ def _extract_lp_data_from_repr(model: Model) -> LPData:
             a_row[j] = repr_.evaluate_constraint(i, ej) - g_at_zero
 
         if sense == "==":
-            eq_rows.append(a_row)
+            eq_terms.append(_row_terms(a_row))
             eq_rhs.append(rhs_val - g_at_zero)
         elif sense == "<=":
-            ineq_rows.append(a_row)
+            ineq_terms.append(_row_terms(a_row))
             ineq_senses.append("le")
             ineq_rhs.append(rhs_val - g_at_zero)
         elif sense == ">=":
-            ineq_rows.append(a_row)
+            ineq_terms.append(_row_terms(a_row))
             ineq_senses.append("ge")
             ineq_rhs.append(rhs_val - g_at_zero)
 
-    n_eq = len(eq_rows)
-    n_ineq = len(ineq_rows)
+    n_eq = len(eq_terms)
+    n_ineq = len(ineq_terms)
     n_slack = n_ineq
     n_total = n_orig + n_slack
 
-    A_rows = []
-    b_vals = []
+    coo_rows: list[int] = []
+    coo_cols: list[int] = []
+    coo_vals: list[float] = []
+    b_vals: list[float] = []
 
     for i in range(n_eq):
-        row_full = np.zeros(n_total, dtype=np.float64)
-        row_full[:n_orig] = eq_rows[i]
-        A_rows.append(row_full)
+        _append_row_coo(coo_rows, coo_cols, coo_vals, i, eq_terms[i])
         b_vals.append(eq_rhs[i])
 
     for i in range(n_ineq):
-        row_full = np.zeros(n_total, dtype=np.float64)
-        row_full[:n_orig] = ineq_rows[i]
-        if ineq_senses[i] == "le":
-            row_full[n_orig + i] = 1.0
-        else:
-            row_full[n_orig + i] = -1.0
-        A_rows.append(row_full)
+        r = n_eq + i
+        _append_row_coo(coo_rows, coo_cols, coo_vals, r, ineq_terms[i])
+        # body <= 0 becomes body + s = 0; body >= 0 becomes body - s = 0; s >= 0.
+        coo_rows.append(r)
+        coo_cols.append(n_orig + i)
+        coo_vals.append(1.0 if ineq_senses[i] == "le" else -1.0)
         b_vals.append(ineq_rhs[i])
 
     m_total = n_eq + n_ineq
-    if m_total > 0:
-        A_eq = np.stack(A_rows).astype(np.float64)
-        b_eq = np.array(b_vals, dtype=np.float64)
-    else:
-        A_eq = np.zeros((0, n_total), dtype=np.float64)
-        b_eq = np.zeros(0, dtype=np.float64)
+    A_eq = _materialise_A(coo_rows, coo_cols, coo_vals, m_total, n_total)
+    b_eq = np.array(b_vals, dtype=np.float64)
 
     x_l_orig, x_u_orig = _get_variable_bounds(model)
     c_full = np.concatenate([c, np.zeros(n_slack, dtype=np.float64)])
@@ -1107,7 +1232,7 @@ def _extract_lp_data_from_repr(model: Model) -> LPData:
     # row per component. (A NaN reaching the LP solver otherwise crashes/hangs
     # HiGHS — issue surfaced via test_mol_collocation_solves.)
     for _name, _arr in (("c", c_full), ("A_eq", A_eq), ("b_eq", b_eq)):
-        if _arr.size and not np.isfinite(_arr).all():
+        if not _all_finite(_arr):
             raise _NotLinearError(
                 f"repr-based LP extraction produced non-finite {_name}; the model "
                 "has vector-valued constraints that are not scalar-representable"
@@ -1115,7 +1240,10 @@ def _extract_lp_data_from_repr(model: Model) -> LPData:
 
     return LPData(
         c=np.asarray(c_full),  # type: ignore[arg-type]
-        A_eq=np.asarray(A_eq),  # type: ignore[arg-type]
+        # Preserve sparsity: np.asarray() on a sparse matrix silently yields a 0-d
+        # object array rather than raising, which would smuggle garbage into every
+        # consumer (#863). Consumers densify via dense_A().
+        A_eq=A_eq if _sp_issparse(A_eq) else np.asarray(A_eq),  # type: ignore[arg-type]
         b_eq=np.asarray(b_eq),  # type: ignore[arg-type]
         x_l=np.asarray(x_l),  # type: ignore[arg-type]
         x_u=np.asarray(x_u),  # type: ignore[arg-type]
@@ -1338,9 +1466,10 @@ def _extract_qcp_data_from_repr(model: Model) -> QCPData:
         n_orig,
     )
 
-    ub_rows: list[np.ndarray] = []
+    # COO accumulators rather than lists of dense rows (#863); see _materialise_A.
+    ub_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
     ub_rhs: list[float] = []
-    eq_rows: list[np.ndarray] = []
+    eq_coo: tuple[list[int], list[int], list[float]] = ([], [], [])
     eq_rhs: list[float] = []
     q_rows: list[QuadraticConstraintData] = []
 
@@ -1362,19 +1491,19 @@ def _extract_qcp_data_from_repr(model: Model) -> QCPData:
             )
             continue
         if sense == "==":
-            eq_rows.append(row_c)
+            _append_dense_row_coo(*eq_coo, len(eq_rhs), row_c)
             eq_rhs.append(rhs)
         elif sense == "<=":
-            ub_rows.append(row_c)
+            _append_dense_row_coo(*ub_coo, len(ub_rhs), row_c)
             ub_rhs.append(rhs)
         elif sense == ">=":
-            ub_rows.append(-row_c)
+            _append_dense_row_coo(*ub_coo, len(ub_rhs), -row_c)
             ub_rhs.append(-rhs)
 
     x_l, x_u = _get_variable_bounds(model)
-    A_ub = np.stack(ub_rows).astype(np.float64) if ub_rows else _empty_matrix(n_orig)
+    A_ub = _materialise_A(*ub_coo, len(ub_rhs), n_orig)
     b_ub = np.asarray(ub_rhs, dtype=np.float64)
-    A_eq = np.stack(eq_rows).astype(np.float64) if eq_rows else _empty_matrix(n_orig)
+    A_eq = _materialise_A(*eq_coo, len(eq_rhs), n_orig)
     b_eq = np.asarray(eq_rhs, dtype=np.float64)
 
     if repr_.objective_sense == "maximize":
@@ -1385,9 +1514,10 @@ def _extract_qcp_data_from_repr(model: Model) -> QCPData:
     return QCPData(
         Q=np.asarray(Q),  # type: ignore[arg-type]
         c=np.asarray(c_vec),  # type: ignore[arg-type]
-        A_ub=np.asarray(A_ub),  # type: ignore[arg-type]
+        # Preserve sparsity (see dense_A / #863).
+        A_ub=A_ub if _sp_issparse(A_ub) else np.asarray(A_ub),  # type: ignore[arg-type]
         b_ub=np.asarray(b_ub),  # type: ignore[arg-type]
-        A_eq=np.asarray(A_eq),  # type: ignore[arg-type]
+        A_eq=A_eq if _sp_issparse(A_eq) else np.asarray(A_eq),  # type: ignore[arg-type]
         b_eq=np.asarray(b_eq),  # type: ignore[arg-type]
         quadratic_constraints=tuple(q_rows),
         x_l=np.asarray(x_l),  # type: ignore[arg-type]
