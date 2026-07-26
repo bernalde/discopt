@@ -56,6 +56,52 @@ discopt is a hybrid Mixed-Integer Nonlinear Programming (MINLP) solver combining
      One passing graduation-gate run meeting both bars suffices — consecutive
      nightly runs are no longer required.)
 
+## Measurement & instrumentation discipline
+
+§4 says no fix ships on a hypothesis. In practice the failure is rarely a *wrong*
+measurement — it is a measurement that **never happened** and reported success
+anyway. Every rule here is from an instrument that silently measured nothing and
+was believed.
+
+6. **Prove the probe fired.** Every experimental script ends by printing an
+   *executed-assertion count* (or comparison count) and exits non-zero when it is
+   zero. A probe with `if x is None: continue` and no counter degrades to a no-op
+   that prints "0 violations" and reads as a pass. Incidents: a probe traversed
+   nothing because it used `Constraint.lhs`/`.expr` (the real attribute is
+   `.body`); an attribution probe gated only the *root* dive, making its "neither"
+   arm meaningless; a sparse-parity test that never asserted
+   `scipy.sparse.issparse()` on the forced-sparse arm compared dense against dense
+   and was believed.
+7. **Never swallow an exception in an instrument.** A bare `except` turns "this
+   path is broken" into "this path is fine". `copy.deepcopy(Model)` raises
+   `TypeError: cannot pickle 'builtins.PyModelRepr'`; a bare `except` hid it and an
+   entire fallback was an invisible no-op while reported as working. Let probes
+   crash. This is §3 applied to the thing you are using to judge §3.
+8. **Verify which code you actually loaded.** Before any measurement in a worktree
+   or against a branch, assert both `module.__file__` *and* a marker string unique
+   to the version under test (and, for a baseline run, assert that marker
+   **absent**). A `pytest` run silently imported `discopt` from the main tree
+   instead of the worktree and produced 19 bogus failures.
+9. **Timing claims require a load gate, an interleaved control, and a spread.**
+   Check `uptime`; run A/B interleaved, not sequentially; report a standard
+   deviation. Two claims were published and retracted this way: "leftover model
+   state slows relaxation ~40%" (true value +2%, pooled sd 4.55 — an unrelated
+   pytest held ~87% CPU) and a `gastrans040` regression that was a timing artifact.
+   **Check for stray load you created yourself**: one round was invalidated by
+   three zombie probes at 99% CPU that survived a `pkill`.
+10. **A long job needs incremental output, and "no output" is not "dead".** Print
+    per-item progress with `python -u`/`flush=True` and never send stderr to
+    `/dev/null`. A background sweep that only prints a summary at the end was twice
+    declared dead while still running, and the second time a competing job was
+    launched that then timed out on the contention. Confirm with `pgrep` and a
+    growing log before concluding anything. For a step that may never return,
+    `faulthandler.dump_traceback_later` is the tool — a timing wrapper that prints
+    on return never fires for a call that does not return.
+11. **When a measurement contradicts a claim you already published, retract it in
+    writing** — in the PR, the issue, or the plan doc — before continuing. §4
+    already requires recording falsifications; this extends it to your *own* prior
+    statements in the same session.
+
 ## Workflow
 
 - **Feature branches + PRs, always.** Work happens on a feature branch
@@ -70,6 +116,17 @@ discopt is a hybrid Mixed-Integer Nonlinear Programming (MINLP) solver combining
   before the change and passes after.
 - Benchmark/perf claims in a PR must include the measurement (suite, baseline,
   numbers), not adjectives.
+- **Never write an issue-closing keyword near a negation.** GitHub matches the
+  substring: "Does **NOT** close #863" auto-closed #863 from PR #868. Write
+  "supersedes #863" / "leaves #863 open", and re-check issue state after merging
+  any PR whose body names an issue number.
+- **Look up an API before calling it; do not guess attribute names.** One `grep`
+  costs seconds; guessing cost four failed runs in a single probe (`Model.variables`,
+  `Model.from_nl`, `m._sense`, `m.objective_sense` — the real names are
+  `model._variables` and the module-level `from_nl`).
+- **Re-derive any order-of-magnitude figure before stating it.** A dense `A_eq` was
+  reported as 91.5 **TB**; it is 91.5 **GB**. Numbers in a PR or issue are read as
+  measurements.
 
 ### Working on an issue
 
@@ -101,6 +158,11 @@ not when a first increment lands. The lifecycle:
    summary of what changed and how it was verified, ending with an explicit
    statement of **whether the issue can be closed or not** — and if not, exactly
    what remains.
+6. **Finish rather than document.** Writing an issue, a plan doc, or a follow-up is
+   not progress on the fix and must never be substituted for it. If an
+   investigation has produced three artifacts and no code change, that is the
+   signal to stop analyzing and start building. Filing a follow-up is the §3
+   exception, not the default deliverable.
 
 ## Canonical planning documents
 
@@ -219,6 +281,18 @@ Optional LLM-powered features using litellm as a universal adapter (100+ provide
 - **ruff** line-length is 100 chars, targeting Python 3.10+. Pinned to v0.14.6 across pre-commit and CI.
 - **Coverage** must stay ≥85% (restored by #87 after the post-AMP-merge lowering).
 - Tests have a 300-second default timeout (configurable in `pyproject.toml`).
+- **`np.asarray()` on a scipy sparse matrix does not raise** — it returns a 0-d
+  object array, so a missed call site feeds garbage onward silently. Use the
+  `dense_Q()` / `dense_A()` helpers in `_jax/problem_classifier.py`, which raise on
+  object/non-2-D input. One such call site was found inside
+  `_quadratic_rows_solution_feasible` — a *feasibility check*, which it would have
+  rendered meaningless. Related: `.size` on a sparse matrix is `nnz`, not rows×cols.
+- **`INF` in the Rust LP layer is the sentinel `1e20`, not `f64::INFINITY`.** Test
+  unboundedness on the *bound* (`hi >= INF`), never on a product like `a_ij * hi`:
+  for `|a_ij| < 1` the product of an unbounded bound is an ordinary finite number,
+  which both defeats the infinity check and destroys smaller terms in a running sum
+  by cancellation. This produced invalid FBBT tightenings that cut the optimum out
+  of the box and returned a certified-`optimal` false bound.
 
 <!-- crucible-project -->
 ## Crucible Knowledge Base
