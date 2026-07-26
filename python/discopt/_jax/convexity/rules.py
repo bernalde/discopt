@@ -56,6 +56,7 @@ Ceccon, Siirola, Misener (2020), "SUSPECT," TOP.
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from collections.abc import Callable
@@ -103,6 +104,8 @@ from .lattice import (
     unary_atom_profile,
 )
 from .linear_context import LinearContext, build_linear_context, extract_affine
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -1056,8 +1059,14 @@ def _recursion_headroom_need(model: Model) -> int:
     size = len(getattr(model, "_constraints", []) or [])
     try:
         size += sum(int(np.size(v.lb)) for v in model._variables)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - the constraint count alone still gates the estimate
+        # Under-counting only risks *not* engaging the deep-stack path, so the
+        # failure shows up later as a RecursionError with no obvious cause.
+        logger.debug(
+            "variable-size term of the recursion estimate unavailable: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
     if size <= _DEEP_RECURSION_SIZE_GATE:
         return 0
     return min(2000 + 60 * size, _DEEP_RECURSION_LIMIT_CAP)

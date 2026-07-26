@@ -418,8 +418,10 @@ def _solve_nlp_relaxation(evaluator, lb, ub, nlp_solver: str) -> np.ndarray | No
 
         if result.status == SolveStatus.OPTIMAL and result.x is not None:
             return np.asarray(result.x, dtype=np.float64)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - no relaxation point is handled by the caller
+        # Capability-disabling: without this point LOA starts from no relaxation
+        # solution at all, so a silent skip looks like "the relaxation is useless".
+        logger.debug("GDP NLP relaxation solve failed: %s: %s", type(exc).__name__, exc)
     return None
 
 
@@ -477,8 +479,10 @@ def _solve_nlp_subproblem(evaluator, sub_lb, sub_ub, nlp_solver: str) -> np.ndar
                             break
                 if feas:
                     return x_sol
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - no subproblem point is handled by the caller
+        # Capability-disabling: a swallowed failure here means LOA silently never
+        # gets an upper bound from this configuration.
+        logger.debug("GDP fixed-integer NLP subproblem failed: %s: %s", type(exc).__name__, exc)
     return None
 
 

@@ -1362,8 +1362,10 @@ def _solve_nlp_attempt(
                     multipliers=result.multipliers,
                     status=result.status,
                 )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - an empty attempt is handled by the caller
+        # Capability-disabling: no NLP point means no OA linearization from this
+        # node, which reads as "OA cuts don't help" rather than as a failure.
+        logger.debug("OA NLP subproblem raised: %s: %s", type(exc).__name__, exc)
     return _NLPAttempt(x=None, objective=None, multipliers=None)
 
 
@@ -1728,8 +1730,12 @@ def _solve_feasibility_subproblem(
             candidate_merit = _constraint_violation_merit(evaluator, candidate, feasibility_norm)
             if candidate_merit <= best_merit + 1e-9:
                 best_x = candidate
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - falls back to the clipped master point
+        logger.debug(
+            "OA feasibility restoration failed, keeping the clipped master point: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     return best_x
 

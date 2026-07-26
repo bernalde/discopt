@@ -32,11 +32,14 @@ Dependencies: A3 (Python passes participate in the orchestrator via
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import numpy as np
 
 from .protocol import make_python_delta
+
+logger = logging.getLogger(__name__)
 
 
 class ConvexReformPass:
@@ -93,11 +96,19 @@ class ConvexReformPass:
             examined += 1
             try:
                 verdict = certify_convex(body, self.model, box=box)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - abstaining is always sound
                 # Certificate threw — abstain. The pass must never
                 # propagate exceptions because the orchestrator catches
                 # them and stamps an "error" delta, which would
-                # incorrectly imply the model is unprocessable.
+                # incorrectly imply the model is unprocessable. Logged because a
+                # constraint that silently abstains is a convex reformulation that
+                # never happened.
+                logger.debug(
+                    "convexity certificate raised on constraint %d: %s: %s",
+                    ci,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
             sense = getattr(c, "sense", None)
             # `f(x) ≤ rhs` is a convex feasible set when f is convex.

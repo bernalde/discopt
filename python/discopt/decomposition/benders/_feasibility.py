@@ -219,8 +219,8 @@ def certify_recourse_feasibility(
     try:
         c0 = ev.evaluate_constraints(z0)
         z0[ev._n] = max(0.0, float(np.max(c0 + z0[ev._n])) if c0.size else 0.0)
-    except Exception:  # noqa: BLE001 - evaluation is best-effort for the seed
-        pass
+    except Exception as exc:  # noqa: BLE001 - evaluation is best-effort for the seed
+        logger.debug("phase-1 seed evaluation skipped: %s: %s", type(exc).__name__, exc)
 
     try:
         res = solve_nlp(

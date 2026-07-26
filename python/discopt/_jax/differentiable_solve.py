@@ -13,6 +13,7 @@ jax.jvp) through the solve for all problem classes:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -25,6 +26,8 @@ from discopt._jax.problem_classifier import (
     extract_qp_data,
 )
 from discopt.modeling.core import Model, Parameter
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -253,8 +256,13 @@ def differentiable_solve(
                     qp_data.x_u,
                 )
                 relaxation_obj = float(qp_relax_state.obj)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - the result is reported without a relaxation
+            logger.debug(
+                "relaxation objective unavailable for %s: %s: %s",
+                problem_class,
+                type(exc).__name__,
+                exc,
+            )
 
         x_flat = None
         x_dict = None

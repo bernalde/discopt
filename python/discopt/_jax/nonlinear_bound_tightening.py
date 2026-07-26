@@ -8,6 +8,7 @@ future rules can be added without changing solver-side plumbing.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, NoReturn, Optional, Sequence, TypeVar
 
@@ -29,6 +30,8 @@ from discopt.modeling.core import (
     Variable,
     VarType,
 )
+
+logger = logging.getLogger(__name__)
 
 is_effectively_finite = _is_effectively_finite
 
@@ -128,8 +131,10 @@ def _get_struct_cache(model: Model) -> dict:
         }
         try:
             setattr(model, "_nl_struct_cache", cache)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - the docstring's documented degradation
+            # Non-persistent cache -> recomputation per call, which is a real cost
+            # the profile would otherwise attribute to the decomposition itself.
+            logger.debug("FBBT structural cache not persisted: %s: %s", type(exc).__name__, exc)
     return cache
 
 

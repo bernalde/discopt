@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import signal
 import socket
@@ -27,6 +28,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from discopt import __version__
+
+logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT = 5.0
 _SPAWN_WAIT = 30.0
@@ -98,8 +101,10 @@ def _clear_jax_caches() -> None:
     if mod is not None:
         try:
             mod.clear_caches()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - reclaiming memory must never kill the daemon
+            # Worth seeing: a persistently failing clear is why RSS keeps climbing
+            # across solves in a long-lived daemon.
+            logger.debug("jax.clear_caches() failed: %s: %s", type(exc).__name__, exc)
 
 
 def socket_path_for(env_var: str, basename: str) -> Path:
@@ -182,7 +187,13 @@ class _DeadlineWatchdog:
                 # parent (if it already exited we were reparented away from it).
                 if os.getppid() == parent:
                     os.kill(parent, signal.SIGKILL)
-            except BaseException:
+            except OSError:
+                # The daemon already exited (ESRCH) or we may not signal it
+                # (EPERM): nothing to enforce, exit quietly. Narrowed from a
+                # blind ``except BaseException`` — the ``finally`` below already
+                # guarantees the child cannot escape, and this is a forked child
+                # where taking the logging lock could deadlock, so anything else
+                # must surface as a traceback rather than vanish.
                 pass
             finally:
                 os._exit(0)

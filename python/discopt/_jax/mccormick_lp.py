@@ -2001,7 +2001,8 @@ class MccormickLPRelaxer:
                     try:
                         gval = float(jnp.reshape(r.value_fn(xv), ()))
                         grad = np.asarray(r.grad_fn(xv), dtype=np.float64).ravel()
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 - a missing cut is always safe
+                        logger.debug("OA cut evaluation skipped: %s: %s", type(exc).__name__, exc)
                         continue
                     if not np.isfinite(gval) or not all(
                         j < grad.size and np.isfinite(grad[j]) for j in r.idxs

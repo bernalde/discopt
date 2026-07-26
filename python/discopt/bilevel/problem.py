@@ -42,6 +42,7 @@ Example
 
 from __future__ import annotations
 
+import logging
 import warnings
 from typing import TypeGuard
 
@@ -52,6 +53,8 @@ from discopt.bilevel import strong_duality as _sd
 from discopt.bilevel.symbolic_diff import diff
 from discopt.modeling.core import Constant, Constraint, Expression, Model, Variable, VarType
 from discopt.mpec import reformulate_gdp, reformulate_sos1
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["BilevelProblem"]
 
@@ -470,7 +473,13 @@ class BilevelProblem:
                 continue
             try:
                 val = float(np.max(np.abs(np.asarray(result.value(mu)))))
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - an unreadable multiplier cannot be checked
+                logger.debug(
+                    "multiplier '%s' not readable for the bound check: %s: %s",
+                    mu.name,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
             if val >= m - tol:
                 warnings.warn(
