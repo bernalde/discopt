@@ -8,7 +8,9 @@ future rules can be added without changing solver-side plumbing.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable, NoReturn, Optional, Sequence, TypeVar
 
@@ -174,6 +176,45 @@ class NonlinearBoundTighteningStats:
     applied_rules: tuple[str, ...]
     infeasible: bool = False
     infeasibility_reason: Optional[str] = None
+    #: True when the pass stopped early because its ``deadline`` passed, so the
+    #: returned box is a valid but *incomplete* tightening (fewer rules ran, or a
+    #: rule saw only a prefix of the constraints). Never set when no deadline was
+    #: given. Purely informational — the box itself is sound either way.
+    deadline_reached: bool = False
+
+
+# Constraints between two ``time.perf_counter()`` reads inside a rule's row scan.
+# The read is ~50 ns and a row's match attempt is orders of magnitude more, so the
+# stride is free; it exists so the poll cannot be starved by a cheap-row model.
+# Granularity matters more than the poll's existence: #868 found ``probing`` polling
+# its deadline once per binary on an instance with 7 binaries and 107k constraints,
+# which is a poll that never fires in time.
+_DEADLINE_POLL_STRIDE = 64
+
+
+def _rows_until(model: Model, deadline: Optional[float]):
+    """Iterate ``model._constraints``, stopping once ``deadline`` passes.
+
+    ``deadline`` is an absolute ``time.perf_counter()`` value, or ``None`` for the
+    unbounded legacy behaviour (the constraint list is then returned as-is, so a
+    budget-free call has *zero* added cost and is byte-identical to before).
+
+    Every rule in this module only ever *intersects* the incoming box, and each
+    constraint's inference is independently valid, so consuming a prefix of the rows
+    yields a valid — merely looser — box. Stopping early is a "do less" bail, never
+    a "do wrong" one (issue #875; same contract as the Rust presolve passes' `_until`
+    variants from #868).
+    """
+    if deadline is None:
+        return model._constraints
+    return _iter_rows_until(model._constraints, deadline)
+
+
+def _iter_rows_until(rows, deadline: float):
+    for i, row in enumerate(rows):
+        if i % _DEADLINE_POLL_STRIDE == 0 and time.perf_counter() >= deadline:
+            return
+        yield row
 
 
 class NonlinearBoundTighteningInfeasible(ValueError):
@@ -188,9 +229,29 @@ _RECIPROCAL_INTERVAL_INFEASIBLE = _ReciprocalIntervalInfeasible()
 
 
 class NonlinearBoundTighteningRule:
-    """Base class for extensible nonlinear bound tightening rules."""
+    """Base class for extensible nonlinear bound tightening rules.
+
+    A rule MAY declare a trailing ``deadline: Optional[float] = None`` parameter on
+    :meth:`tighten`; :func:`tighten_nonlinear_bounds` detects that and passes the
+    absolute ``time.perf_counter()`` budget through, so the rule can stop scanning
+    rows (via :func:`_rows_until`) instead of running the whole constraint list. A
+    rule without the parameter keeps the four-argument contract exactly and is
+    simply called without it — external rules do not need to change.
+    """
 
     name = "unnamed_rule"
+
+    #: True only when consuming a PREFIX of ``model._constraints`` yields a valid
+    #: (merely looser) box — i.e. every row's inference stands on its own and the
+    #: rule draws no conclusion from a row being *absent*.
+    #:
+    #: Default ``False``, deliberately: a rule that accumulates across rows and then
+    #: acts on the complement (``PeriodicVariableBoundRule`` restricts a variable to
+    #: one period precisely because nothing *else* in the model uses it) would cut
+    #: feasible points if a truncated scan missed the disqualifying row. Under a
+    #: budget such a rule is skipped whole rather than run on a prefix, so the safe
+    #: default is the one a new rule inherits without thinking about it.
+    row_scan_is_anytime: bool = False
 
     def tighten(
         self,
@@ -198,8 +259,34 @@ class NonlinearBoundTighteningRule:
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         raise NotImplementedError
+
+
+_RULE_ACCEPTS_DEADLINE: dict[type, bool] = {}
+
+
+def _rule_accepts_deadline(rule: NonlinearBoundTighteningRule) -> bool:
+    """True when ``rule.tighten`` declares a ``deadline`` parameter (memoized).
+
+    Signature inspection rather than a try/except around the call: a ``TypeError``
+    raised from *inside* a rule must not be mistaken for "this rule has the old
+    signature" and silently retried unbudgeted.
+    """
+    cls = type(rule)
+    hit = _RULE_ACCEPTS_DEADLINE.get(cls)
+    if hit is None:
+        try:
+            params = inspect.signature(cls.tighten).parameters
+            hit = "deadline" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError) as exc:
+            logger.debug("cannot inspect %s.tighten, assuming no deadline: %s", cls.__name__, exc)
+            hit = False
+        _RULE_ACCEPTS_DEADLINE[cls] = hit
+    return hit
 
 
 def _constant_value(expr) -> Optional[float]:
@@ -623,6 +710,10 @@ class SumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
     """Tighten bounds from constraints like sum(a_i * x_i^2) <= c."""
 
     name = "sum_of_squares_upper_bound"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_square(
         self,
@@ -638,11 +729,12 @@ class SumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -717,6 +809,10 @@ class SqrtSumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
     """Tighten bounds from constraints like sqrt(sum(a_i * x_i^2)) <= c."""
 
     name = "sqrt_sum_of_squares_upper_bound"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_square(
         self,
@@ -790,11 +886,12 @@ class SqrtSumOfSquaresUpperBoundRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -861,6 +958,10 @@ class SeparableQuadraticUpperBoundRule(NonlinearBoundTighteningRule):
     """Tighten bounds from separable convex quadratic constraints like x + y^2 <= c."""
 
     name = "separable_quadratic_upper_bound"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_square(
         self,
@@ -876,11 +977,12 @@ class SeparableQuadraticUpperBoundRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -1083,6 +1185,10 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
     """Propagate equalities like y == exp(a*x + b) in both directions."""
 
     name = "monotone_function_equality"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_function(
         self,
@@ -1123,11 +1229,12 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) != "==":
                 continue
 
@@ -1266,6 +1373,10 @@ class MonotoneFunctionBoundsRule(NonlinearBoundTighteningRule):
     """Tighten affine arguments of monotone unary function constraints."""
 
     name = "monotone_function_bounds"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_function(
         self,
@@ -1306,11 +1417,12 @@ class MonotoneFunctionBoundsRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -1399,6 +1511,10 @@ class QuadraticEqualityBoundsRule(NonlinearBoundTighteningRule):
     """Propagate equalities like x == y**2 in both directions."""
 
     name = "quadratic_equality_bounds"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     @staticmethod
     def _square_interval(lb: float, ub: float) -> tuple[float, float]:
@@ -1442,11 +1558,12 @@ class QuadraticEqualityBoundsRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) != "==":
                 continue
 
@@ -1566,6 +1683,10 @@ class SquareDifferenceLowerBoundRule(NonlinearBoundTighteningRule):
     """Tighten the leading square in equalities like ``a*x^2 = b*y^2 + c*z^2``."""
 
     name = "square_difference_lower_bound"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _collect_square_sum(
         self,
@@ -1626,11 +1747,12 @@ class SquareDifferenceLowerBoundRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) != "==":
                 continue
 
@@ -1762,6 +1884,10 @@ class PositiveAffineReciprocalBoundsRule(NonlinearBoundTighteningRule):
     """Propagate ``c / positive_affine >= rhs`` into affine upper bounds."""
 
     name = "positive_affine_reciprocal_bounds"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def tighten(
         self,
@@ -1769,12 +1895,13 @@ class PositiveAffineReciprocalBoundsRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
         n_vars = len(flat_lb)
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -1831,6 +1958,10 @@ class NegativePowerBoundsRule(NonlinearBoundTighteningRule):
     """Infer strict positive lower bounds from ``x**p <= affine`` for ``p < 0``."""
 
     name = "negative_power_bounds"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def tighten(
         self,
@@ -1838,12 +1969,13 @@ class NegativePowerBoundsRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
         n_vars = len(flat_lb)
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -1924,6 +2056,10 @@ class ReciprocalBoundsRule(NonlinearBoundTighteningRule):
     """Tighten sign-stable affine denominators in simple reciprocal constraints."""
 
     name = "reciprocal_bounds"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_scaled_reciprocal(
         self,
@@ -1985,11 +2121,12 @@ class ReciprocalBoundsRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) not in ("<=", "=="):
                 continue
 
@@ -2145,6 +2282,10 @@ class BilinearProductEqualityRule(NonlinearBoundTighteningRule):
     """
 
     name = "bilinear_product_equality"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
     def _match_product_term(
         self, term, metadata: FlatVariableMetadata
@@ -2196,12 +2337,13 @@ class BilinearProductEqualityRule(NonlinearBoundTighteningRule):
         flat_lb: np.ndarray,
         flat_ub: np.ndarray,
         metadata: FlatVariableMetadata,
+        deadline: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         tightened_lb = flat_lb.copy()
         tightened_ub = flat_ub.copy()
         eps = 1e-9
 
-        for constraint in model._constraints:
+        for constraint in _rows_until(model, deadline):
             if getattr(constraint, "sense", None) != "==":
                 continue
 
@@ -2291,8 +2433,12 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
     """
 
     name = "function_domain_bound"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
-    def tighten(self, model, flat_lb, flat_ub, metadata):
+    def tighten(self, model, flat_lb, flat_ub, metadata, deadline=None):
         lb = np.asarray(flat_lb, dtype=np.float64).copy()
         ub = np.asarray(flat_ub, dtype=np.float64).copy()
 
@@ -2341,7 +2487,7 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
         try:
             if model._objective is not None:
                 walk(model._objective.expression)
-            for c in model._constraints:
+            for c in _rows_until(model, deadline):
                 walk(c.body)
         except NonlinearBoundTighteningInfeasible:
             # An empty argument domain is a genuine infeasibility proof; let it
@@ -2376,7 +2522,17 @@ class PeriodicVariableBoundRule(NonlinearBoundTighteningRule):
 
     name = "periodic_variable_bound"
 
-    def tighten(self, model, flat_lb, flat_ub, metadata):
+    # NOT anytime (the base-class default, restated because this rule is the reason
+    # the default exists). The reduction is justified by what the model does *not*
+    # contain: a variable stays in ``periodic - disqualified`` only while no scanned
+    # row uses it outside ``sin``/``cos``. A scan cut short at a deadline could miss
+    # exactly the disqualifying row and shrink a variable that is genuinely used
+    # elsewhere to one period — cutting feasible points. Under a budget this rule is
+    # therefore skipped whole; ``deadline`` is accepted and deliberately unused.
+    row_scan_is_anytime = False
+
+    def tighten(self, model, flat_lb, flat_ub, metadata, deadline=None):
+        del deadline  # see row_scan_is_anytime above: this scan must be complete
         lb = np.asarray(flat_lb, dtype=np.float64).copy()
         ub = np.asarray(flat_ub, dtype=np.float64).copy()
         try:
@@ -2439,7 +2595,7 @@ class PeriodicVariableBoundRule(NonlinearBoundTighteningRule):
 
             if model._objective is not None:
                 walk(model._objective.expression)
-            for c in model._constraints:
+            for c in model._constraints:  # must be complete; see row_scan_is_anytime
                 walk(c.body)
 
             if not complete[0]:
@@ -2514,8 +2670,12 @@ class DefinedVariableForwardRule(NonlinearBoundTighteningRule):
     """
 
     name = "defined_variable_forward"
+    # Each row's inference stands alone (bounds derived from THIS constraint,
+    # intersected into the box), so a prefix of the rows is a looser-but-valid
+    # tightening -- safe to stop at a deadline mid-scan (#875).
+    row_scan_is_anytime = True
 
-    def tighten(self, model, flat_lb, flat_ub, metadata):
+    def tighten(self, model, flat_lb, flat_ub, metadata, deadline=None):
         from discopt._jax.convexity.interval import Interval
         from discopt._jax.convexity.interval_eval import evaluate_interval
 
@@ -2535,7 +2695,7 @@ class DefinedVariableForwardRule(NonlinearBoundTighteningRule):
             if sz == 1:
                 idx_to_var[off] = var
 
-        for con in model._constraints:
+        for con in _rows_until(model, deadline):
             if getattr(con, "sense", None) != "==":
                 continue
             rhs = float(getattr(con, "rhs", 0.0) or 0.0)
@@ -2667,8 +2827,38 @@ def tighten_nonlinear_bounds(
     flat_ub: np.ndarray,
     rules: Sequence[NonlinearBoundTighteningRule] = DEFAULT_NONLINEAR_BOUND_RULES,
     max_rounds: int = 5,
+    deadline: Optional[float] = None,
 ) -> tuple[np.ndarray, np.ndarray, NonlinearBoundTighteningStats]:
-    """Run registered nonlinear tightening rules on a variable box."""
+    """Run registered nonlinear tightening rules on a variable box.
+
+    ``deadline`` is an absolute ``time.perf_counter()`` value bounding the whole
+    pass, or ``None`` (the default) for the unbounded legacy behaviour, which is
+    byte-identical to before — the polls are the only difference, and none of them
+    can fire.
+
+    Why it exists (issue #875). This is up to ``max_rounds`` sweeps over every rule,
+    and every rule walks every constraint; nothing downstream bounded it, because it
+    runs *before* the first branch-and-bound node exists. Measured on
+    ``watercontamination0202`` (106,711 vars / 107,209 rows), the three root-setup
+    calls cost **80.9 s against a 30 s ``time_limit``**. Same class as the LP-engine
+    loops of #858 and the Rust presolve passes of #868, one layer up each time.
+
+    The budget is honoured at three granularities, coarsest first: between rounds,
+    between rules, and — for a rule that declares ``row_scan_is_anytime`` — inside
+    its constraint scan (:func:`_rows_until`). The innermost one is what makes the
+    poll real rather than nominal: a single rule's sweep over 107k rows already
+    exceeds a tight budget, so a between-rules-only poll would be #868's ``probing``
+    all over again.
+
+    Soundness. Every early exit does strictly *less* work: rules only intersect the
+    incoming box, so a dropped round, a skipped rule, or an unscanned row leaves the
+    box **looser**, never wrong. A rule whose conclusion depends on a row being
+    *absent* is skipped whole rather than truncated (see
+    :attr:`NonlinearBoundTighteningRule.row_scan_is_anytime`). The one thing a
+    budget can cost is an infeasibility *proof* the full pass would have found —
+    ``infeasible`` stays unset and branch-and-bound discovers it instead, which is
+    weaker, never false.
+    """
     tightened_lb = np.asarray(flat_lb, dtype=np.float64).copy()
     tightened_ub = np.asarray(flat_ub, dtype=np.float64).copy()
     initial_lb = tightened_lb.copy()
@@ -2708,13 +2898,35 @@ def tighten_nonlinear_bounds(
     # so they are explored and validated by the node NLP rather than pruned.
     _snap_tolerant_crossovers(tightened_lb, tightened_ub)
 
+    deadline_reached = False
+
+    def _out_of_budget() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
     for _ in range(max(1, int(max_rounds))):
+        if _out_of_budget():
+            deadline_reached = True
+            break
         round_changed = False
         for rule in rules:
+            # Between-rules poll. A rule that is not ``row_scan_is_anytime`` cannot
+            # be cut mid-scan without risking an unsound conclusion, so this is the
+            # only place it can be declined — never started rather than truncated,
+            # which bounds the overrun to one in-flight rule.
+            if _out_of_budget():
+                deadline_reached = True
+                break
             prev_lb = tightened_lb.copy()
             prev_ub = tightened_ub.copy()
+            rule_kwargs = {}
+            if (
+                deadline is not None
+                and getattr(rule, "row_scan_is_anytime", False)
+                and _rule_accepts_deadline(rule)
+            ):
+                rule_kwargs["deadline"] = deadline
             try:
-                cand_lb, cand_ub = rule.tighten(model, prev_lb, prev_ub, metadata)
+                cand_lb, cand_ub = rule.tighten(model, prev_lb, prev_ub, metadata, **rule_kwargs)
             except NonlinearBoundTighteningInfeasible as exc:
                 _mark_rule(rule.name)
                 return (
@@ -2725,6 +2937,7 @@ def tighten_nonlinear_bounds(
                         applied_rules=tuple(applied_rules),
                         infeasible=True,
                         infeasibility_reason=str(exc),
+                        deadline_reached=deadline_reached,
                     ),
                 )
 
@@ -2746,6 +2959,7 @@ def tighten_nonlinear_bounds(
                         infeasibility_reason=(
                             f"{rule.name} returned an empty interval for flat variable {first_idx}"
                         ),
+                        deadline_reached=deadline_reached,
                     ),
                 )
             # Snap sub-tolerance crossovers introduced by intersecting this rule's
@@ -2759,7 +2973,7 @@ def tighten_nonlinear_bounds(
             if n_changed > 0:
                 _mark_rule(rule.name)
                 round_changed = True
-        if not round_changed:
+        if deadline_reached or not round_changed:
             break
 
     return (
@@ -2768,5 +2982,6 @@ def tighten_nonlinear_bounds(
         NonlinearBoundTighteningStats(
             n_tightened=_count_tightened(tightened_lb, tightened_ub),
             applied_rules=tuple(applied_rules),
+            deadline_reached=deadline_reached,
         ),
     )

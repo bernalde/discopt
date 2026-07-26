@@ -2403,8 +2403,16 @@ def _solve_amp_impl(
     if root_changed:
         logger.info("AMP: root FBBT tightened variable bounds before relaxation")
 
+    # Budgeted root-setup pass (#875): every rule walks every constraint, and this
+    # runs before AMP's first relaxation. A share of ``time_limit`` clamped to the
+    # wall actually left; truncation drops tightenings, so the box comes back looser
+    # but never wrong.
+    _nbt_budget_s = min(
+        min(max(0.15 * float(time_limit), 2.0), 30.0),
+        max(0.0, float(time_limit) - (time.perf_counter() - t_start)),
+    )
     tightened_lb, tightened_ub, nonlinear_bt_stats = tighten_nonlinear_bounds(
-        model, flat_lb, flat_ub
+        model, flat_lb, flat_ub, deadline=time.perf_counter() + _nbt_budget_s
     )
     if nonlinear_bt_stats.infeasible:
         logger.info(

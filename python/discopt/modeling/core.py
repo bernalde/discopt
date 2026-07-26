@@ -1673,6 +1673,14 @@ class Parameter(Expression):
 # Solve Result
 # ─────────────────────────────────────────────────────────────
 
+#: The one status whose ``gap_certified=True`` certifies something OTHER than an
+#: optimality gap — an infeasibility proof legitimately carries neither a dual bound
+#: nor an incumbent. Every other status must produce both ends of a gap to claim one;
+#: see :meth:`SolveResult.__post_init__`. Deliberately not widened to ``unbounded``:
+#: that would *weaken* an existing guard, and an unbounded minimize already carries
+#: ``bound=-inf``, so it is decertified by the dual-side check regardless.
+_NON_GAP_CERTIFICATE_STATUSES = frozenset({"infeasible"})
+
 
 @dataclass
 class SolveResult:
@@ -1854,14 +1862,39 @@ class SolveResult:
         # global lower bound at ``-inf``. Reporting ``gap_certified=True`` there
         # is a false certification (the benchmark gate would miscount it as a
         # solved/certified instance), so we downgrade it and clear the
-        # meaningless bound/gap. Infeasibility certificates are exempt:
-        # ``status="infeasible"`` with ``gap_certified=True`` certifies
-        # infeasibility, not a gap, and legitimately carries ``bound=None``.
-        if self.gap_certified and self.status != "infeasible":
+        # meaningless bound/gap. Infeasibility certificates are exempt
+        # (``_NON_GAP_CERTIFICATE_STATUSES``): ``status="infeasible"`` with
+        # ``gap_certified=True`` certifies infeasibility, not a gap, and
+        # legitimately carries ``bound=None``.
+        if self.gap_certified and self.status not in _NON_GAP_CERTIFICATE_STATUSES:
             if self.bound is None or not np.isfinite(self.bound):
                 self.gap_certified = False
                 self.bound = None
                 self.gap = None
+
+        # Same guard, other end of the gap (#875). A gap has two ends, and the check
+        # above only requires the dual one: a ``time_limit`` exit that never found an
+        # incumbent came back ``objective=None, gap=None, gap_certified=True``, which
+        # claims a certified gap where no gap was ever formed. Harmless where nothing
+        # is reported at all, but the flag is exactly what a consumer checks *before*
+        # reading the values — the graduation panels count a ``gap_certified=True``
+        # instance as certified, and the "no certification regression" rule compares
+        # that flag across a flag flip. Reproduced with a 0.5 s budget on a 300-var
+        # bilinear model: ``status=time_limit objective=None bound=-7497.0 gap=None
+        # gap_certified=True nodes=0``.
+        #
+        # This only ever downgrades True -> False, so it cannot manufacture a
+        # certificate; and it leaves ``bound`` alone, because a dual bound with no
+        # incumbent is still a perfectly valid dual bound worth reporting — it is the
+        # *gap* claim that was unfounded. Same exemption as above: a status whose
+        # certificate is not a gap (``infeasible``) is not asked to produce one.
+        if (
+            self.gap_certified
+            and self.objective is None
+            and self.status not in _NON_GAP_CERTIFICATE_STATUSES
+        ):
+            self.gap_certified = False
+            self.gap = None
 
     def value(self, var: Variable) -> np.ndarray:
         """
