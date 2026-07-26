@@ -83,11 +83,22 @@ def tighten_root_bounds_with_fbbt(
     model_repr: Any | None = None,
     max_iter: int = 20,
     tol: float = 1e-8,
+    time_limit_ms: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool, bool]:
     """Run root FBBT and integer-bound rounding for solver tree bounds.
 
     Returns ``(tightened_lb, tightened_ub, infeasible, changed)``. If the Rust
     FBBT binding is unavailable, this still performs sound integer rounding.
+
+    ``time_limit_ms`` caps the FBBT call's wall time (``None`` / 0 = unlimited).
+    FBBT is anytime — it only ever tightens, and each constraint's inference is
+    independently valid — so on expiry it returns the bounds contracted so far,
+    a valid but looser box, and the integer rounding below still runs.
+
+    The cap matters because this is the last step before tree creation and it has
+    no other escape: on ``watercontamination0202`` (106,711 vars / 107,209 rows)
+    ``max_iter=20`` full sweeps ran for **>10 minutes** against a 30 s solve
+    budget, with the deadline unreachable (issue #863).
     """
     orig_lb = np.asarray(lb, dtype=np.float64)
     orig_ub = np.asarray(ub, dtype=np.float64)
@@ -105,7 +116,9 @@ def tighten_root_bounds_with_fbbt(
 
     if model_repr is not None:
         try:
-            fbbt_lbs, fbbt_ubs = model_repr.fbbt(max_iter=max_iter, tol=tol)
+            fbbt_lbs, fbbt_ubs = model_repr.fbbt(
+                max_iter=max_iter, tol=tol, time_limit_ms=time_limit_ms
+            )
             tightened_lb, tightened_ub = _flat_fbbt_bounds(
                 model,
                 np.asarray(fbbt_lbs, dtype=np.float64),

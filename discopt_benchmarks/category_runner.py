@@ -318,6 +318,7 @@ class CategoryBenchmarkRunner:
 
             # Extract LP data
             from discopt._jax.problem_classifier import (
+                dense_A,
                 extract_lp_data_algebraic,
             )
 
@@ -336,7 +337,8 @@ class CategoryBenchmarkRunner:
                 )
             )
 
-            a_eq = np.asarray(lp.A_eq) if lp.A_eq.size > 0 else None
+            _a_eq_dense = dense_A(lp.A_eq)
+            a_eq = _a_eq_dense if _a_eq_dense.size > 0 else None
             b_eq = np.asarray(lp.b_eq) if lp.b_eq.size > 0 else None
 
             start = time.monotonic()

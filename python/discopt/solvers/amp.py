@@ -221,10 +221,11 @@ def _flat_var_index(expr: Expression, model: Model) -> Optional[int]:
     if isinstance(expr, Variable):
         if expr.size != 1:
             return None
-        return sum(existing.size for existing in model._variables[: expr._index])
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return model._flat_var_offset(expr)
     if isinstance(expr, IndexExpression) and isinstance(expr.base, Variable):
         base = expr.base
-        base_offset = sum(existing.size for existing in model._variables[: base._index])
+        base_offset = model._flat_var_offset(base)
         idx = expr.index
         if base.shape == ():
             return base_offset
@@ -1142,10 +1143,8 @@ def _normalize_partition_var_indices(
 
 def _compute_var_offset(var: Variable, model: Model) -> int:
     """Return a variable's start index in the flattened model vector."""
-    offset = 0
-    for existing in model._variables[: var._index]:
-        offset += existing.size
-    return offset
+    # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+    return model._flat_var_offset(var)
 
 
 def _flat_index_from_expr(expr: Expression, model: Model) -> int | None:

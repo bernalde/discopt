@@ -54,6 +54,7 @@
 //! are eligible. No `HashMap` iteration on the hot path.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use super::polynomial::try_polynomial;
 use crate::expr::{ConstraintSense, ExprArena, ExprId, ExprNode, ModelRepr, VarInfo, VarType};
@@ -92,6 +93,28 @@ pub struct AggregationRecord {
 
 /// Run variable aggregation on `model`. Pure function.
 pub fn aggregate_variables(model: &ModelRepr) -> (ModelRepr, AggregationStats) {
+    aggregate_variables_until(model, None)
+}
+
+/// Like [`aggregate_variables`] but stops once `deadline` passes, returning the
+/// aggregations performed so far.
+///
+/// The fixed-point loop applies at most ONE aggregation per outer iteration, and
+/// each iteration calls `try_one_aggregation`, which rebuilds the candidate leaf map
+/// and walks every constraint body. The orchestrator only checks its time budget
+/// *between passes* (`orchestrator.rs`), so without an internal poll a single
+/// invocation runs to completion no matter what `time_limit_ms` says: measured on
+/// `watercontamination0202` (106,711 vars / 107,209 constraints, issue #863) this
+/// pass ran **>90 s against a 7.5 s budget** and was still going.
+///
+/// Bailing mid-loop only performs *fewer* sound aggregations: the returned model
+/// keeps the not-yet-aggregated variables and their defining equalities, so it stays
+/// equivalent to the input. Mirrors
+/// [`super::eliminate::eliminate_variables_until`].
+pub fn aggregate_variables_until(
+    model: &ModelRepr,
+    deadline: Option<Instant>,
+) -> (ModelRepr, AggregationStats) {
     let mut out = model.clone();
     let mut stats = AggregationStats::default();
 
@@ -101,8 +124,14 @@ pub fn aggregate_variables(model: &ModelRepr) -> (ModelRepr, AggregationStats) {
     // one per outer loop and let the orchestrator interleave with the
     // other passes.
     loop {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
         let n_before = stats.variables_aggregated;
-        if let Some((new_model, record)) = try_one_aggregation(&out, &mut stats.candidates_examined)
+        if let Some((new_model, record)) =
+            try_one_aggregation(&out, &mut stats.candidates_examined, deadline)
         {
             out = new_model;
             stats.aggregations.push(record);
@@ -123,11 +152,19 @@ pub fn aggregate_variables(model: &ModelRepr) -> (ModelRepr, AggregationStats) {
 fn try_one_aggregation(
     model: &ModelRepr,
     candidates_examined: &mut usize,
+    deadline: Option<Instant>,
 ) -> Option<(ModelRepr, AggregationRecord)> {
     // Build leaf → block index map for scalar continuous variables.
     let leaves = scalar_continuous_var_leaves(model);
 
     for (ci, c) in model.constraints.iter().enumerate() {
+        // A single scan walks every constraint body against every candidate leaf, so
+        // poll here too: one outer iteration must not overrun unbounded (#863).
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return None;
+            }
+        }
         if c.sense != ConstraintSense::Eq {
             continue;
         }
@@ -519,6 +556,69 @@ mod tests {
         assert_eq!(out.n_vars, 1);
         // y is now at block index 0.
         assert_eq!(out.variables[0].name, "y");
+    }
+
+    #[test]
+    fn honors_past_deadline() {
+        // The same aggregable model as `aggregates_unused_variable`, with a deadline
+        // already in the past. The fixed-point loop applies one aggregation per outer
+        // iteration and rescans every constraint each time, so on a large model a
+        // single invocation runs far past the orchestrator's *between-passes* time
+        // check: >90 s against a 7.5 s budget on watercontamination0202 (#863).
+        // Bailing performs *fewer* sound aggregations, so the model comes back
+        // unchanged and still valid.
+        let mut arena = ExprArena::new();
+        let x = scalar_var(&mut arena, "x", 0);
+        let y = scalar_var(&mut arena, "y", 1);
+        let eq = affine_eq(&mut arena, 1.0, x, -2.0, y, 1.0);
+        let model = ModelRepr {
+            arena,
+            objective: y,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![eq],
+            variables: vec![vinfo("x", -10.0, 10.0), vinfo("y", 0.0, 5.0)],
+            n_vars: 2,
+        };
+
+        // No deadline: the variable is aggregated away (control).
+        let (_out, stats) = aggregate_variables_until(&model, None);
+        assert_eq!(stats.variables_aggregated, 1);
+
+        // Deadline already passed: bail before any work.
+        let past = std::time::Instant::now();
+        let (out, stats) = aggregate_variables_until(&model, Some(past));
+        assert_eq!(
+            stats.variables_aggregated, 0,
+            "aggregation must bail before any work once the deadline has passed"
+        );
+        assert_eq!(stats.equalities_dropped, 0);
+        assert_eq!(out.variables.len(), 2);
+        assert_eq!(out.constraints.len(), 1);
+    }
+
+    #[test]
+    fn future_deadline_does_not_change_the_result() {
+        // A deadline far in the future must be indistinguishable from no deadline.
+        let mut arena = ExprArena::new();
+        let x = scalar_var(&mut arena, "x", 0);
+        let y = scalar_var(&mut arena, "y", 1);
+        let eq = affine_eq(&mut arena, 1.0, x, -2.0, y, 1.0);
+        let model = ModelRepr {
+            arena,
+            objective: y,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![eq],
+            variables: vec![vinfo("x", -10.0, 10.0), vinfo("y", 0.0, 5.0)],
+            n_vars: 2,
+        };
+        let (a_out, a) = aggregate_variables_until(&model, None);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let (b_out, b) = aggregate_variables_until(&model, Some(future));
+        assert_eq!(a.variables_aggregated, b.variables_aggregated);
+        assert_eq!(a.equalities_dropped, b.equalities_dropped);
+        assert_eq!(a.candidates_examined, b.candidates_examined);
+        assert_eq!(a_out.variables.len(), b_out.variables.len());
+        assert_eq!(a_out.constraints.len(), b_out.constraints.len());
     }
 
     #[test]

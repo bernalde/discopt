@@ -78,10 +78,13 @@ class SparsityPattern:
 
 def _var_offset(var: Variable, model: Model) -> int:
     """Compute flat offset for a variable in the concatenated vector."""
-    offset = 0
-    for v in model._variables[: var._index]:
-        offset += v.size
-    return offset
+    # Delegates to ``Model._flat_var_offset``: a memoized exclusive prefix-sum table,
+    # O(1) per lookup, rebuilt only when the (append-only) variable list grows. This
+    # re-summed ``model._variables[: var._index]`` from scratch -- O(n_vars) per
+    # variable REFERENCE -- which is the quadratic #654 removed on the paths it
+    # covered. Pure speedup: ``_variables`` only grows and a Variable's ``_index`` /
+    # ``size`` are immutable, so the value is unchanged (#863).
+    return model._flat_var_offset(var)
 
 
 def _collect_variable_indices(expr: Expression, model: Model) -> set[int]:

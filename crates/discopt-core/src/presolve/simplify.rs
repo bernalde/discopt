@@ -1,6 +1,8 @@
 //! Model simplification: Big-M strengthening, integer bound tightening,
 //! and redundant constraint removal.
 
+use std::time::Instant;
+
 use super::fbbt::{forward_propagate, Interval};
 use crate::expr::{BinOp, ConstraintSense, ExprArena, ExprId, ExprNode, ModelRepr, UnOp, VarType};
 
@@ -27,6 +29,32 @@ pub struct SimplifyResult {
 /// 2. Big-M strengthening (detect M*y patterns, tighten M).
 /// 3. Redundant constraint removal (always-satisfied constraints).
 pub fn simplify(model: &ModelRepr, var_bounds: &mut [Interval]) -> SimplifyResult {
+    simplify_until(model, var_bounds, None)
+}
+
+/// Number of constraints between deadline polls in the scans below. Matches
+/// `fbbt`'s stride; `Instant::now()` is ~20 ns, so this keeps the poll free.
+const SIMPLIFY_DEADLINE_POLL_STRIDE: usize = 64;
+
+/// Like [`simplify`] but stops the constraint scans once `deadline` passes.
+///
+/// Steps 2 and 3 run a `forward_propagate` per constraint, so on a large model a
+/// single invocation is far longer than a tight budget, and the presolve orchestrator
+/// only checks its budget *between passes*: measured on `watercontamination0202`
+/// (106,711 vars / 107,209 constraints, issue #863) this pass ran **>90 s against a
+/// 7.5 s budget** and was still going.
+///
+/// Bailing mid-scan is sound because both scans only ADD to an optional list:
+/// step 2 records big-M strengthenings and step 3 records redundant constraints, so
+/// stopping early strengthens fewer rows and removes fewer redundant ones — a valid,
+/// merely less-reduced model. Step 1 (integer bound rounding) is O(n_vars), not
+/// O(constraints x body), and always runs: it is cheap and its result is needed for
+/// the interval arithmetic in the scans that follow.
+pub fn simplify_until(
+    model: &ModelRepr,
+    var_bounds: &mut [Interval],
+    deadline: Option<Instant>,
+) -> SimplifyResult {
     let mut result = SimplifyResult {
         bigm_tightened: 0,
         integer_bounds_tightened: 0,
@@ -66,6 +94,12 @@ pub fn simplify(model: &ModelRepr, var_bounds: &mut [Interval]) -> SimplifyResul
 
     // 2. Big-M strengthening.
     for (ci, constr) in model.constraints.iter().enumerate() {
+        if let Some(dl) = deadline {
+            if ci % SIMPLIFY_DEADLINE_POLL_STRIDE == 0 && Instant::now() >= dl {
+                result.var_bounds = var_bounds.to_vec();
+                return result;
+            }
+        }
         if constr.sense != ConstraintSense::Le {
             continue;
         }
@@ -84,6 +118,12 @@ pub fn simplify(model: &ModelRepr, var_bounds: &mut [Interval]) -> SimplifyResul
 
     // 3. Redundant constraint removal.
     for (ci, constr) in model.constraints.iter().enumerate() {
+        if let Some(dl) = deadline {
+            if ci % SIMPLIFY_DEADLINE_POLL_STRIDE == 0 && Instant::now() >= dl {
+                result.var_bounds = var_bounds.to_vec();
+                return result;
+            }
+        }
         let node_bounds = forward_propagate(&model.arena, constr.body, var_bounds);
         let body_interval = node_bounds[constr.body.0];
 
@@ -419,6 +459,113 @@ mod tests {
 
         assert_eq!(result.constraints_removed, 1);
         assert_eq!(result.redundant_constraints, vec![0]);
+    }
+
+    #[test]
+    fn simplify_until_honors_past_deadline() {
+        // The big-M and redundancy scans run a forward_propagate per constraint, and
+        // the presolve orchestrator only checks its budget BETWEEN passes, so a single
+        // invocation overran a 7.5 s budget by >12x on watercontamination0202 (#863).
+        //
+        // With the deadline already past, the constraint scans must not run: no
+        // redundant constraint is recorded, so NOTHING is removed. That is sound --
+        // both scans only add to optional lists, so bailing yields a valid,
+        // less-reduced model. Step 1 (integer bound rounding) is O(n_vars) and still
+        // runs.
+        let mut arena = ExprArena::new();
+        let x = arena.add(ExprNode::Variable {
+            name: "x".into(),
+            index: 0,
+            size: 1,
+            shape: vec![],
+        });
+        let model = ModelRepr {
+            arena,
+            objective: ExprId(0),
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body: x,
+                sense: ConstraintSense::Le,
+                rhs: 10.0,
+                name: Some("c1".into()),
+            }],
+            variables: vec![VarInfo {
+                name: "x".into(),
+                var_type: VarType::Integer,
+                offset: 0,
+                size: 1,
+                shape: vec![],
+                lb: vec![0.0],
+                ub: vec![5.0],
+            }],
+            n_vars: 1,
+        };
+
+        // Control: no deadline -> the redundant constraint is found.
+        let mut b0 = vec![Interval::new(0.2, 5.7)];
+        let control = simplify_until(&model, &mut b0, None);
+        assert_eq!(control.constraints_removed, 1);
+        assert_eq!(control.integer_bounds_tightened, 1);
+
+        // Deadline already passed: no constraint scanned, so nothing removed.
+        let past = std::time::Instant::now();
+        let mut b1 = vec![Interval::new(0.2, 5.7)];
+        let bailed = simplify_until(&model, &mut b1, Some(past));
+        assert_eq!(
+            bailed.constraints_removed, 0,
+            "simplify must not scan constraints once the deadline has passed"
+        );
+        assert!(bailed.redundant_constraints.is_empty());
+        // Step 1 still ran, and its result is reported.
+        assert_eq!(bailed.integer_bounds_tightened, 1);
+        assert_eq!(bailed.var_bounds[0].lo, 1.0);
+        assert_eq!(bailed.var_bounds[0].hi, 5.0);
+    }
+
+    #[test]
+    fn simplify_until_with_a_future_deadline_matches_no_deadline() {
+        let mut arena = ExprArena::new();
+        let x = arena.add(ExprNode::Variable {
+            name: "x".into(),
+            index: 0,
+            size: 1,
+            shape: vec![],
+        });
+        let model = ModelRepr {
+            arena,
+            objective: ExprId(0),
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body: x,
+                sense: ConstraintSense::Le,
+                rhs: 10.0,
+                name: Some("c1".into()),
+            }],
+            variables: vec![VarInfo {
+                name: "x".into(),
+                var_type: VarType::Continuous,
+                offset: 0,
+                size: 1,
+                shape: vec![],
+                lb: vec![0.0],
+                ub: vec![5.0],
+            }],
+            n_vars: 1,
+        };
+        let mut b0 = vec![Interval::new(0.0, 5.0)];
+        let a = simplify_until(&model, &mut b0, None);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut b1 = vec![Interval::new(0.0, 5.0)];
+        let b = simplify_until(&model, &mut b1, Some(future));
+        assert_eq!(a.constraints_removed, b.constraints_removed);
+        assert_eq!(a.redundant_constraints, b.redundant_constraints);
+        assert_eq!(a.bigm_tightened, b.bigm_tightened);
+        assert_eq!(a.integer_bounds_tightened, b.integer_bounds_tightened);
+        assert_eq!(b0.len(), b1.len());
+        for (x, y) in b0.iter().zip(b1.iter()) {
+            assert_eq!(x.lo, y.lo);
+            assert_eq!(x.hi, y.hi);
+        }
     }
 
     #[test]
