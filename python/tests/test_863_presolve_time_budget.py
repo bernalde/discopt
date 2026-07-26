@@ -226,6 +226,44 @@ def test_root_bound_tightening_passes_its_budget_through(monkeypatch):
     assert seen == [1234], f"budget was not forwarded to the binding: {seen}"
 
 
+def test_an_infinite_time_limit_reaches_the_fbbt_call_as_unlimited(monkeypatch):
+    """A non-finite ``time_limit`` means "no wall-clock cap" and must arrive at the
+    FBBT binding as ``time_limit_ms=None``.
+
+    ``int(1000 * inf)`` raises ``OverflowError``, so the first draft of the root-FBBT
+    cap turned every explicitly uncapped solve into a crash. Caught by
+    ``test_spatial_native_kernel``'s #788 test, which pins the same contract at a
+    different call site; pinned here too because this is where it was broken.
+    """
+    import discopt.solvers._root_presolve as rp
+
+    seen: list[object] = []
+    real = rp.tighten_root_bounds_with_fbbt
+
+    def _spy(*a, **k):
+        seen.append(k.get("time_limit_ms", "MISSING"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(rp, "tighten_root_bounds_with_fbbt", _spy)
+
+    # A bilinear body with an integer: this routes onto the spatial B&B path, which
+    # is the one that calls tighten_root_bounds_with_fbbt before tree creation.
+    m = dm.Model("inf_budget")
+    x = m.continuous("x", lb=1.0, ub=4.0)
+    y = m.continuous("y", lb=1.0, ub=4.0)
+    z = m.integer("z", lb=0, ub=2)
+    m.minimize(x * y + z)
+    m.subject_to(x + y >= 3.0)
+    m.subject_to(x - z <= 2.0)
+    m.solve(time_limit=float("inf"))
+
+    assert seen, "tighten_root_bounds_with_fbbt was never reached"
+    assert seen[0] is None, (
+        f"an infinite time_limit reached the FBBT call as {seen[0]!r}; it must be None "
+        "(unlimited), and int(1000 * inf) raises OverflowError"
+    )
+
+
 def test_full_root_presolve_respects_its_budget():
     """The pipeline as ``solve_model`` invokes it, with every default pass on."""
     from discopt._jax.presolve_pipeline import run_root_presolve

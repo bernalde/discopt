@@ -6721,6 +6721,13 @@ def solve_model(
     # >10 minutes against a 30 s budget. FBBT is anytime, so a cap costs only
     # tightening: the returned box is looser but valid, and the integer rounding
     # inside still runs. Same #654 discipline as every other presolve step here.
+    #
+    # ``time_limit`` may be inf (an explicitly uncapped solve), which makes the
+    # remaining budget inf; that must become ``None`` (unlimited), not
+    # ``int(inf)`` — which raises OverflowError and would turn "no time limit"
+    # into a crash.
+    _fbbt_left = _remaining_budget()
+    _fbbt_budget_ms = None if not math.isfinite(_fbbt_left) else max(1, int(1000 * _fbbt_left))
     lb, ub, root_infeasible, _ = tighten_root_bounds_with_fbbt(
         model,
         lb,
@@ -6728,7 +6735,7 @@ def solve_model(
         int_offsets,
         int_sizes,
         model_repr=_model_repr,
-        time_limit_ms=max(1, int(1000 * _remaining_budget())),
+        time_limit_ms=_fbbt_budget_ms,
     )
     rust_time += time.perf_counter() - t_rust_start
     if root_infeasible:
