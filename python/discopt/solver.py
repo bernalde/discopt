@@ -2372,7 +2372,25 @@ def _apply_nonlinear_tightening_with_status(
     try:
         from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 
-        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(model, lb, ub)
+        # #875: this was the ONE nonlinear-tightening entry point with no budget. The
+        # other three all pass a deadline — the root declared-box pass, the
+        # periodic/domain pass, and AMP — so this one ran the pass to completion on
+        # every invocation. On watercontamination0202 (107k rows) that is ~23 s per
+        # call and it fired 3x inside a 30 s ``time_limit``, i.e. ~70 s of a 126 s
+        # profile: the single largest remaining overrun after the sparse-linearizer
+        # fix, and the reason a deadline on ``tighten_nonlinear_bounds`` alone did not
+        # bound the solve.
+        #
+        # Bound it by the solve's own ABSOLUTE deadline rather than a fresh per-call
+        # fraction. A per-call fraction is what let the convexity classifier's budget
+        # multiply across model objects (each reformulation restarted it), and this
+        # helper is called per node as well as at the root, so a fraction here would
+        # compound the same way. ``None`` (no time limit) keeps the unbounded pass,
+        # which is the current behavior for an untimed solve.
+        _nbt_deadline = getattr(model, "_solve_deadline", None)
+        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(
+            model, lb, ub, deadline=_nbt_deadline
+        )
     except Exception as exc:
         logger.debug("Skipping nonlinear tightening after error: %s", exc)
         return lb, ub, False
