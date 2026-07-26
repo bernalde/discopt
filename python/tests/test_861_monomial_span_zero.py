@@ -416,3 +416,36 @@ def test_real_ball_mk2_30_still_finds_no_incumbent():
         )
     assert result.status == "time_limit"
     assert result.node_count > 0, "admitted but explored no nodes — budget spent elsewhere"
+
+
+# --------------------------------------------------------------------------- #
+# The #844 fallback's dual bound is no longer discarded (raised in review of #873)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_no_incumbent_fallback_still_reports_its_dual_bound():
+    """A spent fallback reserve must buy a BOUND even when it buys no primal.
+
+    #861 admits ball_mk2_30 into the LP-per-node engine, so ``Model.solve``'s
+    no-incumbent fallback (#844) now runs it instead of declining under
+    ``require_incremental``. It spends the whole reserve and finds no incumbent — and
+    before this fix the fallback's result was merged into ``result`` only when it
+    carried an objective, so a *sound dual bound* was computed and then thrown away:
+    the solve reported ``bound=None`` while the fallback had proved ``bound=-27.88``.
+    That, not the admission itself, was the real cost behind the review's
+    "spends the budget for nothing".
+
+    Asserts properties rather than values, since the bound tightens with the budget:
+    a bound exists, it never crosses the 0.0 oracle (``minlplib.solu``), and no
+    certificate is claimed without an incumbent. Fails before the fix (``bound is
+    None``), passes after.
+    """
+    result = _ball_mk2_real(30).solve(time_limit=6.0)
+    assert result.bound is not None, "the fallback's dual bound was discarded again"
+    assert result.bound <= 0.0 + 1e-6, f"dual bound {result.bound} crossed the 0.0 oracle"
+    # No incumbent -> no certificate, whatever the bound says.
+    if result.objective is None:
+        assert not getattr(result, "gap_certified", False)
+    else:  # a primal fix landed: the certificate invariant must still hold
+        assert result.bound <= result.objective + 1e-6

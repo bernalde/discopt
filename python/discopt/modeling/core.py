@@ -4182,10 +4182,21 @@ class Model:
                     # the overrun. ball_mk2_30 itself now MAPS (#861 narrowed the
                     # monomial gate to odd powers on a straddling root) and so takes
                     # the incremental path here — but measured, it still returns no
-                    # incumbent, just a sound bound, having spent the reserve. The
-                    # guard's premise ("the structure builds" ⇒ "this path can find a
-                    # primal") is a proxy, and #861 widened the gap between the two;
-                    # closing it is primal work (#844), not a predicate change.
+                    # incumbent, just a sound bound, having spent the reserve.
+                    #
+                    # The guard is deliberately NOT tightened to re-exclude it. Its
+                    # premise ("the structure builds" ⇒ "this path can find a primal")
+                    # is a proxy, and #861 widened the gap between the two — but no
+                    # predicate can decide in advance whether a primal is coming, and
+                    # a "give up if no incumbent by X% of the reserve" rule would
+                    # forfeit precisely the late incumbents this fallback exists to
+                    # catch (tln4/tln5 are found deep in the reserve, not early).
+                    # Tuning such a rule until ball_mk2_30 exits early would be a
+                    # single-instance fix, which this repo rejects. Instead the
+                    # reserve's OUTPUT is no longer discarded: the bound merge below
+                    # runs whether or not a primal was found, so a spent reserve now
+                    # buys a tighter dual bound rather than nothing. Closing the primal
+                    # half remains #844 work.
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,
@@ -4193,21 +4204,39 @@ class Model:
                         use_obbt=False,
                         require_incremental=True,
                     )
+                if _fb is not None:
+                    # Keep the TIGHTER of the two dual bounds, and do it whether or not
+                    # the fallback found a primal. The engine's frontier bound is a
+                    # valid LOWER bound for a minimize (``_is_in_scope`` admits only
+                    # minimize), so the max of two valid lower bounds is a valid lower
+                    # bound — the same merge this branch has always done, just no longer
+                    # conditioned on an incumbent it does not depend on.
+                    #
+                    # Why it moved (#861 review): once a model is admitted but hard, the
+                    # fallback spends its whole reserve, computes a sound bound, finds no
+                    # primal, and everything was thrown away — the reserve produced
+                    # nothing *even though it produced something valid*. Measured on
+                    # ball_mk2_30 at a 30 s budget: the fallback returned bound -27.88
+                    # (<= the 0.0 oracle) and the solve reported ``bound=None``. That is
+                    # the real cost the review flagged as "spends the budget for
+                    # nothing", and it is a reporting gap, not a reason to re-tighten
+                    # ``require_incremental``: no predicate can decide in advance whether
+                    # a primal is coming, and a budget-fraction early exit would forfeit
+                    # exactly the late incumbents this fallback exists to catch.
+                    if _fb.bound is not None:
+                        result.bound = (
+                            _fb.bound if result.bound is None else max(result.bound, _fb.bound)
+                        )
+                    result.node_count = (result.node_count or 0) + _fb.node_count
                 if _fb is not None and _fb.objective is not None:
                     from discopt.solver import _unpack_solution
 
                     result.status = _fb.status
                     result.objective = _fb.objective
                     result.x = _unpack_solution(self, np.asarray(_fb.x))
-                    # Keep the TIGHTER of the two dual bounds and never claim a
-                    # certificate the fallback did not actually prove.
-                    if _fb.bound is not None:
-                        result.bound = (
-                            _fb.bound if result.bound is None else max(result.bound, _fb.bound)
-                        )
                     result.gap = _fb.gap
+                    # Never claim a certificate the fallback did not actually prove.
                     result.gap_certified = _fb.status == "optimal"
-                    result.node_count = (result.node_count or 0) + _fb.node_count
             except Exception as _fb_exc:
                 # Never break a solve -- but never swallow silently either. A bare
                 # ``except`` here previously turned a hard TypeError into an invisible
