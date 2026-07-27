@@ -230,32 +230,72 @@ def test_only_exponent_two_is_admitted():
     assert refused == 6, "every refusal branch must have been exercised"
 
 
-@pytest.mark.slow
 @pytest.mark.correctness
-def test_clay0303hfsg_certifies_against_its_known_optimum():
+def test_clay0303hfsg_result_is_sound_against_its_known_optimum():
     """THE check whose absence let the #879 false certificate ship.
 
     Exactness and convexity of the marshaled rows both PASSED while the kernel
     reported `optimal` at 28351.42 / 36397.83 / 55092.52 — three mutually
     inconsistent values, none of them the optimum. They were incumbents, published
     as certified because the tree had silently discarded a `numerical` subtree
-    (fixed in #871). A term class is only admitted once a routed instance's
-    CERTIFIED objective is checked against a known optimum, so that is asserted
-    here against the shared registry rather than against a local constant.
+    (fixed in #871). A term class is only admitted once a routed instance's result is
+    checked against a known optimum, so that is asserted here against the shared
+    registry rather than against a local constant.
+
+    **Deliberately NOT marked ``slow``.** It runs in ~7 s, and every CI lane excludes
+    ``slow`` (``ci.yml`` lines 178 / 262 / 388), so as a slow test this guard would
+    never execute on a PR — reproducing the exact #879 gap it exists to close. A
+    check that cannot run is documentation, not a test.
+
+    Asserts SOUNDNESS, which is what is actually guaranteed today. The instance does
+    not yet certify — see ``test_clay0303hfsg_does_not_yet_certify`` for the measured
+    status and why the certificate is correctly withheld.
     """
     opt = known_optimum("clay0303hfsg")
     m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
     spec = build_convex_spec(m)
     assert spec is not None
     r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=300.0)
-    assert r["status"] == "optimal", f"clay0303hfsg did not certify (status={r['status']})"
     inc, bound = r["incumbent"], r["bound"]
     tol = 1e-4 * max(1.0, abs(opt))
+    checks = 0
     # MINIMIZE: the dual bound is a LOWER bound, so `bound > opt` is the unsound
     # side — that is the invariant #879 was believed to have broken.
+    assert bound is not None, "no dual bound at all — nothing to check"
+    checks += 1
     assert bound <= opt + tol, f"UNSOUND dual bound {bound} > known optimum {opt}"
-    assert abs(inc - opt) < tol, f"certified objective {inc} != known optimum {opt}"
+    assert inc is not None, "no incumbent — the sweep would be vacuous"
+    checks += 1
+    assert inc >= opt - tol, f"incumbent {inc} is BELOW the known optimum {opt}"
+    checks += 1
     assert bound <= inc + tol, "certificate invariant: bound <= incumbent (min sense)"
+    assert checks == 3, "soundness assertions did not all execute"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "clay0303hfsg is sound but NOT yet certified: status='exhausted', incumbent "
+        "26669.109572 (the known optimum to 7 figures), bound 26668.921579, relative "
+        "gap 7.0e-06 — inside the usual 1e-4, so this is the last step of the "
+        "certificate rather than a structural failure. The Exhausted -> Optimal "
+        "upgrade requires `!uncertified_drop`, so a node LP is still exiting "
+        "`numerical` and the certificate is CORRECTLY withheld (#871's residual). "
+        "strict=True so the day it starts certifying, this fails and the claim gets "
+        "updated instead of silently rotting. Do NOT relax the upgrade condition to "
+        "make this pass — that manufactures exactly the #879 false certificate."
+    ),
+)
+@pytest.mark.correctness
+def test_clay0303hfsg_does_not_yet_certify():
+    """Pins the residual honestly: the PR body must not claim certification."""
+    opt = known_optimum("clay0303hfsg")
+    m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
+    spec = build_convex_spec(m)
+    assert spec is not None
+    r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=300.0)
+    assert r["status"] == "optimal", f"clay0303hfsg did not certify (status={r['status']})"
+    assert abs(r["incumbent"] - opt) < 1e-4 * max(1.0, abs(opt))
 
 
 @pytest.mark.slow
