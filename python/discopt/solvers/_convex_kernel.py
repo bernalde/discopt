@@ -484,8 +484,8 @@ def _build(model, bounds) -> dict:
             # linear now — emit it as a linear row rather than a term-less "convex"
             # one, so the kernel sees it in its natural form.
             a = np.zeros(n)
-            for col, k in d.aff.items():
-                a[col] = k
+            for col, coef in d.aff.items():
+                a[col] = coef
             le_rows.append((a, -d.const))
             continue
         nl_specs.append(d)

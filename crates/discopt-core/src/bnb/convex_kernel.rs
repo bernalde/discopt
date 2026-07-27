@@ -153,7 +153,7 @@ impl CompositeTerm {
                 // would mean a violated precondition, so emit NaN and let the
                 // caller's finiteness check drop the tangent rather than produce
                 // a silently wrong (unsound) cut.
-                if !(s > 0.0) {
+                if s.is_nan() || s <= 0.0 {
                     return (f64::NAN, f64::NAN, f64::NAN);
                 }
                 let t = a / s;
