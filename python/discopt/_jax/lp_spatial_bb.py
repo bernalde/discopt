@@ -78,6 +78,70 @@ _PROD_TOL = 1e-5
 # branched any further is exactly one the leaf test counts as collapsed.
 _MIN_BRANCH_WIDTH = 1e-9
 
+# #862: how deep a single plunge may run before the search returns to best-first.
+# A plunge trades bound quality for depth in order to reach an EXACT LEAF, which is
+# the only place this engine's node loop can produce an incumbent (a fully-fixed box
+# determines every nonlinear term). Best-first on tln6/nvs17 reaches depth 32 with
+# ``fully_fixed = 0`` -- no exact leaf in 2000+ nodes -- so no incumbent ever arrives
+# from the loop and the primal is left entirely to the rounding heuristics, which on
+# this family are reading a relaxation that is ~250x loose (2562/2562 roundings
+# infeasible; see docs/dev/lp-node-primal-quality.md).
+_PLUNGE_MAX_DEPTH = 64
+
+# Relative gap below which plunging STOPS. A plunge is a primal device: it buys depth
+# (hence exact leaves, hence incumbents) at the cost of dual progress. Once the gap is
+# nearly closed the remaining work is proving the bound, which is exactly what
+# best-first does and what a plunge starves. Measured on the in-repo corpus: without
+# this guard ``gear2`` -- whose best-first incumbent is 1.4e-06 against an optimum of
+# 0.0, i.e. already converged -- lost ``status=optimal`` entirely, the one
+# certification regression in the panel. With it, gear2 is untouched and every gain
+# (tln6 +132.7% -> +7.8%, nvs19, nvs23, ex1265) is kept: those all sit at gaps of
+# tens of percent when the plunge decision is made.
+_PLUNGE_MIN_GAP = 1e-2
+
+
+def _plunge_enabled(*, require_incremental: bool = False) -> bool:
+    """#862: depth-first plunging in the node loop.
+
+    **Default: ON for the #844 no-incumbent fallback, OFF for the general engine.**
+
+    The scoping is the point, not a compromise. The fallback exists *only* to find a
+    primal on a model the default path left with no incumbent — it is invoked with
+    ``require_incremental=True`` and its output is an incumbent, never a certificate.
+    There, trading dual progress for depth is the whole job. The general engine, by
+    contrast, is asked to *prove* optimality, and plunging costs it: on ``gear2``
+    best-first certifies in 657 nodes / 7.2 s while an unconditional plunge needs 6017
+    nodes / 61.3 s for the same answer, which shows up as a certification regression at
+    a 20 s panel budget. Enabling it everywhere would buy #862's incumbents at the
+    price of a §5 cert-clean violation; enabling it where it belongs buys them for free.
+
+    Measured on the in-repo corpus at 20 s (engine-direct, 58 in-scope), plunge ON vs
+    OFF *everywhere*: 0 oracle crossings, incumbents 46 -> 49 (``ex1252a``, ``ex1263``,
+    ``nvs24`` gained, none lost), quality better=7 worse=2, wall +7.0% — and exactly
+    one certification regression, ``gear2``. Restricting the default to the fallback
+    keeps the primal gains on the path #862 is about and leaves ``gear2``'s path
+    bit-identical.
+
+    ``DISCOPT_LP_SPATIAL_PLUNGE=1`` forces it on everywhere (the measurement above);
+    ``=0`` forces it off everywhere, fallback included.
+
+    Node ORDER cannot change the set of nodes explored, so plunging cannot make a
+    bound unsound *by itself* -- but the in-loop global lower bound used to be read
+    off the popped node, which is the frontier minimum only under best-first. That
+    read is generalized to a true minimum over all live nodes (see ``glb`` below), so
+    the two orders share one sound accounting rather than plunging relying on the
+    best-first assumption. With this flag off the generalized form is bit-identical to
+    the old one, which is what keeps the default path bound-neutral.
+
+    Opt in with ``DISCOPT_LP_SPATIAL_PLUNGE=1``.
+    """
+    import os as _os
+
+    _raw = _os.environ.get("DISCOPT_LP_SPATIAL_PLUNGE")
+    if _raw is not None:
+        return _raw not in ("0", "", "false", "False")
+    return bool(require_incremental)
+
 
 class LpSpatialResult(NamedTuple):
     status: str  # "optimal" | "feasible" | "infeasible" | "time_limit"
@@ -790,13 +854,19 @@ def solve_lp_spatial_bb(
         if cand is not None and cand[0] < inc_val:
             inc_val, inc_x = cand[0], cand[1].copy()
 
-    def child(lb, ub, parent_basis, parent_cuts, rounds, parent_bound):
+    def child(lb, ub, parent_basis, parent_cuts, rounds, parent_bound, collect=None):
         """Solve a child node (inheriting parent cuts, separating ``rounds`` more);
         push if promising. Returns its bound (or None).
 
         ``parent_bound`` is a valid lower bound for this child (its box is contained
         in the parent's), and is what gets recorded if the child's own relaxation
         cannot be resolved -- see below.
+
+        ``collect`` (#862) receives the surviving node instead of the global heap, so
+        the caller can decide between plunging into it and returning it to the
+        best-first frontier. It changes only WHERE a live node is parked, never
+        whether it stays live: ``_route`` below places every collected node in exactly
+        one of the two containers, and both are counted by ``glb``.
         """
         nonlocal counter, unresolved_lb
         if np.any(lb > ub + 1e-9):
@@ -805,8 +875,12 @@ def solve_lp_spatial_bb(
             lb, ub, parent_basis, parent_cuts, rounds
         )
         if b_ is not None and b_ < inc_val - 1e-9:
-            heapq.heappush(heap, (b_, counter, lb, ub, x_, basis_, cuts_, info_))
+            _node = (b_, counter, lb, ub, x_, basis_, cuts_, info_)
             counter += 1
+            if collect is None:
+                heapq.heappush(heap, _node)
+            else:
+                collect.append(_node)
         elif b_ is None and verdict != "fathom":
             # The child's relaxation gave no certified verdict, so its subtree is NOT
             # ruled out. Dropping it silently (the pre-#844 behaviour) removes live
@@ -835,18 +909,72 @@ def solve_lp_spatial_bb(
     # declared only when that closes the gap to the verified incumbent.
     unresolved_lb = float("inf")
 
+    # #862 plunging: a LIFO of nodes to descend into depth-first. Empty (and every
+    # branch below routes straight to ``heap``) unless the flag is on, so the default
+    # path keeps pure best-first.
+    plunge: list = []
+    plunge_depth = 0
+    _plunge_on = _plunge_enabled(require_incremental=require_incremental)
+
+    def _route(kids, node_bound):
+        """Send the most promising child down the plunge, the rest to the frontier.
+
+        "Most promising" is the smallest bound, i.e. the child best-first would have
+        chosen next anyway -- so a plunge is best-first *committed to for a while*
+        rather than a different search. Every child lands in exactly one container, so
+        the live-node set is identical to what pure best-first would hold; only the
+        ORDER of exploration differs.
+
+        Plunging stops once the gap is nearly closed (``_PLUNGE_MIN_GAP``): past that
+        point the work left is proving the bound, and depth-first starves exactly the
+        dual progress that does it. With no incumbent yet the gap is infinite, so the
+        search plunges freely -- which is when it is most needed, since the node loop
+        has no other way to reach an exact leaf.
+        """
+        if not kids:
+            return
+        kids.sort(key=lambda k: k[0])
+        for k in kids[1:]:
+            heapq.heappush(heap, k)
+        _gap_now = (
+            float("inf") if inc_x is None else abs(inc_val - node_bound) / (1.0 + abs(inc_val))
+        )
+        if plunge_depth < _PLUNGE_MAX_DEPTH and _gap_now > _PLUNGE_MIN_GAP:
+            plunge.append(kids[0])
+        else:
+            heapq.heappush(heap, kids[0])
+
     status = "infeasible"
-    while heap:
+    while heap or plunge:
         if (time.perf_counter() - t0) >= time_limit or nodes >= max_nodes:
             status = "time_limit"
             break
-        bound, _, lb, ub, x, basis, ncuts, ninfo = heapq.heappop(heap)
+        if plunge:
+            bound, _, lb, ub, x, basis, ncuts, ninfo = plunge.pop()
+            plunge_depth += 1
+        else:
+            bound, _, lb, ub, x, basis, ncuts, ninfo = heapq.heappop(heap)
+            plunge_depth = 0
         nodes += 1
-        # Global lower bound = smallest frontier bound (this popped node, best-first)
-        # capped by any unresolved-node floor. Fathoming/gap tests use this, never the
-        # popped node's bound alone, so an unresolved node below the incumbent keeps
-        # the gap open instead of yielding a false optimality proof.
+        # Global lower bound: the minimum over ALL live nodes -- this popped one, the
+        # best-first frontier, and anything parked on the plunge stack -- capped by the
+        # unresolved-node floor. Fathoming/gap tests use this, never the popped node's
+        # bound alone, so an unresolved node below the incumbent keeps the gap open
+        # instead of yielding a false optimality proof.
+        #
+        # The frontier/plunge terms are what make plunging sound. Under pure best-first
+        # the popped node IS the frontier minimum, so ``min(bound, unresolved_lb)`` was
+        # correct; a plunge pops a node that may be far from minimal, and reading the
+        # bound off it would report a global lower bound HIGHER than the truth -- which
+        # closes the gap early and certifies optimality over space still on the heap
+        # (CLAUDE.md §1). With the flag off ``plunge`` is empty and ``heap[0][0] >=
+        # bound`` by the heap invariant, so this expression is bit-identical to the old
+        # one and the default path stays bound-neutral.
         glb = min(bound, unresolved_lb)
+        if heap:
+            glb = min(glb, heap[0][0])
+        for _p in plunge:
+            glb = min(glb, _p[0])
         if bound >= inc_val - 1e-9 * (1 + abs(inc_val)):
             continue
         if inc_x is not None and abs(inc_val - glb) <= gap_tolerance * (1 + abs(inc_val)):
@@ -872,10 +1000,13 @@ def solve_lp_spatial_bb(
         if bi is not None:
             fd = x[bi] - np.floor(x[bi])
             fu = np.ceil(x[bi]) - x[bi]
-            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds, bound)
-            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds, bound)
+            _kids: Optional[list] = [] if _plunge_on else None
+            bd = child(lb, _set(ub, bi, np.floor(x[bi])), basis, ncuts, _rounds, bound, _kids)
+            bu = child(_set(lb, bi, np.ceil(x[bi])), ub, basis, ncuts, _rounds, bound, _kids)
             _update_pc(bi, "d", bound, bd, fd)
             _update_pc(bi, "u", bound, bu, fu)
+            if _kids is not None:
+                _route(_kids, bound)
             continue
         # Integral assignment: spatial-bisect the worst-violated product variable.
         # ``_worst_product_var`` can only see products present in ``info``; once a
@@ -901,16 +1032,22 @@ def solve_lp_spatial_bb(
             # Integer domain split: [lb, mid] and [mid+1, ub] partition the integers
             # in the box exactly, so no integer point is lost.
             mid = np.floor((lb[bv] + ub[bv]) / 2)
-            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
-            child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound)
+            _kids = [] if _plunge_on else None
+            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound, _kids)
+            child(_set(lb, bv, mid + 1.0), ub, basis, ncuts, _rounds, bound, _kids)
+            if _kids is not None:
+                _route(_kids, bound)
         else:
             # Continuous bisection: the children SHARE the midpoint, so their union is
             # the parent box and no feasible point can fall between them. (The integer
             # split above can use disjoint halves only because there is nothing between
             # ``mid`` and ``mid+1``.)
             mid = 0.5 * (lb[bv] + ub[bv])
-            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound)
-            child(_set(lb, bv, mid), ub, basis, ncuts, _rounds, bound)
+            _kids = [] if _plunge_on else None
+            child(lb, _set(ub, bv, mid), basis, ncuts, _rounds, bound, _kids)
+            child(_set(lb, bv, mid), ub, basis, ncuts, _rounds, bound, _kids)
+            if _kids is not None:
+                _route(_kids, bound)
     else:
         # Heap exhausted. Optimal only if the unresolved-node floor does not sit below
         # the incumbent (else there is space the engine could not rule out -> feasible
@@ -929,7 +1066,8 @@ def solve_lp_spatial_bb(
         else:
             status = "infeasible"
 
-    gbound = min([h[0] for h in heap], default=float("inf"))
+    # Every live node counts, on the frontier OR parked mid-plunge (#862).
+    gbound = min([h[0] for h in heap] + [p[0] for p in plunge], default=float("inf"))
     gbound = min(gbound, unresolved_lb)
     if inc_x is not None:
         gbound = min(gbound, inc_val)
