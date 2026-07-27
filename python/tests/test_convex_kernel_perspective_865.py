@@ -27,6 +27,7 @@ import os
 import discopt.modeling as dm
 import numpy as np
 import pytest
+from _optima import known_optimum
 
 _ck = pytest.importorskip("discopt.solvers._convex_kernel")
 build_convex_spec = _ck.build_convex_spec
@@ -43,6 +44,7 @@ _FUNC_NP = {
     "exp": np.exp,
     "sqrt": np.sqrt,
     "log1p": np.log1p,
+    "sqr": np.square,
 }
 
 
@@ -129,33 +131,46 @@ def test_syn05hfsg_certifies_the_true_optimum():
     assert bound >= inc - tol, "certificate invariant: bound ≥ incumbent (max sense)"
 
 
-def test_perspective_lift_is_exact_and_convex():
+@pytest.mark.parametrize(
+    ("instance", "func", "n_pts"),
+    [("syn05hfsg", "log", 120), ("clay0303hfsg", "sqr", 40)],
+)
+def test_perspective_lift_is_exact_and_convex(instance, func, n_pts):
     """The two properties the certificate rests on, checked over the box.
 
     Exactness: the marshaled row must equal the PRISTINE model's row pointwise —
     any drift would mean the lift is an approximation, not an identity.
     Convexity: the midpoint inequality must hold on every routed row, else the OA
     tangent is not a valid relaxation.
+
+    Both properties held for `clay0303hfsg` while #879's false certificate was
+    live, so passing here is necessary but NOT sufficient to admit a term class —
+    see `test_clay0303hfsg_certifies_against_its_known_optimum`, which is the check
+    that was missing.
     """
-    instance, func, n_pts = "syn05hfsg", "log", 120
     model = dm.from_nl(os.path.join(_DATA, f"{instance}.nl"))
     assert build_convex_spec(model) is not None
     m, lb, ub, ev, rows = _nl_decomps(model)
     assert any(t["sc_aff"] is not None for _i, _s, d in rows for t in d.terms)
     assert {t["func"] for _i, _s, d in rows for t in d.terms} == {func}
 
+    # Both loops skip non-finite samples, which can silently degrade the whole test
+    # to a no-op that reports success. Count what actually executed and assert it.
     rng = np.random.default_rng(12345)
     X = _box_sample(lb, ub, rng, n_pts)
+    n_exact = 0
     for x in X:
         g = np.asarray(ev.evaluate_constraints(x), float)
         for i, sign, d in rows:
             ref, got = sign * g[i], _row_value(d, x)
             if np.isfinite(ref) and np.isfinite(got):
+                n_exact += 1
                 assert abs(ref - got) <= 1e-9 * max(1.0, abs(ref)), (
                     f"row {i}: marshaled {got} != model {ref}"
                 )
 
     A, B = _box_sample(lb, ub, rng, n_pts), _box_sample(lb, ub, rng, n_pts)
+    n_convex = 0
     for a, b in zip(A, B):
         for lam in (0.25, 0.5, 0.75):
             mid = lam * a + (1 - lam) * b
@@ -163,26 +178,108 @@ def test_perspective_lift_is_exact_and_convex():
                 gm, ga, gb = _row_value(d, mid), _row_value(d, a), _row_value(d, b)
                 if not all(np.isfinite(v) for v in (gm, ga, gb)):
                     continue
+                n_convex += 1
                 assert gm - (lam * ga + (1 - lam) * gb) <= 1e-9 * max(1.0, abs(gm)), (
                     f"row {i} is not convex at lambda={lam}"
                 )
+    assert n_exact >= n_pts, f"exactness compared only {n_exact} rows — probe did not fire"
+    assert n_convex >= n_pts, f"convexity compared only {n_convex} rows — probe did not fire"
 
 
-def test_square_inner_function_falls_back():
-    """`** 2` is NOT admitted. `clay*hfsg`'s quadratic perspective `a²/s` is
-    mathematically convex and marshals exactly, but routing it produced a FALSE
-    CERTIFIED OPTIMUM on `clay0303hfsg` (certified 28351.42 against a genuinely
-    feasible 26669.11 found by the default path) — see #871. Until that is
-    understood the gate must keep refusing it."""
+# ── the quadratic inner function (#879) ───────────────────────────────────────
+
+
+def test_square_inner_function_is_routed():
+    """`** 2` is admitted: `x²` is convex, and its perspective `s·(a/s)² = a²/s` is
+    quadratic-over-linear — the `clay*hfsg` hull shape (#879)."""
     m = dm.Model()
     x = m.continuous("x", lb=0.0, ub=10.0)
     z = m.binary("z")
     _scalar(m, lambda: x**2 <= 4.0, "sq")
     m.maximize(x + z)
-    assert build_convex_spec(m) is None
+    spec = build_convex_spec(m)
+    assert spec is not None, "a plain convex `x**2 <= c` row must be routable"
+    assert list(spec["term_func"]) == [_ck._FUNC_CODE["sqr"]]
 
     clay = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
-    assert build_convex_spec(clay) is None, "clay0303hfsg must not be routed"
+    clay_spec = build_convex_spec(clay)
+    assert clay_spec is not None, "clay0303hfsg's quadratic perspective must be routed"
+    # Every one of its 72 nonlinear terms is a `sqr` PERSPECTIVE (nonzero scale).
+    assert set(clay_spec["term_func"]) == {_ck._FUNC_CODE["sqr"]}
+    assert int(np.count_nonzero(clay_spec["term_scale_const"])) == len(clay_spec["term_coeff"])
+
+
+def test_only_exponent_two_is_admitted():
+    """Every other power is nonconvex, domain-restricted, or signomial — refuse."""
+    refused = 0
+    for power in (1.5, 3.0, -1.0, 0.5, 2.5):
+        m = dm.Model()
+        x = m.continuous("x", lb=1.0, ub=10.0)
+        _scalar(m, lambda p=power: x**p <= 4.0, "pw")
+        m.maximize(x)
+        assert build_convex_spec(m) is None, f"power {power} must fall back"
+        refused += 1
+    # A non-affine base is refused too: `(log x)²` is not convex in x.
+    m = dm.Model()
+    x = m.continuous("x", lb=1.0, ub=10.0)
+    _scalar(m, lambda: dm.log(x) ** 2 <= 4.0, "logsq")
+    m.maximize(x)
+    assert build_convex_spec(m) is None, "a non-affine power base must fall back"
+    refused += 1
+    assert refused == 6, "every refusal branch must have been exercised"
+
+
+@pytest.mark.slow
+@pytest.mark.correctness
+def test_clay0303hfsg_certifies_against_its_known_optimum():
+    """THE check whose absence let the #879 false certificate ship.
+
+    Exactness and convexity of the marshaled rows both PASSED while the kernel
+    reported `optimal` at 28351.42 / 36397.83 / 55092.52 — three mutually
+    inconsistent values, none of them the optimum. They were incumbents, published
+    as certified because the tree had silently discarded a `numerical` subtree
+    (fixed in #871). A term class is only admitted once a routed instance's
+    CERTIFIED objective is checked against a known optimum, so that is asserted
+    here against the shared registry rather than against a local constant.
+    """
+    opt = known_optimum("clay0303hfsg")
+    m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
+    spec = build_convex_spec(m)
+    assert spec is not None
+    r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=300.0)
+    assert r["status"] == "optimal", f"clay0303hfsg did not certify (status={r['status']})"
+    inc, bound = r["incumbent"], r["bound"]
+    tol = 1e-4 * max(1.0, abs(opt))
+    # MINIMIZE: the dual bound is a LOWER bound, so `bound > opt` is the unsound
+    # side — that is the invariant #879 was believed to have broken.
+    assert bound <= opt + tol, f"UNSOUND dual bound {bound} > known optimum {opt}"
+    assert abs(inc - opt) < tol, f"certified objective {inc} != known optimum {opt}"
+    assert bound <= inc + tol, "certificate invariant: bound <= incumbent (min sense)"
+
+
+@pytest.mark.slow
+def test_clay0303hfsg_root_relaxation_is_sound_not_too_tight():
+    """The #879 hypothesis, falsified and pinned.
+
+    #879 read the false certificate as an invalid (too-tight) `a²/s` relaxation,
+    the tangent coefficients scaling as `a²/s² ≈ 1e6` at the `0.001` smoothing
+    floor. The root node's safe bound is measured here at every separation setting:
+    it is not too tight at any of them — it is *trivially weak* (0.0 against an
+    optimum of 26669), which is the opposite failure. Kept so a future regression
+    that genuinely does over-tighten the root is caught at the node, not the tree.
+    """
+    import discopt._rust as _rust
+
+    opt = known_optimum("clay0303hfsg")
+    spec = build_convex_spec(dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl")))
+    assert spec is not None
+    compared = 0
+    for sep in (0, 2, 12):
+        r = dict(_rust.solve_convex_node_py(**spec, max_sep_rounds=sep))
+        compared += 1
+        assert r["bound"] <= opt + 1e-6, f"sep={sep}: root safe bound {r['bound']} > {opt}"
+        assert r["raw_bound"] <= opt + 1e-6, f"sep={sep}: raw root bound {r['raw_bound']} > {opt}"
+    assert compared == 3, "the root bound must have been compared at every setting"
 
 
 # ── soundness gates ───────────────────────────────────────────────────────────

@@ -55,11 +55,31 @@ back exactly as before):
 Bounds enter the gate here, so an unbounded/undetermined box is a refusal, not a
 guess.
 
-NOT admitted: a ``** 2`` inner function. `clay*hfsg`'s quadratic perspective
-``a²/s`` is mathematically convex, but routing it produced a FALSE CERTIFIED
-OPTIMUM on ``clay0303hfsg`` (certified 28351.42 against a genuinely feasible
-26669.11) — see #871. The rows marshal exactly and are convex, so the fault is
-downstream; until it is understood, ``**`` keeps falling back.
+## Quadratic inner function (#879)
+
+The inner ``func`` may also be a ``** 2`` (see ``_pow_as_sqr``), whose perspective
+``s·(a/s)² = a²/s`` is quadratic-over-linear — the ``clay*hfsg`` hull shape. Only
+the exponent 2 is admitted; every other power (odd, fractional, negative, or
+variable) is nonconvex, domain-restricted, or signomial, and keeps falling back,
+as does a non-affine base such as ``(log x)²``.
+
+This term class was withdrawn once (the evidence is recorded in #879): routing
+``clay0303hfsg`` reported
+``optimal`` at three mutually inconsistent objectives (28351.42 / 36397.83 /
+55092.52), each worse than a point the default path attains, which read as a dual
+bound sitting above the true optimum. It was not. Those three numbers were
+**incumbents**, published as certified by the tree bug #871 fixed — a subtree
+silently discarded on a `numerical` node LP, after which the reported ``bound``
+fell back to the incumbent's own objective. Re-measured with that fix in place,
+the ``a²/s`` relaxation is sound at every separation setting (root safe bound
+``0.0`` vs the optimum ``26669.11``, i.e. valid and merely weak), and
+``clay0303hfsg`` now certifies ``26669.1096`` against its MINLPLib reference.
+
+The lesson that *does* stand: exactness and convexity of the marshaled rows are
+not sufficient evidence to admit a term class. A routed instance's certified
+objective must be checked against a known optimum —
+``test_convex_kernel_perspective_865.py`` does that here, with the reference
+value in ``python/tests/data/known_optima.toml``.
 """
 
 from __future__ import annotations
@@ -88,9 +108,13 @@ _FUNC = {
     "log1p": (np.log1p, -1),
     "sqrt": (np.sqrt, -1),
     "exp": (np.exp, +1),
+    # `sqr` has no FunctionCall spelling — it is how a `** 2` node is admitted
+    # (see `_pow_as_sqr`). Its perspective `s·(a/s)² = a²/s` is
+    # quadratic-over-linear, the `clay*hfsg` hull shape.
+    "sqr": (np.square, +1),
 }
 # Rust term_func codes (must match ConvexFunc in convex_kernel.rs).
-_FUNC_CODE = {"log": 0, "exp": 1, "sqrt": 2, "log1p": 3}
+_FUNC_CODE = {"log": 0, "exp": 1, "sqrt": 2, "log1p": 3, "sqr": 4}
 
 
 class NotConvexKernel(Exception):
@@ -189,6 +213,8 @@ def _decompose(node, offsets) -> _Decomp:
             if rc is not None and rc != 0.0:
                 return _decompose(node.left, offsets).scale(1.0 / rc)
             raise NotConvexKernel("division by non-constant")
+        if node.op == "**":
+            return _pow_as_sqr(node, _decompose, offsets)
         raise NotConvexKernel(f"binary {node.op}")
     if isinstance(node, FunctionCall):
         if node.func_name not in _FUNC:
@@ -201,6 +227,29 @@ def _decompose(node, offsets) -> _Decomp:
         d.terms.append(_term(1.0, node.func_name, arg.aff, arg.const))
         return d
     raise NotConvexKernel(f"node {type(node).__name__}")
+
+
+def _pow_as_sqr(node, decompose_fn, offsets) -> _Decomp:
+    """``base ** 2`` → a convex ``sqr`` term over an affine base; else refuse.
+
+    Only the exponent 2 is admitted. Every other power (odd, fractional, negative,
+    or variable) is either nonconvex, domain-restricted, or a signomial — none of
+    which this gate may wave through, so they keep falling back. ``decompose_fn``
+    is the caller's decomposer, so this works unchanged in ratio space: the base of
+    ``(x/s)**2`` decomposes to the ratio ``x/s``, and the surrounding lift turns the
+    term into the perspective ``s·(a/s)² = a²/s``.
+    """
+    e = _as_const(node.right)
+    if e is None:
+        raise NotConvexKernel("variable exponent")
+    if e != 2.0:
+        raise NotConvexKernel(f"power {e:g}")
+    base = decompose_fn(node.left, offsets)
+    if base.terms:
+        raise NotConvexKernel("non-affine power base")
+    d = _Decomp()
+    d.terms.append(_term(1.0, "sqr", base.aff, base.const))
+    return d
 
 
 def _term(coeff, func, arg_aff, arg_const, sc_aff=None, sc_const=0.0) -> dict:
@@ -304,6 +353,8 @@ def _decompose_over(node, s: _Decomp, offsets) -> _Decomp:
                 raise NotConvexKernel("perspective numerator has a constant")
             d.aff = dict(num.aff)
             return d
+        if node.op == "**":
+            return _pow_as_sqr(node, lambda nd, off: _decompose_over(nd, s, off), offsets)
         raise NotConvexKernel(f"binary {node.op}")
     if isinstance(node, FunctionCall):
         if node.func_name not in _FUNC:
@@ -484,8 +535,10 @@ def _build(model, bounds) -> dict:
             # linear now — emit it as a linear row rather than a term-less "convex"
             # one, so the kernel sees it in its natural form.
             a = np.zeros(n)
-            for col, k in d.aff.items():
-                a[col] = k
+            # `coef`, not `k`: `k` is the integer column counter above, and reusing
+            # it for a float coefficient is a type error mypy (correctly) flags.
+            for col, coef in d.aff.items():
+                a[col] = coef
             le_rows.append((a, -d.const))
             continue
         nl_specs.append(d)
@@ -599,6 +652,21 @@ def convex_kernel_enabled() -> bool:
     return os.environ.get("DISCOPT_CONVEX_KERNEL", "0") not in ("0", "", "false", "False")
 
 
+def dominated_cols_enabled() -> bool:
+    """`DISCOPT_CVX_DOMINATED_COLS` opt-out (default-ON inside the kernel, #879).
+
+    Gates the dominated-cost-column upper bound. Unlike FBBT this is an
+    OPTIMALITY-based reduction — it keeps an optimal solution, not every feasible
+    point (see ``ConvexKernelSpec::tighten_dominated_columns``) — so it keeps its
+    own switch on top of the kernel's default-off gate. It is ON by default because
+    an infinite structural upper bound is what makes a node LP break down and its
+    Neumaier–Shcherbina safe bound decline: measured on `clay0303hfsg`, turning it
+    off takes the instance from `optimal` back to `exhausted`, and it is
+    bit-identical (no-op) on every other in-repo instance the kernel routes.
+    """
+    return os.environ.get("DISCOPT_CVX_DOMINATED_COLS", "1") not in ("0", "", "false", "False")
+
+
 def solve_convex_tree(spec: dict, *, time_limit_s: Optional[float] = None, **cfg) -> dict:
     """Run the native convex kernel on a marshaled `spec` (from build_convex_spec)."""
     import discopt._rust as _rust
@@ -611,6 +679,7 @@ def solve_convex_tree(spec: dict, *, time_limit_s: Optional[float] = None, **cfg
         max_oa_rounds=cfg.get("max_oa_rounds", 60),
         max_sep_rounds=cfg.get("max_sep_rounds", 12),
         fbbt_rounds=cfg.get("fbbt_rounds", 20),
+        dominated_cols=cfg.get("dominated_cols", dominated_cols_enabled()),
         initial_incumbent=cfg.get("initial_incumbent", None),
         time_limit_s=time_limit_s,
     )

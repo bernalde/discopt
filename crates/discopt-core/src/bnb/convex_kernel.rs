@@ -53,6 +53,9 @@ pub enum ConvexFunc {
     Sqrt,
     /// `ln(1 + t)` (concave).
     Log1p,
+    /// `t²` (convex). Its perspective `s·(a/s)² = a²/s` is quadratic-over-linear,
+    /// jointly convex on `s > 0` — the `clay*hfsg` hull shape.
+    Sqr,
 }
 
 impl ConvexFunc {
@@ -64,6 +67,7 @@ impl ConvexFunc {
             ConvexFunc::Exp => t.exp(),
             ConvexFunc::Sqrt => t.sqrt(),
             ConvexFunc::Log1p => t.ln_1p(),
+            ConvexFunc::Sqr => t * t,
         }
     }
 
@@ -81,6 +85,7 @@ impl ConvexFunc {
                 (s, 0.5 / s)
             }
             ConvexFunc::Log1p => (t.ln_1p(), 1.0 / (1.0 + t)),
+            ConvexFunc::Sqr => (t * t, 2.0 * t),
         }
     }
 }
@@ -152,13 +157,18 @@ impl CompositeTerm {
                 // Guarded by the producer's `s > 0` gate; a non-positive `s` here
                 // would mean a violated precondition, so emit NaN and let the
                 // caller's finiteness check drop the tangent rather than produce
-                // a silently wrong (unsound) cut.
-                if !(s > 0.0) {
+                // a silently wrong (unsound) cut. NaN must take this branch too —
+                // hence the explicit `is_nan`, not a bare `s <= 0.0`.
+                if s.is_nan() || s <= 0.0 {
                     return (f64::NAN, f64::NAN, f64::NAN);
                 }
                 let t = a / s;
                 let (f, fp) = self.func.eval_and_deriv(t);
-                (self.coeff * s * f, self.coeff * fp, self.coeff * (f - t * fp))
+                (
+                    self.coeff * s * f,
+                    self.coeff * fp,
+                    self.coeff * (f - t * fp),
+                )
             }
         }
     }
@@ -471,6 +481,7 @@ impl ConvexKernelSpec {
         // Generous safety cap on total (OA + separation) re-solves; normal
         // convergence exits far sooner.
         let iter_cap = max_oa_rounds.max(1) * (max_sep_rounds + 1) + max_sep_rounds + 4;
+        let append_cap = appended_row_cap(self.n);
 
         for _ in 0..iter_cap {
             oa_rounds += 1;
@@ -483,7 +494,7 @@ impl ConvexKernelSpec {
             // slacks are basic); cold+scaled on the first solve. The warm path
             // equilibrates and falls back to a cold solve when the basis is
             // unusable, so the result is always correct — only faster.
-            let sol = match &basis {
+            let mut sol = match &basis {
                 Some(bs) => {
                     let ext = extend_basis(bs.clone(), n_total);
                     let lp = LpView {
@@ -498,6 +509,19 @@ impl ConvexKernelSpec {
                 }
                 None => solve_lp_cols_scaled(sp.clone(), m, n_total, &c, &l, &u, &b, opts),
             };
+            // A warm re-optimize that breaks down numerically is re-solved once COLD
+            // (#879). The carried basis is what is in doubt after a breakdown — it has
+            // been extended once per appended row across the whole OA chain — so the
+            // retry discards it rather than re-using it, exactly as the LP layer's own
+            // `dense_retry` does. Sound by construction: a `Numerical`/`IterLimit` exit
+            // carries no certificate to preserve, so this only ever replaces a failure
+            // with the robust path's verdict; a retry that also fails flows on as that
+            // failure and still poisons the certificate. Measured on `clay0303hfsg`:
+            // without it the tree exits `exhausted` on a dropped subtree, with it the
+            // instance certifies.
+            if basis.is_some() && matches!(sol.status, LpStatus::Numerical | LpStatus::IterLimit) {
+                sol = solve_lp_cols_scaled(sp.clone(), m, n_total, &c, &l, &u, &b, opts);
+            }
             if sol.status != LpStatus::Optimal {
                 // Sound model-sense sentinel — never falsely survives fathoming.
                 let sentinel = match (sol.status, self.sense_max) {
@@ -528,26 +552,30 @@ impl ConvexKernelSpec {
                 None => f64::NEG_INFINITY,
             };
 
-            // 1. OA tangents for violated convex rows at this vertex (append).
+            // 1. OA tangents for violated convex rows at this vertex (append), while
+            // the node relaxation is still within its size cap.
             let mut added = false;
-            for row in &self.nl_rows {
-                if row.residual(&last_x) > oa_tol {
-                    if let Some(cut) = row.oa_tangent(&last_x) {
-                        rows.push(AsmRow {
-                            cols: cut.cols,
-                            coeffs: cut.coeffs,
-                            rhs: cut.rhs,
-                            is_eq: false,
-                        });
-                        added = true;
+            if rows.len() - n_base < append_cap {
+                for row in &self.nl_rows {
+                    if row.residual(&last_x) > oa_tol {
+                        if let Some(cut) = row.oa_tangent(&last_x) {
+                            rows.push(AsmRow {
+                                cols: cut.cols,
+                                coeffs: cut.coeffs,
+                                rhs: cut.rhs,
+                                is_eq: false,
+                            });
+                            added = true;
+                        }
                     }
                 }
             }
             if added {
                 continue; // OA not yet converged
             }
-            // 2. OA converged. Separate integrality cuts if budget remains.
-            if sep_used >= max_sep_rounds {
+            // 2. OA converged (or the size cap stopped it). Separate integrality cuts
+            // if budget remains and the relaxation is still within its size cap.
+            if sep_used >= max_sep_rounds || rows.len() - n_base >= append_cap {
                 break;
             }
             sep_used += 1;
@@ -650,6 +678,30 @@ impl ConvexKernelSpec {
     }
 }
 
+/// Cap on the rows a single node may APPEND to its base relaxation (OA tangents
+/// plus separated cuts), `max(8·n, 500)`.
+///
+/// The OA loop appends a tangent for every violated row at every vertex and never
+/// removes one, so a row whose curvature blows up near the edge of its domain can
+/// grind indefinitely: `clay0303hfsg`'s quadratic perspective `a²/s` at the
+/// `s = 0.001` smoothing floor drove one node to **307 OA rounds / 2042 tangents**
+/// on 99 structural columns, at which point the factorization broke down
+/// (`numerical`, coefficient dynamism `7.3e8`) — the subtree was discarded and the
+/// certificate poisoned (#879).
+///
+/// Stopping is a REFUSAL, not an approximation: the node LP is a relaxation for
+/// any subset of tangents, so a capped node returns a valid (merely weaker) dual
+/// bound, and a vertex reached without OA convergence still violates a nonlinear
+/// row, so `is_integer_feasible` cannot mistake it for an incumbent.
+///
+/// The multiplier is set from measurement, not taste: over every in-repo instance
+/// the kernel routes, the *healthy* ones peak at `2.4·n` appended rows
+/// (`syn05m` 47/20, `syn05hfsg` 21/42, `cvxnonsep_psig40r` 2/82), so `8·n` clears
+/// them by more than 3×, and the `500` floor keeps small models unconstrained.
+fn appended_row_cap(n: usize) -> usize {
+    (8 * n).max(500)
+}
+
 /// Extend a stored basis to `n_total` columns by making the appended slack
 /// columns basic — a valid, dual-repairable warm start after rows/cols were
 /// appended (each new column is its row's slack). No-op when already spanning.
@@ -748,6 +800,10 @@ pub struct ConvexTreeConfig {
     pub max_sep_rounds: usize,
     /// FBBT propagation round cap per node.
     pub fbbt_rounds: usize,
+    /// Apply the DOMINATED-COLUMN upper bound (`tighten_dominated_columns`) after
+    /// each node's FBBT. Unlike FBBT this is an OPTIMALITY-based reduction (it keeps
+    /// an optimal solution, not every feasible point), so it carries its own flag.
+    pub dominated_cols: bool,
     /// Optional wall-clock deadline.
     pub deadline: Option<std::time::Instant>,
     /// Optional known-feasible incumbent objective (model sense) to seed pruning.
@@ -764,6 +820,7 @@ impl Default for ConvexTreeConfig {
             max_oa_rounds: 60,
             max_sep_rounds: 12,
             fbbt_rounds: 20,
+            dominated_cols: true,
             deadline: None,
             initial_incumbent: None,
         }
@@ -928,6 +985,119 @@ impl ConvexKernelSpec {
         true
     }
 
+    /// Give a finite upper bound to each **dominated cost column** — a column that
+    /// is unbounded above and that the problem only ever pushes DOWN (#871/#879).
+    ///
+    /// FBBT cannot close such a column: it is bounded from below only. `clay0303hfsg`
+    /// has six (its fixed-charge cost variables `x81..x86`, objective coefficients
+    /// 300/240/100/…). An infinite structural `ub` is what makes the node LP break
+    /// down (`numerical`) and the Neumaier–Shcherbina safe bound decline — measured
+    /// on `clay0303hfsg` (#879): 12 of 453 nodes exited `numerical`, poisoning the
+    /// certificate, and every one of those failures disappears once these six columns
+    /// are finite.
+    ///
+    /// ## Why the bound is valid (this is an OPTIMALITY argument, not FBBT)
+    ///
+    /// A column `j` qualifies only when ALL of these hold:
+    ///
+    /// * `hi[j]` is `+∞`;
+    /// * its coefficient in the MINIMIZED objective is `> 0` — raising `x_j` strictly
+    ///   costs more;
+    /// * it appears in NO equality row and in NO nonlinear row — so the only thing
+    ///   that can constrain it is a `≤` row;
+    /// * every `≤` row containing it has `a_ij < 0`, i.e. reads
+    ///   `x_j ≥ (rest − rhs)/(−a_ij)` — the row only ever bounds `x_j` from BELOW;
+    /// * each such row's remaining max-activity over the box is finite.
+    ///
+    /// Then set `U_j = max(lo[j], max_i (maxact_rest_i − rhs_i)/(−a_ij))`. For ANY
+    /// feasible point of this node with `x_j > U_j`, lowering `x_j` to `U_j` keeps
+    /// every row satisfied (`U_j` is the largest value the rows can require of `x_j`
+    /// anywhere in the box) and strictly lowers the objective. So an optimal solution
+    /// with `x_j ≤ U_j` always exists: adding `x_j ≤ U_j` leaves the node's optimal
+    /// VALUE unchanged, for the LP relaxation and for the node's true subproblem
+    /// alike. The dual bound therefore stays valid and fathoming stays correct.
+    ///
+    /// Note this differs from FBBT in kind: FBBT keeps every feasible point, this
+    /// keeps only an optimal one. That is why it is flagged separately
+    /// (`ConvexTreeConfig::dominated_cols`) rather than folded into `propagate_fbbt`.
+    /// Any incumbent it admits is still genuinely feasible (the reduction only ever
+    /// DROPS feasible points, never adds any).
+    pub fn tighten_dominated_columns(&self, lo: &[f64], hi: &mut [f64]) -> bool {
+        let cand: Vec<usize> = (0..self.n)
+            .filter(|&j| hi[j].is_infinite() && hi[j] > 0.0)
+            .collect();
+        if cand.is_empty() {
+            return false;
+        }
+        // Structural disqualifiers: any appearance in an equality or nonlinear row
+        // means the "only pushed down" argument does not hold.
+        let mut blocked = vec![false; self.n];
+        for row in &self.eq_rows {
+            for &c in &row.cols {
+                blocked[c] = true;
+            }
+        }
+        for row in &self.nl_rows {
+            for &c in &row.lin.cols {
+                blocked[c] = true;
+            }
+            for t in &row.terms {
+                for &c in &t.arg.cols {
+                    blocked[c] = true;
+                }
+                if let Some(s) = &t.scale {
+                    for &c in &s.cols {
+                        blocked[c] = true;
+                    }
+                }
+            }
+        }
+        // The kernel minimizes `sense·c`, so this is the coefficient that matters.
+        let sense = if self.sense_max { -1.0 } else { 1.0 };
+        let mut changed = false;
+        for j in cand {
+            if blocked[j] || sense * self.c[j] <= 0.0 || !lo[j].is_finite() {
+                continue;
+            }
+            let mut ub = lo[j];
+            let mut ok = true;
+            for row in &self.le_rows {
+                let Some(pos) = row.cols.iter().position(|&c| c == j) else {
+                    continue;
+                };
+                let aj = row.coeffs[pos];
+                if aj >= 0.0 {
+                    ok = false; // this row can bound x_j from ABOVE — argument fails
+                    break;
+                }
+                // max activity of the rest of the row over the box
+                let mut maxact = 0.0;
+                for (kpos, &k) in row.cols.iter().enumerate() {
+                    if kpos == pos {
+                        continue;
+                    }
+                    let ak = row.coeffs[kpos];
+                    let v = if ak > 0.0 { hi[k] } else { lo[k] };
+                    if !v.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                    maxact += ak * v;
+                }
+                if !ok {
+                    break;
+                }
+                ub = ub.max((maxact - row.rhs) / (-aj));
+            }
+            if ok && ub.is_finite() {
+                // Relative safety margin: the bound must never sit BELOW the value an
+                // optimal solution needs, so round it outward past accumulated roundoff.
+                hi[j] = ub + 1e-9 * (1.0 + ub.abs());
+                changed = true;
+            }
+        }
+        changed
+    }
 
     /// Is `x` integer-integral on all integer columns AND OA-tight (every convex
     /// row satisfied to `oa_tol`)? Such an LP vertex is genuinely feasible → a
@@ -1096,6 +1266,16 @@ impl ConvexKernelSpec {
             if !self.propagate_fbbt(&mut lo, &mut hi, config.fbbt_rounds) {
                 continue; // empty box → fathom
             }
+            // Optimality-based: close any dominated cost column FBBT cannot reach, so
+            // the node LP does not break down on an infinite structural bound and its
+            // NS safe bound certifies (#871/#879). Re-propagate, since a new finite
+            // `ub` feeds FBBT.
+            if config.dominated_cols
+                && self.tighten_dominated_columns(&lo, &mut hi)
+                && !self.propagate_fbbt(&mut lo, &mut hi, config.fbbt_rounds)
+            {
+                continue; // empty box → fathom
+            }
 
             // Node relaxation: the shared persistent LP (warm tangent pool +
             // node-local cuts — W2) when DISCOPT_CVX_NATIVELP is on, else today's
@@ -1247,7 +1427,14 @@ impl ConvexKernelSpec {
             // Clamp ONLY against a finite dual: `min`-ing against an infinite
             // `dual_sense` would report ±inf as the incumbent objective even though
             // the incumbent POINT is a perfectly ordinary feasible vector.
-            Some(sense * if dual_sense.is_finite() { inc_sense.min(dual_sense) } else { inc_sense })
+            Some(
+                sense
+                    * if dual_sense.is_finite() {
+                        inc_sense.min(dual_sense)
+                    } else {
+                        inc_sense
+                    },
+            )
         } else {
             None
         };
@@ -1897,6 +2084,8 @@ mod tests {
             (ConvexFunc::Exp, 0.7),
             (ConvexFunc::Sqrt, 3.1),
             (ConvexFunc::Log1p, 1.4),
+            (ConvexFunc::Sqr, -2.5),
+            (ConvexFunc::Sqr, 1.75),
         ];
         for (func, t) in cases {
             let (f, fp) = func.eval_and_deriv(t);
@@ -2279,7 +2468,11 @@ mod tests {
     #[test]
     fn perspective_gradient_matches_finite_difference() {
         let row = perspective_row();
-        for x in [[3.0, 0.5, 1.0, 0.0], [1.5, 0.25, 0.4, 0.0], [0.2, 0.0, 0.05, 0.0]] {
+        for x in [
+            [3.0, 0.5, 1.0, 0.0],
+            [1.5, 0.25, 0.4, 0.0],
+            [0.2, 0.0, 0.05, 0.0],
+        ] {
             let g = row.gradient_dense(&x, N);
             for j in 0..N {
                 let h = 1e-7;
@@ -2396,7 +2589,10 @@ mod tests {
                 "seed={seed:?} certified {:?}, true optimum is 2.5",
                 r.incumbent
             );
-            assert!(r.node_count >= 1, "seed={seed:?} certified without solving a node");
+            assert!(
+                r.node_count >= 1,
+                "seed={seed:?} certified without solving a node"
+            );
         }
     }
 
@@ -2463,5 +2659,222 @@ mod tests {
         assert_eq!(res.status, ConvexTreeStatus::Optimal);
         assert!((res.incumbent.unwrap() - 2.5).abs() < 1e-6);
         assert!(res.bound.is_finite());
+    }
+
+    // ── #879: the quadratic perspective a²/s, and the guards that let it certify ──
+
+    /// The `clay*hfsg` row shape: the quadratic perspective `s·(a/s)² = a²/s`
+    /// (quadratic-over-linear), with `a = x0`, `s = 0.001 + 0.999·x2`.
+    fn sqr_perspective_row() -> ConvexRow {
+        ConvexRow {
+            lin: Affine {
+                cols: vec![1],
+                coeffs: vec![-35.0],
+                cst: 0.0,
+            },
+            terms: vec![CompositeTerm {
+                coeff: 1.0,
+                func: ConvexFunc::Sqr,
+                arg: Affine {
+                    cols: vec![0],
+                    coeffs: vec![1.0],
+                    cst: 0.0,
+                },
+                scale: Some(Affine {
+                    cols: vec![2],
+                    coeffs: vec![0.999],
+                    cst: 0.001,
+                }),
+            }],
+            rhs: 0.0,
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_is_quadratic_over_linear() {
+        let row = sqr_perspective_row();
+        for x in [
+            [3.0, 0.5, 1.0, 0.0],
+            [2.0, 1.0, 0.4, 0.0],
+            [0.25, 0.1, 0.001, 0.0],
+        ] {
+            let s = 0.001 + 0.999 * x[2];
+            let expect = -35.0 * x[1] + x[0] * x[0] / s;
+            assert!(
+                (row.value(&x) - expect).abs() <= 1e-9 * expect.abs().max(1.0),
+                "value {} != a^2/s {expect}",
+                row.value(&x)
+            );
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_gradient_matches_finite_difference() {
+        let row = sqr_perspective_row();
+        for x in [
+            [3.0, 0.5, 1.0, 0.0],
+            [2.0, 1.0, 0.4, 0.0],
+            [0.5, 0.1, 0.2, 0.0],
+        ] {
+            let g = row.gradient_dense(&x, N);
+            for j in 0..N {
+                let h = 1e-7;
+                let (mut xp, mut xm) = (x, x);
+                xp[j] += h;
+                xm[j] -= h;
+                let fd = (row.value(&xp) - row.value(&xm)) / (2.0 * h);
+                assert!((g[j] - fd).abs() < 1e-3, "col {j}: {} vs fd {fd}", g[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn sqr_perspective_oa_tangent_underestimates_everywhere() {
+        // a²/s is jointly convex on s > 0, so its tangent must lie below the row
+        // everywhere in the box — the soundness property the OA relaxation needs,
+        // and the property #879 suspected (wrongly) of being violated.
+        let row = sqr_perspective_row();
+        let xbar = [1.5, 0.4, 0.55, 0.0];
+        let cut = row.oa_tangent(&xbar).expect("finite tangent");
+        for i in 0..14 {
+            for k in 0..14 {
+                let x = [0.05 + 0.5 * (i as f64), 0.4, 0.001 + 0.07 * (k as f64), 0.0];
+                let a_dot_x: f64 = cut
+                    .cols
+                    .iter()
+                    .zip(cut.coeffs.iter())
+                    .map(|(c, a)| a * x[*c])
+                    .sum();
+                assert!(
+                    a_dot_x - cut.rhs <= row.residual(&x) + 1e-9,
+                    "tangent cuts off a feasible point at x={x:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_sqr_value_and_deriv() {
+        assert!((ConvexFunc::Sqr.eval(3.0) - 9.0).abs() < 1e-15);
+        let (f, fp) = ConvexFunc::Sqr.eval_and_deriv(-2.5);
+        assert!((f - 6.25).abs() < 1e-15);
+        assert!((fp - (-5.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn appended_row_cap_is_size_derived_with_a_floor() {
+        // Small models are unconstrained by the floor; large ones scale with n.
+        assert_eq!(appended_row_cap(1), 500);
+        assert_eq!(appended_row_cap(62), 500);
+        assert_eq!(appended_row_cap(99), 8 * 99);
+        assert_eq!(appended_row_cap(1000), 8000);
+        // Clears every healthy routed instance's measured peak by >3x (max 2.4·n).
+        for n in [20usize, 42, 82, 99] {
+            assert!(appended_row_cap(n) as f64 >= 3.0 * 2.4 * n as f64);
+        }
+    }
+
+    // ── dominated cost columns (#871/#879) ────────────────────────────────────
+
+    /// `min 3·x1  s.t.  −x1 + x0 ≤ 2,  x0 ∈ [0, 5],  x1 ∈ [0, ∞)`.
+    /// `x1` is unbounded above, costs 3 per unit, and its only row bounds it from
+    /// BELOW (`x1 ≥ x0 − 2`), so `U = (5 − 2)/1 = 3` keeps an optimal solution.
+    fn dominated_spec() -> ConvexKernelSpec {
+        ConvexKernelSpec {
+            n: 2,
+            c: vec![0.0, 3.0],
+            sense_max: false,
+            integrality: vec![false, false],
+            lb: vec![0.0, 0.0],
+            ub: vec![5.0, f64::INFINITY],
+            le_rows: vec![LinRow {
+                cols: vec![0, 1],
+                coeffs: vec![1.0, -1.0],
+                rhs: 2.0,
+            }],
+            eq_rows: Vec::new(),
+            nl_rows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dominated_column_gets_a_finite_bound() {
+        let spec = dominated_spec();
+        let (lo, mut hi) = (spec.lb.clone(), spec.ub.clone());
+        assert!(spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_finite(), "x1 must be closed");
+        assert!((hi[1] - 3.0).abs() < 1e-6, "expected U=3, got {}", hi[1]);
+        assert_eq!(hi[0], 5.0, "a bounded column must not move");
+    }
+
+    #[test]
+    fn dominated_column_bound_preserves_the_lp_optimum() {
+        let spec = dominated_spec();
+        let opts = SimplexOptions::default();
+        let before = spec.solve_node(&spec.lb, &spec.ub, 1e-6, 30, &opts);
+        let (lo, mut hi) = (spec.lb.clone(), spec.ub.clone());
+        spec.tighten_dominated_columns(&lo, &mut hi);
+        let after = spec.solve_node(&lo, &hi, 1e-6, 30, &opts);
+        assert_eq!(after.status, LpStatus::Optimal);
+        // The reduction may only make a previously-uncertifiable bound certify; it
+        // must never change a finite optimum.
+        if before.raw_bound.is_finite() {
+            assert!(
+                (before.raw_bound - after.raw_bound).abs() < 1e-6,
+                "optimum moved: {} -> {}",
+                before.raw_bound,
+                after.raw_bound
+            );
+        }
+    }
+
+    #[test]
+    fn dominated_column_refuses_when_the_cost_pushes_the_column_up() {
+        // A negative minimized cost means raising x1 PAYS, so the argument fails.
+        let mut spec = dominated_spec();
+        spec.c[1] = -3.0;
+        let (lo, mut hi) = (spec.lb.clone(), spec.ub.clone());
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
+    }
+
+    #[test]
+    fn dominated_column_refuses_on_an_equality_or_nonlinear_appearance() {
+        let mut eq = dominated_spec();
+        eq.eq_rows.push(LinRow {
+            cols: vec![1],
+            coeffs: vec![1.0],
+            rhs: 1.0,
+        });
+        let (lo, mut hi) = (eq.lb.clone(), eq.ub.clone());
+        assert!(!eq.tighten_dominated_columns(&lo, &mut hi));
+
+        let mut nl = dominated_spec();
+        nl.nl_rows.push(ConvexRow {
+            lin: Affine {
+                cols: vec![1],
+                coeffs: vec![1.0],
+                cst: 0.0,
+            },
+            terms: Vec::new(),
+            rhs: 1.0,
+        });
+        let (lo, mut hi) = (nl.lb.clone(), nl.ub.clone());
+        assert!(!nl.tighten_dominated_columns(&lo, &mut hi));
+    }
+
+    #[test]
+    fn dominated_column_refuses_when_a_row_bounds_it_from_above() {
+        // `x1 ≤ 4` (positive coefficient) means the rows do NOT only push it down;
+        // the "lower it freely" argument fails and the column must be left alone.
+        let mut spec = dominated_spec();
+        spec.le_rows.push(LinRow {
+            cols: vec![1],
+            coeffs: vec![1.0],
+            rhs: 4.0,
+        });
+        let (lo, mut hi) = (spec.lb.clone(), spec.ub.clone());
+        assert!(!spec.tighten_dominated_columns(&lo, &mut hi));
+        assert!(hi[1].is_infinite());
     }
 }

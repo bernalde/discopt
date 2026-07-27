@@ -18,7 +18,7 @@
 //!   `nl_lin_cols`/`nl_lin_coeffs`, and `nl_term_ptr` (len n_nl+1) into the term
 //!   arrays.
 //! * per term (len n_terms): `term_coeff`, `term_func` (0=Log,1=Exp,2=Sqrt,
-//!   3=Log1p), `term_arg_const`, `term_arg_ptr` (len n_terms+1) into
+//!   3=Log1p,4=Sqr), `term_arg_const`, `term_arg_ptr` (len n_terms+1) into
 //!   `term_arg_cols`/`term_arg_coeffs`.
 //! * OPTIONAL perspective scale per term (#865), supplied as a group or omitted
 //!   entirely: `term_scale_const` (len n_terms), `term_scale_ptr` (len n_terms+1)
@@ -45,9 +45,10 @@ fn func_from_code(code: i64) -> PyResult<ConvexFunc> {
         1 => ConvexFunc::Exp,
         2 => ConvexFunc::Sqrt,
         3 => ConvexFunc::Log1p,
+        4 => ConvexFunc::Sqr,
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown term_func code {other} (0=Log,1=Exp,2=Sqrt,3=Log1p)"
+                "unknown term_func code {other} (0=Log,1=Exp,2=Sqrt,3=Log1p,4=Sqr)"
             )))
         }
     })
@@ -390,7 +391,7 @@ pub fn solve_convex_node_py<'py>(
     term_coeff, term_func, term_arg_const, term_arg_ptr, term_arg_cols, term_arg_coeffs,
     term_scale_const=None, term_scale_ptr=None, term_scale_cols=None, term_scale_coeffs=None,
     max_nodes=100_000, gap_tol=1e-4, int_tol=1e-5, oa_tol=1e-6,
-    max_oa_rounds=60, max_sep_rounds=12, fbbt_rounds=20,
+    max_oa_rounds=60, max_sep_rounds=12, fbbt_rounds=20, dominated_cols=true,
     initial_incumbent=None, time_limit_s=None,
 ))]
 pub fn solve_convex_tree_py<'py>(
@@ -433,6 +434,7 @@ pub fn solve_convex_tree_py<'py>(
     max_oa_rounds: usize,
     max_sep_rounds: usize,
     fbbt_rounds: usize,
+    dominated_cols: bool,
     initial_incumbent: Option<f64>,
     time_limit_s: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -477,6 +479,7 @@ pub fn solve_convex_tree_py<'py>(
         max_oa_rounds,
         max_sep_rounds,
         fbbt_rounds,
+        dominated_cols,
         deadline: time_limit_s.map(|s| Instant::now() + Duration::from_secs_f64(s.max(0.0))),
         initial_incumbent,
     };
@@ -604,6 +607,7 @@ pub fn convex_warmlp_probe_py<'py>(
         max_oa_rounds,
         max_sep_rounds: 0,
         fbbt_rounds,
+        dominated_cols: true,
         deadline: None,
         initial_incumbent,
     };
