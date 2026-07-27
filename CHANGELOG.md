@@ -44,6 +44,51 @@ The release procedure that produces these entries is documented in
   in-repo `.nl` instances the only routing change is `syn05hfsg` being admitted;
   nothing previously routed was lost.
 
+- **Quadratic inner function (`** 2` → `sqr`) for the convex kernel** (`feat`,
+  #879, same default-off `DISCOPT_CONVEX_KERNEL` path). `clay*hfsg`'s hull rows are
+  `ε·((x/ε)² − c·x/ε + …)`, i.e. the quadratic perspective `x²/ε`
+  (quadratic-over-linear, jointly convex on `ε > 0`), so they declined only because
+  `_FUNC`/`ConvexFunc` had no `sqr` entry. Adds `ConvexFunc::Sqr` and `_pow_as_sqr`,
+  which composes with the perspective machinery unchanged — a plain `x² ≤ c` row is
+  routable too. **Only the exponent 2 is admitted**; every other power (odd,
+  fractional, negative, or variable) is nonconvex, domain-restricted, or signomial,
+  and keeps falling back, as does a non-affine base such as `(log x)²`.
+
+  This class was withdrawn once (evidence recorded in #879) on the reading that its
+  `a²/s` tangents produced an invalid (too-tight) relaxation. **That reading is falsified** — see
+  the *Fixed* entry below. Re-admitted here together with the three guards that let
+  it certify: the dominated-column bound, a per-node relaxation size cap, and a cold
+  retry of a numerically broken warm re-optimize.
+
+  Measured: `clay0303hfsg` goes from *declined* to **certified optimal
+  `26669.1096` in 211 nodes** end-to-end through `Model.solve()` (39.2 s on an idle
+  machine, single run — the node count is the deterministic figure), matching
+  its MINLPLib reference (`26669.10955143`, now recorded in
+  `python/tests/data/known_optima.toml`) and incumbent-verified against the pristine
+  model. Bound-neutral for everything routed before: `syn05m` (3 nodes), `syn05hfsg`
+  (2 nodes) and `cvxnonsep_psig40r` (1 node) are bit-identical in status, objective
+  and node count. Over the 149 in-repo `.nl` instances `clay0303hfsg` is the only
+  routing change.
+
+- **Dominated-cost-column upper bound for the convex kernel** (`feat`, #871/#879,
+  default-ON inside the default-off kernel, opt out with
+  `DISCOPT_CVX_DOMINATED_COLS=0`). FBBT cannot close a column the constraints only
+  bound from *below*; `clay0303hfsg` has six (its fixed-charge cost variables
+  `x81..x86`, objective coefficients 300/240/100/…), and an infinite `ub` is what
+  makes the node LP break down and the Neumaier–Shcherbina safe bound decline.
+  `tighten_dominated_columns` gives such a column the finite bound
+  `U_j = max(lo_j, max_i (maxact_rest_i − rhs_i)/(−a_ij))`.
+
+  This is an **optimality** argument, not FBBT: it qualifies a column only when its
+  minimized-objective coefficient is `> 0`, it appears in no equality and no
+  nonlinear row, and every `≤` row containing it has `a_ij < 0`. Lowering `x_j` to
+  `U_j` from any feasible point then keeps every row satisfied and strictly lowers
+  the objective, so the node's optimal *value* is unchanged and the dual bound stays
+  valid — but unlike FBBT the box no longer contains every feasible point, which is
+  why it keeps its own switch. Measured: turning it off takes `clay0303hfsg` from
+  `optimal` back to `exhausted`, and it is a bit-identical no-op on every other
+  routed instance.
+
 ### Changed
 
 - **`gap_certified` now requires BOTH ends of a gap** (`fix`, #875). A limit exit
@@ -56,6 +101,43 @@ The release procedure that produces these entries is documented in
   because a bound with no incumbent is still a valid bound.
 
 ### Fixed
+
+- **The convex kernel's `clay0303hfsg` "false optimum" was a false CERTIFICATE, not
+  an invalid relaxation** (`fix(correctness)`, #879). #879 recorded three
+  mutually-inconsistent `optimal` results on `clay0303hfsg` (28351.42 / 36397.83 /
+  55092.52), each strictly worse than a point the default path attains, and read
+  them as a dual bound sitting *above* the true optimum — an invalid, too-tight
+  `a²/s` relaxation. Re-measured with the #871 certificate fix in place, **that
+  hypothesis is falsified and is retracted here**:
+
+  * every one of those numbers is an **incumbent**, published as certified because
+    the tree had silently discarded a `numerical` node and then let `bound` fall
+    back to the incumbent's own objective. `28351.41943619983` is reproduced exactly
+    as the incumbent of an *uncertified* run;
+  * the relaxation is not too tight anywhere. `clay0303hfsg`'s root safe bound is
+    `0.0` at every separation setting (0/1/2/4/12) against an optimum of `26669.11`
+    — valid, and in fact trivially weak, the opposite failure. Pinned by
+    `test_clay0303hfsg_root_relaxation_is_sound_not_too_tight`.
+
+  What actually blocked certification was the node LP breaking down (`numerical`) on
+  12 of 453 nodes, correctly poisoning the certificate. Three causes, each fixed and
+  each measured to be necessary — removing any one alone takes the instance back to
+  `exhausted`: the six infinite structural upper bounds (dominated-column bound,
+  above); an unbounded per-node OA tangent pool (`appended_row_cap`, `max(8·n, 500)`
+  — one node reached 307 OA rounds / 2042 tangents on 99 columns before the
+  factorization broke); and a warm re-optimize whose carried basis, extended once per
+  appended row across the whole OA chain, is exactly what is in doubt after a
+  breakdown (now re-solved once **cold**, mirroring the LP layer's own
+  `dense_retry`). All three are refusals or robust re-solves — a capped node returns
+  a valid, merely weaker bound, and a vertex reached without OA convergence still
+  violates a nonlinear row so it cannot be mistaken for an incumbent.
+
+  The methodological lesson from #879 stands and is now enforced: exactness and
+  convexity of the marshaled rows both **passed** while the false certificate was
+  live, so they are not sufficient to admit a term class. A routed instance's
+  certified objective must be checked against a known optimum —
+  `test_clay0303hfsg_certifies_against_its_known_optimum` does exactly that, against
+  the shared `known_optima.toml` registry.
 
 - **Root setup no longer scales with `n_vars × n_constraints`, and no longer runs
   unbudgeted** (`fix(performance)`, #875, successor to #863/#868). After #868,

@@ -188,3 +188,18 @@ note = "Optimum is exactly 0; the incumbent lands at -1.6e-08 (see gear)."
 optimum = -20.59
 source = "MINLPLib (discopt_benchmarks/scripts/t21_root_loop_replay.py ORACLE)"
 status = "certifies"
+
+# ── Convex-kernel routed instances (issues #865 / #879) ──────────────────────
+# `clay*hfsg` writes its disjunctive nonlinearities as the smoothed QUADRATIC
+# perspective `ε·((x/ε)² − c·x/ε)` = `x²/ε`. Admitting that term class once
+# shipped a false certificate (#879) that was actually the tree bug #871 fixed —
+# an incumbent published as certified after a subtree was silently discarded.
+# The reference value below is what re-admission is checked against, which is
+# precisely the check whose absence let the false certificate ship.
+
+[clay0303hfsg]
+optimum = 26669.10955143
+source = "MINLPLib (=opt= 26669.10957; discopt_benchmarks/results/issue764_native_kernel_graduation_panel_20260719T191450Z.txt)"
+functions = ["sqr"]
+status = "certifies"
+note = """Minimization. Certified by the convex LP-OA kernel (#879) at 26669.1096 in 211 nodes with `DISCOPT_CONVEX_KERNEL=1`, and by the default NLP-BB path (python/tests/test_nlp_bb_lns_layer.py). Incumbents come from tolerance-feasible OA vertices, so compare with a relative tolerance rather than exactly."""
