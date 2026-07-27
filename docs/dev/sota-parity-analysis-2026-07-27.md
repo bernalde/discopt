@@ -1,0 +1,239 @@
+# SOTA parity analysis: discopt vs SCIP/BARON — evidence, gaps, and the prioritized plan
+
+**Date:** 2026-07-27 · **Tree:** `main @ 0459d406` (post #870/#877/#878/#880/#881)
+**Rule for this document:** every claim cites a measurement — a dated run in this repo, a
+committed plan-doc table, or a reference CSV. Anything without a number did not make the list.
+Negative results (measured dead ends) are listed with the same force as the gaps: **spending
+time on them is how the last three weeks under-delivered**, and they are binding under
+CLAUDE.md §4 / `baron-gap-plan.md` §8.
+
+## §0. Evidence sources
+
+| source | what it contributes |
+|---|---|
+| fresh 3-way run, this date (`reports/global50_3way_2026-07-27*`) | current headline parity: discopt (warm daemon) vs BARON (GAMS) vs SCIP (.nl), 50 curated global-opt instances, 60 s, shared oracle |
+| `reports/global50_3way_2026-07-20T12-24-28.md` | previous 3-way baseline (pre-#870/#877/#878/#880/#881) |
+| `v-baron-remeasure-2026-07-07.md` | 61-instance defaults-only panel vs BARON; per-instance cert ledger |
+| `baron-gap-plan.md` §1 | measured gap decomposition `wall ≈ floor × per_node × nodes`; TX0 62-instance attribution histogram |
+| `scip-parity-kernel-plan.md` | F1–F3 diagnosis; E0 kernel node-rate bench (real exported node LPs) |
+| `performance-plan.md` §1 | CC1–CC5 measured cost centers; falsified hypotheses |
+| `scip-gap-nvs-diagnosis.md` | SCIP ablation on nvs17 (cuts vs branching); separator findings |
+| `~/Dropbox/…/scip_join.csv` (1,610 rows) | SCIP reference wall/status per MINLPLib instance |
+| `~/Dropbox/…/minlplib.solu` (980 `=opt=`) | ground-truth optima used by every soundness check here |
+| this session's measured runs (2026-07-25→27) | tln quality (#862/#880), watercontamination scaling (#875), clay certification (#882), #844 instance re-measure |
+
+## §1. Where discopt is at parity today (measured)
+
+**1a. Correctness — the product — is at parity.** July-20 3-way, 50 instances, 60 s:
+discopt 48/50 `ok`, **0 violations**; BARON 49/50, 0; SCIP 47/50 (2 GAP), 0. The
+61-instance defaults panel: **0 violations**, and every `status=optimal` cross-checked
+against `minlplib.solu`. The July-27 rerun (§2) re-confirms on the current tree. Three
+days of adversarial probing this week (gear4 presolve `INF`-sentinel #877, the convex-tree
+discarded-subtree #870/`1df5f71a`) found and removed two certificate bugs; the backlog
+now has **zero open correctness bugs**.
+
+**1b. Root bound strength on the convex families.** GMI closes **75–93 %** of the
+convex-panel root spread; `rsyn0805m` root bound **beats SCIP's root** (#781 measurement,
+quoted in `scip-parity-kernel-plan.md` F2). The envelope library is at catalog parity
+(`relaxation-catalog.md`); cert-gap T1.1 measured every uncovered family as closed-form
+box-affine.
+
+**1c. The Rust LP layer already reaches SCIP-class node rates** — when driven correctly.
+E0 bench on *real exported node LPs* (2,000 branching-shaped bound flips, release build):
+
+| node LP | m×n | kernel pattern (amortized scale+CSC+LU) |
+|---|---|---|
+| nvs09 spatial lifted | 292×374 | **25,928 re-solves/s (38 µs p50)** |
+| rsyn0805m OA+cuts (post-P1.0) | 537×635 | **1,419/s** (≥ the 500/s kill gate) |
+| tanksize spatial lifted | 187×257 | 1,288/s |
+
+**1d. This week's closures, oracle-verified on this machine:** tln4 **exact** / tln5 +4.9 %
+/ tln6 +5.9 % (was +12/+213/+327 %, #880 plunging); `clay0303hfsg` certifies 26669.109557
+vs `=opt=` 26669.10957 (#882); `rsyn0805m04hfsg`/`rsyn0810m04hfsg` certify at rel 1.4e-7 /
+1.8e-7 via the convex kernel (#870); `watercontamination0202` 579 s → 49 s with wall
+scaling in `T` (#878).
+
+## §2. Current headline (fresh 3-way, 2026-07-27, 60 s, warm daemon)
+
+Run: `reports/global50_3way_2026-07-27T12-31-43.md` (this tree, `main @ 0459d406`).
+**Correctness gate: PASS — 0 violations, all three solvers.**
+
+| solver | ok | GAP | VIOLATION | n/a | total wall (s) | geomean wall (s) |
+|---|---|---|---|---|---|---|
+| discopt | 48/50 | 0 | **0** | 2 | 340.6 | **0.540** |
+| baron | 49/50 | 0 | 0 | 1 | 130.7 | 0.068 |
+| scip | 47/50 | 2 | 0 | 1 | 391.3 | 0.188 |
+
+Read against July 20 (pre-#870/#877/#878/#880/#881/#882): correctness identical
+(48/49/47, 0 violations), geomean essentially unchanged (0.561 → 0.540 s; BARON
+0.077 → 0.068; SCIP 0.198 → 0.188 — run-to-run noise, same machine). **The week's
+merges were correctness and capability work off this panel; the headline multiplier —
+7.9× vs BARON, 2.9× vs SCIP — is untouched, exactly as the G-A/G-D attribution
+predicts: it lives in the per-node loop and the floor, which none of this week's PRs
+addressed.** That is the cleanest available demonstration that P1 (the kernel) is
+where the wall-clock gap actually is. Illustrative row: `clay0303hfsg` — default path
+34.8 s vs BARON 1.4 s / SCIP 5.7 s, while the flag-gated kernel certifies the same
+instance in ~7 s (G-C in one row).
+
+## §3. The measured gaps
+
+**G-A. Per-node cost: the node loop runs in the interpreter — 50–500× vs SCIP.**
+116-instance profile (`scip-parity-kernel-plan.md` F1): **61 % JAX, 39 % Python, ~0 % Rust
+LP wall**. The entire caching campaign (EP1/2/4a/4b/5 + CC1's −22 % gear4 win) took nvs09
+from 294 → ~50 ms/node and **plateaued — that hypothesis is spent**. SCIP's node is
+0.1–1 ms. nvs05: 20.5 nodes/s vs BARON 1,874 (**90×**), with the bound source being ~780
+Python↔JAX scalar round-trips per NLP solve (`baron-gap-plan.md` §1.3). Meanwhile §1c
+shows the same machine sustaining 26k LP re-solves/s in Rust on the same LPs. The gap is
+architecture, not implementation detail.
+
+**G-B. Primal capability: instances SCIP solves in <6 s where discopt returns *nothing*.**
+Re-measured this session on `main`, 60 s, defaults (18 soundness assertions, 0 unsound):
+
+| instance | discopt (60 s) | SCIP (`scip_join.csv`) |
+|---|---|---|
+| `watercontamination0202` (106,711 vars) | no incumbent, bound ≈ 0 vs opt 125.196 (vacuous) | **optimal, 2.56 s** |
+| `gastrans582_cold13` | no incumbent | optimal, 5.38 s |
+| `gastrans040` | no incumbent | optimal, 0.06 s |
+| `rsyn0805m04hfsg` (default path) | no incumbent | optimal, 1.33 s |
+| `ball_mk2_30` | no incumbent, bound −26.9 vs opt 0 | optimal, ~0 s |
+| `chimera_k64ising-01` (#843) | no incumbent | optimal, 18.69 s |
+
+The counter-evidence that this is fixable with the machinery already present: plunging
+(#880) alone took tln6 from +326.8 % to +5.9 % and certified nvs17 — the node loop simply
+never reached exact leaves before. And `rsyn0805m04hfsg` **is** certified in 5.2 s by the
+convex kernel — the default path just never routes there (G-C).
+
+**G-C. Routing: capabilities exist but the default path does not reach them.**
+`DISCOPT_CONVEX_KERNEL` is default-OFF; with it ON, `rsyn0805m04hfsg`/`rsyn0810m04hfsg`/
+`clay0303hfsg`/`syn05*` all certify correctly (15 assertions, 0 unsound, this session).
+SCIP/BARON do not have a "flag off" state — routing *is* the product. The inverse case is
+also measured: `watercontamination0202` classifies `convex=True` in 2.9 s and the
+convex/MIQP route then runs **2001 s with no bound** (vs 49 s spatial) — so graduation is
+genuinely a §5 panel question in both directions, not a toggle.
+
+**G-D. The wall-clock multiplier on jointly-proved instances.** July-7 panel: discopt/BARON
+geomean **14.4×** on the 40 jointly-proved (median 14.6×, max 180.6×). July-20 global50
+geomean: discopt 0.561 s vs BARON 0.077 s (**7.3×**), SCIP 0.198 s (**2.8×**). TX0
+attribution over 62 instances: **floor 26, node_count 18, no_bound 8, overrun 4** — i.e.
+~42 % of the gap is the per-process floor (import 513 ms; solve itself BARON-competitive
+on easy instances), which the warm daemon already halves (residual 3.7× = engine constant
+~150 ms + per-node cost).
+
+**G-E. The missing multi-row separator, sequenced honestly.** SCIP's ablation on nvs17:
+no-cut SCIP closes in 6,796 nodes; with its `aggregation` separator, **70**. discopt's
+single-row GMI/MIR measured: bound −27,795 → −27,291 then **plateau** (still 25× loose) —
+discopt has no aggregation c-MIR. But two measured constraints order this *after* cheap
+nodes: root-only cutting at certifying intensity starves incumbents (0/5 on
+rsyn0810m/tls2, #781 held), and `scip-gap-nvs-diagnosis.md` measured OBBT × cuts ×
+throughput as **multiplicative — they must land together**.
+
+**G-F. `no_bound` family (8/62) — relaxation strength on family D** (tls2/tspn-class,
+`baron-gap-plan.md` G5): the dual bound never moves, so no budget helps. Distinct from
+G-B (those have vacuous-but-moving bounds); untouched by everything shipped this month.
+
+## §4. The prioritized plan
+
+Ordering rule: (leverage measured on the end metric) ÷ (evidence the approach works),
+with measured dead ends excluded. Each area states the falsifiable exit metric up front.
+
+---
+
+### P1 — The compiled branch-and-cut kernel (BCK). *The only fix for G-A; unlocks G-E.*
+
+**Evidence it is required:** the 50–500× per-node gap is the largest single factor and the
+Python-side campaign to close it is **measured as spent** (G-A). Evidence the approach
+works: E0 passed its own kill criterion on real node LPs (§1c); every ingredient (simplex,
+Gomory, c-MIR, cover, cut_select, FBBT, tree) already exists in Rust and profiles at ~0 %
+wall because Python never drives it (F3).
+
+**Plan of record already exists** (`scip-parity-kernel-plan.md`): next step is **E1**
+(template-refresh parity: analyze-once templates must reproduce Python-built rows ≤1 ulp
+on all 62 vendored instances; kill: <90 % of rows templatable), then P1 behind
+`DISCOPT_KERNEL` default-OFF.
+
+**Fixed when:** E1 passes its gate; then the P1 gate verbatim — `rsyn*/syn*/clay` panel
+certified **≤ 5 s each** (SCIP ≤ ~1 s; 5× interim bar), first-incumbent latency ≤ legacy,
+`incorrect_count = 0`, §5 differential clean. End state: global50 geomean within **2×**
+of SCIP.
+
+### P2 — Primal constructors for the six no-incumbent instances (G-B). *Closes #844, #861, #843.*
+
+**Evidence it is required:** the G-B table — six instances at "no incumbent in 60 s" vs
+SCIP ≤ 18.7 s, all with `=opt=` oracles. Evidence of tractability: plunging's measured
+17× quality jump on the same class (#880); `ball_mk2_30`'s node loop reaches bound −26.9
+soundly, it just never finds a leaf; #844 already specifies the SCIP recipe (LP-based
+feasibility pump, sub-MIP RENS) and records that all current levers were re-measured and
+fail.
+
+**Fixed when:** each of the six returns a **verified-feasible incumbent within 60 s**
+(defaults), measured by the #872 quality panel (which is already wired to `minlplib.solu`
+and counts false primals); quality bar: primal gap ≤ 10 % on each (tln precedent shows
+the machinery reaches ≤ 6 %); `incorrect_count = 0`; and the #844 panel's own gate
+(`gains / lost_incumbents / cert_regressions / overshoots / unsound`) stays clean.
+
+### P3 — Route the convex family by default (G-C). *Cheapest large win; removes rsyn from P2.*
+
+**Evidence it is required:** `rsyn0805m04hfsg` certified in 5.2 s by machinery that ships
+default-OFF while the default path returns nothing in 60 s. SCIP's 1.33 s on the same
+instance is *routing + kernel*, not magic. Evidence of risk (why this is a panel, not a
+toggle): the `watercontamination0202` counter-case — `convex=True` classification routes
+it into a 2001 s no-bound solve.
+
+**Fixed when:** a §5 graduation panel over the kernel-eligible corpus shows the bars below.
+The candidate pool is the `syn*`/`rsyn*`/`clay*`/`cvxnonsep*` families — **136 candidate
+`.nl` files** in the Dropbox snapshot (52+48+12+24, counted) — of which per-instance
+eligibility must be established by the panel itself (an eligibility sweep of all 136 was
+started and did not finish in-session; only the 4 vendored instances are confirmed
+eligible, which is why the in-repo corpus alone cannot graduate this flag). Bars: cert-clean (0 crossings vs `.solu`, 0
+cert regressions), net-positive (wall/certs strictly better on the family, no default-path
+instance worse), **and** a size/time guard that provably excludes the
+watercontamination-class counter-case. Then `DISCOPT_CONVEX_KERNEL` defaults ON and
+`rsyn0805m04hfsg` certifies ≤ 10 s end-to-end from `solve()` with no env vars.
+
+### P4 — Family-D bound strength (G-F). *The 8/62 `no_bound` instances.*
+
+**Evidence it is required:** TX0's histogram — 8 of 62 instances lose to a bound that
+never moves; no throughput or primal work can help them (`baron-gap-plan.md` G5 diagnosis
+stands, unchanged by this month's work). BARON proves 4 of them at 60 s (nvs05/nvs09/
+tanksize/tls2, July-7 ledger).
+
+**Fixed when:** on the G5-named members, the root relaxation produces a finite,
+`.solu`-valid dual bound that **tightens under branching** (trajectory recorder T0.2 shows
+strict improvement), and ≥ 2 of the 4 BARON-proved members certify at 60 s with
+`incorrect_count = 0`. Bound-changing ⇒ full §5 differential panel.
+
+### P5 — Kill the residual floor honestly (G-D floor share). *Measurement + product, not engine.*
+
+**Evidence it is required:** floor dominates 26/62 of the gap ledger; import tax 513 ms
+(86 % of a trivial solve); daemon already halves the easy-class gap to 3.7×, residual =
+~150 ms/solve engine constant (Appendix B) — real to users invoking the CLI cold.
+
+**Fixed when:** the benchmark lane reports daemon-mode by default (G4 landed — keep it the
+lane of record); the per-solve engine constant is profiled and ≤ 50 ms on `alan`
+(currently ~150 ms); cold-start `discopt solve alan.nl` ≤ 250 ms end-to-end. All
+bound-neutral by construction (nothing touches the search); verified by byte-identical
+node counts on the deterministic panel.
+
+---
+
+### Explicit non-areas — measured dead ends; do not staff
+
+| tempting | why not (measurement) |
+|---|---|
+| more Python/JAX caching for node cost | EP campaign plateaued at ~50 ms/node; "hypothesis spent" (kernel-plan F1) |
+| root-only cutting at certifying intensity | starves incumbents 0/5 (#781 held) |
+| single-row GMI/MIR push on nvs family | plateaus 25× loose (`scip-gap-nvs-diagnosis.md`); needs aggregation *inside* cheap nodes (P1) |
+| truncating bound-producing solves to meet budgets | §8.1: casctanks bound −99.09 → **+5.70** — the overruns ARE the dual bound |
+| ratio-of-`T` wall targets for root-setup instances | §8.6 + #654 test: the bar is "wall scales with `T`"; watercontamination floor ≈ 27 s mirrors sonet23v4's documented 24.5 s |
+| capping infinite variable bounds to make NS certify | unsound: shrinks the feasible set (#871, re-scoped) |
+| binary-expansion of integer products | nvs17 7 → 2,751 vars (`scip-gap-nvs-diagnosis.md`) |
+| blanket-disabling node NLPs | tls2 bound looser, tspn12 incumbent lost, panel wall worse (§8.4) |
+
+## §5. How the last three days actually score against this list
+
+For calibration of the plan, not self-congratulation: #877/#870/#881 were correctness
+(the gate, not the goal — but non-negotiable); #880 and #882 were P2-class work (measured
+17× and a new certificate); #878 was P5/G-D-overrun class; the #875 ratio-chasing and the
+sparse-`LinearContext` branch were **non-area work** (the branch was falsified end-to-end:
+40× slower and bound-losing). The lesson encoded above: the non-area table is as
+load-bearing as the priority list.
