@@ -135,6 +135,31 @@ pub fn tighten_bounds_csc(
     }
 }
 
+/// A column's contribution `a_ij * x_j` over `[lo_j, hi_j]`, as
+/// `(cmin, cmin_is_infinite, cmax, cmax_is_infinite)`.
+///
+/// The infinity flags are derived from the **bounds**, never from the products.
+/// `INF` is a sentinel (1e20), not a true infinity, so `a_ij * hi_j` for an
+/// unbounded column is an ordinary finite number whenever `|a_ij| < 1` — e.g.
+/// `-0.5 * 1e20 = -5e19`, which fails a `<= -INF` test and is therefore booked as
+/// a *finite* activity. That is unsound twice over: the row's activity range is no
+/// longer recognised as unbounded, and the huge magnitude then annihilates every
+/// smaller term in the running sum (`ulp(5e19) = 8192`), so the residual
+/// `sum - term` comes back as `0.0` instead of its true value. On gear4's node LP
+/// that fabricated the tightening `x >= 35.2244` on a column whose optimal value is
+/// `0`, cutting the optimum out of the box and turning a `0.0` LP optimum into a
+/// certified-`optimal` `184279.32`.
+#[inline]
+fn contrib(aij: f64, lo_j: f64, hi_j: f64) -> (f64, bool, f64, bool) {
+    let lo_inf = lo_j <= -INF;
+    let hi_inf = hi_j >= INF;
+    if aij > 0.0 {
+        (aij * lo_j, lo_inf, aij * hi_j, hi_inf)
+    } else {
+        (aij * hi_j, hi_inf, aij * lo_j, lo_inf)
+    }
+}
+
 /// One FBBT round over a single row, given its nonzeros `(col, coeff)`. Mutates
 /// `lo`/`hi` in place; returns `Some(changed)` or `None` if the box was proven empty.
 /// Matrix-representation-independent — the dense and CSC entries differ ONLY in how
@@ -154,38 +179,41 @@ fn fbbt_row(
     let mut sum_max_finite = 0.0;
     let mut n_min_inf = 0usize;
     let mut n_max_inf = 0usize;
+    // Largest magnitude entering the running sums. Floating-point accumulation
+    // error is ~eps * max_term, and each residual below is formed by SUBTRACTING
+    // one term from that sum, so this sets the absolute error scale of every
+    // derived bound. See `res_err`.
+    let mut max_abs_term = b_i.abs();
     for &(j, aij) in row_nz {
         if aij == 0.0 {
             continue;
         }
-        let (cmin, cmax) = if aij > 0.0 {
-            (aij * lo[j], aij * hi[j])
-        } else {
-            (aij * hi[j], aij * lo[j])
-        };
-        if cmin <= -INF {
+        let (cmin, cmin_inf, cmax, cmax_inf) = contrib(aij, lo[j], hi[j]);
+        if cmin_inf {
             n_min_inf += 1;
         } else {
             sum_min_finite += cmin;
+            max_abs_term = max_abs_term.max(cmin.abs());
         }
-        if cmax >= INF {
+        if cmax_inf {
             n_max_inf += 1;
         } else {
             sum_max_finite += cmax;
+            max_abs_term = max_abs_term.max(cmax.abs());
         }
     }
+    // Error budget for `sum - term`. A residual is only meaningful to within the
+    // rounding error already baked into the sum; widening each derived bound by
+    // this keeps the contraction sound when a legitimately large (but finite)
+    // bound swamps the smaller terms. Negligible in the normal case: for terms of
+    // order 1e3 this is ~2e-13.
+    let res_err = 8.0 * f64::EPSILON * max_abs_term;
 
     for &(k, aik) in row_nz {
         if aik == 0.0 {
             continue;
         }
-        let (ck_min, ck_max) = if aik > 0.0 {
-            (aik * lo[k], aik * hi[k])
-        } else {
-            (aik * hi[k], aik * lo[k])
-        };
-        let k_min_inf = ck_min <= -INF;
-        let k_max_inf = ck_max >= INF;
+        let (ck_min, k_min_inf, ck_max, k_max_inf) = contrib(aik, lo[k], hi[k]);
 
         let res_min_finite = n_min_inf - (k_min_inf as usize) == 0;
         let res_max_finite = n_max_inf - (k_max_inf as usize) == 0;
@@ -193,12 +221,12 @@ fn fbbt_row(
         let mut term_ub = INF;
         if res_min_finite {
             let res_min = sum_min_finite - if k_min_inf { 0.0 } else { ck_min };
-            term_ub = b_i - res_min;
+            term_ub = b_i - res_min + res_err;
         }
         let mut term_lb = -INF;
         if res_max_finite {
             let res_max = sum_max_finite - if k_max_inf { 0.0 } else { ck_max };
-            term_lb = b_i - res_max;
+            term_lb = b_i - res_max - res_err;
         }
 
         let (mut new_lo, mut new_hi) = if aik > 0.0 {

@@ -70,12 +70,15 @@ def test_failed_child_relaxation_never_yields_a_false_certificate(monkeypatch):
     real = lpsb._relax_bound
     state = {"calls": 0, "failures": 0}
 
-    def flaky(model, terms, lb, ub):
+    def flaky(model, terms, lb, ub, **kw):
+        # ``**kw`` passes through whatever optional arguments the real
+        # ``_relax_bound`` grows (``deadline`` since #860) so the injection keeps
+        # testing the unresolved-child path rather than failing on a signature.
         state["calls"] += 1
         if state["calls"] > 3:  # let the root and first nodes succeed
             state["failures"] += 1
             return None
-        return real(model, terms, lb, ub)
+        return real(model, terms, lb, ub, **kw)
 
     monkeypatch.setattr(lpsb, "_relax_bound", flaky)
     res = lpsb.solve_lp_spatial_bb(_model(), time_limit=30.0, gap_tolerance=1e-4)

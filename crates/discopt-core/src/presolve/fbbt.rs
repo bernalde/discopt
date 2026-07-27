@@ -8,6 +8,7 @@ use crate::expr::{
     VarType,
 };
 use std::f64::consts::PI;
+use std::time::Instant;
 
 /// Feasibility tolerance for declaring a constraint infeasible during FBBT.
 ///
@@ -1148,6 +1149,42 @@ pub fn fbbt_with_cutoff(
     tol: f64,
     incumbent_bound: Option<f64>,
 ) -> Vec<Interval> {
+    fbbt_with_cutoff_until(model, max_iter, tol, incumbent_bound, None)
+}
+
+/// Number of constraints between deadline polls inside a single FBBT sweep.
+/// `Instant::now()` is ~20 ns, so polling every constraint would cost a few
+/// milliseconds per sweep on a 100k-row model -- negligible against the propagation
+/// itself, but the stride keeps it free on models with many trivial rows.
+const FBBT_DEADLINE_POLL_STRIDE: usize = 64;
+
+/// Like [`fbbt_with_cutoff`] but stops once `deadline` passes, returning the bounds
+/// tightened so far.
+///
+/// FBBT is an anytime algorithm: `backward_propagate` only ever *tightens*
+/// `var_bounds`, and each constraint's inference is independently valid, so stopping
+/// after any prefix of sweeps -- or after any prefix of constraints *within* a sweep
+/// -- yields a valid, merely looser box. It is never a fixed point, which FBBT's
+/// callers do not require.
+///
+/// Without this, a single call runs `max_iter` full forward/backward sweeps over
+/// every constraint regardless of any budget, and the presolve orchestrator only
+/// checks its own budget *between passes*. Two passes overran because of it on
+/// `watercontamination0202` (106,711 vars / 107,209 constraints, issue #863), each
+/// >90 s against a 7.5 s budget:
+///
+///   * `fbbt` directly;
+///   * `probing`, which polls its deadline once per binary variable but calls `fbbt`
+///     twice per binary. That instance has only **7** binaries, so the per-binary
+///     poll granularity was ~13 s of unpollable work each -- the poll was there and
+///     still could not help.
+pub fn fbbt_with_cutoff_until(
+    model: &ModelRepr,
+    max_iter: usize,
+    tol: f64,
+    incumbent_bound: Option<f64>,
+    deadline: Option<Instant>,
+) -> Vec<Interval> {
     let n_vars = model.variables.len();
     let mut var_bounds: Vec<Interval> = model.variables.iter().map(seed_block_interval).collect();
 
@@ -1161,9 +1198,21 @@ pub fn fbbt_with_cutoff(
     });
 
     for _ in 0..max_iter {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return var_bounds;
+            }
+        }
         let old_bounds = var_bounds.clone();
 
-        for constr in &model.constraints {
+        for (ci, constr) in model.constraints.iter().enumerate() {
+            // A single sweep over a 100k-row model is itself far longer than a tight
+            // budget, so poll within the sweep as well (#863).
+            if let Some(dl) = deadline {
+                if ci % FBBT_DEADLINE_POLL_STRIDE == 0 && Instant::now() >= dl {
+                    return var_bounds;
+                }
+            }
             let node_bounds = forward_propagate(&model.arena, constr.body, &var_bounds);
 
             let output_bound = match constr.sense {
@@ -1234,15 +1283,38 @@ pub fn fbbt_with_cutoff(
 ///
 /// Returns tightened variable bounds (indexed by variable index, not offset).
 pub fn fbbt(model: &ModelRepr, max_iter: usize, tol: f64) -> Vec<Interval> {
+    fbbt_until(model, max_iter, tol, None)
+}
+
+/// Like [`fbbt`] but stops once `deadline` passes, returning the bounds tightened so
+/// far. See [`fbbt_with_cutoff_until`] for why this is sound (FBBT is anytime: it
+/// only ever tightens, and each constraint's inference is independently valid) and
+/// for the measurement that motivated it (#863).
+pub fn fbbt_until(
+    model: &ModelRepr,
+    max_iter: usize,
+    tol: f64,
+    deadline: Option<Instant>,
+) -> Vec<Interval> {
     let n_vars = model.variables.len();
     // C-31: seed each block from the element-wise union of its bounds (a valid
     // outer bound for every element), NOT element 0 — see `seed_block_interval`.
     let mut var_bounds: Vec<Interval> = model.variables.iter().map(seed_block_interval).collect();
 
     for _ in 0..max_iter {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return var_bounds;
+            }
+        }
         let old_bounds = var_bounds.clone();
 
-        for constr in &model.constraints {
+        for (ci, constr) in model.constraints.iter().enumerate() {
+            if let Some(dl) = deadline {
+                if ci % FBBT_DEADLINE_POLL_STRIDE == 0 && Instant::now() >= dl {
+                    return var_bounds;
+                }
+            }
             // Forward propagation.
             let node_bounds = forward_propagate(&model.arena, constr.body, &var_bounds);
 
@@ -1721,6 +1793,75 @@ mod tests {
         assert!((bounds[0].hi - 10.0).abs() < 1e-10);
         assert!((bounds[1].lo - 0.0).abs() < 1e-10);
         assert!((bounds[1].hi - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fbbt_until_honors_past_deadline() {
+        // FBBT runs `max_iter` full forward/backward sweeps over every constraint and
+        // the presolve orchestrator only checks its time budget BETWEEN passes, so a
+        // single call overran a 7.5 s budget by >12x on watercontamination0202 -- both
+        // directly as the `fbbt` pass and indirectly through `probing`, which calls
+        // FBBT twice per binary and could only poll between binaries (#863).
+        //
+        // With the deadline already past, no propagation may happen: the returned
+        // bounds must be the declared box. That is sound -- FBBT is anytime and only
+        // ever tightens, so an untightened box is valid, merely looser.
+        let model = make_linear_model();
+        let tightened = fbbt_until(&model, 10, 1e-8, None);
+        assert!(
+            (tightened[0].hi - 10.0).abs() < 1e-10,
+            "control must tighten"
+        );
+
+        let past = std::time::Instant::now();
+        let bailed = fbbt_until(&model, 10, 1e-8, Some(past));
+        assert!(
+            (bailed[0].hi - 100.0).abs() < 1e-10,
+            "fbbt must bail before propagating once the deadline has passed; got {:?}",
+            bailed[0]
+        );
+        assert!((bailed[1].hi - 100.0).abs() < 1e-10);
+        // Still a valid enclosure of the tightened box.
+        assert!(bailed[0].lo <= tightened[0].lo && bailed[0].hi >= tightened[0].hi);
+        assert!(bailed[1].lo <= tightened[1].lo && bailed[1].hi >= tightened[1].hi);
+    }
+
+    #[test]
+    fn fbbt_until_with_a_future_deadline_matches_no_deadline() {
+        // The poll must be the ONLY difference: a deadline far in the future has to
+        // give bit-identical bounds, or every presolve result silently changed.
+        let model = make_linear_model();
+        let a = fbbt_until(&model, 10, 1e-8, None);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let b = fbbt_until(&model, 10, 1e-8, Some(future));
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.lo, y.lo, "var {i} lo differs");
+            assert_eq!(x.hi, y.hi, "var {i} hi differs");
+        }
+    }
+
+    #[test]
+    fn fbbt_with_cutoff_until_honors_past_deadline() {
+        let model = make_linear_model();
+        let tightened = fbbt_with_cutoff_until(&model, 10, 1e-8, None, None);
+        assert!(
+            (tightened[0].hi - 10.0).abs() < 1e-10,
+            "control must tighten"
+        );
+
+        let past = std::time::Instant::now();
+        let bailed = fbbt_with_cutoff_until(&model, 10, 1e-8, None, Some(past));
+        assert!((bailed[0].hi - 100.0).abs() < 1e-10);
+        assert!((bailed[1].hi - 100.0).abs() < 1e-10);
+
+        // And a future deadline is indistinguishable from none.
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let same = fbbt_with_cutoff_until(&model, 10, 1e-8, None, Some(future));
+        for (x, y) in tightened.iter().zip(same.iter()) {
+            assert_eq!(x.lo, y.lo);
+            assert_eq!(x.hi, y.hi);
+        }
     }
 
     #[test]

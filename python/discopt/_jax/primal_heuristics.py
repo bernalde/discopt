@@ -9,6 +9,7 @@ and re-solves the resulting NLP.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,8 @@ import numpy as np
 from discopt._jax.nlp_evaluator import NLPEvaluator, cached_evaluator
 from discopt.modeling.core import Model, VarType
 from discopt.solvers import NLPResult, SolveStatus
+
+logger = logging.getLogger(__name__)
 
 # Iteration cap for the *sub-NLP* solves inside the primal heuristics (issue #268).
 # These solves only need an approximately feasible point (the heuristic then checks
@@ -434,10 +437,11 @@ def feasibility_pump(
                 offset += sz
             try:
                 nlp_result = backend(evaluator, x0, options=opts)
-            except BaseException:
+            except BaseException as exc:
                 # Some NLP backends (pounce via PyO3) raise PanicException, which
                 # is not a subclass of Exception; treat any failure as this round
                 # producing no point and perturb on the next round.
+                logger.debug("fix-and-solve NLP round failed: %s: %s", type(exc).__name__, exc)
                 continue
         finally:
             for v, (lb_v, ub_v) in zip(model._variables, saved_bounds):
@@ -725,8 +729,9 @@ def continuous_multistart(
             solve_opts.setdefault("max_wall_time", float(min(3.0, remaining)))
         try:
             res = backend(evaluator, starts[i], options=solve_opts)
-        except BaseException:
+        except BaseException as exc:
             # PyO3 backends can raise PanicException (not an Exception subclass).
+            logger.debug("multistart NLP start %d failed: %s: %s", i, type(exc).__name__, exc)
             continue
         # Accept OPTIMAL or ITERATION_LIMIT — the point is independently
         # re-verified below, mirroring subnlp's acceptance set.
@@ -942,9 +947,9 @@ def integer_local_search(
         relax_res = backend(evaluator, mid, options=relax_opts)
         if relax_res is not None and relax_res.x is not None:
             seeds.append(_round_clip(np.asarray(relax_res.x)))
-    except BaseException:
+    except BaseException as exc:
         # Backend may panic (pounce/PyO3); fall back to the caller's seed alone.
-        pass
+        logger.debug("relaxation restart seed unavailable: %s: %s", type(exc).__name__, exc)
 
     rng = np.random.default_rng(seed)
     best: Optional[tuple[np.ndarray, float]] = None
@@ -1946,7 +1951,7 @@ def _detect_one_hot_groups(model: Model, binary_mask: np.ndarray, n_vars: int) -
     Returns the list of groups (each a sorted list of flat binary indices, one
     entry per slot), or ``[]`` when no such structure is present.
     """
-    from discopt._jax.milp_relaxation import _linearize_affine_expr
+    from discopt._jax.milp_relaxation import _linearize_affine_expr_sparse
 
     groups: list[list[int]] = []
     seen: set[int] = set()
@@ -1954,17 +1959,24 @@ def _detect_one_hot_groups(model: Model, binary_mask: np.ndarray, n_vars: int) -
         if getattr(c, "sense", None) != "==":
             continue
         try:
-            coeff, const = _linearize_affine_expr(c.body, model, n_vars)
-        except Exception:
-            continue  # nonlinear body — not an affine one-hot row
+            # Sparse: this scan touches EVERY constraint, and the dense
+            # linearization costs O(n_vars) per row to allocate and zero — the
+            # #875 shape (~460 s of root setup on a 106,711-var instance from the
+            # identical pattern in ``_fix_single_var_equalities``).
+            terms, const = _linearize_affine_expr_sparse(c.body, model, n_vars)
+        except Exception as exc:  # noqa: BLE001 - a non-affine row is not a one-hot row
+            logger.debug("one-hot row scan skipped a body: %s: %s", type(exc).__name__, exc)
+            continue
         if not np.isfinite(const) or abs(float(const) + 1.0) > 1e-9:
             continue  # not ``... == 1``
-        nz = np.nonzero(np.abs(coeff) > 1e-9)[0]
-        if nz.size < 2:
+        nz = sorted(j for j, v in terms.items() if abs(v) > 1e-9)
+        if len(nz) < 2:
             continue
-        if not np.all(np.abs(coeff[nz] - 1.0) <= 1e-9):
+        if nz[0] < 0 or nz[-1] >= n_vars:
+            continue  # out of the flat range the dense array bounded by raising
+        if any(abs(terms[j] - 1.0) > 1e-9 for j in nz):
             continue  # non-unit coefficients — not a plain one-hot sum
-        if nz.max() >= binary_mask.size or not np.all(binary_mask[nz]):
+        if nz[-1] >= binary_mask.size or not np.all(binary_mask[nz]):
             continue  # support is not entirely binary
         g = [int(i) for i in nz]
         if seen.intersection(g):

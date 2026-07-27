@@ -10,6 +10,7 @@ Uses the HiGHS LP solver with warm-starting for efficiency.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -23,6 +24,8 @@ from discopt.solvers.lp_backend import (
     get_exact_lp_solver,
     get_lp_solver,
 )
+
+logger = logging.getLogger(__name__)
 
 # Beyond this magnitude the McCormick relaxation's LP is too ill-conditioned for
 # an OBBT tightening to be rigorous. OBBT shrinks a variable's domain to an LP
@@ -404,10 +407,8 @@ def _extract_linear_constraints(
     n_vars = sum(v.size for v in model._variables)
 
     def _compute_var_offset(var: Variable) -> int:
-        offset = 0
-        for v in model._variables[: var._index]:
-            offset += v.size
-        return offset
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return model._flat_var_offset(var)
 
     def _extract_coeffs(
         expr: Expression,
@@ -584,10 +585,8 @@ def _extract_linear_objective(
     )
 
     def _compute_var_offset(var: Variable) -> int:
-        offset = 0
-        for v in model._variables[: var._index]:
-            offset += v.size
-        return offset
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return model._flat_var_offset(var)
 
     def _extract(expr: Expression) -> Optional[tuple[dict[int, float], float]]:
         if isinstance(expr, Constant):
@@ -1407,10 +1406,8 @@ def _scalar_flat_index(expr, model) -> Optional[int]:
     from discopt.modeling.core import IndexExpression, Variable
 
     def _offset(var) -> int:
-        off = 0
-        for v in model._variables[: var._index]:
-            off += v.size
-        return off
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return int(model._flat_var_offset(var))
 
     if isinstance(expr, Variable) and expr.size == 1:
         return _offset(expr)
@@ -1443,10 +1440,8 @@ def _flat_indices(expr, model) -> set:
     )
 
     def _offset(var) -> int:
-        off = 0
-        for v in model._variables[: var._index]:
-            off += v.size
-        return off
+        # Memoized O(1) prefix-sum lookup; see Model._flat_var_offset (#654, #863).
+        return int(model._flat_var_offset(var))
 
     out: set = set()
 
@@ -2043,7 +2038,15 @@ def obbt_tighten_root(
                     bound_override=(lb, ub),
                     superposition=relaxer._superposition,
                 )
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
+                # Capability-disabling: without an envelope there is no OBBT round
+                # at all, so a silent break makes "OBBT tightened nothing" a
+                # statement about the builder, not about the model.
+                logger.debug(
+                    "OBBT envelope build failed, ending root OBBT: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 break
             _apply_carried_aux(milp)
 
@@ -2086,10 +2089,18 @@ def obbt_tighten_root(
                                 superposition=relaxer._superposition,
                             )
                             _apply_carried_aux(milp)
-                        except Exception:
+                        except Exception as exc:  # noqa: BLE001 - keeps the bounds already found
+                            logger.debug(
+                                "DBBT envelope rebuild failed, ending the round: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
                             break
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - OBBT continues on the untightened box
+                    # Capability-disabling: a swallowed failure silently drops the
+                    # whole DBBT pass, so "DBBT tightened nothing" can be an artifact
+                    # of code that never ran rather than a measurement.
+                    logger.debug("root DBBT pass skipped: %s: %s", type(exc).__name__, exc)
 
             # Include the aux columns as OBBT candidates (and request the full
             # column vector) when cascading, so their tightening is captured and

@@ -67,7 +67,7 @@ from discopt._jax.milp_relaxation import (
     _expression_lower_bound_for_lift,
     _flat_variable_types,
     _integer_domain_values,
-    _linearize_affine_expr,
+    _linearize_affine_expr_sparse,
 )
 from discopt._jax.model_utils import flat_variable_bounds
 from discopt.modeling.core import Model, ObjectiveSense, UnaryOp
@@ -2481,6 +2481,16 @@ def _fix_single_var_equalities(
     when the pinned value lies inside the current box; an out-of-box value is left
     for the equality's own LP rows to expose as infeasible (never silently widen or
     empty the box here). Returns fresh arrays; inputs are untouched.
+
+    Cost (issue #875). This scan is ``O(sum of equality body sizes)``, NOT
+    ``O(n_constraints * n_vars)``: it reads the *sparse* affine linearization, whose
+    dict carries one entry per referenced variable. The dense
+    ``_linearize_affine_expr`` allocates and zeroes an ``n_vars`` array per call, and
+    walking that array in Python to find the single nonzero costs ``n_vars`` again —
+    on ``watercontamination0202`` (106,711 vars / 107,209 rows) that was **~460 s of
+    a 30 s solve budget**, 23 of 29 stack samples, for bodies with ONE leaf each.
+    The pass runs before the relaxation build and before any node exists, so nothing
+    downstream bounded it.
     """
     lb = np.array(flat_lb, dtype=np.float64)
     ub = np.array(flat_ub, dtype=np.float64)
@@ -2489,13 +2499,19 @@ def _fix_single_var_equalities(
         if getattr(con, "sense", None) != "==":
             continue
         try:
-            coeff, const = _linearize_affine_expr(con.body, model, n)
+            terms, const = _linearize_affine_expr_sparse(con.body, model, n)
         except (ValueError, TypeError):
             continue
-        nz = [(j, float(c)) for j, c in enumerate(np.asarray(coeff)) if abs(float(c)) > 1e-12]
+        nz = [(j, c) for j, c in terms.items() if abs(c) > 1e-12]
         if len(nz) != 1:
             continue
         j, c = nz[0]
+        # The sparse core does not range-check its keys; the dense wrapper's array
+        # store did, by raising an (uncaught) IndexError. Both are unreachable for a
+        # box covering the model's own flat variables, but a pin we cannot index is
+        # a pin we must not apply — skip rather than write outside the box.
+        if not (0 <= j < n):
+            continue
         val = (float(con.rhs) - float(const)) / c
         if not math.isfinite(val):
             continue

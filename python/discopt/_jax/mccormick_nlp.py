@@ -21,11 +21,14 @@ box, which is precisely what the ``nlp`` mode computes.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Optional
 
 import jax.numpy as jnp
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Per-(relaxation, options) jit caches. Keyed by Python id() of the
 # relaxation functions plus negate/max_iter so repeat B&B nodes hit the
@@ -73,7 +76,13 @@ def _filter_well_behaved_constraints(
                     if abs(cv_val) < 1e12 and abs(cc_val) < 1e12:
                         is_ok = True
                         break
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - the next probe point is tried instead
+                # Capability-disabling in aggregate: a relaxation whose probes all
+                # raise is dropped from ``good_fns``, silently shrinking the
+                # relaxation the NLP actually sees.
+                logger.debug(
+                    "relaxation probe raised at a test point: %s: %s", type(exc).__name__, exc
+                )
                 continue
         if is_ok:
             good_fns.append(fn)

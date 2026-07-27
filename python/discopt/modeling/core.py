@@ -83,9 +83,14 @@ def _lp_spatial_fallback_enabled() -> bool:
     enough that a single one runs past the top-of-loop deadline poll. On tln5 at a
     21 s budget: 5 nodes in 43.8 s (2.08x, slowest node 42.4 s) versus 13158 nodes in
     21.0 s (1.00x, slowest node 0.04 s) once the engine passes its own deadline.
-    ball_mk2_30 declines the structure for a genuine structural reason (``monomial
-    x_0^2: root box spans zero``); there the fallback now refuses to run at all
-    (``require_incremental``) rather than spend 61 s on a single root LP for nothing.
+    A model whose structure declines for a genuine structural reason — e.g. an odd
+    power over a root box straddling zero, whose envelope changes facet count across
+    the sign change — makes the fallback refuse to run at all
+    (``require_incremental``) rather than spend a whole reserve on a single root LP
+    for nothing; measured at 61 s against a 21 s reserve on ball_mk2_30 back when its
+    ``x_0**2`` monomial also declined. #861 has since admitted the even powers, so
+    ball_mk2_30 now runs this path and produces a sound bound but still no incumbent —
+    the remaining gap there is primal, not relaxation coverage.
 
     **Known cost.** The incumbents are *worse* than the ones the degraded cold path
     happened to report (tln4 19.6 vs 8.7, tln5 32.8 vs 15.1) — its slower, full-
@@ -94,10 +99,103 @@ def _lp_spatial_fallback_enabled() -> bool:
     baseline; against the actual default path all three are gains from *no incumbent*.
     Closing the remaining gap to the reference optima is primal-quality work, not a
     budget bug.
+
+    **Incumbent quality is now measured (#862).** The panel above scored whether an
+    incumbent *exists*, is sound and stays in budget — never how good it is, so
+    nothing would have caught a change that halved incumbent quality. It does now:
+    ``discopt_benchmarks/scripts/issue844_primal_quality_panel.py`` re-runs this exact
+    OFF/ON differential and adds the primal gap to the reference optimum per instance,
+    the corpus aggregate, and quality regressions ON vs OFF. The quality gap itself is
+    still open: see ``docs/dev/lp-node-primal-quality.md`` for the measurement and for
+    the two primal levers it falsified (a rounding flip, and a narrowing dive), whose
+    common root cause is that the McCormick relaxation on this family is ~250x loose
+    at the root, so no rounding-based heuristic reading it can do better.
     """
     import os as _os
 
     return _os.environ.get("DISCOPT_LP_SPATIAL_FALLBACK", "1") not in (
+        "0",
+        "",
+        "false",
+        "False",
+        "off",
+    )
+
+
+def _lp_spatial_mixed_fallback_enabled() -> bool:
+    """#860: extend the LP-per-node engine's *scope gate* to mixed-integer and MAXIMIZE
+    models.
+
+    Governs **both** production entry points, so the widening is entirely opt-in:
+
+    * ``solve(lp_spatial=True)`` (``solver.py``) — whether the engine accepts a mixed
+      or maximize model at all; and
+    * the #844 no-incumbent fallback (below) — whether the DEFAULT path reserves 35% of
+      its budget for the fallback on such a model.
+
+    The engine's ``mixed`` parameter and ``_is_in_scope``'s keyword both default to
+    ``False`` as well, so a *new* call site inherits the pre-#860 gate rather than
+    silently shipping the widening.
+
+    **Default OFF** — it ran its graduation panel and did NOT graduate, on *both*
+    counts. Opt in with ``DISCOPT_LP_SPATIAL_MIXED=1``.
+
+    On the public ``lp_spatial=True`` path the loss is direct. ``gear4`` is mixed (4
+    integer, 2 continuous with infinite upper bounds), so it is admitted only under the
+    widening; at a 25 s budget:
+
+    ==============  ============================================
+    gate            result
+    ==============  ============================================
+    pre-#860        ``optimal``, 1.6434284641, certified, 3 nodes
+    widened         ``time_limit``, 17.514, uncertified, 2673 nodes
+    ==============  ============================================
+
+    The engine accepts a model the default path already certified in 3 nodes, then
+    spends the entire budget to return an incumbent ~10.7x worse with no certificate.
+    It is *sound* — the bound never crosses the oracle, and the false certificate seen
+    there earlier was the LP-presolve sentinel bug fixed in #877, not this widening —
+    but shipping it by default would be trading a certificate for a worse incumbent.
+
+    **Graduation panel** (20 s budget, 70 newly in-scope in-repo instances, off vs on;
+    the other 49 take a bit-identical path since this gate is the flag's only
+    consumer). *Cert-clean*: 0 certification regressions, 0
+    ``incumbent_verification_failed``, 0 unsound bounds. *Net-positive*: **failed**.
+
+    ==========  ==============================  ==============================
+    instance    off                             on
+    ==========  ==============================  ==============================
+    tspn12      no incumbent (30.6 s)           feasible 262.647 (9.3 s)
+    ex1252a     feasible 183660.35 (24.5 s)     feasible 149530.99 (14.9 s)
+    tls2        feasible 11.30 (20.1 s)         NO INCUMBENT (13.6 s)
+    st_e31      feasible -2.00 (22.2 s)         NO INCUMBENT (14.8 s)
+    ==========  ==============================  ==============================
+
+    ``gains=1  improved=1  lost_incumbents=2  cert_regressions=0  unsound=0``.
+
+    The widening is sound (see ``lp_spatial_bb`` and the #860 Panel A: 33 newly
+    reachable instances get a verified incumbent, 0 unsound results); what it cannot do
+    is pay for itself *here*. The reserve hands 35% of the budget to the fallback before
+    knowing whether the engine can serve the model: on tls2 and st_e31 the primary then
+    runs out of time at 65% and returns nothing, while the fallback declines anyway
+    (``require_incremental=True`` + an infinite root box, which declines the incremental
+    structure). Budget taken from a path that was going to succeed, given to a path that
+    never runs. Sound but harmful stays OFF, with the measurement recorded — the
+    ``DISCOPT_CUT_INHERIT`` rule (CLAUDE.md §5).
+
+    Do not read the 0.747 total wall ratio as a win: the on-runs are faster largely
+    because they gave up earlier, on exactly the two instances that lost their answer.
+
+    **What would change the verdict**: making the reserve conditional on the engine
+    actually being able to build (probe buildability, or relax ``require_incremental``
+    for the mixed class now that cold node builds are deadline-bounded), so a model the
+    fallback will decline never pays for it. Separate change, separate panel. Evidence:
+    ``docs/dev/issue-860-lp-spatial-mixed-scope.md`` §4,
+    ``scratchpad/panel860_flag.json``.
+    """
+    import os as _os
+
+    return _os.environ.get("DISCOPT_LP_SPATIAL_MIXED", "0") not in (
         "0",
         "",
         "false",
@@ -1657,6 +1755,14 @@ class Parameter(Expression):
 # Solve Result
 # ─────────────────────────────────────────────────────────────
 
+#: The one status whose ``gap_certified=True`` certifies something OTHER than an
+#: optimality gap — an infeasibility proof legitimately carries neither a dual bound
+#: nor an incumbent. Every other status must produce both ends of a gap to claim one;
+#: see :meth:`SolveResult.__post_init__`. Deliberately not widened to ``unbounded``:
+#: that would *weaken* an existing guard, and an unbounded minimize already carries
+#: ``bound=-inf``, so it is decertified by the dual-side check regardless.
+_NON_GAP_CERTIFICATE_STATUSES = frozenset({"infeasible"})
+
 
 @dataclass
 class SolveResult:
@@ -1838,14 +1944,39 @@ class SolveResult:
         # global lower bound at ``-inf``. Reporting ``gap_certified=True`` there
         # is a false certification (the benchmark gate would miscount it as a
         # solved/certified instance), so we downgrade it and clear the
-        # meaningless bound/gap. Infeasibility certificates are exempt:
-        # ``status="infeasible"`` with ``gap_certified=True`` certifies
-        # infeasibility, not a gap, and legitimately carries ``bound=None``.
-        if self.gap_certified and self.status != "infeasible":
+        # meaningless bound/gap. Infeasibility certificates are exempt
+        # (``_NON_GAP_CERTIFICATE_STATUSES``): ``status="infeasible"`` with
+        # ``gap_certified=True`` certifies infeasibility, not a gap, and
+        # legitimately carries ``bound=None``.
+        if self.gap_certified and self.status not in _NON_GAP_CERTIFICATE_STATUSES:
             if self.bound is None or not np.isfinite(self.bound):
                 self.gap_certified = False
                 self.bound = None
                 self.gap = None
+
+        # Same guard, other end of the gap (#875). A gap has two ends, and the check
+        # above only requires the dual one: a ``time_limit`` exit that never found an
+        # incumbent came back ``objective=None, gap=None, gap_certified=True``, which
+        # claims a certified gap where no gap was ever formed. Harmless where nothing
+        # is reported at all, but the flag is exactly what a consumer checks *before*
+        # reading the values — the graduation panels count a ``gap_certified=True``
+        # instance as certified, and the "no certification regression" rule compares
+        # that flag across a flag flip. Reproduced with a 0.5 s budget on a 300-var
+        # bilinear model: ``status=time_limit objective=None bound=-7497.0 gap=None
+        # gap_certified=True nodes=0``.
+        #
+        # This only ever downgrades True -> False, so it cannot manufacture a
+        # certificate; and it leaves ``bound`` alone, because a dual bound with no
+        # incumbent is still a perfectly valid dual bound worth reporting — it is the
+        # *gap* claim that was unfounded. Same exemption as above: a status whose
+        # certificate is not a gap (``infeasible``) is not asked to produce one.
+        if (
+            self.gap_certified
+            and self.objective is None
+            and self.status not in _NON_GAP_CERTIFICATE_STATUSES
+        ):
+            self.gap_certified = False
+            self.gap = None
 
     def value(self, var: Variable) -> np.ndarray:
         """
@@ -1884,8 +2015,14 @@ class SolveResult:
         if llm:
             try:
                 return self._explain_with_llm(model)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - falls back to the template explanation
+                import logging as _logging
+
+                _logging.getLogger("discopt.llm").debug(
+                    "LLM explanation unavailable, using the template: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
         if self._explanation:
             return self._explanation
         return (
@@ -3935,8 +4072,12 @@ class Model:
                     import logging
 
                     logging.getLogger("discopt.llm").info("Pre-solve: %s", w)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - advisory only, never blocks solving
+                import logging as _logging
+
+                _logging.getLogger("discopt.llm").debug(
+                    "pre-solve LLM analysis skipped: %s: %s", type(exc).__name__, exc
+                )
 
         if stream:
             return self._solve_streaming(
@@ -4030,7 +4171,8 @@ class Model:
         # self-terminate within ``time_limit + ε`` instead of running to
         # XLA convergence after Python's budget is gone (issue #80).
         # #844: reserve a slice of the budget for the LP-per-node fallback below, but
-        # ONLY for models that engine can serve (pure-integer, minimize). Safe because
+        # ONLY for models that engine can serve (pure-integer, minimize; plus mixed /
+        # maximize when the #860 flag is on). Safe because
         # the instances at risk certify almost instantly -- nvs04 in 0.2 s, nvs06 in
         # 0.3 s of a 40 s budget -- so they finish long before the reduced primary
         # budget binds, while the instances this targets (tln4/tln5) burn 100% of the
@@ -4052,7 +4194,11 @@ class Model:
             try:
                 from discopt._jax.lp_spatial_bb import _is_in_scope
 
-                if _is_in_scope(self):
+                # #860: the engine now also serves mixed-integer and MAXIMIZE models,
+                # but whether the DEFAULT path should hand them 35% of its budget is a
+                # separate, panel-gated decision — hence the flag rather than the
+                # engine's own (already widened) gate.
+                if _is_in_scope(self, mixed=_lp_spatial_mixed_fallback_enabled()):
                     _fb_reserve = 0.35 * time_limit
                     # NOTE: scope is checked here, but whether the engine can actually
                     # build its incremental structure is only known once it runs (see
@@ -4148,12 +4294,29 @@ class Model:
                     #
                     # require_incremental=True: without the incremental McCormick
                     # structure the engine has no cuts, no feasibility pump, and
-                    # rebuilds the relaxation per node. On ball_mk2_30 — where the
-                    # structure legitimately declines (``monomial x_0^2: root box
-                    # spans zero``) — that cold path spent 61 s on the ROOT LP alone
-                    # against a 21 s reserve: 0 nodes, no incumbent, 2.91x over
-                    # budget. It cannot produce a primal inside a fallback-sized
-                    # budget, so declining costs no gain and removes the overrun.
+                    # rebuilds the relaxation per node. Measured on ball_mk2_30 while
+                    # its monomial still declined, that cold path spent 61 s on the
+                    # ROOT LP alone against a 21 s reserve: 0 nodes, no incumbent,
+                    # 2.91x over budget. It cannot produce a primal inside a
+                    # fallback-sized budget, so declining costs no gain and removes
+                    # the overrun. ball_mk2_30 itself now MAPS (#861 narrowed the
+                    # monomial gate to odd powers on a straddling root) and so takes
+                    # the incremental path here — but measured, it still returns no
+                    # incumbent, just a sound bound, having spent the reserve.
+                    #
+                    # The guard is deliberately NOT tightened to re-exclude it. Its
+                    # premise ("the structure builds" ⇒ "this path can find a primal")
+                    # is a proxy, and #861 widened the gap between the two — but no
+                    # predicate can decide in advance whether a primal is coming, and
+                    # a "give up if no incumbent by X% of the reserve" rule would
+                    # forfeit precisely the late incumbents this fallback exists to
+                    # catch (tln4/tln5 are found deep in the reserve, not early).
+                    # Tuning such a rule until ball_mk2_30 exits early would be a
+                    # single-instance fix, which this repo rejects. Instead the
+                    # reserve's OUTPUT is no longer discarded: the bound merge below
+                    # runs whether or not a primal was found, so a spent reserve now
+                    # buys a tighter dual bound rather than nothing. Closing the primal
+                    # half remains #844 work.
                     _fb = solve_lp_spatial_bb(
                         self,
                         time_limit=_fb_reserve,
@@ -4161,21 +4324,52 @@ class Model:
                         use_obbt=False,
                         require_incremental=True,
                     )
+                if _fb is not None:
+                    # Keep the TIGHTER of the two dual bounds, and do it whether or not
+                    # the fallback found a primal.
+                    #
+                    # Which one is tighter depends on the SENSE: for a minimize the dual
+                    # bound is a LOWER bound (larger is tighter); for a maximize it is an
+                    # UPPER bound (smaller is tighter). ``_is_in_scope`` used to admit
+                    # minimize only, so an unconditional ``max`` was correct; #860 widens
+                    # the engine to maximize models, where ``max`` would still be SOUND
+                    # (both are valid upper bounds) but would keep the LOOSER one.
+                    # Merge conflict note: main moved this merge out of the
+                    # ``_fb.objective is not None`` block (#861 review, below) while #860
+                    # made it sense-aware; both are needed and they compose — placement
+                    # from main, sense from #860.
+                    #
+                    # Why it moved (#861 review): once a model is admitted but hard, the
+                    # fallback spends its whole reserve, computes a sound bound, finds no
+                    # primal, and everything was thrown away — the reserve produced
+                    # nothing *even though it produced something valid*. Measured on
+                    # ball_mk2_30 at a 30 s budget: the fallback returned bound -27.88
+                    # (<= the 0.0 oracle) and the solve reported ``bound=None``. That is
+                    # the real cost the review flagged as "spends the budget for
+                    # nothing", and it is a reporting gap, not a reason to re-tighten
+                    # ``require_incremental``: no predicate can decide in advance whether
+                    # a primal is coming, and a budget-fraction early exit would forfeit
+                    # exactly the late incumbents this fallback exists to catch.
+                    if _fb.bound is not None:
+                        if result.bound is None:
+                            result.bound = _fb.bound
+                        elif (
+                            self._objective is not None
+                            and self._objective.sense == ObjectiveSense.MAXIMIZE
+                        ):
+                            result.bound = min(result.bound, _fb.bound)
+                        else:
+                            result.bound = max(result.bound, _fb.bound)
+                    result.node_count = (result.node_count or 0) + _fb.node_count
                 if _fb is not None and _fb.objective is not None:
                     from discopt.solver import _unpack_solution
 
                     result.status = _fb.status
                     result.objective = _fb.objective
                     result.x = _unpack_solution(self, np.asarray(_fb.x))
-                    # Keep the TIGHTER of the two dual bounds and never claim a
-                    # certificate the fallback did not actually prove.
-                    if _fb.bound is not None:
-                        result.bound = (
-                            _fb.bound if result.bound is None else max(result.bound, _fb.bound)
-                        )
                     result.gap = _fb.gap
+                    # Never claim a certificate the fallback did not actually prove.
                     result.gap_certified = _fb.status == "optimal"
-                    result.node_count = (result.node_count or 0) + _fb.node_count
             except Exception as _fb_exc:
                 # Never break a solve -- but never swallow silently either. A bare
                 # ``except`` here previously turned a hard TypeError into an invisible
@@ -4232,8 +4426,12 @@ class Model:
         if llm:
             try:
                 result._explanation = result._explain_with_llm()
-            except Exception:
-                pass
+            except Exception as _exp_exc:  # noqa: BLE001 - advisory only, never blocks solving
+                _logging.getLogger("discopt.llm").debug(
+                    "post-solve LLM explanation skipped: %s: %s",
+                    type(_exp_exc).__name__,
+                    _exp_exc,
+                )
 
         if validate and result.x is not None:
             try:

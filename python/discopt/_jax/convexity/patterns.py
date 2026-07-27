@@ -43,9 +43,11 @@ convex families without regressing soundness.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import numpy as np
+import scipy.sparse as _sp
 
 from discopt.modeling.core import (
     BinaryOp,
@@ -64,6 +66,8 @@ from discopt.modeling.core import (
 )
 
 from .lattice import Curvature
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
 # Local utilities (ported with minor adaptation from bernalde/discopt
@@ -95,8 +99,16 @@ def clear_declared_box_cache(model: Model) -> None:
     try:
         if hasattr(model, _DECLARED_BOX_CACHE_ATTR):
             delattr(model, _DECLARED_BOX_CACHE_ATTR)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - invalidation must never break a classification
+        # The catch stays blind on purpose (a model with a custom ``__delattr__``
+        # must not break a solve; see test_clear_cache_swallows_delattr_failure),
+        # but it is no longer silent: a failed invalidation leaves the box cache
+        # STALE, so the recognizers keep classifying against pre-presolve bounds.
+        logger.debug(
+            "declared-box cache NOT invalidated — it is now stale: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _total_scalar_variables(model: Model) -> int:
@@ -277,8 +289,8 @@ def _box_bounds(model: Model) -> tuple[np.ndarray, np.ndarray]:
         lo_arr, hi_arr = np.concatenate(los), np.concatenate(his)
     try:
         setattr(model, _DECLARED_BOX_CACHE_ATTR, (int(lo_arr.size), lo_arr, hi_arr))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - memoization is optional, the box is rebuilt
+        logger.debug("declared box not memoized: %s: %s", type(exc).__name__, exc)
     return lo_arr, hi_arr
 
 
@@ -447,12 +459,25 @@ def _quadratic_data(expr: Expression, model: Model):
 
     Uses :func:`problem_classifier._extract_quadratic_coefficients` and
     symmetrises ``Q``. Returns ``None`` if the expression is not degree-2.
+
+    Also returns ``None`` when the extractor hands back a *sparse* ``Q`` (#863).
+    Every consumer of this function is unavoidably dense — ``np.diag(Q)``, boolean
+    row/column masks, ``np.linalg.eigvalsh`` — and each already treats ``None`` as
+    "not extractable as a quadratic form", which is the conservative answer (no
+    curvature claim, so the caller keeps its weaker but valid classification). The
+    sparse arm only triggers above ``_QP_DENSE_Q_MAX_BYTES`` (n > ~5,657), where
+    this analysis was already impractical: it makes three ``(n, n)`` copies in the
+    ``0.5 * (Q + Q.T)`` line alone. Refusing there is strictly better than the old
+    behaviour, which allocated ``(n, n)`` unconditionally — 91 GB on
+    watercontamination0202's 106,711 variables.
     """
     from discopt._jax.problem_classifier import _extract_quadratic_coefficients
 
     try:
         Q, c, const = _extract_quadratic_coefficients(expr, model, _total_scalar_variables(model))
     except Exception:
+        return None
+    if _sp.issparse(Q):
         return None
     Q = 0.5 * (Q + Q.T)
     return Q, np.asarray(c, dtype=np.float64), float(const)
@@ -1042,7 +1067,12 @@ def classify_fractional_epigraph_constraint(
 
         try:
             coeff_vec, coeff_const = _extract_linear_coefficients(coeff_expr, model, n)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - this constraint keeps its UNKNOWN verdict
+            logger.debug(
+                "fractional-epigraph coefficient extraction failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             continue
 
         nonzero_coeff = np.flatnonzero(np.abs(coeff_vec) > 1e-10)

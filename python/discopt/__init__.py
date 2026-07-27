@@ -45,6 +45,7 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 # ``JAX_ENABLE_X64`` at its own (lazy) import time, so this keeps ``import
 # discopt`` free of the multi-second jax import for code paths (e.g. the GAMS
 # link's LP/MILP solves) that never touch jax.
+import logging as _logging
 import os as _os
 import sys as _sys
 
@@ -58,8 +59,18 @@ if _os.environ.get("JAX_ENABLE_X64", "1") != "0":
     if "jax" in _sys.modules:
         try:
             _sys.modules["jax"].config.update("jax_enable_x64", True)
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 - never make ``import discopt`` fail
+            # Not optional telemetry: if this update is swallowed, jax stays in
+            # float32 and every downstream relaxation/NLP number is computed at
+            # the wrong precision. Warn rather than debug so the wrong-precision
+            # regime is visible without opting into debug logging.
+            _logging.getLogger(__name__).warning(
+                "jax was imported before discopt and could not be switched to "
+                "float64 (%s: %s); jax is running in float32, which degrades "
+                "solver accuracy. Set JAX_ENABLE_X64=1 before importing jax.",
+                type(_exc).__name__,
+                _exc,
+            )
 
 # Enable JAX's persistent (on-disk) compilation cache. A solve recompiles a
 # handful of small XLA kernels (relaxation evaluators, NLP residual/Jacobian,
@@ -265,10 +276,13 @@ def _eager_import_solve_path() -> None:
     ):
         try:
             importlib.import_module(_name)
-        except Exception:
-            # Optional dependency missing or a submodule import error: skip
-            # silently. The lazy path will surface any real error at solve time.
-            pass
+        except Exception as _exc:  # noqa: BLE001 - the eager path is a pure optimization
+            # Optional dependency missing or a submodule import error: skip. The
+            # lazy path will surface any real error at solve time, but record it
+            # here so "eager imports made no difference" is never a mystery.
+            _logging.getLogger(__name__).debug(
+                "eager import of %s skipped: %s: %s", _name, type(_exc).__name__, _exc
+            )
 
 
 if _os.environ.get("DISCOPT_EAGER_IMPORTS", "0") == "1":

@@ -29,8 +29,8 @@ from discopt._jax.discretization import DiscretizationState
 from discopt._jax.milp_relaxation import (
     _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE,
     _RELAX_NUMERIC_CAP,
+    _any_linear_constraint_form,
     _collect_affine_powers,
-    _linear_constraint_forms,
     _quadratic_constraint_forms,
     build_milp_relaxation,
 )
@@ -468,8 +468,12 @@ class MccormickLPRelaxer:
         # models (e.g. the indefinite integer QPs nvs17/nvs24, whose constraints
         # are all quadratic) from RLT entirely — exactly the dense-QP instances
         # whose McCormick bound is hopelessly loose without it.
+        # ``_any_linear_constraint_form`` short-circuits and stays sparse: the old
+        # ``bool(_linear_constraint_forms(...))`` linearized every row into a dense
+        # ``n_orig`` vector and kept them all just to test emptiness — O(rows * vars)
+        # in the relaxer constructor, on the pre-B&B root path (issue #875).
         self._rlt_applicable = (rlt_level1 or _tuning().rlt) and (
-            bool(_linear_constraint_forms(model, self._n_orig))
+            _any_linear_constraint_form(model, self._n_orig)
             or bool(_quadratic_constraint_forms(model, self._n_orig))
         )
         # Lever 1 (issue #194): solve each spatial-B&B node's relaxation as a pure
@@ -2001,7 +2005,8 @@ class MccormickLPRelaxer:
                     try:
                         gval = float(jnp.reshape(r.value_fn(xv), ()))
                         grad = np.asarray(r.grad_fn(xv), dtype=np.float64).ravel()
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 - a missing cut is always safe
+                        logger.debug("OA cut evaluation skipped: %s: %s", type(exc).__name__, exc)
                         continue
                     if not np.isfinite(gval) or not all(
                         j < grad.size and np.isfinite(grad[j]) for j in r.idxs

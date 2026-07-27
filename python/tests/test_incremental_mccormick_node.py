@@ -307,5 +307,74 @@ def test_incremental_full_solve_matches_cold():
     assert r_fast.gap_certified and r_cold.gap_certified
 
 
+# --------------------------------------------------------------------------- #
+# Objective CONSTANT: the incremental path solves ``min c·x`` but the relaxation's
+# objective is ``c·x + obj_offset``. Dropping the offset made the fast-path node
+# bound differ from the cold build's by that constant — merely weak for a positive
+# constant, but a dual bound ABOVE the true node optimum for a negative one, which
+# is the false-fathom class. Found while widening the LP-spatial engine (#860).
+# --------------------------------------------------------------------------- #
+
+
+def _const_qcqp(const):
+    """Bilinear integer model whose objective carries an additive constant."""
+    m = dm.Model("cq")
+    x = m.integer("x", lb=1, ub=4)
+    y = m.integer("y", lb=1, ub=4)
+    m.subject_to(x + y >= 6)
+    m.minimize(x * y + const)
+    return m
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("const", [0.0, -100.0, 100.0])
+def test_incremental_node_bound_includes_objective_constant(const):
+    """Fail-before/pass-after: the fast path's node bound must equal the cold
+    build's, constant and all. Before the fix the fast path returned 8.0 for every
+    ``const`` (the offset-free ``min c·x``), so at ``const=-100`` it reported a lower
+    bound of +8.0 on a node whose true McCormick optimum is -92.0."""
+    lb, ub = np.array([1.0, 1.0]), np.array([4.0, 4.0])
+    os.environ["DISCOPT_INCREMENTAL_MC"] = "1"
+    try:
+        relaxer = MccormickLPRelaxer(_const_qcqp(const))
+        assert relaxer._inc is not None, "test needs the incremental fast path engaged"
+        r_fast = relaxer.solve_at_node(lb, ub, want_marginals=True)
+        os.environ["DISCOPT_INCREMENTAL_MC"] = "0"
+        r_cold = MccormickLPRelaxer(_const_qcqp(const)).solve_at_node(lb, ub, want_marginals=True)
+    finally:
+        os.environ.pop("DISCOPT_INCREMENTAL_MC", None)
+    assert r_fast.lower_bound == pytest.approx(r_cold.lower_bound, abs=1e-6)
+    # The node's true McCormick optimum shifts exactly with the constant.
+    assert r_fast.lower_bound == pytest.approx(8.0 + const, abs=1e-6)
+    # ... and the certificate's safe bound rides the same origin as the bound beside
+    # it, so a consumer reading either one gets the same answer.
+    if r_fast.safe_bound is not None:
+        assert r_fast.safe_bound == pytest.approx(r_cold.safe_bound, abs=1e-6)
+        assert r_fast.safe_bound <= r_fast.lower_bound + 1e-6
+
+
+@pytest.mark.smoke
+def test_incremental_solve_bound_matches_cold_builder_with_constant():
+    """Same invariant one level down, at ``IncrementalMcCormickLP.solve`` itself:
+    its bound is the relaxation objective (``c·x + obj_offset``), the scale
+    ``MilpRelaxationModel.solve`` reports."""
+    from discopt._jax.discretization import DiscretizationState
+    from discopt._jax.incremental_mccormick import IncrementalMcCormickLP
+    from discopt._jax.milp_relaxation import build_milp_relaxation
+    from discopt._jax.term_classifier import classify_nonlinear_terms
+
+    m = _const_qcqp(-100.0)
+    lb, ub = np.array([1.0, 1.0]), np.array([4.0, 4.0])
+    terms = classify_nonlinear_terms(m)
+    inc = IncrementalMcCormickLP(m, terms)
+    assert inc.ok
+    assert inc.obj_offset == pytest.approx(-100.0)
+    b_inc, _x, _basis = inc.solve(lb, ub)
+    relax, _info = build_milp_relaxation(m, terms, DiscretizationState(), bound_override=(lb, ub))
+    relax._integrality = None
+    b_cold = relax.solve().bound
+    assert b_inc == pytest.approx(b_cold, abs=1e-6)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

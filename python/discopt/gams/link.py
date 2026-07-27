@@ -19,6 +19,7 @@ plain Python and unit-tested without a GAMS installation.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -27,6 +28,8 @@ from discopt.modeling.core import Model, SolveResult, VarType
 
 from .gmo_translate import model_from_gmo
 from .instructions import VAR_FIELD_OPCODES
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .gmo_translate import GmoView
@@ -218,14 +221,16 @@ def _free_handle(mod, handle, created: bool, free_name: str, delete_name: str) -
     if created:
         try:
             getattr(mod, free_name)(handle)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail the solve link
+            # A repeatedly failing free is a native leak across GAMS calls, which
+            # is invisible unless it is logged here.
+            logger.debug("%s failed: %s: %s", free_name, type(exc).__name__, exc)
     deleter = getattr(mod, delete_name, None)
     if deleter is not None:
         try:
             deleter(handle)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail the solve link
+            logger.debug("%s failed: %s: %s", delete_name, type(exc).__name__, exc)
 
 
 def _write_solution(gmo_h, gmo, model: Model, result: SolveResult) -> None:  # pragma: no cover

@@ -167,8 +167,12 @@ class TestFBBTBindings:
         from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
 
         class FailingRepr:
-            def fbbt(self, *, max_iter, tol):
-                del max_iter, tol
+            # ``time_limit_ms`` is passed by tighten_root_bounds_with_fbbt (#863).
+            # Accepting it keeps this fake exercising the *logging* path it is about;
+            # without it the call fails on the signature instead, and the test would
+            # pass for the wrong reason (a TypeError is also caught and logged).
+            def fbbt(self, *, max_iter, tol, time_limit_ms=None):
+                del max_iter, tol, time_limit_ms
                 raise RuntimeError("synthetic fbbt failure")
 
         model = _make_linear_model()

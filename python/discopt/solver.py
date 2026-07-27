@@ -24,6 +24,8 @@ import numpy as np
 # nonlinear bound tightening) are imported lazily at their nonlinear-path call
 # sites, so a pure LP/MILP/MIQP solve never pays JAX/XLA cold-start.
 from discopt._jax.model_utils import flat_variable_bounds
+from discopt._jax.problem_classifier import dense_A as _dense_A
+from discopt._jax.problem_classifier import dense_Q as _dense_Q
 
 if TYPE_CHECKING:
     from discopt._jax.nlp_evaluator import NLPEvaluator
@@ -2121,12 +2123,13 @@ def _cached_structural_linear_mask(evaluator, m):
     try:
         sizes = getattr(evaluator, "_constraint_flat_sizes", None)
         mask = _structural_linear_row_mask(evaluator._model, sizes, m)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - callers fall back to numeric classification
+        logger.debug("structural linear-row mask unavailable: %s: %s", type(exc).__name__, exc)
         mask = None
     try:
         evaluator._structural_linear_mask_cache = (m, mask)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - memoization is optional, the mask is recomputed
+        logger.debug("structural linear-row mask not memoized: %s: %s", type(exc).__name__, exc)
     return mask
 
 
@@ -2272,7 +2275,12 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
         try:
             J = evaluator.evaluate_jacobian(mid)  # (m, n)
             g = evaluator.evaluate_constraints(mid)  # (m,)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
+            logger.debug(
+                "linear-row FBBT stopped, Jacobian evaluation failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             break
 
         for j in range(m):
@@ -2364,7 +2372,25 @@ def _apply_nonlinear_tightening_with_status(
     try:
         from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 
-        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(model, lb, ub)
+        # #875: this was the ONE nonlinear-tightening entry point with no budget. The
+        # other three all pass a deadline — the root declared-box pass, the
+        # periodic/domain pass, and AMP — so this one ran the pass to completion on
+        # every invocation. On watercontamination0202 (107k rows) that is ~23 s per
+        # call and it fired 3x inside a 30 s ``time_limit``, i.e. ~70 s of a 126 s
+        # profile: the single largest remaining overrun after the sparse-linearizer
+        # fix, and the reason a deadline on ``tighten_nonlinear_bounds`` alone did not
+        # bound the solve.
+        #
+        # Bound it by the solve's own ABSOLUTE deadline rather than a fresh per-call
+        # fraction. A per-call fraction is what let the convexity classifier's budget
+        # multiply across model objects (each reformulation restarted it), and this
+        # helper is called per node as well as at the root, so a fraction here would
+        # compound the same way. ``None`` (no time limit) keeps the unbounded pass,
+        # which is the current behavior for an untimed solve.
+        _nbt_deadline = getattr(model, "_solve_deadline", None)
+        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(
+            model, lb, ub, deadline=_nbt_deadline
+        )
     except Exception as exc:
         logger.debug("Skipping nonlinear tightening after error: %s", exc)
         return lb, ub, False
@@ -3144,8 +3170,12 @@ def _strong_branch_lp(
             # => J @ x <= J @ x0 - g(x0)
             A_ub = J
             b_ub = J @ solution - g_vals
-    except Exception:
-        pass  # Proceed without constraints (just variable bounds)
+    except Exception as exc:  # noqa: BLE001 - proceed with variable bounds only
+        logger.debug(
+            "linearized constraints unavailable for the pseudocost LP: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     bounds_list = [(float(node_lb[j]), float(node_ub[j])) for j in range(n_vars)]
 
@@ -3303,7 +3333,51 @@ def _format_bad_bound_entries(
     return bad_vars
 
 
-def _check_finite_bounds(model: Model) -> None:
+def _declared_box_tightening(model: Model, deadline: Optional[float] = None):
+    """Run ``tighten_nonlinear_bounds`` **once** on the model's declared box.
+
+    Returns ``(tightened_lb, tightened_ub, stats)``, or ``None`` when the pass
+    raised (both consumers below degrade to "no information", exactly as they did
+    when each caught the exception itself).
+
+    ``deadline`` (an absolute ``time.perf_counter()``) bounds the pass; ``None``
+    leaves it unbudgeted, which is what a standalone caller outside ``solve_model``
+    gets. Sharing the result (#863) halved this phase but did not bound it: the
+    remaining single call still cost ~27 s against a 30 s ``time_limit`` on
+    ``watercontamination0202``, because the pass had no budget parameter at all
+    (#875). A truncated pass returns a looser — never wrong — box.
+
+    Why this exists (#863): ``_check_finite_bounds`` and
+    ``_detect_nonlinear_bound_infeasibility`` are called back-to-back in
+    ``solve_model`` on an *unmodified* model, and each ran the whole pass over the
+    same ``flat_variable_bounds(model)`` box. Measured on
+    ``watercontamination0202`` (106,711 vars / 107,209 rows), instrumenting both
+    calls: identical inputs, and outputs bit-identical in ``tightened_lb``,
+    ``tightened_ub`` **and** ``stats`` (n_tightened = 37,016, rules =
+    ``defined_variable_forward``, ``separable_quadratic_upper_bound``) — 39.98 s
+    then 39.78 s, i.e. the second call was 40 s of pure waste out of a 30 s budget.
+
+    Sharing the result is sound because the pass does not mutate the model: it
+    copies the input box (``tighten_nonlinear_bounds`` opens with ``.copy()`` on
+    both arrays) and every rule reads the model through the memoized
+    ``_cached_flat_metadata``. The measurement above is the empirical check on that
+    reading, and ``test_863_shared_declared_box_tightening.py`` keeps it honest.
+
+    This never runs the pass more often than before:
+    ``_detect_nonlinear_bound_infeasibility`` always needed it, so one call is the
+    floor, and ``_check_finite_bounds``'s conditional need is a subset of that.
+    """
+    raw_lb, raw_ub = flat_variable_bounds(model)
+    try:
+        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+
+        return tighten_nonlinear_bounds(model, raw_lb, raw_ub, deadline=deadline)
+    except Exception as exc:
+        logger.debug("Nonlinear bound tightening on the declared box failed: %s", exc)
+        return None
+
+
+def _check_finite_bounds(model: Model, tightening=None) -> None:
     """Warn if any variable has very large or infinite declared bounds.
 
     Interior point methods use barrier terms that require reasonably sized
@@ -3312,6 +3386,11 @@ def _check_finite_bounds(model: Model) -> None:
     objectives or reports iteration_limit. Nonlinear tightening is consumed by
     some solver paths, but this warning remains conservative because not every
     path applies the tightened box to the actual NLP solve.
+
+    ``tightening`` is an already-computed :func:`_declared_box_tightening` result,
+    shared with ``_detect_nonlinear_bound_infeasibility`` so the pass runs once per
+    solve rather than twice (#863). ``None`` means "not supplied" and the pass is
+    run here, preserving the standalone behaviour this helper had.
     """
     raw_lb, raw_ub = flat_variable_bounds(model)
     raw_bad_vars = _format_bad_bound_entries(model, raw_lb, raw_ub)
@@ -3319,10 +3398,10 @@ def _check_finite_bounds(model: Model) -> None:
         return
 
     tightening_note = ""
-    try:
-        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
-
-        _tightened_lb, _tightened_ub, bt_stats = tighten_nonlinear_bounds(model, raw_lb, raw_ub)
+    if tightening is None:
+        tightening = _declared_box_tightening(model)
+    if tightening is not None:
+        _tightened_lb, _tightened_ub, bt_stats = tightening
         if bt_stats.infeasible:
             logger.info(
                 "Nonlinear tightening proved infeasibility before large-bound warning: %s",
@@ -3334,8 +3413,6 @@ def _check_finite_bounds(model: Model) -> None:
                 f" Nonlinear tightening can adjust {bt_stats.n_tightened} bounds"
                 f" via {', '.join(bt_stats.applied_rules)}."
             )
-    except Exception as exc:
-        logger.debug("Skipping nonlinear tightening before large-bound warning: %s", exc)
 
     bad_vars = raw_bad_vars
     if bad_vars:
@@ -3352,16 +3429,17 @@ def _check_finite_bounds(model: Model) -> None:
         )
 
 
-def _detect_nonlinear_bound_infeasibility(model: Model) -> Optional[str]:
-    """Return a nonlinear bound-tightening infeasibility proof when available."""
-    flat_lb, flat_ub = flat_variable_bounds(model)
-    try:
-        from discopt._jax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+def _detect_nonlinear_bound_infeasibility(model: Model, tightening=None) -> Optional[str]:
+    """Return a nonlinear bound-tightening infeasibility proof when available.
 
-        _tightened_lb, _tightened_ub, stats = tighten_nonlinear_bounds(model, flat_lb, flat_ub)
-    except Exception as exc:
-        logger.debug("Skipping nonlinear infeasibility precheck after error: %s", exc)
+    ``tightening`` is an already-computed :func:`_declared_box_tightening` result,
+    shared with ``_check_finite_bounds`` (#863); ``None`` runs the pass here.
+    """
+    if tightening is None:
+        tightening = _declared_box_tightening(model)
+    if tightening is None:
         return None
+    _tightened_lb, _tightened_ub, stats = tightening
     if stats.infeasible:
         return stats.infeasibility_reason or "nonlinear bound tightening proved infeasibility"
     return None
@@ -3532,6 +3610,16 @@ def _classify_model_convexity(
     overrun that budget it is abandoned and the model is reported as
     convexity-unknown, which routes to the sound spatial Branch and Bound. This
     keeps a tight ``time_limit`` from being blown by classification alone.
+
+    That per-call budget alone does not bound the *solve*, because the memo is keyed
+    to a model object and a reformulation produces a new one: each classification
+    then gets a fresh ``0.2 * time_limit``, and they add up (#875 measured two runs
+    at 14.7 s under a 30 s ``time_limit`` on ``watercontamination0202``, after which
+    half the budget was already gone). So the deadline is additionally clamped to the
+    absolute ``model._solve_deadline`` — classification, however many times it runs,
+    can never on its own carry the solve past ``time_limit``. Hitting the clamp is
+    sound: an abandoned classification reports convexity-unknown, which is the
+    conservative verdict that routes to spatial Branch and Bound.
     """
     cached = getattr(model, "_convexity_classification_cache", None)
     if cached is not None:
@@ -3543,6 +3631,9 @@ def _classify_model_convexity(
     # solve_model (e.g. on a model produced by factorable reformulation).
     budget = getattr(model, "_convexity_time_budget", 15.0)
     deadline = (time.perf_counter() + budget) if budget else None
+    solve_deadline = getattr(model, "_solve_deadline", None)
+    if solve_deadline is not None:
+        deadline = solve_deadline if deadline is None else min(deadline, float(solve_deadline))
     result: tuple[bool, bool, list[bool] | None]
     try:
         from discopt._jax.convexity import classify_model as _classify_convexity
@@ -3563,8 +3654,8 @@ def _classify_model_convexity(
         result = (False, False, None)
     try:
         model._convexity_classification_cache = result
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - caching is optional, classification is redone
+        logger.debug("convexity classification not cached: %s: %s", type(exc).__name__, exc)
     return result
 
 
@@ -3665,7 +3756,7 @@ def _apply_auto_cut_policy(model: "Model", relaxer) -> None:
     ``_psd_cuts`` / ``_rlt_cuts`` flags; purely a performance choice — every cut
     family is sound, so this never affects correctness.
     """
-    from discopt._jax.milp_relaxation import _linear_constraint_forms
+    from discopt._jax.milp_relaxation import _any_linear_constraint_form
 
     try:
         n = sum(v.size for v in model._variables)
@@ -3674,7 +3765,7 @@ def _apply_auto_cut_policy(model: "Model", relaxer) -> None:
         # product structure is sparse, past the raw variable-count gate.
         if n > _AUTO_CUTS_MAX_VARS and not _rlt_sparse_admit(model, n):
             return  # size gate: leave cuts off
-        has_linear_constraints = bool(_linear_constraint_forms(model, n))
+        has_linear_constraints = _any_linear_constraint_form(model, n)
         if has_linear_constraints:
             relaxer._rlt_cuts = True
             relaxer._psd_cuts = False
@@ -4628,10 +4719,30 @@ def solve_model(
     # branches on integers/products and runs a feasibility-pump primal, closing
     # nvs17 to proven optimality. Opt-in via ``solve(lp_spatial=True)``; returns
     # ``None`` (falls through to the default path, no behavior change) for any model
-    # out of its scope (non-pure-integer, maximize, unbounded box) or on any error.
+    # out of its scope or on any error. #860 widens that scope to "at least one integer
+    # variable, either objective sense, any continuous mix" — mixed-integer and
+    # maximize models served in minimize-equivalent space, with a partially infinite
+    # root box accepted — but the widening is BEHIND ``DISCOPT_LP_SPATIAL_MIXED``
+    # here too, not just on the #844 fallback's reserve.
+    #
+    # Why the gate is flagged and not only the reserve (#860 review): the widened gate
+    # is not net-positive on the default path, which is CLAUDE.md §5 bar (2). Measured
+    # on ``gear4`` at a 25 s budget — a MIXED model (4 integer, 2 continuous with
+    # infinite upper bounds), so it is admitted only under the widening:
+    #
+    #   pre-#860 gate : optimal, objective = 1.6434284641, certified,      3 nodes
+    #   widened gate  : time_limit, objective = 17.514, UNcertified,    2673 nodes
+    #
+    # i.e. the engine accepts a model the default path already certified in 3 nodes,
+    # then spends the whole budget to return an incumbent ~10.7x worse with no
+    # certificate. Sound (the bound never crosses the oracle; the earlier false
+    # certificate there was the LP-presolve bug fixed in #877) but a clear regression,
+    # and ``lp_spatial=True`` is a documented public kwarg. The capability is kept and
+    # is opt-in; what is not shipped by default is a measured loss.
     if kwargs.get("lp_spatial", False):
         try:
             from discopt._jax.lp_spatial_bb import solve_lp_spatial_bb
+            from discopt.modeling.core import _lp_spatial_mixed_fallback_enabled
 
             _lps = solve_lp_spatial_bb(
                 model,
@@ -4639,6 +4750,7 @@ def solve_model(
                 gap_tolerance=gap_tolerance,
                 max_nodes=max_nodes,
                 root_cut_rounds=int(kwargs.get("lp_spatial_cut_rounds", 0)),
+                mixed=_lp_spatial_mixed_fallback_enabled(),
             )
         except Exception as _lps_exc:  # pragma: no cover - defensive
             logger.debug("lp_spatial engine failed, falling back: %s", _lps_exc)
@@ -5422,11 +5534,18 @@ def solve_model(
         # to one period, and clamp log/sqrt arguments to their natural domain so
         # the local NLP never wanders into the undefined region (issue #265's
         # false-infeasible from a free log argument).
+        # Budgeted like the other root-setup passes (#875): both rules walk every
+        # constraint body, and this runs before a single node exists.
+        # ``PeriodicVariableBoundRule`` is not row-anytime (its conclusion rests on a
+        # variable being absent elsewhere), so the budget can only decline to start
+        # it — never truncate it — which is exactly what keeps the reduction sound.
+        _per_budget_s = min(min(max(0.05 * float(time_limit), 1.0), 10.0), _remaining_budget())
         _per_lb, _per_ub, _per_stats = tighten_nonlinear_bounds(
             model,
             _origin_lb_chk,
             _origin_ub_chk,
             rules=(PeriodicVariableBoundRule(), FunctionDomainBoundRule()),
+            deadline=time.perf_counter() + _per_budget_s,
         )
         if _per_stats.n_tightened > 0:
             from discopt.solvers.amp import _apply_flat_bounds_to_model
@@ -5517,6 +5636,10 @@ def solve_model(
                     model = _bml
                     model._convexity_classification_cache = None
                     model._convexity_time_budget = _convexity_time_budget
+                    # Carry the absolute deadline onto the reformulated model too,
+                    # or its classification (and the engines that read this stash)
+                    # would run against no wall clamp at all (#654 / #875).
+                    model._solve_deadline = _solve_t0 + float(time_limit)
                     # Route like the integer-bilinear reform: skip the (slow,
                     # redundant) FBBT root presolve on the lifted rows and use
                     # the monolithic Rust simplex MILP engine, unless the
@@ -5898,8 +6021,15 @@ def solve_model(
 
         _builder = getattr(model, "_builder", None)
         _model_repr = model_to_repr(model, _builder)
-    except Exception:
-        pass  # FBBT bindings unavailable; skip
+    except Exception as exc:  # noqa: BLE001 - the solve proceeds without Rust FBBT
+        # Capability-disabling and high-value: no ``ModelRepr`` means no FBBT,
+        # no root presolve and no in-tree propagation. A silent skip here is
+        # exactly how "presolve doesn't help" becomes a fake measurement.
+        logger.debug(
+            "Rust model repr unavailable — FBBT/presolve disabled: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     # --- Root presolve: M10 variable elimination + (opt-in) M4+M5
     # polynomial reformulation, then FBBT for bound propagation.
@@ -6009,7 +6139,7 @@ def solve_model(
             pcls = classify_problem(model)
             if pcls in (ProblemClass.QP, ProblemClass.MIQP):
                 qp = extract_qp_data(model)
-                Q_qf = 0.5 * np.asarray(qp.Q, dtype=np.float64)
+                Q_qf = 0.5 * _dense_Q(qp.Q)
                 b_qf = np.asarray(qp.c, dtype=np.float64)
                 qf = QuadraticForm(Q=Q_qf, b=b_qf, c=float(qp.obj_const))
                 x_lo = np.asarray(qp.x_l, dtype=np.float64)
@@ -6135,8 +6265,21 @@ def solve_model(
     # --- Check for very large variable bounds ---
     # All solver paths (LP IPM, QP IPM, NLP) use barrier methods that
     # struggle with bounds beyond ~1e15. Check once before any dispatch.
-    _check_finite_bounds(model)
-    nonlinear_infeasibility = _detect_nonlinear_bound_infeasibility(model)
+    # Both of these consume the SAME nonlinear tightening of the SAME declared box
+    # on an unmodified model, so run it once and share it (#863): measured on
+    # watercontamination0202 the second run was 39.78 s of bit-identical repeat work
+    # against a 30 s budget. See _declared_box_tightening.
+    #
+    # #875: sharing halved the phase but left it unbounded — the surviving call was
+    # still ~27 s of a 30 s time_limit, because the pass had no budget parameter.
+    # Same shape as the root presolve budget below: a share of ``time_limit``,
+    # clamped to what is actually left. Truncation only weakens the box.
+    _nbt_budget_s = min(min(max(0.15 * float(time_limit), 2.0), 30.0), _remaining_budget())
+    _declared_tightening = _declared_box_tightening(
+        model, deadline=time.perf_counter() + _nbt_budget_s
+    )
+    _check_finite_bounds(model, _declared_tightening)
+    nonlinear_infeasibility = _detect_nonlinear_bound_infeasibility(model, _declared_tightening)
     if nonlinear_infeasibility is not None:
         logger.info(
             "Nonlinear bound tightening proved model infeasible: %s", nonlinear_infeasibility
@@ -6667,6 +6810,19 @@ def solve_model(
     t_rust_start = time.perf_counter()
     from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
 
+    # Cap the FBBT call at whatever wall time is actually left (#863). This is the
+    # last step before tree creation and it had no escape: on
+    # watercontamination0202 (106,711 vars / 107,209 rows) 20 full sweeps ran
+    # >10 minutes against a 30 s budget. FBBT is anytime, so a cap costs only
+    # tightening: the returned box is looser but valid, and the integer rounding
+    # inside still runs. Same #654 discipline as every other presolve step here.
+    #
+    # ``time_limit`` may be inf (an explicitly uncapped solve), which makes the
+    # remaining budget inf; that must become ``None`` (unlimited), not
+    # ``int(inf)`` — which raises OverflowError and would turn "no time limit"
+    # into a crash.
+    _fbbt_left = _remaining_budget()
+    _fbbt_budget_ms = None if not math.isfinite(_fbbt_left) else max(1, int(1000 * _fbbt_left))
     lb, ub, root_infeasible, _ = tighten_root_bounds_with_fbbt(
         model,
         lb,
@@ -6674,6 +6830,7 @@ def solve_model(
         int_offsets,
         int_sizes,
         model_repr=_model_repr,
+        time_limit_ms=_fbbt_budget_ms,
     )
     rust_time += time.perf_counter() - t_rust_start
     if root_infeasible:
@@ -7047,8 +7204,11 @@ def solve_model(
         from discopt._jax.convexity import refresh_convex_mask as _refresh_mask_import
 
         _refresh_mask = _refresh_mask_import
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - the root mask is then used verbatim
+        # Capability-disabling: with no per-node refresh the solver keeps the root
+        # convexity mask for the whole tree. A silent skip here makes a measurement
+        # of per-node refresh meaningless.
+        logger.debug("per-node convexity refresh unavailable: %s: %s", type(exc).__name__, exc)
 
     # Enable nonconvex spatial branching so integer-feasible nodes are not
     # prematurely fathomed.  The NLP local optimum at such a node may not
@@ -13302,8 +13462,10 @@ def _solve_node_nlp(
                             x=x_mid,
                             objective=_INFEASIBILITY_SENTINEL,
                         )
-            except Exception:
-                pass  # If evaluation fails, fall through to NLP solver
+            except Exception as exc:  # noqa: BLE001 - falls through to the NLP solver
+                logger.debug(
+                    "fixed-box infeasibility probe skipped: %s: %s", type(exc).__name__, exc
+                )
 
     if nlp_solver in ("pounce", "ipm", "sparse_ipm"):
         # "ipm"/"sparse_ipm" are deprecated aliases — the JAX IPM is retired as a
@@ -14211,9 +14373,9 @@ def _solve_lp_matrix(
         )
     )
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(lp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(lp_data.A_eq)
     b_eq_full = np.asarray(lp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14435,7 +14597,10 @@ def _quadratic_rows_solution_feasible(x, quadratic_constraints, tol=1e-6) -> boo
         return False
     x_scale = 1.0 + float(np.max(np.abs(x))) if x.size else 1.0
     for row in quadratic_constraints:
-        Q = np.asarray(row.Q, dtype=np.float64)
+        # dense_Q, not np.asarray: a quadratic row's Q may be scipy sparse (#863),
+        # and np.asarray on that silently yields a 0-d object array instead of
+        # raising -- which would make this feasibility check meaningless.
+        Q = _dense_Q(row.Q)
         c = np.asarray(row.c, dtype=np.float64)
         rhs = float(row.rhs)
         value = float(0.5 * x @ Q @ x + c @ x)
@@ -14473,9 +14638,9 @@ def _solve_qcp_gurobi(
         )
     )
 
-    A_ub = np.asarray(qcp_data.A_ub, dtype=np.float64)
+    A_ub = _dense_A(qcp_data.A_ub)
     b_ub = np.asarray(qcp_data.b_ub, dtype=np.float64)
-    A_eq = np.asarray(qcp_data.A_eq, dtype=np.float64)
+    A_eq = _dense_A(qcp_data.A_eq)
     b_eq = np.asarray(qcp_data.b_eq, dtype=np.float64)
     A_ub_arg = A_ub if A_ub.shape[0] else None
     b_ub_arg = b_ub if b_ub.shape[0] else None
@@ -14493,7 +14658,11 @@ def _solve_qcp_gurobi(
         integrality = int_arr
 
     result = _gurobi_solve_qcp(
-        Q=np.asarray(qcp_data.Q[:n_orig, :n_orig]),
+        # ``_dense_Q``, not ``np.asarray``: the QCP extractor may now emit a scipy
+        # sparse Q (#875, matching the QP extractor since #863), and ``np.asarray``
+        # on one returns a 0-d object array rather than raising — it would smuggle
+        # garbage into the Gurobi call instead of failing loudly.
+        Q=_dense_Q(qcp_data.Q)[:n_orig, :n_orig],
         c=np.asarray(qcp_data.c[:n_orig]),
         A_ub=A_ub_arg,
         b_ub=b_ub_arg,
@@ -14652,9 +14821,9 @@ def _solve_qp_matrix(
         )
     )
 
-    n_total = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(qp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(qp_data.A_eq)
     b_eq_full = np.asarray(qp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14671,7 +14840,7 @@ def _solve_qp_matrix(
         integrality = int_arr
 
     # Q matrix: only the original variable part (no slacks)
-    Q_orig = np.asarray(qp_data.Q[:n_orig, :n_orig])
+    Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
     c_orig = np.asarray(qp_data.c[:n_orig])
 
     try:
@@ -14841,9 +15010,9 @@ def _solve_milp_gurobi(
         )
     )
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    A_eq_full = _dense_A(lp_data.A_eq)
+    n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
-    A_eq_full = np.asarray(lp_data.A_eq)
     b_eq_full = np.asarray(lp_data.b_eq)
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(A_eq_full, b_eq_full, n_orig, n_slack)
 
@@ -14953,9 +15122,9 @@ def _solve_qp_jax(model: Model, t_start: float) -> SolveResult:
     t_jax_start = time.perf_counter()
     qp_data = extract_qp_data(model)
     state = qp_ipm_solve(
-        qp_data.Q,
+        cast(Any, _dense_Q(qp_data.Q)),
         qp_data.c,
-        qp_data.A_eq,
+        cast(Any, _dense_A(qp_data.A_eq)),
         qp_data.b_eq,
         qp_data.x_l,
         qp_data.x_u,
@@ -15093,9 +15262,9 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
     callback path if ``solve_qp_batch`` is unavailable or the wave raises.
     """
     n_batch = len(batch_lb)
-    Q = np.asarray(qp_data.Q, dtype=np.float64)
+    Q = _dense_Q(qp_data.Q)
     c = np.asarray(qp_data.c, dtype=np.float64)
-    A_eq = np.asarray(qp_data.A_eq, dtype=np.float64)
+    A_eq = _dense_A(qp_data.A_eq)
     b_eq = np.asarray(qp_data.b_eq, dtype=np.float64)
     n_total = int(qp_data.x_l.shape[0])
     n_slack = n_total - n_orig
@@ -15252,10 +15421,11 @@ def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, ti
     # MILP B&B visit enough nodes to bound the tree. It needs the native
     # inequality form, so decompose the slack-expanded standard form back to
     # A_ub/A_eq over the structural columns.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     try:
         A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            np.asarray(lp_data.A_eq, dtype=np.float64),
+            _A_eq_dense,
             np.asarray(lp_data.b_eq, dtype=np.float64),
             n_orig,
             n_slack,
@@ -15332,10 +15502,11 @@ def _solve_node_lp_simplex(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, t
     # Decompose the slack-expanded standard form back to native A_ub/A_eq over
     # the structural columns (the simplex adapter's matrix form), matching
     # _solve_node_lp_pounce so node bounds apply to the structural columns.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     try:
         A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            np.asarray(lp_data.A_eq, dtype=np.float64),
+            _A_eq_dense,
             np.asarray(lp_data.b_eq, dtype=np.float64),
             n_orig,
             n_slack,
@@ -15508,9 +15679,10 @@ def _root_reduced_cost_fixing(lp_data, n_orig, lb, ub, int_offsets, int_sizes, t
     if not POUNCE_AVAILABLE:
         return lb, ub, None
 
-    n_total = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_total = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, n_total - n_orig
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, n_total - n_orig
     )
     c_m = np.asarray(lp_data.c[:n_orig])
     obj_const = float(lp_data.obj_const)
@@ -15577,7 +15749,7 @@ def _augment_lpdata_with_cover_cuts(lp_data, n_orig: int, cuts):
     original-variable structure is untouched, so the B&B branches exactly as
     before but on a tighter relaxation. Cover cuts are valid, so the optimum
     is preserved (cannot affect ``incorrect_count``)."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15634,7 +15806,7 @@ def _augment_lpdata_with_gomory_cuts(lp_data, coeffs: np.ndarray, rhs: np.ndarra
     numerical error in the refined basis, so a cut can never exclude a true
     integer point (preserving ``incorrect_count == 0``) while still separating
     the fractional vertex."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15709,7 +15881,7 @@ def _separate_gomory_cuts(lp_data, x_vertex, n_orig, int_idx, max_cuts: int = 8)
         from discopt._rust import gomory_cuts_py
     except ImportError:
         return None
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     n_cur = A.shape[1]
     integrality = np.zeros(n_cur, dtype=bool)
@@ -15745,7 +15917,7 @@ def _augment_lpdata_with_mir_cuts(lp_data, coeffs: np.ndarray, rhs: np.ndarray):
     coupling), so the augmented relaxation stays well-conditioned. A small rhs
     relaxation guards against floating-point error in the separation point so a
     cut cannot exclude a true integer point."""
-    A = np.asarray(lp_data.A_eq, dtype=np.float64)
+    A = _dense_A(lp_data.A_eq)
     b = np.asarray(lp_data.b_eq, dtype=np.float64)
     c = np.asarray(lp_data.c, dtype=np.float64)
     xl = np.asarray(lp_data.x_l, dtype=np.float64)
@@ -15816,7 +15988,7 @@ def _separate_mir_cuts(lp_data, x_vertex, n_orig, int_idx, a_ub_orig, b_ub_orig,
     if res is None:
         return None
     coeffs, rhs = np.asarray(res[0], dtype=np.float64), np.asarray(res[1], dtype=np.float64)
-    n_cur = int(np.asarray(lp_data.A_eq).shape[1])
+    n_cur = int(_dense_A(lp_data.A_eq).shape[1])
     embedded = np.zeros((coeffs.shape[0], n_cur), dtype=np.float64)
     embedded[:, :n_orig] = coeffs[:, :n_orig]
     return embedded[:max_cuts], rhs[:max_cuts]
@@ -15865,7 +16037,7 @@ def _separate_aggregation_mir_cuts(
     if res is None:
         return None
     coeffs, rhs = np.asarray(res[0], dtype=np.float64), np.asarray(res[1], dtype=np.float64)
-    n_cur = int(np.asarray(lp_data.A_eq).shape[1])
+    n_cur = int(_dense_A(lp_data.A_eq).shape[1])
     embedded = np.zeros((coeffs.shape[0], n_cur), dtype=np.float64)
     embedded[:, :n_orig] = coeffs[:, :n_orig]
     return embedded[:max_cuts], rhs[:max_cuts]
@@ -15922,7 +16094,7 @@ def _cut_loop_relaxation_x(lp_data, prefer_pounce: bool):
     try:
         res = _pounce_solve(
             c=np.asarray(lp_data.c, dtype=np.float64),
-            A_eq=np.asarray(lp_data.A_eq, dtype=np.float64),
+            A_eq=_dense_A(lp_data.A_eq),
             b_eq=np.asarray(lp_data.b_eq, dtype=np.float64),
             bounds=list(
                 zip(
@@ -16001,7 +16173,7 @@ def _root_cover_cut_loop(
         try:
             x_vertex = crossover_to_vertex(
                 x_relax,
-                np.asarray(lp_data.A_eq),
+                _dense_A(lp_data.A_eq),
                 np.asarray(lp_data.b_eq),
                 np.asarray(lp_data.c),
                 np.asarray(lp_data.x_l),
@@ -16306,7 +16478,7 @@ def _solve_milp_simplex(
         return None
 
     lp_data = extract_lp_data(model)
-    A = np.ascontiguousarray(lp_data.A_eq, dtype=np.float64)
+    A = np.ascontiguousarray(_dense_A(lp_data.A_eq))
     if A.shape[0] == 0:
         return None  # no constraints — let the default path handle it
     n_orig = sum(v.size for v in model._variables)
@@ -16360,9 +16532,10 @@ def _solve_milp_simplex(
     # Feasibility gate (shared by the return path below and the #698 re-entry
     # adoption test). The row/bound/integrality decomposition is independent of
     # the point, so build it once and close over it.
-    n_slack = int(lp_data.A_eq.shape[1]) - n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    n_slack = int(_A_eq_dense.shape[1]) - n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, n_slack
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, n_slack
     )
     _xl_gate = np.asarray(lp_data.x_l[:n_orig], dtype=np.float64)
     _xu_gate = np.asarray(lp_data.x_u[:n_orig], dtype=np.float64)
@@ -16669,9 +16842,10 @@ def _solve_milp_bb(
     # auxiliary cover rows). The B&B node LP relaxations below use the
     # cover-augmented ``lp_data``; recovery uses ``lp_data_orig`` / these.
     lp_data_orig = lp_data
-    _n_total0 = lp_data.A_eq.shape[1] if lp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(lp_data.A_eq)
+    _n_total0 = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(lp_data.A_eq), np.asarray(lp_data.b_eq), n_orig, _n_total0 - n_orig
+        _A_eq_dense, np.asarray(lp_data.b_eq), n_orig, _n_total0 - n_orig
     )
     _cut_by_source = {"cover_clique": 0, "gomory": 0, "mir": 0, "aggregation": 0}
     try:
@@ -17289,12 +17463,13 @@ def _solve_miqp_bb(
     # nodes are first re-solved with POUNCE; only unrecoverable ones
     # decertify the gap (mirrors the P0.3 trust-gate + polish-retry).
     _gap_certified = True
-    _n_total0 = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+    _A_eq_dense = _dense_A(qp_data.A_eq)
+    _n_total0 = _A_eq_dense.shape[1] if _A_eq_dense.shape[0] > 0 else n_orig
     _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m = _decompose_eq_slack_form(
-        np.asarray(qp_data.A_eq), np.asarray(qp_data.b_eq), n_orig, _n_total0 - n_orig
+        _A_eq_dense, np.asarray(qp_data.b_eq), n_orig, _n_total0 - n_orig
     )
     _c_m = np.asarray(qp_data.c[:n_orig])
-    _Q_m = np.asarray(qp_data.Q[:n_orig, :n_orig])
+    _Q_m = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
 
     def _maybe_inject_snapped(x_row, node_lb_i, node_ub_i):
         # Purification (increment 3): near-integral interior points become
@@ -17339,7 +17514,7 @@ def _solve_miqp_bb(
         finite_feas = (
             x_full is not None
             and bool(np.all(np.isfinite(x_full)))
-            and _check_lp_solution_feasibility(qp_data.A_eq, qp_data.b_eq, x_full)
+            and _check_lp_solution_feasibility(_A_eq_dense, qp_data.b_eq, x_full)
         )
         if finite_feas:
             # Try first to recover a trusted (KKT) lower bound; if POUNCE
@@ -17465,7 +17640,7 @@ def _solve_miqp_bb(
             if infeasible[i]:
                 # POUNCE Phase-1-certified empty box: a sound infeasibility prune.
                 result_sols[i] = 0.5 * (lb_c + ub_c)
-            elif clean[i] and _check_lp_solution_feasibility(qp_data.A_eq, qp_data.b_eq, x_vals[i]):
+            elif clean[i] and _check_lp_solution_feasibility(_A_eq_dense, qp_data.b_eq, x_vals[i]):
                 # KKT-valid relaxation optimum -> a valid node lower bound.
                 result_lbs[i] = obj_vals[i] + float(qp_data.obj_const)
                 result_sols[i] = x_vals[i, :n_vars]
@@ -17571,14 +17746,14 @@ def _solve_miqp_bb(
         # Recover relaxation duals at the integer-feasible incumbent by
         # re-solving the QP relaxation with integer variables fixed.
         try:
-            n_total = qp_data.A_eq.shape[1] if qp_data.A_eq.shape[0] > 0 else n_orig
+            A_eq_full = _dense_A(qp_data.A_eq)
+            n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
             n_slack_local = n_total - n_orig
-            A_eq_full = np.asarray(qp_data.A_eq)
             b_eq_full = np.asarray(qp_data.b_eq)
             A_ub_, b_ub_, A_eq_, b_eq_ = _decompose_eq_slack_form(
                 A_eq_full, b_eq_full, n_orig, n_slack_local
             )
-            Q_orig = np.asarray(qp_data.Q[:n_orig, :n_orig])
+            Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
             constraint_duals, bound_duals_lower, bound_duals_upper = _mip_recover_relaxation_duals(
                 model,
                 lp_data=qp_data,

@@ -46,8 +46,56 @@ The release procedure that produces these entries is documented in
 
 ### Changed
 
+- **`gap_certified` now requires BOTH ends of a gap** (`fix`, #875). A limit exit
+  with a valid dual bound but *no incumbent* used to report
+  `status="time_limit", objective=None, gap=None, gap_certified=True` — a certified
+  gap where no gap was ever formed. `SolveResult.__post_init__` already required a
+  finite bound; it now also requires an objective, for every status except
+  `infeasible` (whose certificate is not a gap). The downgrade is True → False only,
+  so it cannot manufacture a certificate, and the dual `bound` is left in place
+  because a bound with no incumbent is still a valid bound.
+
 ### Fixed
 
+- **Root setup no longer scales with `n_vars × n_constraints`, and no longer runs
+  unbudgeted** (`fix(performance)`, #875, successor to #863/#868). After #868,
+  `watercontamination0202` (106,711 vars / 107,209 rows) returned instead of hanging
+  but still took 579 s against a 30 s `time_limit` with `nodes=0`. Two distinct
+  defects, both entirely before the first branch-and-bound node:
+  - *Cost.* `_fix_single_var_equalities` was `O(n_constraints × n_vars)` — the affine
+    linearizer it calls allocated and zeroed a dense `n_vars` array per constraint,
+    and the caller then walked all `n_vars` entries in Python to find the single
+    nonzero — for bodies with **one leaf each**. That was ~460 s of the 579 s (23 of
+    29 stack samples). Adds `_linearize_affine_expr_sparse` as the core, with the
+    dense `_linearize_affine_expr` as a view of it, and routes every per-constraint
+    scan through the sparse form (`_fix_single_var_equalities`, the one-hot group
+    scan, the monomial-factor fallback, the affine bound helpers). A new
+    `_any_linear_constraint_form` short-circuits the RLT-applicability probe, which
+    previously built and kept one dense row vector per constraint — 91 GB on that
+    instance — to evaluate a boolean. Measured on a synthetic probe at a fixed
+    constraint count: 0.85 s → 0.001 s at `n_vars=32,000`, and flat in `n_vars`
+    (18.8× → 1.0× across a 16× variable increase) instead of exactly linear.
+  - *Budget.* `tighten_nonlinear_bounds` (80.9 s over three root calls) had no
+    `deadline` parameter at all; it now takes one and polls at three granularities —
+    between rounds, between rules, and inside a rule's constraint scan — because a
+    single rule's sweep over 107k rows already exceeds a tight budget (#868's
+    `probing` lesson: a poll at the wrong granularity is not a poll). Rules declare
+    `row_scan_is_anytime`; the default is `False`, so a rule whose conclusion rests
+    on a row being *absent* (`PeriodicVariableBoundRule`) is skipped whole rather
+    than truncated. The convexity classifier's budget is a fraction of `time_limit`
+    recomputed per *model object*, so a reformulation restarted it and the fractions
+    added up (14.7 s over two runs); it is now additionally clamped to the absolute
+    `model._solve_deadline`. Every early exit does strictly less work — a looser box,
+    fewer rules, `convexity-unknown` routing to sound spatial branch-and-bound —
+    never a wrong one.
+- **The QCP probe extractor's Hessian may be sparse** (`fix`, #875).
+  `_extract_quadratic_coefficients_from_values` still swept all `O(n²)` variable
+  pairs into a dense `(n, n)` array, per constraint — the one extractor #863/#868
+  left dense. It now restricts off-diagonal probing to the evaluator's support (free:
+  the `O(n)` diagonal probes already identify it) and materialises through
+  `_materialise_Q`, matching the QP path. `_quadratic_row_has_terms` and the Gurobi
+  QCP entry point are made sparse-aware in step, so a sparse `Q` cannot reach a
+  consumer as the 0-d object array `np.asarray` silently produces.
 - **Two false-certificate paths in the convex kernel tree** (`fix(correctness)`,
   #871). Both are latent on today's default path (the kernel is default-off and
   `try_convex_solve` seeds no incumbent), and both are removed.
