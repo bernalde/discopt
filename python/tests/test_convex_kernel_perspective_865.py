@@ -154,11 +154,13 @@ def test_perspective_lift_is_exact_and_convex(instance, func, n_pts):
     assert any(t["sc_aff"] is not None for _i, _s, d in rows for t in d.terms)
     assert {t["func"] for _i, _s, d in rows for t in d.terms} == {func}
 
-    # Both loops skip non-finite samples, which can silently degrade the whole test
-    # to a no-op that reports success. Count what actually executed and assert it.
+    # Count the assertions that ACTUALLY execute. The finiteness guards below
+    # would otherwise let this test pass having compared nothing (CLAUDE.md
+    # "Measurement & instrumentation discipline" rule 6) — and this is the test
+    # the certificate's soundness argument rests on.
     rng = np.random.default_rng(12345)
+    n_exact = n_convex = 0
     X = _box_sample(lb, ub, rng, n_pts)
-    n_exact = 0
     for x in X:
         g = np.asarray(ev.evaluate_constraints(x), float)
         for i, sign, d in rows:
@@ -170,7 +172,6 @@ def test_perspective_lift_is_exact_and_convex(instance, func, n_pts):
                 )
 
     A, B = _box_sample(lb, ub, rng, n_pts), _box_sample(lb, ub, rng, n_pts)
-    n_convex = 0
     for a, b in zip(A, B):
         for lam in (0.25, 0.5, 0.75):
             mid = lam * a + (1 - lam) * b

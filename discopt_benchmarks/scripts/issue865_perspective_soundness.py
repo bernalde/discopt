@@ -95,8 +95,12 @@ def check(name, path, n_pts=400):
     rng = np.random.default_rng(12345)
     pts = sample(lb, ub, rng, n_pts)
 
-    # 1. exactness vs the pristine model
+    # 1. exactness vs the pristine model. `n_exact` counts comparisons ACTUALLY
+    # made: the finiteness guard below would otherwise let this degrade to a
+    # silent no-op that reports `worst=0.0` and reads as a pass (CLAUDE.md
+    # "Measurement & instrumentation discipline" rule 6).
     worst = 0.0
+    n_exact = 0
     for x in pts:
         g = np.asarray(ev.evaluate_constraints(x), float)
         for i, sign, d in rows:
@@ -104,10 +108,12 @@ def check(name, path, n_pts=400):
             got = row_value(d, x)
             if np.isfinite(ref) and np.isfinite(got):
                 worst = max(worst, abs(ref - got) / max(1.0, abs(ref)))
-    ok_exact = worst < 1e-9
+                n_exact += 1
+    ok_exact = worst < 1e-9 and n_exact > 0
 
     # 2. midpoint convexity of every routed row
     worst_cx = 0.0
+    n_cx = 0
     left, right = sample(lb, ub, rng, n_pts), sample(lb, ub, rng, n_pts)
     for a, b in zip(left, right, strict=True):
         for lam in (0.25, 0.5, 0.75):
@@ -118,12 +124,15 @@ def check(name, path, n_pts=400):
                     continue
                 viol = gm - (lam * ga + (1 - lam) * gb)
                 worst_cx = max(worst_cx, viol / max(1.0, abs(gm)))
-    ok_cx = worst_cx < 1e-9
+                n_cx += 1
+    ok_cx = worst_cx < 1e-9 and n_cx > 0
 
     print(
         f"{name}: rows={len(rows)} persp_terms={n_persp} funcs={kinds} "
-        f"exactness worst_rel_err={worst:.3e} {'OK' if ok_exact else 'FAIL'} | "
-        f"convexity worst_violation={worst_cx:.3e} {'OK' if ok_cx else 'FAIL'}"
+        f"exactness worst_rel_err={worst:.3e} over {n_exact} cmps "
+        f"{'OK' if ok_exact else 'FAIL'} | "
+        f"convexity worst_violation={worst_cx:.3e} over {n_cx} cmps "
+        f"{'OK' if ok_cx else 'FAIL'}"
     )
     return ok_exact and ok_cx
 
