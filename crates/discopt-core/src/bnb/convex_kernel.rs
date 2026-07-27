@@ -1298,9 +1298,9 @@ impl ConvexKernelSpec {
                     None => {
                         // Warm solve gave up: it does not distinguish "proven
                         // infeasible" from "numerically failed", so this subtree is
-                        // not certified as explored.
-                        uncertified_drop = true;
-                        continue;
+                        // not certified as explored -- unless the cut-free retry
+                        // below resolves it (#871).
+                        self.solve_node(&lo, &hi, config.oa_tol, config.max_oa_rounds, opts)
                     }
                 }
             } else {
@@ -1312,6 +1312,48 @@ impl ConvexKernelSpec {
                     config.max_sep_rounds,
                     opts,
                 )
+            };
+            // #871: a node that breaks down numerically has proven nothing, so
+            // poisoning the certificate is correct -- but premature. The breakdown is
+            // caused by the separated pool itself: on clay0303hfsg one node reached
+            // 307 OA rounds / 2042 tangents with coefficient dynamism 7.3e8 before the
+            // factorization failed. Re-solving the SAME box with `solve_node` (K1,
+            // OA-only, no integrality separation) is a *different, weaker* relaxation:
+            // every cut dropped can only enlarge the feasible region, so its optimum
+            // stays a valid bound in the sense convention -- weaker, never tighter,
+            // which is the sound direction. Only if that also fails is the subtree
+            // genuinely unexplored.
+            //
+            // This is #871 step 2's retry-with-fewer-cuts. It is NOT a tolerance tweak:
+            // no threshold moves and nothing is relaxed. The thing to avoid is lowering
+            // `max_sep_rounds` globally, which would cost separation everywhere it is
+            // net-positive.
+            // #871: a node that breaks down numerically has proven nothing, so
+            // poisoning the certificate is correct -- but premature. The breakdown is
+            // caused by the separated pool itself: on clay0303hfsg one node reached
+            // 307 OA rounds / 2042 tangents with coefficient dynamism 7.3e8 before the
+            // factorization failed. Re-solving the SAME box with `solve_node` (K1,
+            // OA-only, no integrality separation) is a *different, weaker* relaxation:
+            // every cut dropped can only enlarge the feasible region, so its optimum
+            // stays a valid bound in the sense convention -- weaker, never tighter,
+            // which is the sound direction. Only if that also fails is the subtree
+            // genuinely unexplored.
+            //
+            // This is #871 step 2's retry-with-fewer-cuts. It is NOT a tolerance tweak:
+            // no threshold moves and nothing is relaxed. The thing to avoid is lowering
+            // `max_sep_rounds` globally, which would cost separation everywhere it is
+            // net-positive.
+            //
+            // Deliberately scoped to the non-`Optimal` exit. The sibling symptom -- an
+            // `Optimal` LP whose Neumaier-Shcherbina bound is `-inf` -- was also tried
+            // here and MEASURED to be a no-op: `cvxnonsep_psig40r` returns
+            // `exhausted`/`-inf` at node 1 both with and without that retry, because
+            // its NS decline is not caused by the separated pool. Unmeasured code does
+            // not ship; that face of #871 stays open.
+            let r = if matches!(r.status, LpStatus::Optimal | LpStatus::Infeasible) {
+                r
+            } else {
+                self.solve_node(&lo, &hi, config.oa_tol, config.max_oa_rounds, opts)
             };
             if r.status != LpStatus::Optimal {
                 // A PROVEN-infeasible node is a legitimate fathom — its subtree is
