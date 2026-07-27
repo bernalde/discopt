@@ -20,6 +20,12 @@
 //! * per term (len n_terms): `term_coeff`, `term_func` (0=Log,1=Exp,2=Sqrt,
 //!   3=Log1p), `term_arg_const`, `term_arg_ptr` (len n_terms+1) into
 //!   `term_arg_cols`/`term_arg_coeffs`.
+//! * OPTIONAL perspective scale per term (#865), supplied as a group or omitted
+//!   entirely: `term_scale_const` (len n_terms), `term_scale_ptr` (len n_terms+1)
+//!   into `term_scale_cols`/`term_scale_coeffs`. A term whose scale row is empty
+//!   AND whose scale constant is 0 is the plain composite `coeff·func(arg)`;
+//!   otherwise it is the perspective `coeff·s·func(arg/s)`. Omitting the group is
+//!   equivalent to an all-zero scale, so pre-#865 callers are unaffected.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use discopt_core::bnb::convex_kernel::{
@@ -109,6 +115,11 @@ struct SpecArrays<'py> {
     term_arg_ptr: PyReadonlyArray1<'py, i64>,
     term_arg_cols: PyReadonlyArray1<'py, i64>,
     term_arg_coeffs: PyReadonlyArray1<'py, f64>,
+    // Perspective terms (optional; absent ⇒ every term is the plain composite form).
+    term_scale_const: Option<PyReadonlyArray1<'py, f64>>,
+    term_scale_ptr: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_cols: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_coeffs: Option<PyReadonlyArray1<'py, f64>>,
 }
 
 impl SpecArrays<'_> {
@@ -149,6 +160,36 @@ impl SpecArrays<'_> {
         let term_arg_ptr = self.term_arg_ptr.as_slice()?;
         let term_arg_cols = self.term_arg_cols.as_slice()?;
         let term_arg_coeffs = self.term_arg_coeffs.as_slice()?;
+        // Perspective scales are all-or-nothing: either the four arrays are supplied
+        // together (a term is perspective iff its scale CSR row is non-empty or its
+        // scale constant is non-zero) or none is, and every term is plain composite.
+        let scale = match (
+            self.term_scale_const.as_ref(),
+            self.term_scale_ptr.as_ref(),
+            self.term_scale_cols.as_ref(),
+            self.term_scale_coeffs.as_ref(),
+        ) {
+            (None, None, None, None) => None,
+            (Some(cst), Some(ptr), Some(cols), Some(coeffs)) => {
+                let (cst, ptr, cols, coeffs) = (
+                    cst.as_slice()?,
+                    ptr.as_slice()?,
+                    cols.as_slice()?,
+                    coeffs.as_slice()?,
+                );
+                if cst.len() != term_coeff.len() || ptr.len() != term_coeff.len() + 1 {
+                    return Err(PyValueError::new_err(
+                        "term_scale_const must have length n_terms and term_scale_ptr n_terms+1",
+                    ));
+                }
+                Some((cst, ptr, cols, coeffs))
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "term_scale_const/ptr/cols/coeffs must be supplied together or not at all",
+                ))
+            }
+        };
         let n_nl = nl_rhs.len();
         if nl_lin_const.len() != n_nl
             || nl_lin_ptr.len() != n_nl + 1
@@ -173,6 +214,24 @@ impl SpecArrays<'_> {
             let mut terms = Vec::with_capacity(te - ts);
             for t in ts..te {
                 let (ac, ak) = csr_row(term_arg_ptr, term_arg_cols, term_arg_coeffs, t)?;
+                let scale_aff = match scale {
+                    None => None,
+                    Some((cst, ptr, cols, coeffs)) => {
+                        let (sc, sk) = csr_row(ptr, cols, coeffs, t)?;
+                        // An all-zero scale marks a plain composite term; a real
+                        // perspective always carries `s = 0.001 + 0.999·y` (or similar),
+                        // so it has either a nonzero constant or a nonempty column set.
+                        if sc.is_empty() && cst[t] == 0.0 {
+                            None
+                        } else {
+                            Some(Affine {
+                                cols: sc,
+                                coeffs: sk,
+                                cst: cst[t],
+                            })
+                        }
+                    }
+                };
                 terms.push(CompositeTerm {
                     coeff: term_coeff[t],
                     func: func_from_code(term_func[t])?,
@@ -181,6 +240,7 @@ impl SpecArrays<'_> {
                         coeffs: ak,
                         cst: term_arg_const[t],
                     },
+                    scale: scale_aff,
                 });
             }
             nl_rows.push(ConvexRow {
@@ -224,6 +284,7 @@ fn lp_status_str(s: LpStatus) -> &'static str {
     eq_row_ptr, eq_cols, eq_coeffs, eq_rhs,
     nl_rhs, nl_lin_const, nl_lin_ptr, nl_lin_cols, nl_lin_coeffs, nl_term_ptr,
     term_coeff, term_func, term_arg_const, term_arg_ptr, term_arg_cols, term_arg_coeffs,
+    term_scale_const=None, term_scale_ptr=None, term_scale_cols=None, term_scale_coeffs=None,
     oa_tol=1e-6, max_oa_rounds=60, max_sep_rounds=0, expel_zero_artificials=true,
 ))]
 pub fn solve_convex_node_py<'py>(
@@ -254,6 +315,11 @@ pub fn solve_convex_node_py<'py>(
     term_arg_ptr: PyReadonlyArray1<'py, i64>,
     term_arg_cols: PyReadonlyArray1<'py, i64>,
     term_arg_coeffs: PyReadonlyArray1<'py, f64>,
+    // Perspective terms (optional; absent ⇒ every term is the plain composite form).
+    term_scale_const: Option<PyReadonlyArray1<'py, f64>>,
+    term_scale_ptr: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_cols: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_coeffs: Option<PyReadonlyArray1<'py, f64>>,
     oa_tol: f64,
     max_oa_rounds: usize,
     max_sep_rounds: usize,
@@ -286,6 +352,10 @@ pub fn solve_convex_node_py<'py>(
         term_arg_ptr,
         term_arg_cols,
         term_arg_coeffs,
+        term_scale_const,
+        term_scale_ptr,
+        term_scale_cols,
+        term_scale_coeffs,
     };
     let spec = arrays.build()?;
     let lo = arrays.lo.as_slice()?;
@@ -318,6 +388,7 @@ pub fn solve_convex_node_py<'py>(
     eq_row_ptr, eq_cols, eq_coeffs, eq_rhs,
     nl_rhs, nl_lin_const, nl_lin_ptr, nl_lin_cols, nl_lin_coeffs, nl_term_ptr,
     term_coeff, term_func, term_arg_const, term_arg_ptr, term_arg_cols, term_arg_coeffs,
+    term_scale_const=None, term_scale_ptr=None, term_scale_cols=None, term_scale_coeffs=None,
     max_nodes=100_000, gap_tol=1e-4, int_tol=1e-5, oa_tol=1e-6,
     max_oa_rounds=60, max_sep_rounds=12, fbbt_rounds=20,
     initial_incumbent=None, time_limit_s=None,
@@ -350,6 +421,11 @@ pub fn solve_convex_tree_py<'py>(
     term_arg_ptr: PyReadonlyArray1<'py, i64>,
     term_arg_cols: PyReadonlyArray1<'py, i64>,
     term_arg_coeffs: PyReadonlyArray1<'py, f64>,
+    // Perspective terms (optional; absent ⇒ every term is the plain composite form).
+    term_scale_const: Option<PyReadonlyArray1<'py, f64>>,
+    term_scale_ptr: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_cols: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_coeffs: Option<PyReadonlyArray1<'py, f64>>,
     max_nodes: usize,
     gap_tol: f64,
     int_tol: f64,
@@ -387,6 +463,10 @@ pub fn solve_convex_tree_py<'py>(
         term_arg_ptr,
         term_arg_cols,
         term_arg_coeffs,
+        term_scale_const,
+        term_scale_ptr,
+        term_scale_cols,
+        term_scale_coeffs,
     };
     let spec = arrays.build()?;
     let config = ConvexTreeConfig {
@@ -434,6 +514,7 @@ pub fn solve_convex_tree_py<'py>(
     eq_row_ptr, eq_cols, eq_coeffs, eq_rhs,
     nl_rhs, nl_lin_const, nl_lin_ptr, nl_lin_cols, nl_lin_coeffs, nl_term_ptr,
     term_coeff, term_func, term_arg_const, term_arg_ptr, term_arg_cols, term_arg_coeffs,
+    term_scale_const=None, term_scale_ptr=None, term_scale_cols=None, term_scale_coeffs=None,
     max_stats=25, gap_tol=1e-4, int_tol=1e-5, oa_tol=1e-6,
     max_oa_rounds=60, fbbt_rounds=20, initial_incumbent=None,
     gc_pool_cap=0, gc_max_age=5,
@@ -467,6 +548,11 @@ pub fn convex_warmlp_probe_py<'py>(
     term_arg_ptr: PyReadonlyArray1<'py, i64>,
     term_arg_cols: PyReadonlyArray1<'py, i64>,
     term_arg_coeffs: PyReadonlyArray1<'py, f64>,
+    // Perspective terms (optional; absent ⇒ every term is the plain composite form).
+    term_scale_const: Option<PyReadonlyArray1<'py, f64>>,
+    term_scale_ptr: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_cols: Option<PyReadonlyArray1<'py, i64>>,
+    term_scale_coeffs: Option<PyReadonlyArray1<'py, f64>>,
     max_stats: usize,
     gap_tol: f64,
     int_tol: f64,
@@ -504,6 +590,10 @@ pub fn convex_warmlp_probe_py<'py>(
         term_arg_ptr,
         term_arg_cols,
         term_arg_coeffs,
+        term_scale_const,
+        term_scale_ptr,
+        term_scale_cols,
+        term_scale_coeffs,
     };
     let spec = arrays.build()?;
     let config = ConvexTreeConfig {

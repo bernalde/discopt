@@ -12,6 +12,38 @@ The release procedure that produces these entries is documented in
 
 ### Added
 
+- **Perspective terms in the convex-kernel producer** (`feat`, #865, inside the
+  default-off `DISCOPT_CONVEX_KERNEL` path). Hull-reformulated (`*hfsg`) models
+  write their disjunctive nonlinearities as the perspective `s·f(a/s)` with the
+  smoothed indicator `s = 0.001 + 0.999·y` — e.g. `syn05hfsg`'s
+  `(x2/ε − log(x0/ε + 1))·ε ≤ 0`. Syntactically that is a product of two
+  non-constant subexpressions, so the gate rejected the whole family as a
+  "bilinear product"; mathematically the perspective of a convex `f` is *jointly
+  convex* in `(a, s)` on `s > 0`, so admitting it **recognises convexity the
+  syntactic gate missed rather than loosening the gate**. `_decompose` now
+  recognises the shape, lifts `s·h(·/s)` to affine terms plus perspective terms
+  (an algebraic identity), and `CompositeTerm` carries an optional affine `scale`
+  whose value/gradient feed the existing OA-tangent machinery unchanged
+  (`∂/∂a = coeff·f'(t)`, `∂/∂s = coeff·(f(t) − t·f'(t))`, `t = a/s`).
+
+  Three hard gates gate admission, each a refusal rather than an approximation:
+  the existing `sign(coeff)·curvature(func) ≥ 0` curvature rule; `s > 0` **proven
+  by interval arithmetic over the variable box** (the convexity precondition —
+  the smoothing floor is exactly what makes it hold); and `a/s` inside `func`'s
+  domain over the box. A genuine bilinear product, a mismatched denominator, and
+  a scale that touches 0 all still fall back to the (always-correct) default path.
+
+  Measured: `syn05hfsg` goes from *declined* to **certified optimal 837.7324009
+  in 2 nodes / 0.00 s**, matching the BARON reference and the value the
+  already-trusted path gets on its sibling `syn05m`. Verified over the box —
+  marshaled rows equal the pristine model's pointwise (worst relative error
+  1.0e-15, so the lift is exact) and every routed row satisfies the midpoint
+  convexity inequality (worst violation 0.0). Bound-neutral for everything routed
+  before: `syn05m` and `cvxnonsep_psig40r` marshal and solve identically
+  (node counts 3→3, 1→1; objectives bit-identical). Corpus-wide over the 147
+  in-repo `.nl` instances the only routing change is `syn05hfsg` being admitted;
+  nothing previously routed was lost.
+
 ### Changed
 
 - **`gap_certified` now requires BOTH ends of a gap** (`fix`, #875). A limit exit
@@ -64,6 +96,34 @@ The release procedure that produces these entries is documented in
   `_materialise_Q`, matching the QP path. `_quadratic_row_has_terms` and the Gurobi
   QCP entry point are made sparse-aware in step, so a sparse `Q` cannot reach a
   consumer as the 0-d object array `np.asarray` silently produces.
+- **Two false-certificate paths in the convex kernel tree** (`fix(correctness)`,
+  #871). Both are latent on today's default path (the kernel is default-off and
+  `try_convex_solve` seeds no incumbent), and both are removed.
+
+  1. **A silently discarded subtree could still certify.** `solve_tree` skips any
+     node whose LP does not return `Optimal`. For a *proven-infeasible* node that
+     is a legitimate fathom; for `numerical` / `unbounded` / iteration-limit the
+     subtree is simply never explored — yet the tree upgraded `Exhausted →
+     Optimal` on the drained frontier, or exited `Optimal` on a closed frontier
+     gap. The reported `bound` then fell back to the **incumbent's own objective**
+     (reading as a closed gap) and the incumbent was clamped against an infinite
+     dual to `±inf`. An uncertified drop now poisons the certificate: neither
+     `Optimal` exit can fire, the bound reports `±inf` ("no bound"), and the
+     incumbent is clamped only against a *finite* dual.
+
+  2. **A seeded incumbent was certified as the optimum on a MINIMIZATION.** The
+     root node's trivial dual bound was written `sense * INFINITY`, which is `−∞`
+     for a min — the *best* value in the loop's "maximize `sense·bound`"
+     convention — so the root looked already fathomed against any seeded incumbent
+     and the gap check fired on node 0. Measured: seeding `9.0` on a spec whose
+     true optimum is `2.5` returned `Optimal, bound=9, nodes=0`. Maximization was
+     correct by accident. The trivial bound is `+∞` in the convention for both
+     senses.
+
+  The guards are exact: `syn05hfsg` (2 nodes), `syn05m` (3 nodes) and
+  `cvxnonsep_psig40r` (1 node) are bit-identical, statuses and objectives
+  unchanged.
+
 
 ## [0.7.0] - 2026-07-24
 
