@@ -127,6 +127,32 @@ nodes: root-only cutting at certifying intensity starves incumbents (0/5 on
 rsyn0810m/tls2, #781 held), and `scip-gap-nvs-diagnosis.md` measured OBBT × cuts ×
 throughput as **multiplicative — they must land together**.
 
+**G-G. Presolve/reformulation: the dominant mechanism on the hardest gap instances —
+initially missing from this analysis.** (Added same-day after review pushback; measured
+with `scip -c "read … optimize display statistics"` on the local SCIP, logs in the
+session scratchpad.) Mechanism attribution for all five P2 instances:
+
+| instance | SCIP presolve effect | nodes | incumbent found by | restarts |
+|---|---|---|---|---|
+| `watercontamination0202` | 106,712 → **566 vars, 107,210 → 560 cons (189×), 0.19 s** | 11 | `relaxation` | 0 |
+| `gastrans582_cold13` | 2,186 → 598 vars | 12 | `pscostdiving` | 0 |
+| `gastrans040` | 279 → 80 vars | 1 | `feaspump` | 0 |
+| `ball_mk2_30` | none needed (30 vars) | 1 | **`trivial`** | 0 |
+| `chimera_k64ising-01` | *grew* it: 1,192 ints → binaries + 1,587 product lifts (2,779 vars) | 14 | `relaxation` | 0 |
+
+Three consequences. (1) **`watercontamination0202` is a presolve problem, not a primal
+problem** — no incumbent constructor competes with deleting 99.5 % of the model; discopt
+runs its entire root setup at full 106k size (#875's measured floor ≈ 27 s is *paying for
+the un-presolved model*). (2) `ball_mk2_30` needs only a trivial-point probe — note the
+open discrepancy with #843's claim that the graduated trivial seed already resolves it;
+defaults measurement shows no incumbent, so the seed's cold-start gating likely excludes
+this class (same gate that excludes chimera, per #843). (3) The do-not-staff entry
+"binary expansion (nvs17 7 → 2,751 vars)" is **family-scoped, not universal**: SCIP wins
+`chimera` precisely by binarizing + lifting products; the falsification stands for the
+nvs family only. **Restarts and conflict analysis measured NOT implicated on these five;
+they remain unmeasured on the 40 jointly-proved slow-ratio panel — an open evidence task,
+not a claimed non-area.**
+
 **G-F. `no_bound` family (8/62) — relaxation strength on family D** (tls2/tspn-class,
 `baron-gap-plan.md` G5): the dual bound never moves, so no budget helps. Distinct from
 G-B (those have vacuous-but-moving bounds); untouched by everything shipped this month.
@@ -156,7 +182,19 @@ certified **≤ 5 s each** (SCIP ≤ ~1 s; 5× interim bar), first-incumbent lat
 `incorrect_count = 0`, §5 differential clean. End state: global50 geomean within **2×**
 of SCIP.
 
-### P2 — Primal constructors for the six no-incumbent instances (G-B). *Closes #844, #861, #843.*
+### P2 — The six no-incumbent instances, by measured mechanism (G-B + G-G). *Closes #844, #861, #843.*
+
+**Re-scoped after the G-G attribution:** these six are not one class. The fixes, in
+SCIP-measured order of mechanism: **(a) presolve/reduction parity** for
+`watercontamination0202` and the `gastrans*` pair — entry experiment: run discopt's
+existing Rust presolve passes (`presolve/aggregate.rs`, `eliminate.rs`,
+`factorable_elim.rs`) on these three and measure the achieved reduction vs SCIP's
+(189×, 3.7×, 3.5×); the passes exist and the solve path shows no reduction (#875 kept
+106k vars end-to-end), so the first question is wiring, not new algorithms. **(b) a
+trivial-point seed gating fix** for `ball_mk2_30` (and re-test chimera's exclusion) —
+likely a one-line gate, blocked on reproducing the #843 discrepancy. **(c) genuine
+primal constructors** (LP feasibility pump, pscost diving — both named by SCIP's own
+stats) for whatever remains after (a) and (b).
 
 **Evidence it is required:** the G-B table — six instances at "no incumbent in 60 s" vs
 SCIP ≤ 18.7 s, all with `=opt=` oracles. Evidence of tractability: plunging's measured
