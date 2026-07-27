@@ -109,18 +109,63 @@ impl Affine {
     }
 }
 
-/// One composite term `coeff · func(arg)` of a convex row.
+/// One composite term of a convex row.
+///
+/// With `scale = None` this is the plain composite `coeff · func(arg)`.
+///
+/// With `scale = Some(s)` it is the **perspective** form `coeff · s · func(arg/s)`
+/// — the shape produced by hull/`hfsg` reformulations, where `s` is the (smoothed)
+/// indicator `0.001 + 0.999·y`. The perspective of a convex `func` is *jointly*
+/// convex in `(arg, s)` on `s > 0`, and `arg`/`s` are affine in `x`, so the term is
+/// convex in `x` under the same `sign(coeff)·curvature ≥ 0` rule as the plain form.
+/// The `s > 0` precondition is NOT checked here: the Python producer
+/// (`_convex_kernel.build_convex_spec`) refuses the model unless interval arithmetic
+/// proves `s > 0` over the whole box, so every node's box keeps `s` strictly positive.
 #[derive(Clone, Debug)]
 pub struct CompositeTerm {
     /// Outer coefficient.
     pub coeff: f64,
     /// The univariate function.
     pub func: ConvexFunc,
-    /// The affine argument `p·x + q`.
+    /// The affine argument: `p·x + q` (plain) or the perspective numerator (scaled).
     pub arg: Affine,
+    /// `Some(s)` selects the perspective form `coeff · s · func(arg/s)`.
+    pub scale: Option<Affine>,
 }
 
-/// A convex nonlinear constraint `g(x) = lin·x + b + Σ_t coeff_t·func_t(arg_t) ≤ rhs`.
+impl CompositeTerm {
+    /// `(value, d/d(arg), d/d(scale))` of this term at `x`.
+    ///
+    /// Plain: `coeff·f(a)`, so `d/da = coeff·f'(a)` and the scale derivative is 0.
+    /// Perspective with `t = a/s`: `coeff·s·f(t)`, so `d/da = coeff·f'(t)` and
+    /// `d/ds = coeff·(f(t) − t·f'(t))`.
+    #[inline]
+    fn value_and_partials(&self, x: &[f64]) -> (f64, f64, f64) {
+        let a = self.arg.eval(x);
+        match &self.scale {
+            None => {
+                let (f, fp) = self.func.eval_and_deriv(a);
+                (self.coeff * f, self.coeff * fp, 0.0)
+            }
+            Some(s_aff) => {
+                let s = s_aff.eval(x);
+                // Guarded by the producer's `s > 0` gate; a non-positive `s` here
+                // would mean a violated precondition, so emit NaN and let the
+                // caller's finiteness check drop the tangent rather than produce
+                // a silently wrong (unsound) cut.
+                if !(s > 0.0) {
+                    return (f64::NAN, f64::NAN, f64::NAN);
+                }
+                let t = a / s;
+                let (f, fp) = self.func.eval_and_deriv(t);
+                (self.coeff * s * f, self.coeff * fp, self.coeff * (f - t * fp))
+            }
+        }
+    }
+}
+
+/// A convex nonlinear constraint `g(x) = lin·x + b + Σ_t term_t(x) ≤ rhs`, where each
+/// term is `coeff·func(arg)` or its perspective `coeff·scale·func(arg/scale)`.
 #[derive(Clone, Debug)]
 pub struct ConvexRow {
     /// The affine part `lin·x + b`.
@@ -147,7 +192,7 @@ impl ConvexRow {
     pub fn value(&self, x: &[f64]) -> f64 {
         let mut v = self.lin.eval(x);
         for t in &self.terms {
-            v += t.coeff * t.func.eval(t.arg.eval(x));
+            v += t.value_and_partials(x).0;
         }
         v
     }
@@ -164,11 +209,14 @@ impl ConvexRow {
             *grad.entry(*c).or_insert(0.0) += a;
         }
         for t in &self.terms {
-            let arg = t.arg.eval(x);
-            let (_f, fp) = t.func.eval_and_deriv(arg);
-            let outer = t.coeff * fp;
+            let (_v, d_arg, d_scale) = t.value_and_partials(x);
             for (c, a) in t.arg.cols.iter().zip(t.arg.coeffs.iter()) {
-                *grad.entry(*c).or_insert(0.0) += outer * a;
+                *grad.entry(*c).or_insert(0.0) += d_arg * a;
+            }
+            if let Some(s_aff) = &t.scale {
+                for (c, a) in s_aff.cols.iter().zip(s_aff.coeffs.iter()) {
+                    *grad.entry(*c).or_insert(0.0) += d_scale * a;
+                }
             }
         }
     }
@@ -880,6 +928,7 @@ impl ConvexKernelSpec {
         true
     }
 
+
     /// Is `x` integer-integral on all integer columns AND OA-tight (every convex
     /// row satisfied to `oa_tol`)? Such an LP vertex is genuinely feasible → a
     /// valid incumbent (the minimal LP-NLP-BB primal; K3 adds NLP/rounding).
@@ -966,7 +1015,15 @@ impl ConvexKernelSpec {
         let mut heap = std::collections::BinaryHeap::new();
         heap.push(TreeNode {
             key: f64::INFINITY,
-            parent_bound: sense * f64::INFINITY, // sense·(trivial dual bound)
+            // The trivial dual bound is the WORST-case objective (−∞ for a min, +∞
+            // for a max), which in this loop's "maximize sense·bound" convention is
+            // `sense·(∓∞) = +∞` for BOTH senses. Writing `sense * INFINITY` gave −∞
+            // for a minimization — the *best* value in the convention — so the root
+            // looked already fathomed against any seeded incumbent and the gap check
+            // fired on node 0. A seeded `min` then certified the SEED as optimal
+            // (measured: seed 9.0 on a spec whose true optimum is 2.5 returned
+            // `Optimal, bound=9, nodes=0`). Maximization was correct by accident.
+            parent_bound: f64::INFINITY,
             lo: root_lo,
             hi: root_hi,
             branch: None,
@@ -981,6 +1038,14 @@ impl ConvexKernelSpec {
         // and, unlike the frontier max, it never drops below the true optimum when
         // a late (tolerance-feasible) incumbent is accepted. `+= frontier` at the end.
         let mut leaf_dual_sense = f64::NEG_INFINITY;
+        // A node that leaves the tree WITHOUT either a certified dual bound or a
+        // proof that its box is empty has had its subtree silently discarded — the
+        // frontier draining afterwards proves nothing. Certifying optimality on such
+        // a run would be a FALSE CERTIFICATE (observed on clay0303hfsg: every node
+        // dropped `numerical`, no leaf dual was ever recorded, yet the tree reported
+        // `optimal` with the incumbent's own objective standing in for the dual
+        // bound and the incumbent itself clamped to ±inf). Poison the certificate.
+        let mut uncertified_drop = false;
 
         while let Some(node) = heap.pop() {
             // Global dual bound = best (largest sense·bound) still on the frontier,
@@ -995,8 +1060,12 @@ impl ConvexKernelSpec {
             // Gap check: if the best remaining dual has closed onto the incumbent,
             // the whole tree is certified.
             if inc_sense > worse
+                && !uncertified_drop
                 && global_dual_sense <= inc_sense + config.gap_tol * inc_sense.abs().max(1.0)
             {
+                // Gap closed on the frontier. This certifies the WHOLE problem only
+                // if no subtree was silently discarded — an uncertified drop leaves a
+                // region with no bound at all, so a closed frontier gap proves nothing.
                 status = ConvexTreeStatus::Optimal;
                 break;
             }
@@ -1046,7 +1115,13 @@ impl ConvexKernelSpec {
                         w.age_and_gc(opts.tol.max(1e-7), NATIVELP_POOL_CAP, NATIVELP_MAX_AGE);
                         res
                     }
-                    None => continue, // infeasible child → fathom
+                    None => {
+                        // Warm solve gave up: it does not distinguish "proven
+                        // infeasible" from "numerically failed", so this subtree is
+                        // not certified as explored.
+                        uncertified_drop = true;
+                        continue;
+                    }
                 }
             } else {
                 self.solve_node_cut(
@@ -1059,7 +1134,13 @@ impl ConvexKernelSpec {
                 )
             };
             if r.status != LpStatus::Optimal {
-                continue; // infeasible/unbounded region → skip
+                // A PROVEN-infeasible node is a legitimate fathom — its subtree is
+                // genuinely empty. Unbounded / numerical / iteration-limit is NOT:
+                // the subtree is simply unexplored, so the certificate is poisoned.
+                if r.status != LpStatus::Infeasible {
+                    uncertified_drop = true;
+                }
+                continue;
             }
             // Node dual in the sense convention, floored by the parent (rigorous:
             // a child's bound can only be ≤ the parent's in sense convention).
@@ -1140,8 +1221,13 @@ impl ConvexKernelSpec {
             }
         }
 
-        if heap.is_empty() && status == ConvexTreeStatus::Exhausted && inc_sense > worse {
-            // Frontier drained with an incumbent: fully certified.
+        if heap.is_empty()
+            && status == ConvexTreeStatus::Exhausted
+            && inc_sense > worse
+            && !uncertified_drop
+        {
+            // Frontier drained with an incumbent AND every node accounted for:
+            // fully certified. With `uncertified_drop` the drain proves nothing.
             status = ConvexTreeStatus::Optimal;
         }
         // Reported dual bound = max over all tree leaves (fathomed/incumbent) AND
@@ -1158,13 +1244,20 @@ impl ConvexKernelSpec {
         // to the dual bound so the certificate stays consistent (bound ≥ incumbent
         // for max / ≤ for min); the incumbent POINT is still returned.
         let incumbent = if inc_sense > worse {
-            Some(sense * inc_sense.min(dual_sense))
+            // Clamp ONLY against a finite dual: `min`-ing against an infinite
+            // `dual_sense` would report ±inf as the incumbent objective even though
+            // the incumbent POINT is a perfectly ordinary feasible vector.
+            Some(sense * if dual_sense.is_finite() { inc_sense.min(dual_sense) } else { inc_sense })
         } else {
             None
         };
         let bound = if dual_sense.is_finite() {
             sense * dual_sense
-        } else if inc_sense > worse {
+        } else if inc_sense > worse && !uncertified_drop {
+            // No leaf produced a finite dual, but every node was accounted for, so
+            // the incumbent itself is the tight bound. With `uncertified_drop` that
+            // reasoning does not hold — report "no bound" rather than pass the
+            // incumbent's own objective off as a dual bound.
             sense * inc_sense
         } else {
             sense * f64::INFINITY
@@ -1840,6 +1933,7 @@ mod tests {
                     coeffs: vec![1.0],
                     cst: 1.0,
                 },
+                scale: None,
             }],
             rhs: 0.0,
         }
@@ -1944,6 +2038,7 @@ mod tests {
                         coeffs: vec![1.0],
                         cst: 0.0,
                     },
+                    scale: None,
                 }],
                 rhs: 5.0,
             }],
@@ -2083,6 +2178,7 @@ mod tests {
                         coeffs: vec![1.0],
                         cst: 0.0,
                     },
+                    scale: None,
                 }],
                 rhs: 5.0,
             }],
@@ -2133,5 +2229,239 @@ mod tests {
         assert_eq!(r.status, LpStatus::Optimal);
         assert!((r.bound - 11.0).abs() < 1e-6, "bound {} != 11", r.bound);
         assert_eq!(r.oa_rounds, 1, "linear node needs one solve");
+    }
+
+    // ── perspective terms (#865) ──────────────────────────────────────────────
+
+    /// `syn05hfsg`'s row shape: `g = x1 − s·ln(a/s)` with `a = x0 + s`,
+    /// `s = 0.001 + 0.999·x2` — i.e. `−s·ln(1 + x0/s)`, the perspective of the
+    /// convex `−ln(1+·)`.
+    fn perspective_row() -> ConvexRow {
+        let scale = Affine {
+            cols: vec![2],
+            coeffs: vec![0.999],
+            cst: 0.001,
+        };
+        ConvexRow {
+            lin: Affine {
+                cols: vec![1],
+                coeffs: vec![1.0],
+                cst: 0.0,
+            },
+            terms: vec![CompositeTerm {
+                coeff: -1.0,
+                func: ConvexFunc::Log,
+                // numerator `a = x0 + 1·s`, so `a/s = x0/s + 1`
+                arg: Affine {
+                    cols: vec![0, 2],
+                    coeffs: vec![1.0, 0.999],
+                    cst: 0.001,
+                },
+                scale: Some(scale),
+            }],
+            rhs: 0.0,
+        }
+    }
+
+    #[test]
+    fn perspective_value_matches_closed_form() {
+        let row = perspective_row();
+        let x = [3.0, 0.5, 1.0, 0.0]; // s = 1.0
+        let expect = 0.5 - 1.0 * (1.0 + 3.0 / 1.0_f64).ln();
+        assert!((row.value(&x) - expect).abs() < 1e-12, "{}", row.value(&x));
+
+        let x = [3.0, 0.5, 0.0, 0.0]; // s = 0.001 (the smoothing floor)
+        let s = 0.001_f64;
+        let expect = 0.5 - s * (1.0 + 3.0 / s).ln();
+        assert!((row.value(&x) - expect).abs() < 1e-12, "{}", row.value(&x));
+    }
+
+    #[test]
+    fn perspective_gradient_matches_finite_difference() {
+        let row = perspective_row();
+        for x in [[3.0, 0.5, 1.0, 0.0], [1.5, 0.25, 0.4, 0.0], [0.2, 0.0, 0.05, 0.0]] {
+            let g = row.gradient_dense(&x, N);
+            for j in 0..N {
+                let h = 1e-7;
+                let (mut xp, mut xm) = (x, x);
+                xp[j] += h;
+                xm[j] -= h;
+                let fd = (row.value(&xp) - row.value(&xm)) / (2.0 * h);
+                assert!((g[j] - fd).abs() < 1e-4, "col {j}: {} vs fd {fd}", g[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn perspective_oa_tangent_underestimates_everywhere() {
+        // The whole soundness argument: the perspective of a convex function is
+        // jointly convex on `s > 0`, so its first-order tangent must lie BELOW the
+        // row at every point of the box — otherwise the OA relaxation is invalid.
+        let row = perspective_row();
+        let xbar = [2.0, 0.3, 0.6, 0.0];
+        let cut = row.oa_tangent(&xbar).expect("finite tangent");
+        for i in 0..12 {
+            for k in 0..12 {
+                let x = [0.05 + 0.9 * (i as f64), 0.3, 0.001 + 0.08 * (k as f64), 0.0];
+                let a_dot_x: f64 = cut
+                    .cols
+                    .iter()
+                    .zip(cut.coeffs.iter())
+                    .map(|(c, a)| a * x[*c])
+                    .sum();
+                assert!(
+                    a_dot_x - cut.rhs <= row.residual(&x) + 1e-9,
+                    "tangent cuts off a feasible point at x={x:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perspective_with_nonpositive_scale_yields_no_tangent() {
+        // The producer proves `s > 0` on the box, so this cannot arise in a routed
+        // model; if the precondition were ever violated the term must refuse to
+        // produce a cut rather than emit a silently wrong one.
+        let row = perspective_row();
+        let mut bad = row.clone();
+        bad.terms[0].scale = Some(Affine {
+            cols: vec![2],
+            coeffs: vec![1.0],
+            cst: 0.0,
+        });
+        let x = [3.0, 0.5, 0.0, 0.0]; // s = 0
+        assert!(!bad.value(&x).is_finite());
+        assert!(bad.oa_tangent(&x).is_none());
+    }
+
+    #[test]
+    fn plain_term_is_unaffected_by_the_perspective_field() {
+        // `scale: None` must reproduce the pre-#865 value/gradient exactly.
+        let row = panel_row();
+        let x = [3.0, 0.5, 0.25, 0.0];
+        let expect = -1.2 * (4.0_f64).ln() + 0.5 + 0.25 - 1.0;
+        assert!((row.value(&x) - expect).abs() < 1e-15);
+        let g = row.gradient_dense(&x, N);
+        assert!((g[0] - (-0.3)).abs() < 1e-15);
+        assert!((g[2] - 1.0).abs() < 1e-15);
+    }
+
+    // ── a discarded subtree must never yield a certificate (#871) ─────────────
+
+    /// `min −x0` with `x0 ∈ [0, ∞)` and a binary `x1`: the root LP is UNBOUNDED, so
+    /// the node leaves the tree without a dual bound and its subtree is unexplored.
+    fn unbounded_root_spec() -> ConvexKernelSpec {
+        ConvexKernelSpec {
+            n: 2,
+            c: vec![-1.0, 0.0],
+            sense_max: false,
+            integrality: vec![false, true],
+            lb: vec![0.0, 0.0],
+            ub: vec![f64::INFINITY, 1.0],
+            le_rows: vec![],
+            eq_rows: vec![],
+            nl_rows: vec![],
+        }
+    }
+
+    /// `min x0+x1 s.t. x0+x1 >= 2.5` — true optimum 2.5. A SEEDED incumbent must
+    /// only prune; it must never be certified as the optimum. Before the root
+    /// `parent_bound` fix a seed of 9.0 returned `Optimal, bound=9, nodes=0`.
+    #[test]
+    fn a_seeded_incumbent_is_never_certified_as_the_optimum() {
+        let spec = ConvexKernelSpec {
+            n: 2,
+            c: vec![1.0, 1.0],
+            sense_max: false,
+            integrality: vec![false, true],
+            lb: vec![0.0, 0.0],
+            ub: vec![3.0, 1.0],
+            le_rows: vec![LinRow {
+                cols: vec![0, 1],
+                coeffs: vec![-1.0, -1.0],
+                rhs: -2.5,
+            }],
+            eq_rows: vec![],
+            nl_rows: vec![],
+        };
+        for seed in [None, Some(9.0f64)] {
+            let cfg = ConvexTreeConfig {
+                initial_incumbent: seed,
+                ..Default::default()
+            };
+            let r = spec.solve_tree(&cfg, &SimplexOptions::default());
+            assert_eq!(r.status, ConvexTreeStatus::Optimal, "seed={seed:?}");
+            assert!(
+                (r.incumbent.unwrap() - 2.5).abs() < 1e-6,
+                "seed={seed:?} certified {:?}, true optimum is 2.5",
+                r.incumbent
+            );
+            assert!(r.node_count >= 1, "seed={seed:?} certified without solving a node");
+        }
+    }
+
+    /// The root LP is UNBOUNDED, so its node leaves the tree with no dual bound and
+    /// its subtree is unexplored.
+    #[test]
+    fn uncertified_node_drop_never_reports_optimal() {
+        // Seeded with a known-feasible objective so an incumbent exists: before the
+        // #871 fix the drained frontier upgraded Exhausted → Optimal, certifying a
+        // tree whose only node had been silently discarded.
+        let spec = unbounded_root_spec();
+        let config = ConvexTreeConfig {
+            initial_incumbent: Some(0.0),
+            ..Default::default()
+        };
+        let res = spec.solve_tree(&config, &SimplexOptions::default());
+        assert_ne!(
+            res.status,
+            ConvexTreeStatus::Optimal,
+            "certified optimality on a tree whose node was dropped uncertified"
+        );
+    }
+
+    #[test]
+    fn uncertified_drop_does_not_pass_the_incumbent_off_as_a_dual_bound() {
+        let spec = unbounded_root_spec();
+        let config = ConvexTreeConfig {
+            initial_incumbent: Some(0.0),
+            ..Default::default()
+        };
+        let res = spec.solve_tree(&config, &SimplexOptions::default());
+        // Minimization: with no leaf dual the bound must read "no bound" (−∞), not
+        // the incumbent's own objective (which would present as a closed gap).
+        assert!(
+            res.bound == f64::NEG_INFINITY,
+            "uncertified run reported bound {} as if it were a dual bound",
+            res.bound
+        );
+        // ...and the incumbent, if any, is a real objective value, never ±∞.
+        if let Some(inc) = res.incumbent {
+            assert!(inc.is_finite(), "incumbent reported as {inc}");
+        }
+    }
+
+    #[test]
+    fn a_fully_certified_tree_still_certifies() {
+        // The guard must be exact: nothing is dropped here, so Optimal must survive.
+        let spec = ConvexKernelSpec {
+            n: 2,
+            c: vec![1.0, 1.0],
+            sense_max: true,
+            integrality: vec![false, true],
+            lb: vec![0.0, 0.0],
+            ub: vec![3.0, 1.0],
+            le_rows: vec![LinRow {
+                cols: vec![0, 1],
+                coeffs: vec![1.0, 1.0],
+                rhs: 2.5,
+            }],
+            eq_rows: vec![],
+            nl_rows: vec![],
+        };
+        let res = spec.solve_tree(&ConvexTreeConfig::default(), &SimplexOptions::default());
+        assert_eq!(res.status, ConvexTreeStatus::Optimal);
+        assert!((res.incumbent.unwrap() - 2.5).abs() < 1e-6);
+        assert!(res.bound.is_finite());
     }
 }
