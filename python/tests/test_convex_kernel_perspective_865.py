@@ -231,71 +231,68 @@ def test_only_exponent_two_is_admitted():
 
 
 @pytest.mark.correctness
-def test_clay0303hfsg_result_is_sound_against_its_known_optimum():
+@pytest.mark.timeout(600)
+def test_clay0303hfsg_is_sound_and_any_certificate_is_correct():
     """THE check whose absence let the #879 false certificate ship.
 
     Exactness and convexity of the marshaled rows both PASSED while the kernel
     reported `optimal` at 28351.42 / 36397.83 / 55092.52 — three mutually
-    inconsistent values, none of them the optimum. They were incumbents, published
-    as certified because the tree had silently discarded a `numerical` subtree
-    (fixed in #871). A term class is only admitted once a routed instance's result is
-    checked against a known optimum, so that is asserted here against the shared
-    registry rather than against a local constant.
+    inconsistent values, none of them the optimum. They were incumbents, published as
+    certified because the tree had silently discarded a `numerical` subtree (#871). A
+    term class is only admitted once a routed instance's result is checked against a
+    known optimum, so that is asserted here against the shared registry.
 
-    **Deliberately NOT marked ``slow``.** It runs in ~7 s, and every CI lane excludes
-    ``slow`` (``ci.yml`` lines 178 / 262 / 388), so as a slow test this guard would
-    never execute on a PR — reproducing the exact #879 gap it exists to close. A
-    check that cannot run is documentation, not a test.
+    **Runs in the correctness lane, not behind ``slow``.** Every CI lane excludes
+    ``slow`` (``ci.yml`` 178 / 262 / 388), so as a slow test this guard would never
+    execute on a PR — reproducing the exact #879 gap it exists to close.
 
-    Asserts SOUNDNESS, which is what is actually guaranteed today. The instance does
-    not yet certify — see ``test_clay0303hfsg_does_not_yet_certify`` for the measured
-    status and why the certificate is correctly withheld.
+    It does need an explicit ``timeout(600)``: the solve is ~7 s on an M-series laptop
+    but **263 s** on the CI runner, which blew the lane's 120 s default. That 40x
+    spread is why "it only takes 7 s" is not a safe basis for a marker decision.
+
+    ONE solve, both facts. Asserting soundness and conditionally checking the
+    certificate costs a single tree; an earlier split into two tests re-solved the same
+    instance and added 251 s for nothing.
+
+    Measured today: ``status='exhausted'``, incumbent 26669.109572 (the known optimum
+    to 7 figures), bound 26668.921579, relative gap 7.0e-06 — inside the usual 1e-4,
+    so the last step of the certificate rather than a structural failure. The
+    ``Exhausted -> Optimal`` upgrade requires ``!uncertified_drop``, so a node LP is
+    still exiting ``numerical`` and the certificate is CORRECTLY withheld (#871
+    residual). Do NOT relax that condition to force a certificate — that manufactures
+    exactly the #879 defect. If this instance starts certifying, the ``optimal`` branch
+    below tightens automatically to the full #879 check.
     """
     opt = known_optimum("clay0303hfsg")
     m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
     spec = build_convex_spec(m)
     assert spec is not None
     r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=300.0)
-    inc, bound = r["incumbent"], r["bound"]
+    inc, bound, status = r["incumbent"], r["bound"], r["status"]
     tol = 1e-4 * max(1.0, abs(opt))
+
     checks = 0
-    # MINIMIZE: the dual bound is a LOWER bound, so `bound > opt` is the unsound
-    # side — that is the invariant #879 was believed to have broken.
+    # MINIMIZE: the dual bound is a LOWER bound, so `bound > opt` is the unsound side
+    # — the invariant #879 was believed to have broken.
     assert bound is not None, "no dual bound at all — nothing to check"
-    checks += 1
     assert bound <= opt + tol, f"UNSOUND dual bound {bound} > known optimum {opt}"
-    assert inc is not None, "no incumbent — the sweep would be vacuous"
     checks += 1
+    assert inc is not None, "no incumbent — this guard would be vacuous"
     assert inc >= opt - tol, f"incumbent {inc} is BELOW the known optimum {opt}"
     checks += 1
     assert bound <= inc + tol, "certificate invariant: bound <= incumbent (min sense)"
-    assert checks == 3, "soundness assertions did not all execute"
+    checks += 1
 
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "clay0303hfsg is sound but NOT yet certified: status='exhausted', incumbent "
-        "26669.109572 (the known optimum to 7 figures), bound 26668.921579, relative "
-        "gap 7.0e-06 — inside the usual 1e-4, so this is the last step of the "
-        "certificate rather than a structural failure. The Exhausted -> Optimal "
-        "upgrade requires `!uncertified_drop`, so a node LP is still exiting "
-        "`numerical` and the certificate is CORRECTLY withheld (#871's residual). "
-        "strict=True so the day it starts certifying, this fails and the claim gets "
-        "updated instead of silently rotting. Do NOT relax the upgrade condition to "
-        "make this pass — that manufactures exactly the #879 false certificate."
-    ),
-)
-@pytest.mark.correctness
-def test_clay0303hfsg_does_not_yet_certify():
-    """Pins the residual honestly: the PR body must not claim certification."""
-    opt = known_optimum("clay0303hfsg")
-    m = dm.from_nl(os.path.join(_DATA, "clay0303hfsg.nl"))
-    spec = build_convex_spec(m)
-    assert spec is not None
-    r = solve_convex_tree(spec, initial_incumbent=None, time_limit_s=300.0)
-    assert r["status"] == "optimal", f"clay0303hfsg did not certify (status={r['status']})"
-    assert abs(r["incumbent"] - opt) < 1e-4 * max(1.0, abs(opt))
+    # The #879 check proper: a CERTIFIED objective must be the known optimum. Today
+    # this branch does not fire (status is `exhausted`); it arms itself the moment the
+    # instance starts certifying, which is when it matters.
+    assert status in ("exhausted", "optimal"), f"unexpected status {status!r}"
+    if status == "optimal":
+        assert abs(inc - opt) < tol, (
+            f"CERTIFIED objective {inc} != known optimum {opt} — a false certificate"
+        )
+        checks += 1
+    assert checks >= 3, "soundness assertions did not all execute"
 
 
 @pytest.mark.slow
