@@ -145,12 +145,18 @@ def test_perspective_lift_is_exact_and_convex():
     assert {t["func"] for _i, _s, d in rows for t in d.terms} == {func}
 
     rng = np.random.default_rng(12345)
+    # Count the assertions that ACTUALLY execute. The finiteness guards below
+    # would otherwise let this test pass having compared nothing (CLAUDE.md
+    # "Measurement & instrumentation discipline" rule 6) — and this is the test
+    # the certificate's soundness argument rests on.
+    n_exact = n_convex = 0
     X = _box_sample(lb, ub, rng, n_pts)
     for x in X:
         g = np.asarray(ev.evaluate_constraints(x), float)
         for i, sign, d in rows:
             ref, got = sign * g[i], _row_value(d, x)
             if np.isfinite(ref) and np.isfinite(got):
+                n_exact += 1
                 assert abs(ref - got) <= 1e-9 * max(1.0, abs(ref)), (
                     f"row {i}: marshaled {got} != model {ref}"
                 )
@@ -163,9 +169,13 @@ def test_perspective_lift_is_exact_and_convex():
                 gm, ga, gb = _row_value(d, mid), _row_value(d, a), _row_value(d, b)
                 if not all(np.isfinite(v) for v in (gm, ga, gb)):
                     continue
+                n_convex += 1
                 assert gm - (lam * ga + (1 - lam) * gb) <= 1e-9 * max(1.0, abs(gm)), (
                     f"row {i} is not convex at lambda={lam}"
                 )
+
+    assert n_exact >= n_pts, f"exactness probe only fired {n_exact} times"
+    assert n_convex >= n_pts, f"convexity probe only fired {n_convex} times"
 
 
 def test_square_inner_function_falls_back():
