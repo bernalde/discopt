@@ -44,76 +44,38 @@ The release procedure that produces these entries is documented in
   in-repo `.nl` instances the only routing change is `syn05hfsg` being admitted;
   nothing previously routed was lost.
 
-- **Quadratic inner function (`** 2` → `sqr`) for the convex kernel** (`feat`,
-  #865 follow-up, same default-off `DISCOPT_CONVEX_KERNEL` path). `clay*hfsg`'s
-  hull rows are `ε·((x/ε)² − c·x/ε + …)`, i.e. the quadratic perspective `x²/ε`
-  (quadratic-over-linear, jointly convex on `ε > 0`), so they declined only
-  because `_FUNC`/`ConvexFunc` had no `sqr` entry. Adds `ConvexFunc::Sqr` and
-  `_pow_as_sqr`, which composes with the perspective machinery unchanged — a
-  plain `x² ≤ c` row is now routable too. **Only the exponent 2 is admitted**;
-  every other power (odd, fractional, negative, or variable) is nonconvex,
-  domain-restricted, or signomial, and keeps falling back, as does a non-affine
-  base such as `(log x)²`.
-
-  Measured: `clay0303hfsg` goes from *declined* to routed with 36 rows / 72
-  quadratic perspective terms, verified exact (worst relative error 3.7e-13
-  against the pristine model) and convex (worst midpoint violation 0.0). It is
-  the only instance whose routing changes across the 147 in-repo `.nl` files.
-  It does **not** yet certify: at the tree's default `max_sep_rounds=12` its
-  Neumaier–Shcherbina safe bound degrades to `-inf` (raw LP optimum stays finite
-  at `5.5e-12`, and the safe bound is finite at `max_sep_rounds ≤ 4` or with a
-  finite cap on its 72 infinite upper bounds), so the tree returns `exhausted`
-  and `try_convex_solve` falls back. That blocker is in the safe-bounding layer,
-  not the producer, and is tracked separately.
-
-- **Dominated-cost-column upper bound for the convex kernel** (`feat`, #871,
-  behind the new default-off `DISCOPT_CVX_DOMINATED_COLS`, inside the default-off
-  `DISCOPT_CONVEX_KERNEL` path). FBBT cannot close a column that the constraints
-  only bound from *below*; `clay0303hfsg` has six (its fixed-charge cost variables
-  `x81..x86`, objective coefficients 300/240/100/…), and an infinite `ub` meeting a
-  roundoff-negative reduced cost is precisely what makes the Neumaier–Shcherbina
-  safe bound decline. `tighten_dominated_columns` gives such a column the finite
-  bound `U_j = max(lo_j, max_i (maxact_rest_i − rhs_i)/(−a_ij))`.
-
-  This is an **optimality** argument, not FBBT: it qualifies a column only when its
-  minimized-objective coefficient is `> 0`, it appears in no equality and no
-  nonlinear row, and every `≤` row containing it has `a_ij < 0`. Then lowering
-  `x_j` to `U_j` from any feasible point keeps every row satisfied and strictly
-  lowers the objective, so the node's optimal *value* is unchanged and the dual
-  bound stays valid — but unlike FBBT the box no longer contains every feasible
-  point, which is why it carries its own flag.
-
-  Measured on `clay0303hfsg`: 1 node / no incumbent → 27 nodes with a feasible
-  incumbent (41709.769). It does **not** yet certify — the node LPs still fail
-  `numerical` at ~884 tangents — so per the `DISCOPT_CUT_INHERIT` lesson (sound ≠
-  helpful) the flag stays **default-off**. Bound-neutral with the flag off, and
-  `syn05hfsg` / `syn05m` / `cvxnonsep_psig40r` are bit-identical either way.
-
 ### Changed
 
 ### Fixed
 
-- **False certificate when the convex kernel silently discards a subtree**
-  (`fix(correctness)`, #871). `solve_tree` skips any node whose LP does not return
-  `Optimal`. For a *proven-infeasible* node that is a legitimate fathom, but for a
-  `numerical` / `unbounded` / iteration-limit node the subtree is simply never
-  explored — and the tree then upgraded `Exhausted → Optimal` on the drained
-  frontier, or exited `Optimal` on a closed frontier gap, certifying a search space
-  with a hole in it. The reported `bound` fell back to the **incumbent's own
-  objective** (reading as a closed gap) and the incumbent was clamped against an
-  infinite dual to `±inf`.
+- **Two false-certificate paths in the convex kernel tree** (`fix(correctness)`,
+  #871). Both are latent on today's default path (the kernel is default-off and
+  `try_convex_solve` seeds no incumbent), and both are removed.
 
-  Observed on `clay0303hfsg`: `status="optimal"`, `bound=41709.769…`,
-  `incumbent=inf`, while the incumbent point was a perfectly ordinary finite
-  feasible vector and no leaf had ever recorded a dual bound. Downstream that is a
-  false certificate — `try_convex_solve` accepts `status == "optimal"` and reports
-  `gap_certified=True`.
+  1. **A silently discarded subtree could still certify.** `solve_tree` skips any
+     node whose LP does not return `Optimal`. For a *proven-infeasible* node that
+     is a legitimate fathom; for `numerical` / `unbounded` / iteration-limit the
+     subtree is simply never explored — yet the tree upgraded `Exhausted →
+     Optimal` on the drained frontier, or exited `Optimal` on a closed frontier
+     gap. The reported `bound` then fell back to the **incumbent's own objective**
+     (reading as a closed gap) and the incumbent was clamped against an infinite
+     dual to `±inf`. An uncertified drop now poisons the certificate: neither
+     `Optimal` exit can fire, the bound reports `±inf` ("no bound"), and the
+     incumbent is clamped only against a *finite* dual.
 
-  An uncertified drop now poisons the certificate: neither `Optimal` exit can fire,
-  and the bound is reported as `±inf` ("no bound") rather than as the incumbent.
-  The incumbent is clamped only against a *finite* dual. The guard is exact —
-  `syn05hfsg` (2 nodes), `syn05m` (3 nodes) and `cvxnonsep_psig40r` (1 node) are
-  bit-identical, statuses and objectives unchanged.
+  2. **A seeded incumbent was certified as the optimum on a MINIMIZATION.** The
+     root node's trivial dual bound was written `sense * INFINITY`, which is `−∞`
+     for a min — the *best* value in the loop's "maximize `sense·bound`"
+     convention — so the root looked already fathomed against any seeded incumbent
+     and the gap check fired on node 0. Measured: seeding `9.0` on a spec whose
+     true optimum is `2.5` returned `Optimal, bound=9, nodes=0`. Maximization was
+     correct by accident. The trivial bound is `+∞` in the convention for both
+     senses.
+
+  The guards are exact: `syn05hfsg` (2 nodes), `syn05m` (3 nodes) and
+  `cvxnonsep_psig40r` (1 node) are bit-identical, statuses and objectives
+  unchanged.
+
 
 ## [0.7.0] - 2026-07-24
 
