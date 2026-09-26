@@ -1194,6 +1194,12 @@ def _classify_nary_max(expr: FunctionCall, model: Optional[Model], cache: dict) 
             elif info.curvature == Curvature.AFFINE and curv == Curvature.AFFINE:
                 curv = Curvature.AFFINE
         s = info.sign if i == 0 else _sign_join(s, info.sign)
+    if curv == Curvature.AFFINE and len(expr.args) >= 2:
+        # #1489: the pointwise max of >= 2 affine functions is CONVEX, not
+        # affine (``max(x, -x) = |x|``). Keeping AFFINE let ``max(L) >= c`` and
+        # ``max(L) == c`` pass as convex rows. (Identical arguments would make
+        # it affine; we do not attempt that refinement — CONVEX is sound.)
+        curv = Curvature.CONVEX
     return ExprInfo(curv, s)
 
 
@@ -1211,6 +1217,10 @@ def _classify_nary_min(expr: FunctionCall, model: Optional[Model], cache: dict) 
             elif info.curvature == Curvature.AFFINE and curv == Curvature.AFFINE:
                 curv = Curvature.AFFINE
         s = info.sign if i == 0 else _sign_join(s, info.sign)
+    if curv == Curvature.AFFINE and len(expr.args) >= 2:
+        # #1489: the pointwise min of >= 2 affine functions is CONCAVE, not
+        # affine (``min(x, -x) = -|x|``); see ``_classify_nary_max``.
+        curv = Curvature.CONCAVE
     return ExprInfo(curv, s)
 
 
