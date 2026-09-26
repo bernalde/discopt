@@ -13174,6 +13174,28 @@ def solve_model(
     # be the global optimum of the continuous subproblem.
     if not _model_is_convex:
         tree.set_nonconvex(True)
+        # Issue #1490: register EVERY integer column that enters a nonlinear
+        # expression for spatial domain-partition branching, on every relaxation
+        # route (McCormick LP, alphaBB "none", "nlp"). In nonconvex mode the tree
+        # treats a node whose relaxation point is integral and whose registered
+        # dimensions are all tight as RESOLVED and fathoms it, dropping its (valid,
+        # but below-incumbent) bound. Registration used to happen only on the
+        # McCormick LP route, and only for product / monomial / fractional-power
+        # columns, so an integer inside a transcendental intrinsic (``sin(x)``,
+        # ``cos(x)``, ``exp(x)``, ...) — or any integer on the alphaBB route — was
+        # an "ordinary" integer: once the local NLP point was integral the box
+        # counted as tight, the node was fathomed and a non-optimal integer point
+        # was certified optimal (``min sin(x)``, x in [-8, 8]: -0.909 at x=-2 vs
+        # the true -0.989 at x=-8). The column set is taken over the full
+        # expression DAG, so it covers every intrinsic, not a list of them.
+        from discopt._relax.sparsity import nonlinear_columns as _dag_nonlinear_columns
+
+        _nl_int_cols_all = sorted(
+            {j for off, sz in zip(int_offsets, int_sizes) for j in range(off, off + int(sz))}
+            & _dag_nonlinear_columns(model)
+        )
+        if _nl_int_cols_all:
+            tree.set_spatial_integer_cols(np.asarray(_nl_int_cols_all, dtype=np.int64))
     _gap_certified = True
 
     # --- #740: single funnel for every non-batch incumbent injection ---

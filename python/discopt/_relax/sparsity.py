@@ -287,6 +287,97 @@ def _collect_nonlinear_pairs(expr: Expression, model: Model) -> set[tuple[int, i
     return pairs
 
 
+def _collect_nonlinear_columns(expr: Expression, model: Model, out: set[int]) -> None:
+    """Add to ``out`` every flat column that ``expr`` depends on NON-affinely.
+
+    A column is nonlinear when it reaches the result through any operation other
+    than ``+``, ``-``, negation, summation, indexing, or multiplication/division
+    by a variable-free factor. Every intrinsic (``sin``, ``cos``, ``exp``, ``log``,
+    ``abs``, ...), every power with a variable base or exponent, every product of
+    two variable-bearing factors and every variable-bearing divisor makes its
+    columns nonlinear. The walk over-approximates (e.g. ``x**1`` counts), which is
+    the sound direction for its consumer: registering an extra column for spatial
+    branching can only cost nodes, whereas missing one lets the tree fathom a box
+    whose objective still varies over that column (issue #1490).
+
+    Raises ``TypeError`` on an expression type it does not know, rather than
+    silently reporting the subtree as linear.
+    """
+    if isinstance(expr, (Variable, Constant, Parameter)):
+        return
+    if isinstance(expr, IndexExpression):
+        if not isinstance(expr.base, Variable):
+            _collect_nonlinear_columns(expr.base, model, out)
+        return
+    if isinstance(expr, BinaryOp):
+        left_vars = _collect_variable_indices(expr.left, model)
+        right_vars = _collect_variable_indices(expr.right, model)
+        op = expr.op
+        if op in ("+", "-"):
+            pass
+        elif op == "*":
+            if left_vars and right_vars:
+                out |= left_vars | right_vars
+        elif op == "/":
+            if right_vars:
+                out |= left_vars | right_vars
+        else:
+            # ``**`` and any other binary operator: every variable in either
+            # operand enters non-affinely.
+            out |= left_vars | right_vars
+        _collect_nonlinear_columns(expr.left, model, out)
+        _collect_nonlinear_columns(expr.right, model, out)
+        return
+    if isinstance(expr, UnaryOp):
+        if expr.op != "neg":
+            out |= _collect_variable_indices(expr.operand, model)
+        _collect_nonlinear_columns(expr.operand, model, out)
+        return
+    if isinstance(expr, (FunctionCall, CustomCall)):
+        for arg in expr.args:
+            out |= _collect_variable_indices(arg, model)
+        return
+    if isinstance(expr, MatMulExpression):
+        left_vars = _collect_variable_indices(expr.left, model)
+        right_vars = _collect_variable_indices(expr.right, model)
+        if left_vars and right_vars:
+            out |= left_vars | right_vars
+        _collect_nonlinear_columns(expr.left, model, out)
+        _collect_nonlinear_columns(expr.right, model, out)
+        return
+    if isinstance(expr, SumExpression):
+        _collect_nonlinear_columns(expr.operand, model, out)
+        return
+    if isinstance(expr, SumOverExpression):
+        for t in expr.terms:
+            _collect_nonlinear_columns(t, model, out)
+        return
+    raise TypeError(
+        f"nonlinear_columns: unhandled expression type {type(expr).__name__}; "
+        "refusing to report its variables as linear"
+    )
+
+
+def nonlinear_columns(model: Model) -> set[int]:
+    """Flat columns that enter the objective or any constraint body non-affinely.
+
+    Unlike :attr:`MccormickLPRelaxer.nonlinear_columns` (which lists only the
+    columns of the product / monomial / fractional-power terms the LP relaxer
+    envelopes), this covers EVERY nonlinearity, including unary transcendental
+    intrinsics. It is the set of integer columns whose domain the spatial B&B tree
+    must be able to partition: at a node whose relaxation point is integral, the
+    objective can still vary over such a column's box, so the node is not resolved
+    until the column is fixed or the node's bound reaches the incumbent.
+    """
+    out: set[int] = set()
+    if model._objective is not None:
+        _collect_nonlinear_columns(model._objective.expression, model, out)
+    for c in model._constraints:
+        if isinstance(c, Constraint):
+            _collect_nonlinear_columns(c.body, model, out)
+    return out
+
+
 def detect_sparsity_dag(model: Model) -> SparsityPattern:
     """Detect Jacobian and Hessian sparsity patterns from a Model's expression DAG.
 
