@@ -287,6 +287,45 @@ def _collect_nonlinear_pairs(expr: Expression, model: Model) -> set[tuple[int, i
     return pairs
 
 
+def _variable_indices_iterative(expr: Expression, model: Model) -> set[int]:
+    """:func:`_collect_variable_indices` without recursion on the operator spine.
+
+    Leaves (a ``Variable`` or an index into one) are resolved by
+    :func:`_collect_variable_indices` itself, so slot resolution is identical; the
+    operator nodes above them are walked with an explicit stack, so a long ``+``
+    chain cannot exhaust the interpreter's recursion limit. Unlike the recursive
+    helper, an unknown node type raises instead of contributing no variables.
+    """
+    found: set[int] = set()
+    stack: list = [expr]
+    while stack:
+        e = stack.pop()
+        if isinstance(e, Variable):
+            found |= _collect_variable_indices(e, model)
+        elif isinstance(e, IndexExpression):
+            if isinstance(e.base, Variable):
+                found |= _collect_variable_indices(e, model)
+            else:
+                stack.append(e.base)
+        elif isinstance(e, (Constant, Parameter)):
+            continue
+        elif isinstance(e, (BinaryOp, MatMulExpression)):
+            stack.append(e.left)
+            stack.append(e.right)
+        elif isinstance(e, (UnaryOp, SumExpression)):
+            stack.append(e.operand)
+        elif isinstance(e, (FunctionCall, CustomCall)):
+            stack.extend(e.args)
+        elif isinstance(e, SumOverExpression):
+            stack.extend(e.terms)
+        else:
+            raise TypeError(
+                f"nonlinear_columns: unhandled expression type {type(e).__name__}; "
+                "refusing to report its variables as absent"
+            )
+    return found
+
+
 def _collect_nonlinear_columns(expr: Expression, model: Model, out: set[int]) -> None:
     """Add to ``out`` every flat column that ``expr`` depends on NON-affinely.
 
@@ -300,62 +339,69 @@ def _collect_nonlinear_columns(expr: Expression, model: Model, out: set[int]) ->
     branching can only cost nodes, whereas missing one lets the tree fathom a box
     whose objective still varies over that column (issue #1490).
 
-    Raises ``TypeError`` on an expression type it does not know, rather than
-    silently reporting the subtree as linear.
+    Iterative (explicit stack), so a long affine ``+`` chain is linear-time and
+    cannot hit the recursion limit. Raises ``TypeError`` on an expression type it
+    does not know, rather than silently reporting the subtree as linear.
     """
-    if isinstance(expr, (Variable, Constant, Parameter)):
-        return
-    if isinstance(expr, IndexExpression):
-        if not isinstance(expr.base, Variable):
-            _collect_nonlinear_columns(expr.base, model, out)
-        return
-    if isinstance(expr, BinaryOp):
-        left_vars = _collect_variable_indices(expr.left, model)
-        right_vars = _collect_variable_indices(expr.right, model)
-        op = expr.op
-        if op in ("+", "-"):
-            pass
-        elif op == "*":
+    stack: list = [expr]  # nodes reached through an affine path only
+    while stack:
+        e = stack.pop()
+        if isinstance(e, (Variable, Constant, Parameter)):
+            continue
+        if isinstance(e, IndexExpression):
+            if not isinstance(e.base, Variable):
+                stack.append(e.base)
+            continue
+        if isinstance(e, BinaryOp):
+            op = e.op
+            if op in ("+", "-"):
+                stack.append(e.left)
+                stack.append(e.right)
+                continue
+            left_vars = _variable_indices_iterative(e.left, model)
+            right_vars = _variable_indices_iterative(e.right, model)
+            # ``*`` / ``/`` by a variable-free factor is still affine in the other
+            # operand; every other case (``**``, a product or quotient of two
+            # variable-bearing operands, any other operator) makes every variable
+            # in the node nonlinear, and the subtree then needs no further walk.
+            affine = (op == "*" and not (left_vars and right_vars)) or (
+                op == "/" and not right_vars
+            )
+            if affine:
+                stack.append(e.left)
+                stack.append(e.right)
+            else:
+                out |= left_vars | right_vars
+            continue
+        if isinstance(e, UnaryOp):
+            if e.op == "neg":
+                stack.append(e.operand)
+            else:
+                out |= _variable_indices_iterative(e.operand, model)
+            continue
+        if isinstance(e, (FunctionCall, CustomCall)):
+            for arg in e.args:
+                out |= _variable_indices_iterative(arg, model)
+            continue
+        if isinstance(e, MatMulExpression):
+            left_vars = _variable_indices_iterative(e.left, model)
+            right_vars = _variable_indices_iterative(e.right, model)
             if left_vars and right_vars:
                 out |= left_vars | right_vars
-        elif op == "/":
-            if right_vars:
-                out |= left_vars | right_vars
-        else:
-            # ``**`` and any other binary operator: every variable in either
-            # operand enters non-affinely.
-            out |= left_vars | right_vars
-        _collect_nonlinear_columns(expr.left, model, out)
-        _collect_nonlinear_columns(expr.right, model, out)
-        return
-    if isinstance(expr, UnaryOp):
-        if expr.op != "neg":
-            out |= _collect_variable_indices(expr.operand, model)
-        _collect_nonlinear_columns(expr.operand, model, out)
-        return
-    if isinstance(expr, (FunctionCall, CustomCall)):
-        for arg in expr.args:
-            out |= _collect_variable_indices(arg, model)
-        return
-    if isinstance(expr, MatMulExpression):
-        left_vars = _collect_variable_indices(expr.left, model)
-        right_vars = _collect_variable_indices(expr.right, model)
-        if left_vars and right_vars:
-            out |= left_vars | right_vars
-        _collect_nonlinear_columns(expr.left, model, out)
-        _collect_nonlinear_columns(expr.right, model, out)
-        return
-    if isinstance(expr, SumExpression):
-        _collect_nonlinear_columns(expr.operand, model, out)
-        return
-    if isinstance(expr, SumOverExpression):
-        for t in expr.terms:
-            _collect_nonlinear_columns(t, model, out)
-        return
-    raise TypeError(
-        f"nonlinear_columns: unhandled expression type {type(expr).__name__}; "
-        "refusing to report its variables as linear"
-    )
+            else:
+                stack.append(e.left)
+                stack.append(e.right)
+            continue
+        if isinstance(e, SumExpression):
+            stack.append(e.operand)
+            continue
+        if isinstance(e, SumOverExpression):
+            stack.extend(e.terms)
+            continue
+        raise TypeError(
+            f"nonlinear_columns: unhandled expression type {type(e).__name__}; "
+            "refusing to report its variables as linear"
+        )
 
 
 def nonlinear_columns(model: Model) -> set[int]:

@@ -152,3 +152,15 @@ def test_nonlinear_columns_covers_intrinsics_and_skips_affine():
     assert nonlinear_columns(m) == {0}
     m.subject_to(y / (w + 1) <= 5)
     assert nonlinear_columns(m) == {0, 1, 3}
+
+
+def test_nonlinear_columns_long_affine_chain():
+    """A Python ``sum`` builds a left-deep ``+`` chain; the walk must not collect
+    variables at every level (quadratic) on the affine spine."""
+    m = dm.Model("chain")
+    xs = [m.integer(f"x{i}", lb=0, ub=1) for i in range(3000)]
+    body = xs[0]
+    for v in xs[1:]:
+        body = body + 2 * v
+    m.minimize(3 * body + dm.exp(xs[7]) + xs[3] * xs[5])
+    assert nonlinear_columns(m) == {3, 5, 7}
