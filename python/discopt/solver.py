@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import functools
+import inspect
 import logging
 import math
 import os
@@ -4634,6 +4635,61 @@ def _refuse_on_callback_failure() -> None:
     ) from first_exc
 
 
+#: The ``solver=`` selectors whose solve reaches the spatial branch-and-bound loop,
+#: the only engine that screens every incumbent through ``lazy_constraints`` /
+#: ``incumbent_callback`` (#740, #1365). Every other family is refused up front
+#: when either callback is set (#1500).
+_CALLBACK_ENFORCING_SOLVERS: frozenset = frozenset({None, "bb"})
+
+
+def _feasibility_callback_names(lazy_constraints, incumbent_callback) -> list[str]:
+    """Names of the feasibility-defining callbacks the caller set (#1500)."""
+    names = []
+    if lazy_constraints is not None:
+        names.append("lazy_constraints")
+    if incumbent_callback is not None:
+        names.append("incumbent_callback")
+    return names
+
+
+def _refuse_unenforced_callbacks(route: str, names: list[str], why: str) -> None:
+    """Refuse loudly: ``route`` cannot enforce the feasibility callbacks (#1500).
+
+    ``lazy_constraints`` and ``incumbent_callback`` define which points are
+    acceptable, so a route that never consults them answers a relaxation of the
+    caller's model -- and routes that certify (``amp``, ``mip-nlp``, the LP/QP/NLP
+    entry routes) then report ``optimal`` with ``gap_certified=True`` at a point the
+    callback rejects. Same contract, and same exception type, as the ``nlp_bb=True``
+    refusal (INT-1, #413).
+    """
+    if not names:
+        return
+    raise ValueError(
+        f"{' and '.join(names)} cannot be used with {route}: {why} It never calls "
+        "the callback, so its answer would be for a relaxation of your model and "
+        "could be a point the callback rejects. These callbacks are enforced by the "
+        "default spatial branch-and-bound (solver=None or solver='bb')."
+    )
+
+
+class _CallbackEnforcement(threading.local):
+    """Whether the current solve reached an engine that screens incumbents through
+    the feasibility callbacks (#1500). Read by the outermost ``solve_model``
+    wrapper as a backstop: a result carrying a point that no callback-screening
+    engine produced is refused, so a route added later cannot silently skip them."""
+
+    def __init__(self):
+        self.enforced = False
+
+
+_CALLBACK_ENFORCEMENT = _CallbackEnforcement()
+
+
+def _mark_callbacks_enforced() -> None:
+    """Called by the spatial B&B once its incumbent funnel honours the callbacks."""
+    _CALLBACK_ENFORCEMENT.enforced = True
+
+
 def _invoke_pre_import_callbacks(
     *,
     model,
@@ -9167,11 +9223,35 @@ def _refusing_on_callback_failure(fn: _F) -> _F:
     on this thread resets on entry anyway.
     """
 
+    _sig = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         _reset_callback_failures()
-        result = fn(*args, **kwargs)
+        # #1500 backstop: record whether THIS solve (or a nested one it delegated
+        # to) reached the callback-screening spatial B&B. Saved and restored so a
+        # nested ``solve_model`` cannot clear the outer solve's marker.
+        _prev_enforced = _CALLBACK_ENFORCEMENT.enforced
+        _CALLBACK_ENFORCEMENT.enforced = False
+        try:
+            result = fn(*args, **kwargs)
+            _enforced = _CALLBACK_ENFORCEMENT.enforced
+        finally:
+            _CALLBACK_ENFORCEMENT.enforced = _prev_enforced or _CALLBACK_ENFORCEMENT.enforced
         _refuse_on_callback_failure()
+        _bound = _sig.bind_partial(*args, **kwargs).arguments
+        _names = _feasibility_callback_names(
+            _bound.get("lazy_constraints"), _bound.get("incumbent_callback")
+        )
+        # Only a returned POINT can violate a callback: an infeasibility proof or a
+        # bound over the unrestricted model is still valid for its restriction.
+        if _names and not _enforced and getattr(result, "x", None):
+            _refuse_unenforced_callbacks(
+                "the route this solve took",
+                _names,
+                "it returned a point without passing it through the callbacks "
+                "(no explicit refusal caught this route earlier -- please report it).",
+            )
         return result
 
     return cast(_F, wrapper)
@@ -9965,6 +10045,37 @@ def solve_model(
         )
     gurobi_options = kwargs.pop("gurobi_options", None) if _solver == "gurobi" else None
 
+    # --- #1500: feasibility callbacks are enforced by the spatial B&B only ---
+    # Checked HERE, where the family is chosen, rather than inside each family:
+    # ``amp`` and ``mip-nlp`` used to accept the callbacks with a "ignores options"
+    # warning and then certify a point the callback rejects, and ``direct`` /
+    # ``surrogate`` returned such a point uncertified. A family added to the list
+    # above is refused by default until it is added to
+    # ``_CALLBACK_ENFORCING_SOLVERS`` -- i.e. until it actually screens incumbents.
+    # The default path's own shortcut routes (LP/QP/NLP entry, GP, decomposition)
+    # are handled where they branch off below, and the outermost wrapper refuses
+    # any point that still reaches the caller unscreened.
+    _feasibility_callbacks = _feasibility_callback_names(lazy_constraints, incumbent_callback)
+    if _feasibility_callbacks and _solver not in _CALLBACK_ENFORCING_SOLVERS:
+        _refuse_unenforced_callbacks(
+            f"solver={_solver!r}",
+            _feasibility_callbacks,
+            "that solver family has no hook that screens candidate incumbents.",
+        )
+    if _feasibility_callbacks and decomposition is not None:
+        _refuse_unenforced_callbacks(
+            f"decomposition={decomposition!r}",
+            _feasibility_callbacks,
+            "the decomposition engines solve their own master/subproblems and "
+            "never screen candidate incumbents.",
+        )
+    if _feasibility_callbacks and gdp_method in ("oa", "loa"):
+        _refuse_unenforced_callbacks(
+            f"gdp_method={gdp_method!r}",
+            _feasibility_callbacks,
+            "that GDP decomposition route has no hook that screens candidate incumbents.",
+        )
+
     # --- #1059: check the declared box BEFORE dispatching to a solver family ---
     # This block used to sit ~1700 lines below, past the point where six of the
     # eight families return. Measured on a convex MINLP with an unbounded ``x``:
@@ -10403,8 +10514,6 @@ def solve_model(
                 ("cutting_planes", cutting_planes is not False),
                 ("mccormick_bounds", mccormick_bounds != "auto"),
                 ("nlp_bb", nlp_bb is not None),
-                ("lazy_constraints", lazy_constraints is not None),
-                ("incumbent_callback", incumbent_callback is not None),
                 ("node_callback", node_callback is not None),
                 ("max_nodes", max_nodes != 100_000),
                 ("strategy", strategy != "best_first"),
@@ -10478,8 +10587,6 @@ def solve_model(
                 ("cutting_planes", cutting_planes is not False),
                 ("mccormick_bounds", mccormick_bounds != "auto"),
                 ("nlp_bb", nlp_bb is not None),
-                ("lazy_constraints", lazy_constraints is not None),
-                ("incumbent_callback", incumbent_callback is not None),
                 ("node_callback", node_callback is not None),
                 ("max_nodes", max_nodes != 100_000),
                 ("strategy", strategy != "best_first"),
@@ -10598,8 +10705,6 @@ def solve_model(
         _note_ignored("use_learned_relaxations", use_learned_relaxations is not False)
         _note_ignored("mccormick_bounds", mccormick_bounds != "auto")
         _note_ignored("nlp_bb", nlp_bb is not None)
-        _note_ignored("lazy_constraints", lazy_constraints is not None)
-        _note_ignored("incumbent_callback", incumbent_callback is not None)
         _note_ignored("node_callback", node_callback is not None)
         amp_gdp_methods = {"big-m", "hull", "mbigm", "auto"}
         amp_gdp_method = gdp_method if gdp_method in amp_gdp_methods else "big-m"
@@ -10681,8 +10786,6 @@ def solve_model(
         _note_ignored_gp("gdp_method", gdp_method != "big-m")
         _note_ignored_gp("cutting_planes", cutting_planes is not False)
         _note_ignored_gp("nlp_bb", nlp_bb is not None)
-        _note_ignored_gp("lazy_constraints", lazy_constraints is not None)
-        _note_ignored_gp("incumbent_callback", incumbent_callback is not None)
         _note_ignored_gp("node_callback", node_callback is not None)
         _note_ignored_gp("abs_gap_tolerance", abs_gap_tolerance is not None)
         if kwargs:
@@ -10776,8 +10879,6 @@ def solve_model(
         _note_ignored_gp_minlp("gdp_method", gdp_method != "big-m")
         _note_ignored_gp_minlp("cutting_planes", cutting_planes is not False)
         _note_ignored_gp_minlp("nlp_bb", nlp_bb is not None)
-        _note_ignored_gp_minlp("lazy_constraints", lazy_constraints is not None)
-        _note_ignored_gp_minlp("incumbent_callback", incumbent_callback is not None)
         _note_ignored_gp_minlp("node_callback", node_callback is not None)
         _note_ignored_gp_minlp("abs_gap_tolerance", abs_gap_tolerance is not None)
         if kwargs:
@@ -10815,7 +10916,14 @@ def solve_model(
         or node_callback is not None
         or kwargs.get("iteration_callback") is not None
     )
-    if _solver is None and not _has_bb_callbacks and not skip_convex_check:
+    # #1500: ``_has_bb_callbacks`` covers incumbent_callback but not
+    # lazy_constraints, which the GP path would drop just the same.
+    if (
+        _solver is None
+        and not _has_bb_callbacks
+        and not _feasibility_callbacks
+        and not skip_convex_check
+    ):
         from discopt.gp import classify_gp, solve_gp
 
         # A GP that is also a pure LP (a linear posynomial over positive boxes, e.g.
@@ -12047,6 +12155,13 @@ def solve_model(
                     "Model.solve(solver='direct'), a derivative-free global search that "
                     "needs values only."
                 )
+            # #1500: this route is one local NLP, never the spatial B&B, so it
+            # cannot fall through to an engine that screens incumbents.
+            _refuse_unenforced_callbacks(
+                "a dm.custom(...) body outside the reduced-space (MCBox) scope",
+                _feasibility_callbacks,
+                "such a model is solved by a single local NLP, not branch-and-bound.",
+            )
             logger.info(
                 "Model contains a dm.custom(...) AD-only user function outside the "
                 "sound reduced-space (MCBox) scope — solving on the local NLP path "
@@ -12278,13 +12393,28 @@ def solve_model(
         except Exception as _tp_exc:
             logger.debug("Trivial-point primal seed failed: %s", _tp_exc)
 
-    _pure_continuous_force_spatial = False
+    # #1500: a model with no integer variable used to leave on the LP / QP /
+    # convex-NLP / local-NLP entry routes below, none of which calls the
+    # feasibility callbacks -- an LP ``min -x-y`` with the lazy cut ``x+y <= 4``
+    # came back certified at (5, 5), objective -10, with 0 callback calls. With a
+    # callback set, send it to the spatial B&B instead (the same fall-through the
+    # MILP / MIQP branches take, #748): there every node's relaxation point is
+    # integer-feasible, so each one is screened, and a lazy cut requeues the node
+    # against the cut-augmented relaxation (#1365).
+    _callbacks_force_bb = bool(_feasibility_callbacks)
+    if _callbacks_force_bb and _pure_continuous:
+        logger.info(
+            "Continuous model with %s — routing to spatial Branch-and-Bound (the "
+            "LP/QP/NLP entry routes cannot honor these callbacks; #1500)",
+            " and ".join(_feasibility_callbacks),
+        )
+    _pure_continuous_force_spatial = _callbacks_force_bb and _pure_continuous
     if problem_class is not None:
-        if problem_class == ProblemClass.LP:
+        if problem_class == ProblemClass.LP and not _callbacks_force_bb:
             if _lp_milp_backend() == "highs":
                 return _solve_lp_highs(model, t_start, time_limit)
             return _solve_lp(model, t_start, time_limit)
-        elif problem_class == ProblemClass.QP:
+        elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
                 if _pure_continuous_convexity_known and _pure_continuous_is_convex:
                     return _solve_qp(model, t_start, prefer_pounce=nlp_solver == "pounce")
@@ -12528,7 +12658,12 @@ def solve_model(
         nlp_solver = "pounce"
 
     # --- Convex NLP fast path: skip B&B for convex continuous problems ---
-    if _pure_continuous and _pure_continuous_convexity_known and _pure_continuous_is_convex:
+    if (
+        _pure_continuous
+        and _pure_continuous_convexity_known
+        and _pure_continuous_is_convex
+        and not _callbacks_force_bb  # #1500: see the entry-route note above
+    ):
         logger.info("Convex NLP detected — solving with single NLP (global optimality guaranteed)")
         result = _solve_continuous(
             model,
@@ -13197,6 +13332,10 @@ def solve_model(
         if _nl_int_cols_all:
             tree.set_spatial_integer_cols(np.asarray(_nl_int_cols_all, dtype=np.int64))
     _gap_certified = True
+    # #1500: from here on every incumbent is screened -- the batch import gate and
+    # the funnel below -- so this solve's result honours the feasibility callbacks.
+    # The outermost ``solve_model`` wrapper refuses a returned point otherwise.
+    _mark_callbacks_enforced()
 
     # --- #740: single funnel for every non-batch incumbent injection ---
     # All warm-start / heuristic / completeness-guard injections on this
