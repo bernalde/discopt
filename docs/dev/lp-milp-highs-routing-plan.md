@@ -1374,3 +1374,46 @@ fresh subprocess. Executed 144 per panel, `incorrect_count` 0 on both.
 - **Retraction:** the 2026-09-15 audit entry above reports M 85.0 s / 5.3 s and geo-mean
   5.68 / 11.89 from an earlier out-of-gate run. This run supersedes those numbers. Neither
   is gate-valid; direction and magnitude agree.
+
+**2026-09-27 — #1509: a HiGHS MIP false optimum none of the existing guards can see; fixed
+by refuting the bound against verified points.** `min x**2 + n s.t. log(x+1) + n >= 2`,
+`x in [c, c+10]`, through `dm.nonlinear_to_pwl`: at `c = 3e3` the route certified the
+surrogate at `9000012.455` (`1e4`: `100000012.487`) while `x = c, n = 0` is feasible at
+`c**2`; `DISCOPT_LP_MILP_BACKEND=rust` certified `c**2`. On the extracted standard form
+(165 cols, 119 rows): the #1295 open-column ratio is `0.64` (cap `2**-20`, and no column
+has an open side), the #1410 root dual violation is `0` / `1.7e-16` (round-off bound
+`1.3e-13`), and the root cross-check passes because the tree bound is *above* the NS root
+bound (`9e6`), the direction it does not test. HiGHS answers `c**2` with `presolve=off`, with
+`mip_feasibility_tolerance = 1e-7`, or with the `log` block's error-band columns (width
+`8.67e-8`, below the `1e-6` tolerance) zeroed; no single `presolve_rule_off` bit changes it.
+On a hand-written MILP of the same shape the false optimum appears for band widths `8.67e-8`
+and `5e-7` and disappears at `2e-6` and above -- so the MIP's tolerance-level reductions on
+sub-tolerance columns are the mechanism, amplified through the `x**2` rows' `~2*c*h`
+coefficients, which is why only large offsets show it.
+
+The fix (`solve_milp_std._refutation_check`) is not a new threshold: after the root check it
+holds the reported bound against every point it can verify at an LP's cost -- the root LP
+point, the NS-safe LP over the incumbent's own integers, and (root point fractional) the LP
+over its rounding -- and a bound more than `CERT_ABS + CERT_REL*|bound|` above a verified
+point is refuted: HiGHS's tree bound is dropped, the NS-safe root bound reported, and the
+result certified only if that closes the gap. An inconclusive fixed-integer LP decertifies
+(the #1320 rule). It is a falsifier, not a proof. A rust cross-check was considered and not
+built: §4 forbids a HiGHS -> Rust fallback, and as a pure falsifier it costs a second full
+MILP solve per model from the weaker engine, where these LPs caught every case measured.
+
+- Family panel (`scratchpad/i1509/panel.py`, 180 instances: 144 hand-written PWL MILPs over
+  `c in {1e2..1e5}`, 4 segment counts, 3 band widths, taper on/off, plus 36
+  `nonlinear_to_pwl` surrogates of `log`/`sqrt` at 3 segment counts; rust route as the
+  second opinion). Before: **60/180 HiGHS bounds above the best verified objective**
+  (`> 1e-6*(1+|ref|)`), rust 0. With only the first two candidates: 2/180 (both
+  `c=1e5, K=16`: a gap-limit stop on the wrong integers, bound `+27742` / `+160001`). With
+  the rounded root point: **0/180**, 103 refutations, certified 179/180 on both arms (the
+  one uncertified instance is uncertified before as well).
+- Neutrality panel (`scratchpad/i1509/neutral.py`, 240 generated integer-data MILPs --
+  knapsack, multi-knapsack, set cover, facility location, general integer, big-M with an
+  `M**2` objective constant -- plus i1183): status, objective, bound, `gap_certified` and
+  node count **identical on all 241**; 0 refutations, 0 inconclusive checks; largest
+  non-refuting margin `6.8e-13` (relative `5.0e-16`) against a refutation threshold of
+  `1e-6 + 1e-9*|bound|`. Node counts cannot move by construction -- the check runs after
+  HiGHS returns. Total wall 5.05 s -> 5.50 s on the 240 (the extra LPs; single run, load
+  not gated, indicative only).
