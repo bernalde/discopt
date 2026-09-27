@@ -36,16 +36,15 @@ from typing import Any
 
 import numpy as np
 
-try:  # scipy is a hard dep of the relaxation path, but keep the import defensive.
-    import scipy.sparse as _sp
+# #1520: no except. scipy is a core dependency. The old ``except Exception``
+# fallback defined ``_is_sparse`` as "never sparse", so a broken scipy import
+# would have made the audit fingerprint every sparse matrix as a dense object
+# and report the claims as checked.
+import scipy.sparse as _sp
 
-    def _is_sparse(a: Any) -> bool:
-        return bool(_sp.issparse(a))
 
-except Exception:  # pragma: no cover - scipy always present in practice
-
-    def _is_sparse(a: Any) -> bool:
-        return False
+def _is_sparse(a: Any) -> bool:
+    return bool(_sp.issparse(a))
 
 
 __all__ = [

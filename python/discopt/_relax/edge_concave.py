@@ -161,14 +161,9 @@ def collect_edge_concave_quadratics(model, *, max_factors: int = 12) -> list[Edg
     blocks: list[EdgeConcaveQuadratic] = []
     seen: set = set()
     for body in bodies:
-        try:
-            poly = _expr_to_polynomial(distribute_products(body), model)
-        except Exception as exc:  # noqa: BLE001 - a body we cannot polynomialize is skipped
-            # Capability-disabling: every skipped body is an edge-concave block the
-            # relaxation never gets, so "edge-concave found nothing" can be an
-            # artifact of the extractor rather than of the model.
-            logger.debug("edge-concave polynomialization failed: %s: %s", type(exc).__name__, exc)
-            continue
+        # #1520: no except. ``_expr_to_polynomial`` declines by returning ``None``
+        # (skipped just below); a raise is a defect, not "no edge-concave block".
+        poly = _expr_to_polynomial(distribute_products(body), model)
         if poly is None:
             continue
         const, terms = poly

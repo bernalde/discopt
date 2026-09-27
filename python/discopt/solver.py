@@ -12346,8 +12346,8 @@ def solve_model(
     # can be slow on very large models. Skipped once the budget is blown (#654):
     # it only tightens bounds, so declining it leaves a valid looser box.
     if presolve and presolve_reverse_ad and not _deadline_exhausted():
-        # #1514: no ``except``. ``run_reverse_ad_tightening`` absorbs the
-        # propagation's own decline internally and returns a count; a raise is a defect.
+        # #1514/#1520: no ``except``. ``run_reverse_ad_tightening`` has no decline of its
+        # own (it returns a count); a raise from it or ``tighten_box`` is a defect.
         from discopt._relax.presolve_pipeline import run_reverse_ad_tightening
 
         n_rad = run_reverse_ad_tightening(model)

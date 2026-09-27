@@ -330,7 +330,7 @@ class IntegerRatioPartitioner:
         self._n_pre = sum(int(v.size) for v in prereform_model._variables)
         self._terms = classify_nonlinear_terms(prereform_model)
         self._disc = DiscretizationState(partitions={})
-        self._stats = {"nodes": 0, "lifted": 0, "lps": 0, "abstained": 0}
+        self._stats = {"nodes": 0, "lifted": 0, "lps": 0}
 
     @property
     def stats(self) -> dict:
@@ -346,23 +346,24 @@ class IntegerRatioPartitioner:
         """Sound lower bound on the node's objective from the ratio partition.
 
         Returns the best bound across the registered specs, or ``None`` to
-        abstain (the caller keeps the engine bound). Never raises.
+        abstain (the caller keeps the engine bound). The dive abstains by value
+        (``_dive``/``_solve_piece`` return ``None``); an exception is a defect and
+        propagates (#1520).
         """
         self._stats["nodes"] += 1
         best: Optional[float] = None
-        try:
-            lb = np.asarray(node_lb, dtype=np.float64).ravel()[: self._n_pre]
-            ub = np.asarray(node_ub, dtype=np.float64).ravel()[: self._n_pre]
-            if lb.size < self._n_pre or ub.size < self._n_pre:
-                return None
-            for spec in self._specs:
-                b = self._dive(spec, lb, ub, deadline)
-                if b is not None and (best is None or b > best):
-                    best = b
-        except Exception:
-            logger.debug("integer-ratio dive abstained", exc_info=True)
-            self._stats["abstained"] += 1
+        # #1520: no except. Every decline in ``_dive``/``_solve_piece`` is a
+        # ``None`` return (LP not optimal, no ratio column, sign gate); the old
+        # ``except Exception`` turned defects into "abstained", a silent loss of
+        # the bound this pass exists to provide.
+        lb = np.asarray(node_lb, dtype=np.float64).ravel()[: self._n_pre]
+        ub = np.asarray(node_ub, dtype=np.float64).ravel()[: self._n_pre]
+        if lb.size < self._n_pre or ub.size < self._n_pre:
             return None
+        for spec in self._specs:
+            b = self._dive(spec, lb, ub, deadline)
+            if b is not None and (best is None or b > best):
+                best = b
         if best is not None:
             self._stats["lifted"] += 1
         return best

@@ -1633,16 +1633,11 @@ def propagate_equality_defined_bounds(
                     rest_lo, rest_hi = 0.0, 0.0
                     ok = True
                     for ocoeff, oexpr in others:
-                        try:
-                            elo, ehi = _bound_expression(oexpr, model)
-                        except OverflowError:
-                            # #1520: narrowed. ``_bound_expression`` evaluates integer
-                            # powers as Python floats, and ``1e200 ** 2`` raises instead
-                            # of returning ``inf``. A range past float is unbounded for
-                            # this purpose: skip the row (no tightening), exactly as the
-                            # non-finite check below does.
-                            ok = False
-                            break
+                        # #1520: no ``except``. ``_bound_expression`` returns an
+                        # infinite range to decline (an integer power that overflows
+                        # float is a signed inf since #1520), which the non-finite
+                        # check below turns into "skip the row".
+                        elo, ehi = _bound_expression(oexpr, model)
                         if ocoeff >= 0:
                             rest_lo += ocoeff * elo
                             rest_hi += ocoeff * ehi

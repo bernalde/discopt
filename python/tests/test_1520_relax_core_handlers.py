@@ -11,7 +11,7 @@ now one of:
   a defect and propagates;
 * **narrowed** -- the callee documents a decline exception (``model_to_repr``'s and
   ``interval_hessian``'s ``ValueError``, the incremental structure's ``ValueError`` /
-  ``_IncrementalStructureTooLarge``, a float ``**`` ``OverflowError``), which is still
+  ``_IncrementalStructureTooLarge``), which is still
   absorbed; everything else propagates;
 * **kept as a sound fallback** -- reported once per solve at WARNING on
   ``discopt.solver`` through ``warn_fallback_once``.
@@ -539,7 +539,7 @@ def _eq_defined() -> dm.Model:
     return m
 
 
-def test_equality_propagation_overflow_skips_row_and_defect_propagates(monkeypatch):
+def test_equality_propagation_bound_defect_propagates(monkeypatch):
     from discopt._relax import gdp_reformulate
 
     m = _eq_defined()
@@ -550,18 +550,12 @@ def test_equality_propagation_overflow_skips_row_and_defect_propagates(monkeypat
 
     calls: list[int] = []
     monkeypatch.setattr(
-        gdp_reformulate, "_bound_expression", _counting_raiser(lambda: OverflowError(34), calls)
-    )
-    lb_out, ub_out, n = obbt_mod.propagate_equality_defined_bounds(m, lb, ub)
-    assert calls and n == 0 and np.array_equal(ub_out, ub)
-
-    monkeypatch.setattr(
         gdp_reformulate, "_bound_expression", _counting_raiser(lambda: _Boom("bnd"), calls)
     )
     saved = [(np.copy(v.lb), np.copy(v.ub)) for v in m._variables]
     with pytest.raises(_Boom, match="bnd"):
         obbt_mod.propagate_equality_defined_bounds(m, lb, ub)
-    assert len(calls) == 2
+    assert len(calls) == 1
     for v, (olb, oub) in zip(m._variables, saved):  # ``finally`` still restores
         assert np.array_equal(v.lb, olb) and np.array_equal(v.ub, oub)
 
@@ -816,3 +810,17 @@ def test_node_cutoff_fbbt_uses_the_repr_objective_space(monkeypatch):
     )
     assert seen == [-0.5], seen  # the repr (maximize) space: f >= -0.5
     assert not res.infeasible
+
+
+def test_bound_expression_power_overflow_is_an_infinite_range():
+    """Root fix for the ``OverflowError`` the equality pass used to catch: a float
+    integer power past the float range is a signed ``inf``, not a raise."""
+    import discopt.modeling as dm
+    from discopt._relax.gdp_reformulate import _bound_expression
+
+    m = dm.Model("pow_1520")
+    x = m.continuous("x", lb=-1e200, ub=1e200)
+    assert _bound_expression(x**2, m) == (0.0, np.inf)
+    assert _bound_expression(x**3, m) == (-np.inf, np.inf)
+    y = m.continuous("y", lb=1e200, ub=2e200)
+    assert _bound_expression(y**2, m) == (np.inf, np.inf)

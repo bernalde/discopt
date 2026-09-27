@@ -138,12 +138,21 @@ def run_orchestrated_presolve(
             pass_started = time.monotonic()
             try:
                 d = p.run(model_repr)
-            except Exception as exc:  # pragma: no cover - diagnostic
-                # Python-pass failures should not silently break the
-                # solve. Record an empty delta tagged with the error
-                # and continue; the caller can inspect deltas to see
-                # which pass failed.
-                d = make_python_delta(getattr(p, "name", "python_pass"), pass_iter=sweep)
+            except Exception as exc:
+                # #1520: kept as a sound fallback. ``python_passes`` is a caller-
+                # supplied extension point (the built-in passes no longer swallow
+                # their own defects), and a pass that raises contributes an empty
+                # delta: no tightening from it, which is sound. Recorded on the
+                # delta AND reported, so a broken pass is not a silent no-op.
+                from discopt._relax._fallback import warn_fallback_once
+
+                pass_name = getattr(p, "name", "python_pass")
+                warn_fallback_once(
+                    f"presolve Python pass {pass_name!r}",
+                    exc,
+                    "the pass contributes an empty delta (no tightening)",
+                )
+                d = make_python_delta(pass_name, pass_iter=sweep)
                 d["error"] = repr(exc)
             if d is None:
                 continue

@@ -32,14 +32,11 @@ Dependencies: A3 (Python passes participate in the orchestrator via
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Optional
 
 import numpy as np
 
 from .protocol import make_python_delta
-
-logger = logging.getLogger(__name__)
 
 
 class ConvexReformPass:
@@ -94,22 +91,11 @@ class ConvexReformPass:
             if body is None:
                 continue
             examined += 1
-            try:
-                verdict = certify_convex(body, self.model, box=box)
-            except Exception as exc:  # noqa: BLE001 - abstaining is always sound
-                # Certificate threw — abstain. The pass must never
-                # propagate exceptions because the orchestrator catches
-                # them and stamps an "error" delta, which would
-                # incorrectly imply the model is unprocessable. Logged because a
-                # constraint that silently abstains is a convex reformulation that
-                # never happened.
-                logger.debug(
-                    "convexity certificate raised on constraint %d: %s: %s",
-                    ci,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
+            # #1520: no except. ``certify_convex`` absorbs its own documented
+            # decline (the interval Hessian's ``ValueError``, including
+            # ``IntervalHessianTooLarge``) and returns ``None``; any other raise is a
+            # defect and must not read as "this constraint is not convex".
+            verdict = certify_convex(body, self.model, box=box)
             sense = getattr(c, "sense", None)
             # `f(x) ≤ rhs` is a convex feasible set when f is convex.
             # `f(x) ≥ rhs` is a convex feasible set when f is concave

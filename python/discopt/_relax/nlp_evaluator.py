@@ -789,26 +789,24 @@ class NLPEvaluator:
             return False
         if not hasattr(self, "_sparse_jac_fn"):
             self._sparse_jac_fn = None
-            try:
-                from discopt._relax.sparse_jacobian import make_sparse_jac_fn
-                from discopt._relax.sparsity import (
-                    compute_coloring,
-                    make_seed_matrix,
-                    should_use_sparse,
-                )
+            # #1520: no except. Coloring and the sparse-JVP builder are in-package
+            # and deterministic with no documented failure mode; the old handler
+            # made a defect here a silent switch to the dense path (so a sparsity
+            # benchmark measured the dense one).
+            from discopt._relax.sparse_jacobian import make_sparse_jac_fn
+            from discopt._relax.sparsity import (
+                compute_coloring,
+                make_seed_matrix,
+                should_use_sparse,
+            )
 
-                pattern = self.sparsity_pattern
-                if pattern is not None and should_use_sparse(pattern):
-                    colors, n_colors = compute_coloring(pattern)
-                    seed = make_seed_matrix(colors, n_colors, pattern.n_vars)
-                    # make_sparse_jac_fn expects fn(x); the legacy single-arg
-                    # wrapper reads current parameter values on each call.
-                    self._sparse_jac_fn = make_sparse_jac_fn(self._cons_fn, pattern, colors, seed)
-            except Exception as exc:  # noqa: BLE001 - falls back to the dense Jacobian
-                # Capability-disabling: without this the evaluator is dense on a
-                # problem that was measured as sparse, so a sparsity benchmark
-                # silently measures the dense path.
-                logger.debug("sparse Jacobian setup failed: %s: %s", type(exc).__name__, exc)
+            pattern = self.sparsity_pattern
+            if pattern is not None and should_use_sparse(pattern):
+                colors, n_colors = compute_coloring(pattern)
+                seed = make_seed_matrix(colors, n_colors, pattern.n_vars)
+                # make_sparse_jac_fn expects fn(x); the legacy single-arg
+                # wrapper reads current parameter values on each call.
+                self._sparse_jac_fn = make_sparse_jac_fn(self._cons_fn, pattern, colors, seed)
         return self._sparse_jac_fn is not None
 
     def evaluate_jacobian(self, x: np.ndarray) -> np.ndarray:
@@ -884,18 +882,18 @@ class NLPEvaluator:
         the Jacobian nonzero count tight for large vectorized NMPC models.
         """
         if not hasattr(self, "_sparse_pattern") or self._sparse_pattern is None:
-            try:
-                has_vector_body = self._constraint_flat_sizes.size > 0 and bool(
-                    np.any(self._constraint_flat_sizes > 1)
-                )
-                if has_vector_body:
-                    self._sparse_pattern = self._detect_sparsity_traced()
-                else:
-                    from discopt._relax.sparsity import detect_sparsity_dag
+            # #1520: no except. Both detectors are in-package walks with no
+            # documented failure mode; a raise used to become ``None`` ("no sparse
+            # structure"), silently switching the evaluator to dense.
+            has_vector_body = self._constraint_flat_sizes.size > 0 and bool(
+                np.any(self._constraint_flat_sizes > 1)
+            )
+            if has_vector_body:
+                self._sparse_pattern = self._detect_sparsity_traced()
+            else:
+                from discopt._relax.sparsity import detect_sparsity_dag
 
-                    self._sparse_pattern = detect_sparsity_dag(self._model)
-            except Exception:
-                self._sparse_pattern = None
+                self._sparse_pattern = detect_sparsity_dag(self._model)
         return self._sparse_pattern
 
     def _detect_sparsity_traced(self):
@@ -1009,16 +1007,11 @@ class NLPEvaluator:
             self._use_compressed_cache = False
             pattern = self.sparsity_pattern
             if pattern is not None:
-                try:
-                    from discopt._relax.sparsity import should_use_sparse
+                # #1520: no except. ``should_use_sparse`` is arithmetic on the
+                # pattern's counts; a raise is a defect.
+                from discopt._relax.sparsity import should_use_sparse
 
-                    self._use_compressed_cache = should_use_sparse(pattern)
-                except Exception as exc:  # noqa: BLE001 - defaults to dense-then-project
-                    logger.debug(
-                        "compressed-evaluation decision unavailable: %s: %s",
-                        type(exc).__name__,
-                        exc,
-                    )
+                self._use_compressed_cache = should_use_sparse(pattern)
         return self._use_compressed_cache
 
     def jacobian_structure(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1068,23 +1061,21 @@ class NLPEvaluator:
         if hasattr(self, "_sparse_jac_values_fn"):
             return self._sparse_jac_values_fn
         self._sparse_jac_values_fn = None
-        try:
-            from discopt._relax.sparse_jacobian import make_sparse_jac_values_fn
-            from discopt._relax.sparsity import (
-                compute_coloring,
-                make_seed_matrix,
-                should_use_sparse,
-            )
+        # #1520: no except (same builders as ``_ensure_sparse_jac_fn``).
+        from discopt._relax.sparse_jacobian import make_sparse_jac_values_fn
+        from discopt._relax.sparsity import (
+            compute_coloring,
+            make_seed_matrix,
+            should_use_sparse,
+        )
 
-            pattern = self.sparsity_pattern
-            if pattern is not None and should_use_sparse(pattern):
-                colors, n_colors = compute_coloring(pattern)
-                seed = make_seed_matrix(colors, n_colors, pattern.n_vars)
-                self._sparse_jac_values_fn = make_sparse_jac_values_fn(
-                    self._cons_fn_jit, pattern, colors, seed
-                )
-        except Exception as exc:  # noqa: BLE001 - falls back to the dense Jacobian
-            logger.debug("sparse Jacobian-values setup failed: %s: %s", type(exc).__name__, exc)
+        pattern = self.sparsity_pattern
+        if pattern is not None and should_use_sparse(pattern):
+            colors, n_colors = compute_coloring(pattern)
+            seed = make_seed_matrix(colors, n_colors, pattern.n_vars)
+            self._sparse_jac_values_fn = make_sparse_jac_values_fn(
+                self._cons_fn_jit, pattern, colors, seed
+            )
         return self._sparse_jac_values_fn
 
     def evaluate_hessian_values(
@@ -1142,24 +1133,24 @@ class NLPEvaluator:
             return self._sparse_hess_values_fn
         self._sparse_hess_values_fn = None
         if self._use_sparse_hessian():
-            try:
-                from discopt._relax.sparse_hessian import (
-                    build_hessian_coloring,
-                    make_sparse_hess_values_fn,
-                )
+            # #1520: no except. The Hessian coloring and HVP builder are in-package
+            # with no documented failure mode; a raise used to become a silent
+            # switch to the dense ``n x n`` Hessian (the #95 blow-up).
+            from discopt._relax.sparse_hessian import (
+                build_hessian_coloring,
+                make_sparse_hess_values_fn,
+            )
 
-                self._ensure_coo_cache()
-                seed, coo_seed_idx, coo_lookup_row = build_hessian_coloring(
-                    self.sparsity_pattern, self._hess_rows, self._hess_cols
-                )
-                self._sparse_hess_values_fn = make_sparse_hess_values_fn(
-                    self._lagrangian_hvp_fn_jit,
-                    seed,
-                    coo_seed_idx,
-                    coo_lookup_row,
-                )
-            except Exception:
-                self._sparse_hess_values_fn = None
+            self._ensure_coo_cache()
+            seed, coo_seed_idx, coo_lookup_row = build_hessian_coloring(
+                self.sparsity_pattern, self._hess_rows, self._hess_cols
+            )
+            self._sparse_hess_values_fn = make_sparse_hess_values_fn(
+                self._lagrangian_hvp_fn_jit,
+                seed,
+                coo_seed_idx,
+                coo_lookup_row,
+            )
         return self._sparse_hess_values_fn
 
     def _ensure_coo_cache(self) -> None:

@@ -186,14 +186,16 @@ def _objective_hessian(model: Model):
     ``Q`` follows the classifier's ``0.5 x'Qx`` convention, so a term ``q*x^2``
     appears as ``Q[j, j] = 2q``.
     """
-    from .problem_classifier import _extract_quadratic_coefficients, dense_Q
+    from .problem_classifier import _extract_quadratic_coefficients, _NotQuadraticError, dense_Q
 
     if model._objective is None:
         return None
     n = sum(v.size for v in model._variables)
     try:
         Q, _c, _d = _extract_quadratic_coefficients(model._objective.expression, model, n)
-    except Exception as exc:
+    except _NotQuadraticError as exc:
+        # #1520: narrowed to the extractor's documented decline; anything else is
+        # a defect and must not read as "not quadratic, no perspective candidates".
         logger.debug("perspective reform: objective is not quadratic (%s)", exc)
         return None
     Q = dense_Q(Q)
