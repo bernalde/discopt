@@ -356,8 +356,8 @@ def _curv_cos(lo: float, hi: float) -> Optional[str]:
 # singularity, ``nan`` outside the domain, the same quotient inside it), so every
 # downstream ``_finite`` verdict and every emitted row is unchanged.
 #
-# ``acosh`` gets the same treatment for uniformity even though its ``dom_ok``
-# (``lo > 1``) keeps the singular point out of every admitted box.
+# ``acosh`` gets the same treatment; its singular point ``t = 1`` is reached since
+# #1510 admits the closed lower domain edge (``_closed_edge_lo``).
 # --------------------------------------------------------------------------- #
 def _dsqrt(t: float) -> float:
     """``d/dt sqrt(t)`` = ``0.5/sqrt(t)``; ``+inf`` at the vertical tangent t=0."""
@@ -1613,10 +1613,11 @@ def _interval_box(model: Model, flat_lb: np.ndarray, flat_ub: np.ndarray) -> dic
 #
 # Which atoms actually reach that case: ``sqrt`` at ``t = 0`` (``dom_ok`` is
 # ``lo >= 0``), and ``asin``/``acos`` at ``t = +1`` (``dom_ok`` constrains only
-# ``lo``, so ``hi = 1`` is admitted). ``acosh`` and ``log`` do NOT — their
-# ``dom_ok`` is a strict inequality (``lo > 1``, ``lo > 0``), so the singular point
-# is outside every admitted box and the endpoint derivative is finite there. (A
-# finite-but-huge derivative is deliberately out of scope; see below.)
+# ``lo``, so ``hi = 1`` is admitted). Since #1510 (``_closed_edge_lo``) also
+# ``asin``/``acos`` at ``t = -1`` and ``acosh`` at ``t = 1``: the closed LOWER edge
+# is admitted too. ``log`` does NOT — its ``dom_ok`` is a strict inequality
+# (``lo > 0``) and ``log`` itself is infinite there. (A finite-but-huge derivative
+# is deliberately out of scope; see below.)
 #
 # Dropping the facet is SOUND but loose, and ``t = 0`` is frequently the
 # interesting point rather than an
@@ -2138,9 +2139,69 @@ def _build_univariate_call(ctx: _Builder, node: CNode, w: int) -> Envelope:
         return Envelope(rows=[], tight=False)  # unknown intrinsic -> interval floor
     f, fp, curv_fn, dom_ok = entry
     if not dom_ok(lo):
-        return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
+        edge_lo = _closed_edge_lo(fname, lo, hi)
+        if edge_lo is None:
+            return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
+        lo = edge_lo  # #1510: the closed lower domain edge
     tight = _emit_1d(ctx, w, lt, lo, hi, f, fp, curv_fn(lo, hi))
     return Envelope(rows=[], tight=tight)
+
+
+#: #1510: the CLOSED lower domain edge of each atom whose ``dom_ok`` is strict there
+#: although the function is finite (only its derivative diverges). ``asin``/``acos``
+#: are defined on ``[-1, 1]`` and ``acosh`` on ``[1, inf)``, but ``dom_ok`` demanded
+#: ``lo > -1`` / ``lo > 1`` while the mirror edge ``hi = +1`` of asin/acos was
+#: already admitted -- so the box that touches the edge, the very one holding an
+#: edge optimum (#1492), got only the interval floor.
+_CLOSED_LOWER_EDGE: dict[str, float] = {"asin": -1.0, "acos": -1.0, "acosh": 1.0}
+
+
+def _closed_edge_envelopes_enabled() -> bool:
+    """``DISCOPT_CLOSED_EDGE_ENVELOPES`` (#1510) -- GRADUATED default-ON;
+    ``DISCOPT_CLOSED_EDGE_ENVELOPES=0`` restores the legacy interval floor.
+
+    Bound-changing (it adds envelope rows on boxes that used to get none), so it
+    shipped behind a CLAUDE.md section-5 gate. Panel (2026-09-27, see
+    ``docs/dev/flag-retirement-audit.md``): the in-repo corpus contains no
+    asin/acos/acosh term (66/66 scanned) -- and MINLPLib has no inverse-trig
+    instance at all -- so it is cert-clean and byte-identical there; on an 88-model
+    synthetic family of closed-edge asin/acos/acosh models (1-D, affine-argument
+    epigraph, 2-D coupled, MINLP) ON vs OFF: 0 unsound on either arm, 0
+    certification regressions, 1 gain, nodes 878 -> 132 over the 87 models both
+    arms certify, wall 32.0 s -> 22.1 s.
+    """
+    return os.environ.get("DISCOPT_CLOSED_EDGE_ENVELOPES", "1").strip() != "0"
+
+
+#: How far below a closed edge an argument's lower bound may sit and still be read
+#: as that edge (#1510): interval evaluation of an affine argument rounds
+#: OUTWARD, so ``asin(x - 1)`` over ``x in [0, 1]`` arrives as ``lo = -1 - ulp``.
+_CLOSED_EDGE_TOL = 1e-12
+
+
+def _closed_edge_lo(fname: str, lo: float, hi: float) -> Optional[float]:
+    """The lower end to envelope a box over when its argument starts at (or a
+    rounding error below) the CLOSED lower domain edge of ``fname`` -- that edge --
+    or ``None`` to keep the interval floor (#1510; ``=0`` opts out).
+
+    Sound for the same reason ``hi = +1`` already is for asin/acos: ``f`` is finite
+    and continuous at the edge and has a single proven curvature on
+    ``[edge, hi]``, so the secant through ``(edge, f(edge))`` is a valid chord and
+    every finite-slope tangent is a valid facet; the one facet that does not exist
+    is the tangent AT the edge, whose slope is infinite, and ``_tangent_row``
+    already drops a non-finite slope. Clamping an outward-rounded ``lo`` up to the
+    edge removes only argument values where ``f`` is undefined, i.e. no point the
+    model can take. A ``lo`` further below the edge than ``_CLOSED_EDGE_TOL`` (a box
+    genuinely reaching outside the domain) keeps the floor, as before.
+    """
+    edge = _CLOSED_LOWER_EDGE.get(fname)
+    if edge is None or not _closed_edge_envelopes_enabled():
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= edge:
+        return None
+    if not (edge - _CLOSED_EDGE_TOL * max(1.0, abs(edge)) <= lo <= edge):
+        return None
+    return edge
 
 
 def _registered_envelope_entry(fname: str):
