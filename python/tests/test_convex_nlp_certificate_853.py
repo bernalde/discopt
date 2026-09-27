@@ -74,10 +74,7 @@ def test_neglog_interior_stall_not_false_optimal(solver):
     obj~-18.99, bound~-18.99 (crossing the true opt -27.63)."""
     r = _neglog(1e12).solve(nlp_solver=solver)
     _assert_sound("ub=1e12", r, -math.log(1e12))
-    assert not (r.status == "optimal" and r.gap_certified), (
-        f"ub=1e12: still emits a certificate (status={r.status}, "
-        f"gap_certified={r.gap_certified}, obj={r.objective!r})"
-    )
+    _assert_no_certificate("ub=1e12", r, -math.log(1e12))
 
 
 @pytest.mark.parametrize("ub", [1e4, 1e6, 1e8, 1e9, 1e10, 1e12], ids=lambda v: f"ub={v:.0e}")
@@ -141,10 +138,21 @@ from discopt.constants import DEFAULT_VARIABLE_BOUND  # noqa: E402
 _BOX_UB = DEFAULT_VARIABLE_BOUND
 
 
-def _assert_no_certificate(name: str, r) -> None:
-    assert not (r.status == "optimal" and r.gap_certified), (
-        f"{name}: still emits a certificate (status={r.status}, "
+def _assert_no_certificate(name: str, r, opt: float) -> None:
+    """No certificate for the STALL point. Since #1499 the fast path may instead
+    certify the box optimum itself -- from a rigorous tangent bound at the exhibited
+    witness, with that witness adopted as the incumbent -- which is a correct
+    certificate, so it is accepted when (and only when) it is at the true optimum
+    to 1e-9 and its bound does not cross it."""
+    if not (r.status == "optimal" and r.gap_certified):
+        return
+    tol = 1e-9 * (1.0 + abs(opt))
+    assert r.objective is not None and abs(r.objective - opt) <= tol, (
+        f"{name}: still certifies a non-optimal point (status={r.status}, "
         f"gap_certified={r.gap_certified}, obj={r.objective!r}, bound={r.bound!r})"
+    )
+    assert r.bound is not None and abs(r.bound - opt) <= tol, (
+        f"{name}: certified optimum carries bound {r.bound!r} vs optimum {opt!r}"
     )
 
 
@@ -157,7 +165,7 @@ def test_neglog_default_box_not_false_optimal(solver):
     m.minimize(-dm.log(x))
     r = m.solve(nlp_solver=solver)
     _assert_sound("default box", r, -math.log(_BOX_UB))
-    _assert_no_certificate("default box", r)
+    _assert_no_certificate("default box", r, -math.log(_BOX_UB))
 
 
 @pytest.mark.parametrize("ub", [1e19, 5e19, 9e19], ids=lambda v: f"ub={v:.0e}")
@@ -165,7 +173,7 @@ def test_neglog_large_explicit_ub_not_false_optimal(ub):
     """Explicit ub in [1e19, 1e20) is a finite bound and must be refuted like 1e12."""
     r = _neglog(ub).solve(nlp_solver="ipm")
     _assert_sound(f"ub={ub:.0e}", r, -math.log(ub))
-    _assert_no_certificate(f"ub={ub:.0e}", r)
+    _assert_no_certificate(f"ub={ub:.0e}", r, -math.log(ub))
 
 
 def test_neglog_shifted_default_box_not_false_optimal():
@@ -175,7 +183,7 @@ def test_neglog_shifted_default_box_not_false_optimal():
     m.minimize(-dm.log(1 + x))
     r = m.solve(nlp_solver="ipm")
     _assert_sound("-log(1+x) default box", r, -math.log(1.0 + _BOX_UB))
-    _assert_no_certificate("-log(1+x) default box", r)
+    _assert_no_certificate("-log(1+x) default box", r, -math.log(1.0 + _BOX_UB))
 
 
 def test_neglog_two_var_constrained_default_box_not_false_optimal():
@@ -188,7 +196,7 @@ def test_neglog_two_var_constrained_default_box_not_false_optimal():
     m.minimize(-dm.log(x) - dm.log(y))
     r = m.solve(nlp_solver="ipm")
     _assert_sound("two-var default box", r, -2.0 * math.log(_BOX_UB))
-    _assert_no_certificate("two-var default box", r)
+    _assert_no_certificate("two-var default box", r, -2.0 * math.log(_BOX_UB))
 
 
 def test_maximize_log_default_box_not_false_optimal():
@@ -201,7 +209,7 @@ def test_maximize_log_default_box_not_false_optimal():
     opt = math.log(_BOX_UB)
     if r.bound is not None:
         assert r.bound >= opt - 1e-4 * opt, f"UNSOUND upper bound {r.bound!r} < max {opt:.6g}"
-    _assert_no_certificate("max log default box", r)
+    _assert_no_certificate("max log default box", r, opt)
 
 
 def test_default_box_interior_optimum_still_certifies():

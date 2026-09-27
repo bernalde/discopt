@@ -21,7 +21,17 @@ import threading
 import time
 import weakref
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeGuard, TypeVar, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    NamedTuple,
+    Optional,
+    TypeGuard,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import numpy as np
 
@@ -18792,6 +18802,29 @@ _KKT_STATIONARITY_REL_TOL = 1e-4
 _FW_LINE_SEARCH_ITERS = 50
 
 
+#: Relative size below which an exhibited "better" point is floating-point noise
+#: rather than evidence (#1499). It only decides whether the rigorous first-order
+#: bound below is REQUIRED; it can never loosen a certificate, since a point this
+#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see.
+_WITNESS_NOISE_REL = 1e-12
+
+
+class _ConvexNLPCertificate(NamedTuple):
+    """What :func:`_convex_nlp_certificate` proved about a convex single-NLP point.
+
+    ``bound`` is a rigorous lower bound on the internal (minimized) objective when
+    the witness search forced one to be computed (#1499), else ``None`` -- the
+    caller then keeps the legacy "incumbent is the bound" certificate. ``better_x``
+    is a feasible point strictly better than the NLP's, when one was exhibited.
+    """
+
+    stationarity_rel: float
+    complementarity_rel: float
+    bound: Optional[float] = None
+    better_x: Optional[np.ndarray] = None
+    better_obj: Optional[float] = None
+
+
 def _convex_nlp_certificate_gap(
     evaluator: "NLPEvaluator",
     x: np.ndarray,
@@ -18803,6 +18836,51 @@ def _convex_nlp_certificate_gap(
     obj_internal: Optional[float],
     gap_tolerance: float = 1e-6,
 ) -> Optional[tuple[float, float]]:
+    """``(stationarity_rel, complementarity_rel)`` of :func:`_convex_nlp_certificate`,
+    or ``None`` when ``x`` itself is not certified -- the check refused, or it
+    exhibited a strictly better feasible point (which the full result carries for
+    the caller to adopt, #1499). Kept for callers that only need the residuals."""
+    cert = _convex_nlp_certificate(
+        evaluator, x, multipliers, lb, ub, cl, cu, obj_internal, gap_tolerance=gap_tolerance
+    )
+    if cert is None or cert.better_x is not None:
+        return None
+    return cert.stationarity_rel, cert.complementarity_rel
+
+
+def _tangent_box_bound(value: float, grad: np.ndarray, s: np.ndarray, lo, hi) -> float:
+    """``value + min over [lo, hi] of grad . (y - s)`` in closed form.
+
+    For a function convex over the box, the tangent at ``s`` underestimates it
+    everywhere in the box, so this is a rigorous lower bound on its box minimum.
+    ``-inf`` when a non-zero gradient component points at an infinite bound, and
+    when anything is non-finite (#1491): no bound is claimed from a bad slope.
+    """
+    if not (np.isfinite(value) and np.all(np.isfinite(grad)) and np.all(np.isfinite(s))):
+        return -np.inf
+    total = float(value)
+    for j in range(grad.size):
+        gj = float(grad[j])
+        if gj == 0.0:
+            continue
+        target = lo[j] if gj > 0.0 else hi[j]
+        if not np.isfinite(target):
+            return -np.inf
+        total += gj * (float(target) - float(s[j]))
+    return total
+
+
+def _convex_nlp_certificate(
+    evaluator: "NLPEvaluator",
+    x: np.ndarray,
+    multipliers: Optional[np.ndarray],
+    lb: np.ndarray,
+    ub: np.ndarray,
+    cl: np.ndarray,
+    cu: np.ndarray,
+    obj_internal: Optional[float],
+    gap_tolerance: float = 1e-6,
+) -> Optional[_ConvexNLPCertificate]:
     """Recompute the *unscaled* KKT optimality residuals of a convex single-NLP.
 
     Under convexity the KKT conditions are sufficient for global optimality, so a
@@ -18816,10 +18894,26 @@ def _convex_nlp_certificate_gap(
     certificate. Only the solver's CONSTRAINT multipliers ``λ`` are trusted; the
     variable box is handled from the primal geometry.
 
-    Returns ``(stationarity_rel, complementarity_rel)`` — both dimensionless and ~0
-    at a true optimum — or ``None`` when the certificate cannot be assessed
-    (constraints present but no multipliers, or a dual-INFEASIBLE multiplier that
-    would invalidate the dual bound), which the caller treats as "not certified".
+    Returns the residuals ``(stationarity_rel, complementarity_rel)`` — both
+    dimensionless and ~0 at a true optimum — in a :class:`_ConvexNLPCertificate`,
+    or ``None`` when the certificate cannot be assessed (constraints present but no
+    multipliers, or a dual-INFEASIBLE multiplier that would invalidate the dual
+    bound), which the caller treats as "not certified".
+
+    **When a better point is exhibited, the incumbent is no longer the bound
+    (#1499).** The #853 witness searches below used to withhold the certificate
+    only when the exhibited point beat ``x`` by more than the gap tolerance, and
+    otherwise let the caller publish ``f(x)`` as the dual bound. But a feasible
+    point with ``f(y) < f(x)`` by ANY real amount proves ``f(x)`` is not a lower
+    bound: ``min 1/(x+1)`` on ``[0, 1e6]`` stalled at ``x = 11258`` (``f = 8.88e-5``),
+    the vertex ``x = 1e6`` beat it by 8.8e-5 -- inside the 1e-4 tolerance -- and
+    ``8.88e-5`` was certified as the bound against a true optimum of ``1e-6``. Now
+    any non-noise improvement makes the certificate rest on a RIGOROUS bound
+    instead: the best of the first-order (tangent) box bounds of the convex
+    Lagrangian at ``x`` and at every exhibited point, adjusted by the multipliers'
+    constant term. It is certified only if the best feasible point found is within
+    tolerance of that bound; the bound and that point are returned for the caller
+    to publish.
 
     * ``stationarity_rel``: the box-projected-gradient optimality measure
       ``||x − clip(x − r, lb, ub)||_∞`` for the reduced gradient ``r = ∇f + Jᵀλ``,
@@ -18922,6 +19016,7 @@ def _convex_nlp_certificate_gap(
     # spurious direction from a near-zero (numerically noisy) gradient finds no real
     # descent and does not fire — a genuine optimum, which has no better feasible
     # point, is never rejected.
+    witnesses: list[np.ndarray] = []
     y_fw = x.copy()
     moved = False
     for j in range(n):
@@ -18952,7 +19047,11 @@ def _convex_nlp_certificate_gap(
                 val = float(evaluator.evaluate_objective(y))
                 if m > 0:
                     val += float(lam @ np.asarray(evaluator.evaluate_constraints(y), np.float64))
-                return val if np.isfinite(val) else np.inf
+                val = val if np.isfinite(val) else np.inf
+                probed.append((val, t))
+                return val
+
+            probed: list[tuple[float, float]] = []
 
             # Golden-section minimization of the convex map t ↦ L(x + t·d) on [0, 1];
             # ``best`` is a valid upper bound on min_box L. The FW vertex (t=1) is
@@ -18973,11 +19072,14 @@ def _convex_nlp_certificate_gap(
                     e_ = a + gr * (b - a)
                     fe = _lag(e_)
                 best = min(best, fc, fe)
-            if L0 - best > margin:
-                # An in-box point beats the incumbent Lagrangian by more than the
-                # optimality tolerance: the dual bound these multipliers support is
-                # more than tol below f(x). Withhold the certificate.
-                return None
+            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0)):
+                # An in-box point beats the incumbent Lagrangian: the dual bound these
+                # multipliers support is below f(x), so f(x) is not a bound (#1499;
+                # before, only a beat by more than ``margin`` withheld). Certify only
+                # from a rigorous bound, with the supports the search visited.
+                t_best = min(probed)[1]
+                witnesses.append(x + t_best * d)
+                witnesses.append(y_fw)
 
     # --- Primal better-point refutation on the far box (#853, default box) ---
     # The refutation above caps bounds at ``_INF = 1e19``, so a bound in [1e19, 1e20)
@@ -19026,8 +19128,9 @@ def _convex_nlp_certificate_gap(
             if obj_internal is not None
             else float(evaluator.evaluate_objective(x))
         )
-        margin_p = max(gap_tolerance, 1e-6) * (1.0 + abs(f0))
         d_p = y_pv - x
+
+        probed_p: list[tuple[float, float]] = []
 
         def _feasible_obj(t: float) -> float:
             y = x + t * d_p
@@ -19036,7 +19139,9 @@ def _convex_nlp_certificate_gap(
                 if not np.all(np.isfinite(cy)) or _viol(cy) > viol_tol:
                     return np.inf
             val = float(evaluator.evaluate_objective(y))
-            return val if np.isfinite(val) else np.inf
+            val = val if np.isfinite(val) else np.inf
+            probed_p.append((val, t))
+            return val
 
         # Along the segment the feasible set of a convex problem is an interval
         # containing t=0 and f is convex on it, so (f, +∞ outside) is unimodal and
@@ -19057,10 +19162,150 @@ def _convex_nlp_certificate_gap(
                 e_ = a + gr * (b - a)
                 fe = _feasible_obj(e_)
             best = min(best, fc, fe)
-        if f0 - best > margin_p:
-            return None
+        if f0 - best > _WITNESS_NOISE_REL * (1.0 + abs(f0)):
+            # #1499: an exhibited feasible point beats f(x); see the Lagrangian arm.
+            witnesses.append(x + min(probed_p)[1] * d_p)
+            witnesses.append(y_pv)
 
-    return stationarity_rel, complementarity_rel
+    if not witnesses:
+        return _ConvexNLPCertificate(stationarity_rel, complementarity_rel)
+    return _rigorous_convex_certificate(
+        evaluator,
+        x,
+        lam,
+        cons,
+        grad,
+        jtlam,
+        lb,
+        ub,
+        cl,
+        cu,
+        obj_internal,
+        witnesses,
+        gap_tolerance,
+        stationarity_rel,
+        complementarity_rel,
+    )
+
+
+def _rigorous_convex_certificate(
+    evaluator,
+    x: np.ndarray,
+    lam: np.ndarray,
+    cons: np.ndarray,
+    grad: np.ndarray,
+    jtlam: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    cl: np.ndarray,
+    cu: np.ndarray,
+    obj_internal: Optional[float],
+    witnesses: list[np.ndarray],
+    gap_tolerance: float,
+    stationarity_rel: float,
+    complementarity_rel: float,
+) -> Optional[_ConvexNLPCertificate]:
+    """Certify a convex single-NLP from a RIGOROUS first-order bound (#1499).
+
+    ``L_r(y) = f(y) + sum_i lam_i (c_i(y) - b_i)`` with ``b_i = cu_i`` for
+    ``lam_i > 0`` and ``cl_i`` for ``lam_i < 0`` (a multiplier on an infinite side
+    is dropped, so the term stays bounded). The caller has already refused any
+    dual-infeasible ``lam``, so ``L_r`` is convex and ``L_r <= f`` on the feasible
+    set; hence for every support point ``s`` in the box
+
+        f*  >=  min_box L_r  >=  L_r(s) + min_box grad L_r(s) . (y - s),
+
+    a closed form (:func:`_tangent_box_bound`). The bound is the best of these over
+    ``x`` and the exhibited witnesses. The incumbent is the best FEASIBLE point
+    among them (feasible as ``x`` is: no row violated by more than ``x`` violates
+    it, floor 1e-9). Certified only when incumbent - bound is within tolerance;
+    otherwise ``None`` (withhold), exactly as a refuted certificate always was.
+    """
+    m = cons.size
+    n = x.size
+    _INF = 1e19
+    lo = np.where(lb > -_CONSTRAINT_INF, lb, -np.inf)
+    hi = np.where(ub < _CONSTRAINT_INF, ub, np.inf)
+    lam_r = np.asarray(lam, dtype=np.float64).copy()
+    shift = 0.0
+    for i in range(m):
+        li = float(lam_r[i])
+        if li > 0.0 and cu[i] < _INF:
+            shift += li * float(cu[i])
+        elif li < 0.0 and cl[i] > -_INF:
+            shift += li * float(cl[i])
+        else:
+            lam_r[i] = 0.0
+
+    lo_on = cl > -_INF
+    hi_on = cu < _INF
+
+    def _viol(cv: np.ndarray) -> float:
+        if m == 0:
+            return 0.0
+        v = np.maximum(np.where(lo_on, cl - cv, 0.0), np.where(hi_on, cv - cu, 0.0))
+        return float(np.max(v, initial=0.0))
+
+    viol_tol = max(_viol(cons), 1e-9)
+    f_x = (
+        float(obj_internal) if obj_internal is not None else float(evaluator.evaluate_objective(x))
+    )
+
+    def _support(s: np.ndarray) -> tuple[float, float, Optional[np.ndarray]]:
+        """(tangent box bound of L_r at s, f(s), constraint values at s)."""
+        f_s = float(evaluator.evaluate_objective(s))
+        g_s = np.asarray(evaluator.evaluate_gradient(s), dtype=np.float64)
+        if m > 0:
+            c_s = np.asarray(evaluator.evaluate_constraints(s), dtype=np.float64)
+            j_s = np.asarray(evaluator.evaluate_jacobian(s), dtype=np.float64).reshape(m, n)
+            val = f_s + float(lam_r @ c_s) - shift
+            g_s = g_s + j_s.T @ lam_r
+        else:
+            c_s = None
+            val = f_s
+        return _tangent_box_bound(val, g_s, s, lo, hi), f_s, c_s
+
+    bound = _tangent_box_bound(
+        f_x + (float(lam_r @ cons) - shift if m > 0 else 0.0),
+        _lagrangian_grad(evaluator, x, grad, lam_r, m, n),
+        x,
+        lo,
+        hi,
+    )
+    best_x: Optional[np.ndarray] = None
+    best_f = f_x
+    for s in witnesses:
+        s = np.clip(np.asarray(s, dtype=np.float64), lo, hi)
+        b_s, f_s, c_s = _support(s)
+        bound = max(bound, b_s)
+        feasible = c_s is None or (np.all(np.isfinite(c_s)) and _viol(c_s) <= viol_tol)
+        if feasible and np.isfinite(f_s) and f_s < best_f:
+            best_x, best_f = s, f_s
+
+    if not np.isfinite(bound):
+        return None
+    # A valid bound can never exceed a feasible point; if it does, something in the
+    # premises (convexity, multipliers) failed -- refuse rather than publish it.
+    if bound > best_f + 1e-9 * (1.0 + abs(best_f)):
+        return None
+    bound = min(bound, best_f)
+    if best_f - bound > max(gap_tolerance, 1e-6) * (1.0 + abs(best_f)):
+        return None
+    return _ConvexNLPCertificate(
+        stationarity_rel,
+        complementarity_rel,
+        bound=float(bound),
+        better_x=best_x,
+        better_obj=None if best_x is None else float(best_f),
+    )
+
+
+def _lagrangian_grad(evaluator, x, grad, lam_r, m: int, n: int) -> np.ndarray:
+    """``grad f(x) + J(x)^T lam_r`` (``grad f`` alone without rows)."""
+    if m == 0:
+        return np.asarray(grad, dtype=np.float64)
+    jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64).reshape(m, n)
+    return np.asarray(grad, dtype=np.float64) + jac.T @ lam_r
 
 
 def _build_pounce_warm_start(evaluator, state: dict):
@@ -19336,6 +19581,7 @@ def _solve_continuous(
         )
 
     _gap_certified = True
+    _cert: Optional[_ConvexNLPCertificate] = None
 
     # Convex single-NLP certificate gate (issue #849). On the convexity-CERTIFIED
     # fast path a reported ``optimal`` is taken as a *global* optimality
@@ -19356,7 +19602,7 @@ def _solve_continuous(
     if certify_convex and status == "optimal" and nlp_result.x is not None:
         try:
             _cl_g, _cu_g = _infer_constraint_bounds(model, evaluator)
-            _cert = _convex_nlp_certificate_gap(
+            _cert = _convex_nlp_certificate(
                 evaluator,
                 np.asarray(nlp_result.x, dtype=np.float64),
                 nlp_result.multipliers,
@@ -19375,26 +19621,68 @@ def _solve_continuous(
             _cert = None
         if (
             _cert is None
-            or _cert[0] > _KKT_STATIONARITY_REL_TOL
-            or _cert[1] > max(gap_tolerance, 1e-6)
+            or _cert.stationarity_rel > _KKT_STATIONARITY_REL_TOL
+            or _cert.complementarity_rel > max(gap_tolerance, 1e-6)
         ):
             logger.warning(
                 "Convex NLP reported optimal but the unscaled KKT residuals are not "
                 "certifiable (stationarity_rel=%s, complementarity_rel=%s, "
                 "gap_tol=%s); withholding the optimality certificate and reporting "
                 "iteration_limit (issue #849).",
-                "unassessable" if _cert is None else f"{_cert[0]:.3e}",
-                "unassessable" if _cert is None else f"{_cert[1]:.3e}",
+                "unassessable" if _cert is None else f"{_cert.stationarity_rel:.3e}",
+                "unassessable" if _cert is None else f"{_cert.complementarity_rel:.3e}",
                 gap_tolerance,
             )
             status = "iteration_limit"
             _gap_certified = False
+            _cert = None
+
+    # #1499: the certificate rests on a rigorous first-order bound (an exhibited
+    # point beat the NLP's), so publish THAT bound, and the better point if one was
+    # found -- never f(x) of a point a feasible witness has already beaten.
+    _rigorous_bound_internal: Optional[float] = None
+    if _cert is not None and _cert.bound is not None:
+        _rigorous_bound_internal = float(_cert.bound)
+        if _cert.better_x is not None and _cert.better_obj is not None:
+            logger.info(
+                "Convex NLP: an exhibited feasible point improves on the NLP's "
+                "(internal objective %.6g -> %.6g); adopting it (issue #1499).",
+                float(nlp_result.objective) if nlp_result.objective is not None else np.nan,
+                _cert.better_obj,
+            )
+            _better = np.asarray(_cert.better_x, dtype=np.float64)
+            x_dict = _unpack_solution(model, _better)
+            obj_val = float(_cert.better_obj)
+            if model._objective.sense == ObjectiveSense.MAXIMIZE:
+                obj_val = -obj_val
+            nlp_result.x = _better
+            nlp_result.objective = float(_cert.better_obj)
+            constraint_duals, bound_duals_lower, bound_duals_upper = _duals_against_declared_box(
+                model=model,
+                evaluator=evaluator,
+                x_flat=_better,
+                declared_lb=np.asarray(raw_lb, dtype=float),
+                declared_ub=np.asarray(raw_ub, dtype=float),
+                solved_lb=lb,
+                solved_ub=ub,
+                constraint_duals=constraint_duals,
+                bound_duals_lower=bound_duals_lower,
+                bound_duals_upper=bound_duals_upper,
+            )
 
     # Root-node certification metrics (cert:T0.1). This path has no B&B tree —
     # the single NLP solve at the root box is the whole solve, so the root
     # bound/gap/time equal the reported ones.
     _c_bound = obj_val if status == "optimal" else None
     _c_gap = _optimal_relative_gap(obj_val) if status == "optimal" and obj_val is not None else None
+    if status == "optimal" and _rigorous_bound_internal is not None and obj_val is not None:
+        # Internal space is minimization; map the bound back to the model's sense.
+        _c_bound = (
+            -_rigorous_bound_internal
+            if model._objective.sense == ObjectiveSense.MAXIMIZE
+            else _rigorous_bound_internal
+        )
+        _c_gap = _relative_gap_from_objective_bound(obj_val, _c_bound)
 
     # #815: this single-NLP path reports the solver's returned point as the
     # incumbent. A local NLP that stalls at the time/iteration limit — or, on a

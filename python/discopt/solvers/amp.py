@@ -2362,6 +2362,11 @@ def _solve_amp_impl(
                     "AMP: convex NLP detected; solving with single NLP "
                     "(global optimality guaranteed; partitioning skipped)"
                 )
+                # `certify_convex=True`: the single NLP's `optimal` is published
+                # as a GLOBAL certificate here, so it must pass the same #849/#853
+                # KKT gate and #1499 first-order bound as the default route's
+                # convex fast path. Without it this path certified whatever point
+                # the NLP stopped at (min 1/(x+1) on [0, 1e6]: 8.88e-5 vs 1e-6).
                 result = _solve_continuous(
                     model,
                     time_limit,
@@ -2369,6 +2374,8 @@ def _solve_amp_impl(
                     t_start=t_start,
                     nlp_solver=nlp_solver,
                     initial_point=initial_point_arr,
+                    gap_tolerance=rel_gap,
+                    certify_convex=True,
                 )
                 result.convex_fast_path = True
                 return _finish(result)

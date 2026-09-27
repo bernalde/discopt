@@ -931,9 +931,12 @@ def test_solve_amp_convex_model_delegates_to_continuous_solver(monkeypatch):
         t_start,
         nlp_solver,
         initial_point,
+        gap_tolerance,
+        certify_convex,
     ):
-        del model, time_limit, ipopt_options, t_start, nlp_solver
+        del model, time_limit, ipopt_options, t_start, nlp_solver, gap_tolerance
         captured["initial_point"] = initial_point.copy()
+        captured["certify_convex"] = certify_convex
         return SolveResult(status="optimal", objective=0.0, x={"x": np.array(0.25)})
 
     monkeypatch.setattr(solver_mod, "_solve_continuous", fake_solve_continuous)
@@ -943,6 +946,8 @@ def test_solve_amp_convex_model_delegates_to_continuous_solver(monkeypatch):
     assert result.status == "optimal"
     assert result.convex_fast_path is True
     np.testing.assert_allclose(captured["initial_point"], np.array([1.0]))
+    # #1499: AMP's delegation must run the convex certificate gate, not bypass it.
+    assert captured["certify_convex"] is True
 
 
 @pytest.mark.parametrize(
