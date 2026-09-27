@@ -3490,6 +3490,26 @@ def _polish_preserves_feasibility(evaluator, x_new, x_old, cl_list, cu_list) -> 
     return False
 
 
+def _polish_repairs_rows(evaluator, x_new, x_old, cl_list, cu_list) -> bool:
+    """Does the polished point sit strictly closer to the rows than the incumbent?
+
+    The terminal polish may adopt a point with a slightly WORSE objective only to
+    repair an incumbent that uses up its row tolerance (#1285). This is that test,
+    on the arbiter's own scale (``scaled_violation_ratio``): False when the
+    incumbent violates no row, since then there is nothing to buy.
+    """
+    if cl_list is None or len(cl_list) == 0:
+        return False
+    from discopt._relax.primal_heuristics import scaled_violation_ratio
+
+    cl_arr = np.asarray(cl_list, dtype=np.float64)
+    cu_arr = np.asarray(cu_list, dtype=np.float64)
+    ratio_old = scaled_violation_ratio(evaluator, x_old, cl_arr, cu_arr)
+    if ratio_old <= 0.0:
+        return False
+    return scaled_violation_ratio(evaluator, x_new, cl_arr, cu_arr) < ratio_old
+
+
 def _is_integer_feasible_solution(x, int_offsets, int_sizes, tol=1e-5):
     """Return True if all discrete variables are integral within tolerance."""
     for off, sz in zip(int_offsets, int_sizes):
@@ -18098,6 +18118,23 @@ def solve_model(
                 # completion is a valid MINLP point), so an improving-but-divergent
                 # re-solve can never report a false optimum.
                 _unchanged = abs(_pobj - obj_val) <= 1e-4 * (1.0 + abs(obj_val))
+                # A purification that WORSENS the objective must buy feasibility
+                # with it. #1285 is the case it exists for: an incumbent that
+                # beats the optimum by spending its row tolerance is swapped for
+                # a feasible point 5.1e-5 worse. With no row violation to repair
+                # the trade buys nothing and can cost the certificate: on
+                # ``min acosh(x), x in [1, 3]`` the tree holds x = 1 (objective
+                # 0, closed against the bound) and the polish returns
+                # x = 1 + 1.5e-10 -- a barrier distance off the active bound --
+                # whose objective sqrt(2 * 1.5e-10) = 1.74e-5 sits inside the
+                # 1e-4 window but outside the gap tolerance, so the solve
+                # reported ``feasible`` at a worse point than it had found. The
+                # crossover above cannot recover it: at a sqrt-type kink
+                # ``|df/dx| * d`` (8.7e-6) exceeds its first-order bar by design.
+                if _unchanged and _pobj > obj_val + 1e-12 * (1.0 + abs(obj_val)):
+                    _unchanged = _polish_repairs_rows(
+                        evaluator, _refined, sol_flat, cl_list, cu_list
+                    )
                 # An objective improvement from the re-solve is adopted ONLY for
                 # convex models, where the integer-fixed continuous relaxation is
                 # exact (no spatial-envelope slack) so a KKT completion is a genuine
@@ -19305,7 +19342,7 @@ def _lagrangian_grad(evaluator, x, grad, lam_r, m: int, n: int) -> np.ndarray:
     if m == 0:
         return np.asarray(grad, dtype=np.float64)
     jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64).reshape(m, n)
-    return np.asarray(grad, dtype=np.float64) + jac.T @ lam_r
+    return np.asarray(np.asarray(grad, dtype=np.float64) + jac.T @ lam_r, dtype=np.float64)
 
 
 def _build_pounce_warm_start(evaluator, state: dict):

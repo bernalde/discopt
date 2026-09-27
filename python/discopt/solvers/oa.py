@@ -5648,6 +5648,7 @@ def solve_lp_nlp_bb(
             heuristic_nonconvex=heuristic_nonconvex,
         )
         if x_sol is not None:
+            assert obj is not None  # an accepted NLP point carries its objective
             # An integer-free OA "loop" is a single local NLP solve. That is the
             # global optimum only on a convex model; on a nonconvex one it is a
             # local minimum, and reporting it with ``bound = objective, gap = 0``
@@ -7921,6 +7922,7 @@ def solve_oa(
             heuristic_nonconvex=heuristic_nonconvex,
         )
         if x_sol is not None:
+            assert obj is not None  # an accepted NLP point carries its objective
             LB = float(obj)
             UB = float(obj)
             if certified:
