@@ -736,6 +736,39 @@ pub fn solve_lp_warm_scaled_csc(
     }
 }
 
+/// The first nonbasic, non-fixed, non-free column of a warm-start basis that sits
+/// on an INFINITE side of its box (`AT_UPPER` with `u = +inf`, or `AT_LOWER` with
+/// `l = -inf` while `u` is finite), or `None` (#1510).
+///
+/// Such a column has no vertex value. Both simplex engines read a nonbasic
+/// at-lower column with `l = -inf` as sitting at 0, an interior point it can
+/// leave in either direction, but price it as if it could only increase; an
+/// `AT_UPPER` column with `u = +inf` sits at the 1e20 sentinel. A start that
+/// contains one is not a basis of the LP, and neither warm path may run from it.
+/// Free columns (both sides infinite) keep the engines' free encoding, which is
+/// priced two-sided and solves correctly.
+pub(crate) fn nonbasic_at_infinite_bound(
+    stat: &[i8],
+    l: &[f64],
+    u: &[f64],
+    tol: f64,
+) -> Option<usize> {
+    (0..stat.len()).find(|&j| {
+        if stat[j] == BASIC || u[j] - l[j] <= tol {
+            return false;
+        }
+        let (lo_inf, hi_inf) = (l[j] <= -INF, u[j] >= INF);
+        if lo_inf && hi_inf {
+            return false; // free: the engines' two-sided encoding
+        }
+        if stat[j] == AT_UPPER {
+            hi_inf
+        } else {
+            lo_inf
+        }
+    })
+}
+
 /// A basis factorization prepared once for repeated dual re-optimizations that
 /// differ only in their bounds and right-hand side.
 ///
@@ -765,8 +798,9 @@ pub struct PreparedDual<'a> {
 
 impl<'a> PreparedDual<'a> {
     /// Factorize `start` for the LP `lp` and verify dual feasibility, or `None`
-    /// if the basis is unusable (wrong size, singular, or dual-infeasible) and the
-    /// caller should cold-solve instead. `lp.l`/`lp.u` are the bounds at which the
+    /// if the basis is unusable (wrong size, a nonbasic column at an infinite
+    /// bound, singular, or dual-infeasible) and the caller should cold-solve
+    /// instead. Every refusal increments its own `DualPrepReject*` counter. `lp.l`/`lp.u` are the bounds at which the
     /// basis is dual-feasible (the reference for the precondition check).
     pub fn prepare(
         lp: &LpView<'a>,
@@ -789,6 +823,19 @@ impl<'a> PreparedDual<'a> {
         let stat = start.col_status.clone();
         if stat.len() != n {
             crate::profile::incr(crate::profile::Ctr::DualPrepRejectShape);
+            return None;
+        }
+        // #1510: a nonbasic column must sit at a FINITE bound (or be free). One
+        // parked on an infinite side has no vertex value: the engine reads it at
+        // 0 (or the 1e20 sentinel), a point it can leave in both directions, so
+        // the one-sided reduced-cost test below would accept a dual-infeasible
+        // start and the loop would stop `Optimal` at a non-optimal vertex
+        // (#1492: -0.5 against the true -2.07).
+        if let Some(j) = nonbasic_at_infinite_bound(&stat, l, u, tol) {
+            crate::profile::incr(crate::profile::Ctr::DualPrepRejectInfBound);
+            if dual_trace_enabled() {
+                eprintln!("DUALPREP reject: column {j} nonbasic at an infinite bound");
+            }
             return None;
         }
 
@@ -3494,6 +3541,76 @@ mod tests {
             "obj {} vs {}",
             pert.obj,
             base.obj
+        );
+    }
+
+    /// #1510: `min y s.t. -x/2 - y + w + s = 0` (i.e. `y >= w - x/2`), `s >= 0`,
+    /// with `w` open below. The optimum is `y`'s own lower bound -2.07 (take
+    /// `w <= -2.07 + x/2`). Column order `[x, y, w, s]`.
+    fn open_below_lp(w_ub: f64) -> (SparseCols, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let a = [-0.5, -1.0, 1.0, 1.0];
+        let sp = SparseCols::from_dense(&a, 1, 4);
+        let c = vec![0.0, 1.0, 0.0, 0.0];
+        let l = vec![0.0, -2.07, -INF, 0.0];
+        let u = vec![1.0, 10.0, w_ub, INF];
+        (sp, c, l, u, vec![0.0])
+    }
+
+    /// #1510: a nonbasic column parked at an INFINITE bound (`AT_LOWER` with
+    /// `l = -inf` but `u` finite, or `AT_UPPER` with `u = +inf`) has no vertex
+    /// value — the engine reads it as sitting at 0 (or at the 1e20 sentinel), a
+    /// point from which it can move both ways, yet the dual-feasibility test
+    /// checks only one sign of its reduced cost. `prepare` accepted such a basis
+    /// and the dual simplex returned `Optimal` at a non-optimal vertex (#1492:
+    /// -0.5 vs -2.07).
+    #[test]
+    fn prepare_refuses_a_nonbasic_column_at_an_infinite_bound() {
+        let _guard = crate::profile::test_guard();
+        crate::profile::reset();
+        crate::profile::set_enabled(true);
+        let o = opts();
+        let mut checked = 0;
+        for w_ub in [0.0, 3.0] {
+            let (sp, c, l, u, b) = open_below_lp(w_ub);
+            let cold = solve_lp_cols(sp.clone(), 1, 4, &c, &l, &u, &b, &o);
+            assert_eq!(cold.status, LpStatus::Optimal);
+            assert!((cold.obj + 2.07).abs() < 1e-9, "cold obj {}", cold.obj);
+            // `w` nonbasic AT_LOWER on its -inf side; `s` basic.
+            let bad_lower = Basis {
+                col_status: vec![AT_LOWER, AT_LOWER, AT_LOWER, BASIC],
+                basic_vars: vec![3],
+            };
+            // `s` nonbasic AT_UPPER on its +inf side; `w` basic.
+            let bad_upper = Basis {
+                col_status: vec![AT_LOWER, AT_LOWER, BASIC, AT_UPPER],
+                basic_vars: vec![2],
+            };
+            for (label, start) in [("at -inf", &bad_lower), ("at +inf", &bad_upper)] {
+                assert!(
+                    PreparedDual::prepare_cols(&sp, 1, 4, &c, &l, &u, start, &o).is_none(),
+                    "w_ub={w_ub} {label}: a nonbasic column at an infinite bound must be refused"
+                );
+                // Every warm entry still returns the true optimum (primal/cold
+                // fallback), never the vertex the malformed basis points at.
+                let warm = solve_lp_warm_csc(sp.clone(), 1, 4, &c, &l, &u, &b, Some(start), &o);
+                assert_eq!(warm.status, LpStatus::Optimal, "w_ub={w_ub} {label}");
+                assert!(
+                    (warm.obj + 2.07).abs() < 1e-9,
+                    "w_ub={w_ub} {label}: warm obj {} != -2.07",
+                    warm.obj
+                );
+                checked += 1;
+            }
+        }
+        let rejects = crate::profile::counter(crate::profile::Ctr::DualPrepRejectInfBound);
+        let primal = crate::profile::counter(crate::profile::Ctr::PrimalWarmRejectInfBound);
+        crate::profile::set_enabled(false);
+        assert_eq!(checked, 4);
+        assert!(rejects >= 4, "refusals must be counted, got {rejects}");
+        // The primal warm fallback refuses the same start (then solves cold).
+        assert!(
+            primal >= 4,
+            "primal warm refusals must be counted, got {primal}"
         );
     }
 }

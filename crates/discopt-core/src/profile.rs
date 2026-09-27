@@ -530,6 +530,10 @@ counters!(
     DualPrepRejectShape,
     DualPrepRejectSingular,
     DualPrepRejectDualInf,
+    // #1510: a nonbasic column parked at an INFINITE bound (no vertex value).
+    DualPrepRejectInfBound,
+    // #1510: the primal warm entry (`run_warm`) refusing the same malformed start.
+    PrimalWarmRejectInfBound,
     DualPrepAccept,
     ExpandResetArmed,
     ExpandResetRetries,

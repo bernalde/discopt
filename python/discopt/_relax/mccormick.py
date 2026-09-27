@@ -200,12 +200,49 @@ def relax_div(x, y, x_lb, x_ub, y_lb, y_ub):
 # ---------------------------------------------------------------------------
 
 
+def relax_negative_int_power(x, lb, ub, n):
+    """Sound McCormick relaxation of ``x**n`` for a NEGATIVE integer ``n`` (#1493).
+
+    ``x**n`` (``n < 0``) has a pole at 0, so its curvature is only defined on one
+    side of it: convex on ``(0, inf)``; on ``(-inf, 0)`` convex for even ``n`` and
+    concave for odd ``n``. On a box that touches or straddles 0 no finite secant or
+    tangent is valid (the function is unbounded there), so the envelope carries no
+    information: ``cc = +inf`` and ``cv = -inf`` -- or ``cv = 0`` for even ``n``,
+    where ``x**n > 0``. The legacy callers used to treat every even ``n`` as
+    "convex on all of R" and every odd ``n`` like ``x**3``, which on ``[-3, 3]``
+    made ``x**-2``'s overestimator the secant ``1/9`` -- the same unsound class
+    #1493 removed from ``uniform_relax._pow_curv`` (77b9acc). Returns (cv, cc).
+    """
+    if not n < 0:
+        raise ValueError(f"relax_negative_int_power needs n < 0, got {n!r}")
+    even = n % 2 == 0
+    pole_in_box = (lb <= 0) & (ub >= 0)
+    # Evaluate every branch at pole-free stand-ins so no branch computes 0**n;
+    # ``jnp.where`` then keeps only the branch that applies.
+    safe_lb = jnp.where(pole_in_box, 1.0, lb)
+    safe_ub = jnp.where(pole_in_box, 2.0, ub)
+    safe_x = jnp.where(pole_in_box, 1.5, x)
+
+    def f(t):
+        return t**n
+
+    f_x = f(safe_x)
+    secant = _secant(f, safe_x, safe_lb, safe_ub)
+    convex = (safe_lb > 0) | even
+    cv = jnp.where(convex, f_x, secant)
+    cc = jnp.where(convex, secant, f_x)
+    cv = jnp.where(pole_in_box, 0.0 if even else -jnp.inf, cv)
+    cc = jnp.where(pole_in_box, jnp.inf, cc)
+    return cv, cc
+
+
 def relax_pow(x, lb, ub, n):
     """McCormick relaxation of x^n for integer n on [lb, ub].
 
     Returns (cv, cc).
 
     - n == 1: exact (linear)
+    - n < 0: :func:`relax_negative_int_power` (pole at 0, #1493)
     - n even: x^n is convex -> cv = x^n, cc = secant
     - n odd >= 3: x^n is convex on [0,inf), concave on (-inf,0]
     """
@@ -215,6 +252,8 @@ def relax_pow(x, lb, ub, n):
 
     if n == 1:
         return x, x
+    if n < 0:
+        return relax_negative_int_power(x, lb, ub, n)
 
     if n % 2 == 0:
         # Even power: always convex

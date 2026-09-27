@@ -1136,6 +1136,26 @@ class SolverTuning:
     differential panel (CLAUDE.md §5, ``incorrect_count = 0`` + net-positive)
     before any graduation."""
 
+    pole_branching: bool = field(
+        default_factory=lambda: _env_flag("DISCOPT_POLE_BRANCHING", default=False)
+    )
+    """Branch a node whose bound is unresolved instead of fathoming it
+    (``DISCOPT_POLE_BRANCHING``, default OFF; issue #1493).
+
+    ``min 1/x`` s.t. ``x**2 >= 1`` on ``x in [-3, 3]`` has no bound on the root
+    box (the reciprocal's hull over a range straddling 0 is ``(-inf, inf)``), so
+    the tree used to fathom the root ``bound_unresolved`` and stop uncertified.
+    When on, such a nonconvex node is split spatially -- exactly at the pole when
+    :func:`discopt._relax.poles.objective_pole_loci` locates one inside the box,
+    else by longest-edge bisection -- so each child can see a one-signed
+    denominator and earn a finite bound. Children inherit the parent's
+    (non-finite) bound and keep the global bound unresolved while open; a
+    lineage past ``POLE_MAX_DEPTH`` (24) or a solve past ``POLE_MAX_BRANCHES``
+    (512) takes the legacy unresolved fathom, so a pole the objective genuinely
+    reaches still terminates with no certificate. Search-changing, so default
+    OFF under CLAUDE.md §5; see ``docs/dev/flag-retirement-audit.md`` for its
+    panel and state."""
+
     lp_warmstart: bool = field(
         default_factory=lambda: _env_flag("DISCOPT_LP_WARMSTART", default=True)
     )

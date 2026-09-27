@@ -18,6 +18,7 @@ import jax.numpy as jnp
 from discopt._relax.mccormick import (
     _secant,
     relax_bilinear,
+    relax_negative_int_power,
 )
 
 _TRILINEAR_FACET_CANDIDATES = jnp.array(tuple(combinations(range(8), 4)), dtype=jnp.int32)
@@ -315,9 +316,16 @@ def relax_power_int(x, lb, ub, p):
         ub: upper bound
         p: positive integer exponent
 
+    A NEGATIVE ``p`` (the compiler routes every integral constant exponent here)
+    has a pole at 0 and is delegated to
+    :func:`~discopt._relax.mccormick.relax_negative_int_power`: the even/odd
+    cases above hold only for ``p > 0`` (#1493).
+
     Returns:
         (cv, cc) where cv <= x^p <= cc
     """
+    if p < 0:
+        return relax_negative_int_power(x, lb, ub, p)
 
     def f(t):
         return t**p
