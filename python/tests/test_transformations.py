@@ -427,3 +427,112 @@ def test_apply_to_detects_a_pass_that_only_changes_coefficients(monkeypatch):
     dt.apply_to("test.rescale", m)
     assert dt.model_fingerprint(m) != before
     assert "_source_nl_path" not in m.__dict__
+
+
+# ── #1498: rebuilding passes keep the model's validation guards ──────────
+
+
+def _piecewise_sos2_model():
+    m = dm.Model("s")
+    x = m.continuous("x", lb=0, ub=4)
+    m.piecewise(x, [0, 1, 2, 4], [0, 3, 1, 5], method="sos2", name="y")
+    m.maximize(x)
+    return m
+
+
+def _widen_x(model, ub=6.0):
+    next(v for v in model._variables if v.name == "x").ub = ub
+
+
+@pytest.mark.parametrize("name", ["gdp", "gdp.bigm", "gdp.hull", "gdp.auto"])
+def test_gdp_copy_of_a_piecewise_model_still_refuses_a_widened_bound(name):
+    """Pre-#1498 the lowered copy had no ``_piecewise_domains`` and solved a
+    widened ``x <= 6`` to 4.0, the breakpoint span, instead of refusing."""
+    from discopt.modeling._piecewise import PiecewiseDomainError
+
+    m = _piecewise_sos2_model()
+    out = dt.create_using(name, m)
+    assert out is not m
+    assert len(out._piecewise_domains) == len(m._piecewise_domains) == 1
+    _widen_x(out)
+    with pytest.raises(PiecewiseDomainError):
+        out.validate()
+
+
+def test_apply_to_keeps_the_piecewise_guard():
+    from discopt.modeling._piecewise import PiecewiseDomainError
+
+    m = _piecewise_sos2_model()
+    dt.apply_to("gdp", m)
+    assert not any(type(c).__name__ == "_SOSConstraint" for c in m._constraints)
+    _widen_x(m)
+    with pytest.raises(PiecewiseDomainError):
+        m.validate()
+
+
+def _guarded_model(nonlinear: bool):
+    """A model carrying one piecewise domain (and, if nonlinear, one atan2
+    precondition) plus the structure each rebuilding pass acts on."""
+    m = dm.Model("g")
+    x = m.continuous("x", lb=0, ub=4)
+    a = m.integer("a", lb=0, ub=5)
+    c = m.integer("c", lb=0, ub=5)
+    b = m.binary("b")
+    d = m.binary("d")
+    f = m.binary("f")
+    y = m.piecewise(x, [0, 1, 2, 4], [0, 3, 1, 5], method="sos2", name="y")
+    m.subject_to(b * d * f <= 0.5)
+    if nonlinear:
+        q = m.continuous("q", lb=0.5, ub=3)
+        r = m.continuous("r", lb=-2, ub=2)
+        m.subject_to(dm.atan2(r, q) <= 1.0)
+        m.subject_to(a * c <= 10)
+        e = m.continuous("e", lb=0.1, ub=2)
+        m.subject_to(x / q + e * dm.log(e) <= 20)
+        assert len(m._atan2_preconditions) == 1
+    m.minimize(-y - x + a + c)
+    assert len(m._piecewise_domains) == 1
+    return m
+
+
+def _assert_guards_carried(src, out, label):
+    assert out is not src, f"{label} did not rebuild the model; the probe is void"
+    for attr in ("_atan2_preconditions", "_piecewise_domains"):
+        want = [id(t) for t in getattr(src, attr)]
+        assert [id(t) for t in getattr(out, attr)] == want, (label, attr)
+
+
+def test_every_rebuilding_pass_carries_atan2_and_piecewise_guards():
+    """Each pass that rebuilds a model into a fresh ``Model`` must forward both
+    guard lists (#1498). Every pass must actually rebuild here, or the probe
+    would pass vacuously (CLAUDE.md §6)."""
+    from discopt._relax.factorable_reform import canonicalize_entropy, factorable_reformulate
+
+    fired = 0
+    m = _guarded_model(nonlinear=True)
+    for name in ("gdp", "integer.bilinear", "integer.multilinear"):
+        _assert_guards_carried(m, dt.get(name).apply(m), name)
+        fired += 1
+    for fn in (factorable_reformulate, canonicalize_entropy):
+        _assert_guards_carried(m, fn(m), fn.__name__)
+        fired += 1
+    # binary.multilinear only fires on a pure MILP without SOS records: lower first.
+    milp = dt.get("gdp").apply(_guarded_model(nonlinear=False))
+    _assert_guards_carried(milp, dt.get("binary.multilinear").apply(milp), "binary.multilinear")
+    fired += 1
+    assert fired == 6
+
+
+def test_a_pass_that_drops_a_guard_is_refused(monkeypatch):
+    def rebuild_without_guards(model):
+        out = dm.Model(model.name)
+        out._variables = list(model._variables)
+        out._rebuild_name_index()
+        out._constraints = list(model._constraints)
+        out._objective = model._objective
+        return out
+
+    t = dt.Transformation("test.drop", rebuild_without_guards, "functional", "drops guards")
+    monkeypatch.setitem(dt._REGISTRY, "test.drop", t)
+    with pytest.raises(RuntimeError, match="_piecewise_domains"):
+        dt.create_using("test.drop", _piecewise_sos2_model())

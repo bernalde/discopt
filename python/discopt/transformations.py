@@ -67,7 +67,7 @@ from typing import Any, Callable, Literal, Mapping, Optional, Union
 
 import numpy as np
 
-from discopt.modeling.core import Model, Parameter, Variable
+from discopt.modeling.core import Model, Parameter, Variable, missing_validation_guards
 
 __all__ = [
     "ModelDiff",
@@ -157,6 +157,17 @@ class Transformation:
                 f"transformation {self.name!r} is registered functional but its "
                 f"function returned {type(out).__name__}, not a Model"
             )
+        if out is not model:
+            # A rebuilt model that lost a validation guard (an atan2 sign
+            # precondition, a piecewise domain) turns a later bound widening
+            # from a refusal into a silent clamp (#1498). Refuse the result.
+            missing = missing_validation_guards(model, out)
+            if missing:
+                raise RuntimeError(
+                    f"transformation {self.name!r} returned a model without the "
+                    f"validation guards {missing} of its input; the pass must "
+                    f"forward them with discopt.modeling.core.carry_validation_guards"
+                )
         return out
 
     def apply_to(self, model: Model, **options: Any) -> Model:

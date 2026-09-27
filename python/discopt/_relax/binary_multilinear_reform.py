@@ -117,6 +117,7 @@ from discopt.modeling.core import (
     UnaryOp,
     Variable,
     VarType,
+    carry_validation_guards,
 )
 from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
 
@@ -1162,6 +1163,7 @@ def _reformulate(model: Model) -> Model:
     # relation set forwards intact. This forwarding is what replaced the
     # ``_complementarities`` clause of ``_model_carries_unsupported_state``.
     carry_complementarities(model, new_model, pass_name="binary-multilinear linearization")
+    carry_validation_guards(model, new_model)  # #1498
     return new_model
 
 

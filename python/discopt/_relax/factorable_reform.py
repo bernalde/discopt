@@ -57,6 +57,7 @@ from discopt.modeling.core import (
     UnaryOp,
     Variable,
     VarType,
+    carry_validation_guards,
 )
 from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
 
@@ -1614,6 +1615,7 @@ def canonicalize_entropy(model: Model) -> Model:
         # rebuilt model. An unresolvable relation raises past the defensive
         # handler rather than degrading to a silent drop.
         carry_complementarities(model, new_model, pass_name="entropy canonicalization")
+        carry_validation_guards(model, new_model)  # #1498
         return new_model
     except ComplementarityProvenanceError:
         raise
@@ -1746,6 +1748,7 @@ def _factorable_reformulate_inner(
         # *bodies*; the relation's source operands are untouched and still read
         # the shared Variable objects, so the relation set forwards intact.
         carry_complementarities(model, new_model, pass_name="factorable reformulation")
+        carry_validation_guards(model, new_model)  # #1498
         return new_model
     except ComplementarityProvenanceError:
         raise

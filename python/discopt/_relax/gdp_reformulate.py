@@ -56,6 +56,7 @@ from discopt.modeling.core import (
     _semantics_supported_by,
     _SOSConstraint,
     _wrap,
+    carry_validation_guards,
 )
 from discopt.mpec import carry_complementarities
 
@@ -267,6 +268,7 @@ def reformulate_gdp(
     # ``_complementarities`` and was dropped here, leaving the pair name baked
     # into generated identifiers as the sole surviving trace. Forward it.
     carry_complementarities(model, new_model, pass_name="gdp lowering")
+    carry_validation_guards(model, new_model)  # #1498
 
     return new_model
 

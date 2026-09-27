@@ -4903,6 +4903,55 @@ def _is_fast_linear_quadratic_family(model) -> bool:
 # these to ``None`` on the copy and omits every other ``*_cache`` attribute (#1479).
 _MODEL_INIT_CACHES = frozenset({"_flat_var_offsets_cache"})
 
+#: Model-level *validation guards*: lists of assumptions a construction-time
+#: rewrite relied on, re-checked by :meth:`Model.validate` before every solve
+#: because variable bounds are mutable afterwards. ``_atan2_preconditions`` holds
+#: the sign an ``atan2`` rewrite assumed; ``_piecewise_domains`` the breakpoint
+#: span a ``piecewise`` lowering clamps its input to. Each record references the
+#: model's own ``Variable`` objects. A pass that rebuilds a model into a fresh
+#: ``Model`` must forward them with :func:`carry_validation_guards` -- the rows the
+#: guard protects are forwarded with it, so dropping the guard turns a later bound
+#: widening from a refusal into a silent clamp (#1498).
+VALIDATION_GUARD_ATTRS: tuple[str, ...] = ("_atan2_preconditions", "_piecewise_domains")
+
+
+def carry_validation_guards(src: "Model", dst: "Model") -> None:
+    """Forward ``src``'s validation guards onto ``dst``, a model rebuilt from it.
+
+    The same record objects are appended (identity-deduplicated), so carrying
+    twice, or through any number of passes, is idempotent and
+    :func:`missing_validation_guards` can check by identity.
+    """
+    for attr in VALIDATION_GUARD_ATTRS:
+        records = getattr(src, attr, None) or []
+        if not records:
+            continue
+        held = getattr(dst, attr, None)
+        if held is None:
+            held = []
+            setattr(dst, attr, held)
+        seen = {id(r) for r in held}
+        for r in records:
+            if id(r) not in seen:
+                held.append(r)
+                seen.add(id(r))
+
+
+def missing_validation_guards(src: "Model", dst: "Model") -> list[str]:
+    """``attr: label`` of every guard of ``src`` that ``dst`` does not hold.
+
+    Compared by record identity, which is what :func:`carry_validation_guards`
+    preserves (and what a guard's expression -- whose ``==`` builds a constraint
+    -- forces).
+    """
+    missing = []
+    for attr in VALIDATION_GUARD_ATTRS:
+        held = {id(r) for r in (getattr(dst, attr, None) or [])}
+        for r in getattr(src, attr, None) or []:
+            if id(r) not in held:
+                missing.append(f"{attr}: {r[-1]}")
+    return missing
+
 
 class Model:
     """

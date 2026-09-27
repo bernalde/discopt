@@ -49,6 +49,7 @@ from discopt.modeling.core import (
     Model,
     Variable,
     VarType,
+    carry_validation_guards,
 )
 from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
 from discopt.solver_tuning import _env_flag
@@ -918,6 +919,7 @@ def expand_integer_products(model: Model, implied=frozenset(), multilinear: bool
         # against it — forward the relation set explicitly rather than dropping
         # it, and let an unresolvable one raise past the defensive handler below.
         carry_complementarities(model, new_model, pass_name="integer-product expansion")
+        carry_validation_guards(model, new_model)  # #1498
         return new_model
     except ComplementarityProvenanceError:
         # Never swallowed into "returned the model unchanged": a dropped relation
