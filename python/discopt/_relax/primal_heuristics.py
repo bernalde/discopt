@@ -843,8 +843,18 @@ def row_term_scale(evaluator: NLPEvaluator, x: np.ndarray) -> np.ndarray:
 def _scale_from_jacobian(jac, x: np.ndarray) -> np.ndarray:
     """:func:`row_term_scale` from a Jacobian already in hand — the tolerance needs
     the row scale AND the row gradient norm, and evaluating the Jacobian twice for
-    them is pure waste."""
+    them is pure waste.
+
+    Non-finite Jacobian entries contribute NOTHING (#1491). The tape reports the
+    honest ``inf``/``NaN`` slope at a ``sqrt`` edge, and ``inf * |x_j|`` is ``NaN``
+    at ``x_j = 0`` -- which made every comparison against the tolerance False and
+    rejected a point 7e-8 from ``t <= sqrt(x)`` as infeasible -- and ``inf`` for
+    ``x_j != 0``, which would make the tolerance infinite and accept ANY violation.
+    Dropping the entry keeps the scale finite and only ever *shrinks* this
+    loosening term, so the test can never become more permissive through it.
+    """
     jac = np.abs(np.asarray(jac, dtype=np.float64))
+    jac = np.where(np.isfinite(jac), jac, 0.0)
     return jac @ np.abs(np.asarray(x, dtype=np.float64))
 
 

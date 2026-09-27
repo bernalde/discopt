@@ -66,7 +66,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from discopt._nl_expr_compiler import _FLATTEN_MIN_TERMS
+from discopt._nl_expr_compiler import _FLATTEN_MIN_TERMS, _pow, _sqrt
 from discopt.export._common import has_builder_only_constraint_rows
 
 # Opcodes -- must track `crates/discopt-python/src/expr_bindings.rs::tape_program`.
@@ -97,6 +97,8 @@ OP_FUNC_BASE = 20
 # it. Indices past the end (Acos, Tanh, Erf, ...) are simply not lowered here --
 # `.get()` returns None and the model falls back to the Python DAG path.
 _FUNC_LOG2 = 2
+#: ``Sqrt`` is lowered through ``_nl_expr_compiler._sqrt``, not the bare method.
+_FUNC_SQRT = 4
 
 _FUNC_METHOD = {
     0: "exp",
@@ -289,6 +291,10 @@ def lower(prog: _Program, roots: list[int], E: Any) -> list:
                 # paths must build the same tape: `log(a) * (1/ln 2)`.
                 cache[i] = E.log(arg) * E.const_(1.0 / math.log(2.0))
                 continue
+            if fidx == _FUNC_SQRT:
+                # Same edge-honest form as `_nl_expr_compiler._sqrt` (#1491).
+                cache[i] = _sqrt(E, arg)
+                continue
             method = _FUNC_METHOD.get(fidx)
             if method is None:
                 continue
@@ -307,7 +313,7 @@ def lower(prog: _Program, roots: list[int], E: Any) -> list:
         elif o == OP_DIV:
             cache[i] = lhs / rhs
         elif o == OP_POW:
-            cache[i] = lhs**rhs
+            cache[i] = _pow(E, lhs, rhs)
 
     return cache
 

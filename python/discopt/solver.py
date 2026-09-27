@@ -18855,8 +18855,15 @@ def _convex_nlp_certificate_gap(
     )
 
     grad = np.asarray(evaluator.evaluate_gradient(x), dtype=np.float64)
+    if not np.all(np.isfinite(grad)):
+        # #1491: an infinite/undefined objective slope at x (sqrt at 0) means x is
+        # not a KKT point; a residual computed from it (inf/inf) is meaningless and
+        # could read as ~0. Not assessable -> not certified.
+        return None
     if m > 0:
         jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64).reshape(m, n)
+        if not np.all(np.isfinite(jac)):
+            return None  # #1491, as for the gradient above
         jtlam = jac.T @ lam
         cons = np.asarray(evaluator.evaluate_constraints(x), dtype=np.float64)
         jac_row_inf = np.max(np.abs(jac), axis=1) if jac.size else np.zeros(m)

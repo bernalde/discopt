@@ -538,7 +538,9 @@ def _lower_uncached(
         if op == "/":
             return cast(np.ndarray, left / right)
         if op == "**":
-            return cast(np.ndarray, left**right)
+            # Elementwise through `_pow` rather than `left**right`, so a constant
+            # 0.5 exponent gets `_sqrt`'s honest edge derivative (#1491).
+            return _map(lambda a, b: _pow(E, a, b), left, right)
         raise UnsupportedForTape(f"binary operator {op!r}")
 
     if isinstance(expr, UnaryOp):
@@ -761,6 +763,68 @@ def _abs(E: Any, a: Any) -> Any:
     return E.max(a, -a)
 
 
+#: Exponent of the ``a <= 0`` branch of :func:`_sqrt`: the largest double below
+#: ``0.5``. Any ``p`` in ``(0, 1)`` gives the honest edge behaviour there -- value
+#: ``0`` at ``a == 0`` and ``NaN`` for ``a < 0`` (the same as ``sqrt``), derivative
+#: ``p * 0**(p-1) = +inf`` -- but it must NOT be the literal ``0.5``, which POUNCE
+#: canonicalises onto its ``sqrt`` rule (measured, pounce 0.12.0: ``x ** 0.5``
+#: at 0 has gradient ``0``, ``x ** (0.25 + 0.25)`` has ``inf``).
+_SQRT_EDGE_EXPONENT = math.nextafter(0.5, 0.0)
+
+
+def _sqrt(E: Any, a: Any) -> Any:
+    """``sqrt(a)`` with an honest derivative at the domain edge (#1491).
+
+    POUNCE's ``sqrt`` derivative rule returns ``0`` wherever ``a <= 0`` (and so does
+    ``a ** 0.5``, which it canonicalises onto the same rule), while the true one-sided
+    slope at ``a == 0`` is ``+inf`` and there is no derivative at all for ``a < 0``.
+    Every consumer that linearises -- objective/constraint OA, separation tangents,
+    convex-kernel gradients -- then saw ``sqrt`` as *flat* at 0 and emitted a
+    "supporting hyperplane" that cut off the optimum: ``max sqrt(x) - 0.3x`` over
+    integer ``x in [0, 10]`` certified ``0`` at ``x = 0`` against a true ``0.832``.
+
+    ``select`` routes value and derivatives through the active branch only, so where
+    ``a > 0`` this is ``E.sqrt(a)`` exactly -- value, gradient, Jacobian and Hessian
+    were verified bit-identical, with identical Jacobian/Hessian structure, over
+    6000 random points on three argument shapes (#1491 entry experiment). Only
+    ``a <= 0`` (and a ``NaN`` argument) changes: the derivative becomes ``+inf`` times
+    the inner gradient (``NaN`` where that product is ``0 * inf``, e.g.
+    ``sqrt(x**2)`` at 0, which has no derivative either), matching the legacy JAX
+    evaluator instead of a silent finite ``0``.
+
+    ``dm.norm(.., 2)`` keeps the plain ``E.sqrt`` (see :func:`_lower_norm`): a norm is
+    convex and ``0`` IS a valid subgradient of it at the origin.
+    """
+    return E.select(
+        E.compare(">", a, E.const_(0.0)),
+        E.sqrt(a),
+        a ** E.const_(_SQRT_EDGE_EXPONENT),
+    )
+
+
+def _is_constant_half(node: Any) -> bool:
+    """Is ``node`` a variable-free tape node whose value is exactly ``0.5``?"""
+    try:
+        if node.variables():
+            return False
+    except AttributeError:
+        return False
+    return float(node.eval([])) == 0.5
+
+
+def _pow(E: Any, base: Any, exponent: Any) -> Any:
+    """``base ** exponent``, routing a constant ``0.5`` exponent through :func:`_sqrt`.
+
+    ``x ** 0.5`` is the same function as ``sqrt(x)`` and POUNCE gives it the same
+    flat-at-zero derivative, so it needs the same edge handling (#1491). Every other
+    exponent keeps the tape's general power rule, which is already honest at the
+    edge (``x ** 0.3`` at 0 has gradient ``inf``).
+    """
+    if _is_constant_half(exponent):
+        return _sqrt(E, base)
+    return base**exponent
+
+
 #: Argument floor for ``entropy``/``centropy``, matching `_relax/dag_compiler.py`
 #: (``jnp.maximum(x, 1e-300)``). It regularizes the ``x -> 0+`` limit: the true
 #: derivative of ``x*log(x)`` at 0 is ``-inf``, and both backends deliberately
@@ -967,7 +1031,6 @@ def _lower_function(expr: FunctionCall, E: Any, args: list, budget: _Budget) -> 
         "exp",
         "log",
         "log10",
-        "sqrt",
         "sin",
         "cos",
         "tan",
@@ -982,6 +1045,10 @@ def _lower_function(expr: FunctionCall, E: Any, args: list, budget: _Budget) -> 
         "atanh",
         "erf",
     }
+    if name == "sqrt":
+        # Not the native opcode directly: see `_sqrt` (#1491).
+        _require(args, 1, name)
+        return _map(lambda a: _sqrt(E, a), arg0())
     if name in native_unary:
         _require(args, 1, name)
         return _map(getattr(E, name), arg0())
@@ -1119,7 +1186,7 @@ def _lower_function(expr: FunctionCall, E: Any, args: list, budget: _Budget) -> 
     if name == "signpower":
         # sign(x) * |x|**p -- the standard smooth-away-from-zero signed power.
         _require(args, 2, name)
-        return _map(lambda a, p: _sign(E, a) * (_abs(E, a) ** p), args[0], args[1])
+        return _map(lambda a, p: _sign(E, a) * _pow(E, _abs(E, a), p), args[0], args[1])
     if name == "prod":
         # NOT a variadic multiply. `dag_compiler` compiles prod as `jnp.prod(arg)`
         # -- ONE argument, which is an ARRAY, reduced to a scalar. Lowering it as
@@ -1206,8 +1273,8 @@ def _lower_norm(name: str, E: Any, arr: np.ndarray) -> Any:
         return E.sqrt(E.sum(_map(lambda a: a * a, absolutes).tolist()))
     # `sum(|x_i|**p) ** (1/p)`. Built from |x| rather than x so a non-integer p
     # never raises a negative base to a fractional power.
-    powered = _map(lambda a: a ** E.const_(ord_p), absolutes)
-    return E.sum(powered.tolist()) ** E.const_(1.0 / ord_p)
+    powered = _map(lambda a: _pow(E, a, E.const_(ord_p)), absolutes)
+    return _pow(E, E.sum(powered.tolist()), E.const_(1.0 / ord_p))
 
 
 def _require(args: list, n: int, name: str) -> None:

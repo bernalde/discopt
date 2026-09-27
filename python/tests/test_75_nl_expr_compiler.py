@@ -99,6 +99,9 @@ REWRITE_CASES = {
     "entropy": lambda x, y: FunctionCall("entropy", x) + y,
     "centropy": lambda x, y: FunctionCall("centropy", x, y),
     "signpower": lambda x, y: FunctionCall("signpower", x, Constant(3.0)) + y,
+    # #1491: `sqrt` (and `** 0.5`) lower through an edge-honest `select`; away
+    # from the edge it must agree with JAX exactly like the native opcode did.
+    "sqrt": lambda x, y: dm.sqrt(x * y) + x**0.5 + FunctionCall("signpower", x - y, Constant(0.5)),
 }
 CASES.update(REWRITE_CASES)
 

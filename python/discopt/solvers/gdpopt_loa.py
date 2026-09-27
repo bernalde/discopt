@@ -649,9 +649,11 @@ def _add_oa_cuts(
     # Objective OA cut (only if nonlinear)
     if not obj_is_linear and objective_is_convex:
         obj_cut = generate_objective_oa_cut(evaluator, x_star, n_vars + 1, z_index=n_vars)
-        # This cut is: coeffs @ x <= rhs (underestimates the objective)
-        oa_A_rows.append(obj_cut.coeffs.copy())
-        oa_b_rows.append(obj_cut.rhs)
+        # `None`: no finite tangent at x_star (e.g. sqrt at 0) -- add no row (#1491).
+        if obj_cut is not None:
+            # This cut is: coeffs @ x <= rhs (underestimates the objective)
+            oa_A_rows.append(obj_cut.coeffs.copy())
+            oa_b_rows.append(obj_cut.rhs)
 
 
 def _int_config_key(x_master, int_indices) -> tuple[int, ...]:

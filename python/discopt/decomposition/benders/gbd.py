@@ -194,6 +194,9 @@ def _box_min_linear(
     total = 0.0
     for j in cols:
         gj = float(grad[j])
+        if not np.isfinite(gj):
+            # #1491: an infinite/undefined slope gives no first-order bound.
+            return 0.0, False
         if abs(gj) < _STATIONARY_TOL:  # stationary component: no contribution
             continue
         target = lb[j] if gj > 0 else ub[j]
@@ -515,6 +518,11 @@ def solve_gbd(
             # the box is a superset of the feasible set. The cut is just weaker.
             grad_lag = grad
             l0 = v
+        if not (np.isfinite(l0) and np.all(np.isfinite(grad_lag))):
+            # #1491: no Lagrangian subgradient cut exists at a point of infinite or
+            # undefined slope (sqrt at 0). Treat it like a failed recourse: x̂ is
+            # not excluded and the bound is withheld, never cut from a NaN/inf row.
+            return _Recourse("fail", rigorous=False)
         s = grad_lag[mcols]
 
         # m_y = min over the recourse box of grad_y L^T (y - y*) (closed form).
