@@ -151,16 +151,18 @@ def test_l3_sum_over_expression_renders_as_sum():
     s = m.set("s", [0, 1, 2])
     y = m.continuous("y", over=s, lb=0)
     tex = expr_to_latex(dm.sum(y[i] for i in s))
-    assert r"\sum" in tex  # a real summation, not the raw `Σ[3 terms]` repr
+    # A real summation, not the raw `Σ[3 terms]` repr -- recovered symbolically
+    # because every term is y at the running index.
     assert "Σ" not in tex
-    assert "y_{0}" in tex and "y_{2}" in tex
+    assert tex == r"\sum_{i=0}^{2} y_{i}"
 
 
 def test_l3_parameter_renders_as_escaped_symbol():
     m = dm.Model("l3param")
     price = m.parameter("price_A", value=50.0)
     tex = expr_to_latex(price)
-    assert tex == r"price\_A"  # escaped underscore, not the `param(price_A)` repr
+    # A typeset symbol (the underscore is a subscript), not the `param(price_A)` repr
+    assert tex == r"\mathit{price}_{A}"
     assert "param(" not in tex
 
 
@@ -168,7 +170,7 @@ def test_l3_parameter_renders_as_escaped_symbol():
 def test_l4_negation_parenthesised_under_power():
     m = dm.Model("l4neg")
     x = m.continuous("x", lb=-5, ub=5)
-    assert expr_to_latex((-x) ** 2) == r"\left(-x\right)^{2}"
+    assert expr_to_latex((-x) ** 2) == r"(-x)^{2}"
 
 
 def test_l4_sum_parenthesised_under_power():
