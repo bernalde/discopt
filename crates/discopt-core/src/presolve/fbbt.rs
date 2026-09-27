@@ -41,8 +41,18 @@ pub const FEAS_TOL: f64 = 1e-6;
 /// obtained here for *every* even power: the sum node's backward step already
 /// yields their `q_j` (Lemma 1), and only the hole was missing.
 ///
-/// Bound-changing, so default-OFF until the corpus differential panel of
-/// CLAUDE.md §5 passes; row in `docs/dev/flag-retirement-audit.md`. Read once.
+/// Bound-changing (CLAUDE.md §5). Panel run 2026-09-27
+/// (`discopt_benchmarks/scripts/even_pow_hole_panel.py`): **cert-clean** on all
+/// 66 in-repo corpus instances and 5 unit-square point-dispersion models, 0
+/// violations. **Net-positive only on the min-distance class**: the corpus has
+/// no minimum-distance constraints, and there the rule never fires, so node counts
+/// are identical. On dispersion it fires (disp3 247 -> 85 nodes, disp4 311 -> 181),
+/// but those are generated probes, not a corpus. **Not the default because** its
+/// net-positive bar has only been scored on synthetic instances (the #727
+/// lesson). **What would change that:** the same panel over the MINLPLib
+/// instances with minimum-distance constraints (Hojny & Liberti's 46-instance
+/// set), graduating on a gain there, retiring on none. Row in
+/// `docs/dev/flag-retirement-audit.md`. Read once.
 pub(crate) fn even_pow_hole_enabled() -> bool {
     #[cfg(test)]
     if let Some(v) = EVEN_POW_HOLE_OVERRIDE.with(|c| c.get()) {
