@@ -5630,6 +5630,64 @@ def _gap_values_converged(
     return abs_gap / denom <= gap_tolerance
 
 
+#: The Rust spatial brancher's ``SPATIAL_MIN_WIDTH`` (``branching.rs``) doubled, so
+#: :func:`_may_be_tight_fathomed` errs toward "may be fathomed" (#1492).
+_TIGHT_FATHOM_REL_WIDTH = 2e-6
+#: ``INTEGRALITY_TOL`` of the Rust ``is_integer_feasible`` (``branching.rs``).
+_TREE_INTEGRALITY_TOL = 1e-5
+
+
+def _may_be_tight_fathomed(
+    node_lb: np.ndarray,
+    node_ub: np.ndarray,
+    sol: np.ndarray,
+    is_feasible: bool,
+    global_lb: np.ndarray,
+    global_ub: np.ndarray,
+    int_mask: np.ndarray,
+    spatial_int_cols: np.ndarray,
+) -> bool:
+    """Whether the Rust tree may fathom this node as a TIGHT box (#1492).
+
+    In nonconvex mode ``process_evaluated`` fathoms an integer-feasible node when no
+    dimension is branchable any more -- every continuous column narrower than
+    ``SPATIAL_MIN_WIDTH`` (1e-6) of its root width, every spatial-integer column
+    narrower than 1. Since #1510 the tree floors its dual bound at such a node's
+    bound (a width of 1e-6 makes the relaxation gap negligible only for a
+    Lipschitz objective: ``asin`` at ``-1`` still moves by ``sqrt(2e-6)``), so this
+    predicate carries no soundness weight. It only picks the nodes whose
+    relaxation point and gradient-descent vertex are offered as incumbents before
+    the region is closed for good -- which is what lets that floor close against
+    the edge optimum and the solve still certify.
+
+    A conservative mirror of the Rust test: every condition is checked with the
+    same or a looser threshold, so any node the tree can fathom this way reads
+    True here; a spurious True only costs a verified-feasible incumbent candidate.
+    Unbounded dimensions are treated as tight -- the tree marks those unresolved
+    itself.
+    """
+    if not is_feasible:
+        x = np.asarray(sol, dtype=np.float64)
+        xi = x[int_mask]
+        frac = xi - np.floor(xi)
+        # NaN compares False here, as it does in the Rust test (reads integral).
+        if np.any((frac > _TREE_INTEGRALITY_TOL) & (frac < 1.0 - _TREE_INTEGRALITY_TOL)):
+            return False  # the tree integer-branches instead
+    w = np.asarray(node_ub, dtype=np.float64) - np.asarray(node_lb, dtype=np.float64)
+    gw = np.asarray(global_ub, dtype=np.float64) - np.asarray(global_lb, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = w / gw
+    cont = (~int_mask) & (gw >= 1e-15) & np.isfinite(rel)
+    if np.any(rel[cont] >= _TIGHT_FATHOM_REL_WIDTH):
+        return False  # a continuous column is still bisected
+    if spatial_int_cols.size:
+        s = spatial_int_cols
+        s_branch = (w[s] >= 1.0 - 1e-9) & (gw[s] >= 1e-15) & np.isfinite(rel[s])
+        if np.any(s_branch):
+            return False  # a spatial-integer column is still partitioned
+    return True
+
+
 def _objective_at_reported_point(
     x: np.ndarray,
     c: np.ndarray,
@@ -6588,6 +6646,17 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
     from discopt.modeling.core import FunctionCall, UnaryOp
 
     _nonsmooth_funcs = {"abs", "min", "max"}
+    # ``norm1`` / ``norminf`` of a VECTOR are sum|x_i| / max|x_i| -- the same
+    # abs/max kinks, along whole hyperplanes, and the relaxation layer spells them
+    # out through those exact envelopes (#1493: the convex single NLP stalled on
+    # ``min norm(v, inf)`` at 0.545 against the optimum 0.5 and, without this,
+    # never fell back to the B&B that certifies it). A >=2-D argument is a MATRIX
+    # norm with no relaxation, where the B&B could only discard the NLP's point,
+    # and a p-norm with 1 < p < inf is smooth away from the origin: both stay on
+    # the NLP.
+    _nonsmooth_vector_norms = {"norm1", "norm1.0", "norminf"}
+    from discopt._relax.scalarize import static_shape
+
     # Expressions are DAGs; without this a shared subexpression is walked once
     # per path, which is exponential in the sharing depth.
     seen: set[int] = set()
@@ -6599,6 +6668,14 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
         if isinstance(expr, UnaryOp) and expr.op == "abs":
             return True
         if isinstance(expr, FunctionCall) and expr.func_name in _nonsmooth_funcs:
+            return True
+        if (
+            isinstance(expr, FunctionCall)
+            and expr.func_name in _nonsmooth_vector_norms
+            and len(expr.args) == 1
+            and (shape := static_shape(expr.args[0])) is not None
+            and len(shape) <= 1
+        ):
             return True
         left = getattr(expr, "left", None)
         if left is not None and _walk(left):
@@ -11252,38 +11329,39 @@ def solve_model(
     # converges (nlp_001: 237 nodes -> 1). Surgical: only this rule runs here, so
     # variables the relaxation already handles analytically (e.g. x*exp(x) over a
     # free x) are left untouched. Sound: the reduction only shrinks the box.
-    try:
-        from discopt._relax.nonlinear_bound_tightening import (
-            FunctionDomainBoundRule,
-            PeriodicVariableBoundRule,
-            tighten_nonlinear_bounds,
-        )
+    # #1497 (solve-time): no catch-all. The rules decline by returning an
+    # untightened box (and the budget can only decline to START the periodic
+    # rule), so an exception here is a defect in a bound reduction and must fail
+    # the solve rather than be logged at DEBUG and skipped.
+    from discopt._relax.nonlinear_bound_tightening import (
+        FunctionDomainBoundRule,
+        PeriodicVariableBoundRule,
+        tighten_nonlinear_bounds,
+    )
 
-        # Two domain/period reductions that hand the spatial+NLP paths a valid
-        # box on otherwise-free nonlinear variables: restrict sin/cos-only angles
-        # to one period, and clamp log/sqrt arguments to their natural domain so
-        # the local NLP never wanders into the undefined region (issue #265's
-        # false-infeasible from a free log argument).
-        # Budgeted like the other root-setup passes (#875): both rules walk every
-        # constraint body, and this runs before a single node exists.
-        # ``PeriodicVariableBoundRule`` is not row-anytime (its conclusion rests on a
-        # variable being absent elsewhere), so the budget can only decline to start
-        # it — never truncate it — which is exactly what keeps the reduction sound.
-        _per_budget_s = min(min(max(0.05 * float(time_limit), 1.0), 10.0), _remaining_budget())
-        _per_lb, _per_ub, _per_stats = tighten_nonlinear_bounds(
-            model,
-            _origin_lb_chk,
-            _origin_ub_chk,
-            rules=(PeriodicVariableBoundRule(), FunctionDomainBoundRule()),
-            deadline=_role2_deadline(time.perf_counter() + _per_budget_s),
-        )
-        if _per_stats.n_tightened > 0:
-            from discopt.solvers.amp import _apply_flat_bounds_to_model
+    # Two domain/period reductions that hand the spatial+NLP paths a valid
+    # box on otherwise-free nonlinear variables: restrict sin/cos-only angles
+    # to one period, and clamp log/sqrt arguments to their natural domain so
+    # the local NLP never wanders into the undefined region (issue #265's
+    # false-infeasible from a free log argument).
+    # Budgeted like the other root-setup passes (#875): both rules walk every
+    # constraint body, and this runs before a single node exists.
+    # ``PeriodicVariableBoundRule`` is not row-anytime (its conclusion rests on a
+    # variable being absent elsewhere), so the budget can only decline to start
+    # it — never truncate it — which is exactly what keeps the reduction sound.
+    _per_budget_s = min(min(max(0.05 * float(time_limit), 1.0), 10.0), _remaining_budget())
+    _per_lb, _per_ub, _per_stats = tighten_nonlinear_bounds(
+        model,
+        _origin_lb_chk,
+        _origin_ub_chk,
+        rules=(PeriodicVariableBoundRule(), FunctionDomainBoundRule()),
+        deadline=_role2_deadline(time.perf_counter() + _per_budget_s),
+    )
+    if _per_stats.n_tightened > 0:
+        from discopt.solvers.amp import _apply_flat_bounds_to_model
 
-            _apply_flat_bounds_to_model(model, _per_lb, _per_ub)
-            _origin_lb_chk, _origin_ub_chk = _per_lb, _per_ub
-    except Exception as _per_exc:  # pragma: no cover - defensive
-        logger.debug("periodic-variable bound reduction skipped: %s", _per_exc)
+        _apply_flat_bounds_to_model(model, _per_lb, _per_ub)
+        _origin_lb_chk, _origin_ub_chk = _per_lb, _per_ub
     _origin_has_finite_continuous_var = False
     _origin_chk_off = 0
     for _ov in model._variables:
@@ -11315,16 +11393,15 @@ def solve_model(
     # deadline: the set steers spatial branching, so a clock here would make the
     # search tree a function of machine speed (#912).
     _dependent_var_names: set = set()
-    try:
-        from discopt._relax.dependent_vars import find_functionally_dependent_names
+    # #1497 (solve-time): no catch-all. The scan degrades to a partial set on
+    # its own work budget; an exception is a defect, not 'no dependencies'.
+    from discopt._relax.dependent_vars import find_functionally_dependent_names
 
-        # Its own ``_SCAN_WORK_BUDGET`` bounds ONE call deterministically; the
-        # deadline decides whether the block can still afford the call at all
-        # (#1456). Measured 5.25 s on ``densitymod`` with that budget in force.
-        if _presolve_deadline.afford("find_functionally_dependent_names"):
-            _dependent_var_names = find_functionally_dependent_names(model)
-    except Exception as _dep_exc:  # pragma: no cover - defensive
-        logger.debug("functional-dependency detection skipped: %s", _dep_exc)
+    # Its own ``_SCAN_WORK_BUDGET`` bounds ONE call deterministically; the
+    # deadline decides whether the block can still afford the call at all
+    # (#1456). Measured 5.25 s on ``densitymod`` with that budget in force.
+    if _presolve_deadline.afford("find_functionally_dependent_names"):
+        _dependent_var_names = find_functionally_dependent_names(model)
 
     # --- Pure-binary multilinear exact linearization (issue #187) ---
     # A polynomial objective/constraint over binary-valued variables ({0,1}
@@ -11339,79 +11416,83 @@ def solve_model(
     # aux variables and destroy the pure-binary structure this one needs. The
     # pass abstains (returns the model unchanged) on anything it cannot
     # linearize exactly, so it is a no-op everywhere else.
-    try:
-        from discopt._relax.binary_multilinear_reform import has_binary_multilinear_work
-        from discopt.transformations import get as _get_transformation
+    # #1497 (solve-time): no catch-all here. The pass's documented give-ups
+    # (``_Unsupported``: out-of-scope structure or a budget) are absorbed INSIDE
+    # ``reformulate_binary_multilinear``, which then returns ``model`` itself, so
+    # the ``_bml is not model`` test below is the abstention signal. Anything that
+    # reaches this call site is a defect (or a broken #1147 provenance chain) and
+    # must fail the solve: the old ``except Exception`` + DEBUG log made a crashed
+    # pass indistinguishable from 'nothing to linearize' (CLAUDE.md §3/§7).
+    from discopt._relax.binary_multilinear_reform import has_binary_multilinear_work
+    from discopt.transformations import get as _get_transformation
 
-        if _presolve_deadline.afford("binary_multilinear") and has_binary_multilinear_work(model):
-            _bml = _get_transformation("binary.multilinear").apply(model)
-            if _bml is not model:
-                from discopt._relax.problem_classifier import ProblemClass, classify_problem
-                from discopt._relax.term_classifier import classify_nonlinear_terms
+    if _presolve_deadline.afford("binary_multilinear") and has_binary_multilinear_work(model):
+        _bml = _get_transformation("binary.multilinear").apply(model)
+        if _bml is not model:
+            from discopt._relax.problem_classifier import ProblemClass, classify_problem
+            from discopt._relax.term_classifier import classify_nonlinear_terms
 
-                # Same adoption guard as the integer-bilinear reform below:
-                # adopt ONLY a genuinely pure MILP, confirmed by BOTH the
-                # extract_lp_data-based classifier and the DAG-walking term
-                # classifier (see that block's rationale / issue #286).
-                _bml_nl = classify_nonlinear_terms(_bml)
-                _bml_pure_milp = not (
-                    _bml_nl.bilinear
-                    or _bml_nl.trilinear
-                    or _bml_nl.multilinear
-                    or _bml_nl.monomial
-                    or _bml_nl.fractional_power
-                    or _bml_nl.bilinear_with_fp
-                    or _bml_nl.ratio_of_products
-                    or _bml_nl.general_nl
+            # Same adoption guard as the integer-bilinear reform below:
+            # adopt ONLY a genuinely pure MILP, confirmed by BOTH the
+            # extract_lp_data-based classifier and the DAG-walking term
+            # classifier (see that block's rationale / issue #286).
+            _bml_nl = classify_nonlinear_terms(_bml)
+            _bml_pure_milp = not (
+                _bml_nl.bilinear
+                or _bml_nl.trilinear
+                or _bml_nl.multilinear
+                or _bml_nl.monomial
+                or _bml_nl.fractional_power
+                or _bml_nl.bilinear_with_fp
+                or _bml_nl.ratio_of_products
+                or _bml_nl.general_nl
+            )
+            if _bml_pure_milp and classify_problem(_bml) == ProblemClass.MILP:
+                logger.info(
+                    "binary-multilinear linearization: exact pure-MILP "
+                    "reformulation adopted (%d -> %d vars, %d -> %d rows)",
+                    len(model._variables),
+                    len(_bml._variables),
+                    len(model._constraints),
+                    len(_bml._constraints),
                 )
-                if _bml_pure_milp and classify_problem(_bml) == ProblemClass.MILP:
-                    logger.info(
-                        "binary-multilinear linearization: exact pure-MILP "
-                        "reformulation adopted (%d -> %d vars, %d -> %d rows)",
-                        len(model._variables),
-                        len(_bml._variables),
-                        len(model._constraints),
-                        len(_bml._constraints),
-                    )
-                    model = _bml
-                    model._convexity_classification_cache = None
-                    model._convexity_time_budget = _convexity_time_budget
-                    # Carry the absolute deadline onto the reformulated model too,
-                    # or its classification (and the engines that read this stash)
-                    # would run against no wall clamp at all (#654 / #875).
-                    model._solve_deadline = _solve_t0 + float(time_limit)
-                    # Route like the integer-bilinear reform: skip the (slow,
-                    # redundant) FBBT root presolve on the lifted rows and use
-                    # the monolithic Rust simplex MILP engine, unless the
-                    # cert:P3.1c cut-reachability experiment keeps the solve
-                    # on the cut-carrying _solve_milp_bb path.
-                    presolve = False
-                    if nlp_solver == "pounce" and not _p3_force_cut_path_enabled():
-                        nlp_solver = "simplex"
-                    # Incumbent seeding. A user warm start is over the ORIGINAL
-                    # variables; the aux columns (z = prod b, y = E(b),
-                    # t = y**2) are determined by it, so extend it to the
-                    # reformed vector. Without one, run the class-gated
-                    # deterministic local search (any bit assignment is
-                    # feasible on this class, so its best point is a valid
-                    # incumbent). Purely primal: the Rust MILP driver
-                    # re-validates the seed and recomputes its objective, so a
-                    # bad point is dropped, never trusted (the dual bound and
-                    # the certified optimum are unaffected either way).
-                    from discopt._relax.binary_multilinear_reform import (
-                        extend_initial_point,
-                        heuristic_incumbent,
-                    )
+                model = _bml
+                model._convexity_classification_cache = None
+                model._convexity_time_budget = _convexity_time_budget
+                # Carry the absolute deadline onto the reformulated model too,
+                # or its classification (and the engines that read this stash)
+                # would run against no wall clamp at all (#654 / #875).
+                model._solve_deadline = _solve_t0 + float(time_limit)
+                # Route like the integer-bilinear reform: skip the (slow,
+                # redundant) FBBT root presolve on the lifted rows and use
+                # the monolithic Rust simplex MILP engine, unless the
+                # cert:P3.1c cut-reachability experiment keeps the solve
+                # on the cut-carrying _solve_milp_bb path.
+                presolve = False
+                if nlp_solver == "pounce" and not _p3_force_cut_path_enabled():
+                    nlp_solver = "simplex"
+                # Incumbent seeding. A user warm start is over the ORIGINAL
+                # variables; the aux columns (z = prod b, y = E(b),
+                # t = y**2) are determined by it, so extend it to the
+                # reformed vector. Without one, run the class-gated
+                # deterministic local search (any bit assignment is
+                # feasible on this class, so its best point is a valid
+                # incumbent). Purely primal: the Rust MILP driver
+                # re-validates the seed and recomputes its objective, so a
+                # bad point is dropped, never trusted (the dual bound and
+                # the certified optimum are unaffected either way).
+                from discopt._relax.binary_multilinear_reform import (
+                    extend_initial_point,
+                    heuristic_incumbent,
+                )
 
-                    _bml_x0 = None
-                    if initial_point is not None:
-                        _bml_x0 = extend_initial_point(model, initial_point)
-                    if _bml_x0 is None:
-                        _bml_x0 = heuristic_incumbent(model)
-                    if _bml_x0 is not None:
-                        initial_point = _bml_x0
-    except Exception as _bml_exc:  # pragma: no cover - defensive
-        logger.debug("binary-multilinear reformulation skipped: %s", _bml_exc)
+                _bml_x0 = None
+                if initial_point is not None:
+                    _bml_x0 = extend_initial_point(model, initial_point)
+                if _bml_x0 is None:
+                    _bml_x0 = heuristic_incumbent(model)
+                if _bml_x0 is not None:
+                    initial_point = _bml_x0
 
     # Pre-reform model + original variable count, set only when the factorable
     # lift actually fires (see below). Used by the per-node interval bound to
@@ -11441,27 +11522,28 @@ def solve_model(
         # and only run when the reform is about to fire; sound (FBBT only removes
         # infeasible regions, so the tightened box still contains every feasible
         # point). The later root presolve re-tightens, so this never loosens.
-        try:
-            from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
+        # #1497 (solve-time): no catch-all. ``tighten_root_bounds_with_fbbt``
+        # already declines on its own when the Rust model/FBBT is unavailable, so
+        # the old outer ``except Exception`` could only hide a defect in the
+        # bookkeeping around it.
+        from discopt.solvers._root_presolve import tighten_root_bounds_with_fbbt
 
-            _fr_off: list[int] = []
-            _fr_sz: list[int] = []
-            _fr_o = 0
-            for _v in model._variables:
-                if _v.var_type in (VarType.BINARY, VarType.INTEGER):
-                    _fr_off.append(_fr_o)
-                    _fr_sz.append(_v.size)
-                _fr_o += _v.size
-            _, _fr_lb, _fr_ub, _, _ = _extract_variable_info(model)
-            _fr_lb, _fr_ub, _fr_infeas, _fr_changed = tighten_root_bounds_with_fbbt(
-                model, _fr_lb, _fr_ub, _fr_off, _fr_sz
-            )
-            if not _fr_infeas and _fr_changed:
-                from discopt.solvers.amp import _apply_flat_bounds_to_model
+        _fr_off: list[int] = []
+        _fr_sz: list[int] = []
+        _fr_o = 0
+        for _v in model._variables:
+            if _v.var_type in (VarType.BINARY, VarType.INTEGER):
+                _fr_off.append(_fr_o)
+                _fr_sz.append(_v.size)
+            _fr_o += _v.size
+        _, _fr_lb, _fr_ub, _, _ = _extract_variable_info(model)
+        _fr_lb, _fr_ub, _fr_infeas, _fr_changed = tighten_root_bounds_with_fbbt(
+            model, _fr_lb, _fr_ub, _fr_off, _fr_sz
+        )
+        if not _fr_infeas and _fr_changed:
+            from discopt.solvers.amp import _apply_flat_bounds_to_model
 
-                _apply_flat_bounds_to_model(model, _fr_lb, _fr_ub)
-        except Exception as _fr_fbbt_exc:  # pragma: no cover - defensive
-            logger.debug("pre-reform FBBT skipped: %s", _fr_fbbt_exc)
+            _apply_flat_bounds_to_model(model, _fr_lb, _fr_ub)
 
         _fr_ok, _fr_convex, _ = _classify_model_convexity(model)
         if _fr_ok and not _fr_convex:
@@ -11521,158 +11603,165 @@ def solve_model(
     # nonlinearity remains (ex1252's continuous cubic cost rows) — the tightening
     # of the integer-multilinear terms is a strict, sound gain on the spatial path.
     _did_multilinear_reform = False
-    try:
-        if _tuning().integer_multilinear_reform:
-            from discopt._relax.integer_product_reform import (
-                extend_initial_point as _iml_extend,
-            )
-            from discopt._relax.integer_product_reform import (
-                has_integer_multilinear_reformulation_work,
-            )
-            from discopt.transformations import get as _get_transformation
+    # #1497 (solve-time): no catch-all around the pass. Its documented give-ups
+    # (``IntegerProductNotApplicable``: an unbounded/over-cap big-M factor, or the
+    # multilinear monomial estimate over its cap) are caught inside
+    # ``expand_integer_products``, which returns ``model`` unchanged -- the
+    # ``_iml is not model`` test below. Every other exception is a defect and
+    # propagates instead of being logged at DEBUG and skipped.
+    if _tuning().integer_multilinear_reform:
+        from discopt._relax.integer_product_reform import (
+            extend_initial_point as _iml_extend,
+        )
+        from discopt._relax.integer_product_reform import (
+            has_integer_multilinear_reformulation_work,
+        )
+        from discopt.transformations import get as _get_transformation
 
-            if has_integer_multilinear_reformulation_work(model):
-                _iml_n0 = sum(v.size for v in model._variables)
-                _iml = _get_transformation("integer.multilinear").apply(model)
-                if _iml is not model:
-                    from discopt._relax.problem_classifier import ProblemClass, classify_problem
-                    from discopt._relax.term_classifier import classify_nonlinear_terms
+        if has_integer_multilinear_reformulation_work(model):
+            _iml_n0 = sum(v.size for v in model._variables)
+            _iml = _get_transformation("integer.multilinear").apply(model)
+            if _iml is not model:
+                from discopt._relax.problem_classifier import ProblemClass, classify_problem
+                from discopt._relax.term_classifier import classify_nonlinear_terms
 
-                    # Does the reform eliminate *all* nonlinearity (pure MILP)? Then
-                    # route to the MILP engine as the bilinear pass does; otherwise
-                    # keep the reformed model on the spatial B&B path (still tighter).
-                    _iml_nl = classify_nonlinear_terms(_iml)
-                    _iml_pure_milp = not (
-                        _iml_nl.bilinear
-                        or _iml_nl.trilinear
-                        or _iml_nl.multilinear
-                        or _iml_nl.monomial
-                        or _iml_nl.fractional_power
-                        or _iml_nl.bilinear_with_fp
-                        or _iml_nl.ratio_of_products
-                        or _iml_nl.general_nl
-                    )
-                    # Blowup guard for the *spatial-path* case. The big-M/AND auxes
-                    # only pay off when they tighten a *binding* dual bound (ex1252:
-                    # the objective barrier); on an already-tractable instance they
-                    # merely balloon the per-node LP and slow convergence (nvs01: a
-                    # 3-var instance the spatial solve certifies fast blows up to
-                    # ~200 columns and *regresses*). So keep a non-pure-MILP reform
-                    # only when the column count stays within a modest factor of the
-                    # original; a pure-MILP reform is always worth the MILP-engine
-                    # route. When rejected, leave the model untouched so the normal
-                    # path (incl. the bilinear reform below) runs exactly as it would
-                    # with the flag off — never a regression.
-                    _iml_n1 = sum(v.size for v in _iml._variables)
-                    _iml_adopt = _iml_pure_milp or _iml_n1 <= 4 * max(_iml_n0, 16)
-                    # Budget-aware adoption for the disjunctive-eligible spatial-path
-                    # reform (#732 blocker b). On the gated-configuration class
-                    # (ex1252: the reform records configuration indicators, and its
-                    # payoff is the disjunctive config-bound floor / deep spatial
-                    # recursion) the exact-linearization only pays for its heavier
-                    # per-node LPs once that payoff mechanism can engage — which needs
-                    # a generous budget (the disjunctive pass engages at
-                    # ``min(0.25*time_limit, 150) >= 45`` s, i.e. ``time_limit >=
-                    # 180`` s). Below that the reform is pure cost: measured on
-                    # ex1252@60 s the reformed tree dual collapses 9273 -> 0 (heavier
-                    # LPs halve node throughput and the floor pass is skipped) and the
-                    # incumbent is lost, versus the flag-off spatial path's 9273. So on
-                    # the config class, keep the flag-off path until the budget affords
-                    # the payoff. A non-config reform (nvs05: payoff is the direct
-                    # node-LP tightening, +0.19 dual at equal nodes @60 s) and a
-                    # pure-MILP reform (MILP-engine route, cheap+exact) are unaffected.
-                    if _iml_adopt and not _iml_pure_milp:
-                        _iml_config = getattr(_iml, "_ipx_config_indicators", None) or ()
-                        if _iml_config and min(0.25 * float(time_limit), 150.0) < 45.0:
-                            _iml_adopt = False
-                    if _iml_adopt:
-                        _did_multilinear_reform = True
-                        model = _iml
-                        model._convexity_classification_cache = None
-                        clear_declared_box_cache(model)
-                        model._convexity_time_budget = _convexity_time_budget
-                        model._solve_deadline = _solve_t0 + float(time_limit)
-                        if _iml_pure_milp and classify_problem(_iml) == ProblemClass.MILP:
-                            presolve = False
-                            if nlp_solver == "pounce" and not _p3_force_cut_path_enabled():
-                                nlp_solver = "simplex"
-                        elif _tuning().disjunctive_config_bound:
-                            # #732 Stage 2 (default-OFF): root disjunctive
-                            # configuration bound for the spatial-path case.
-                            # Enumerate the reform's configuration-indicator
-                            # patterns, bound each config box (FBBT->OBBT->LP,
-                            # unit-peeling), and stash min-over-leaves as a
-                            # global-dual floor. The floor is a valid lower
-                            # bound over the ROOT box, hence over every node's
-                            # sub-box — ``MccormickLPRelaxer.solve_at_node``
-                            # max-combines it into every node bound (the
-                            # integer-ratio-partitioner precedent), so it flows
-                            # through the tree's existing bound plumbing with
-                            # no new threading. Budgeted to a fraction of the
-                            # solve's wall budget; a declined/failed pass
-                            # stashes nothing and the solve is unchanged.
-                            class _DcbSkip(Exception):
-                                pass
+                # Does the reform eliminate *all* nonlinearity (pure MILP)? Then
+                # route to the MILP engine as the bilinear pass does; otherwise
+                # keep the reformed model on the spatial B&B path (still tighter).
+                _iml_nl = classify_nonlinear_terms(_iml)
+                _iml_pure_milp = not (
+                    _iml_nl.bilinear
+                    or _iml_nl.trilinear
+                    or _iml_nl.multilinear
+                    or _iml_nl.monomial
+                    or _iml_nl.fractional_power
+                    or _iml_nl.bilinear_with_fp
+                    or _iml_nl.ratio_of_products
+                    or _iml_nl.general_nl
+                )
+                # Blowup guard for the *spatial-path* case. The big-M/AND auxes
+                # only pay off when they tighten a *binding* dual bound (ex1252:
+                # the objective barrier); on an already-tractable instance they
+                # merely balloon the per-node LP and slow convergence (nvs01: a
+                # 3-var instance the spatial solve certifies fast blows up to
+                # ~200 columns and *regresses*). So keep a non-pure-MILP reform
+                # only when the column count stays within a modest factor of the
+                # original; a pure-MILP reform is always worth the MILP-engine
+                # route. When rejected, leave the model untouched so the normal
+                # path (incl. the bilinear reform below) runs exactly as it would
+                # with the flag off — never a regression.
+                _iml_n1 = sum(v.size for v in _iml._variables)
+                _iml_adopt = _iml_pure_milp or _iml_n1 <= 4 * max(_iml_n0, 16)
+                # Budget-aware adoption for the disjunctive-eligible spatial-path
+                # reform (#732 blocker b). On the gated-configuration class
+                # (ex1252: the reform records configuration indicators, and its
+                # payoff is the disjunctive config-bound floor / deep spatial
+                # recursion) the exact-linearization only pays for its heavier
+                # per-node LPs once that payoff mechanism can engage — which needs
+                # a generous budget (the disjunctive pass engages at
+                # ``min(0.25*time_limit, 150) >= 45`` s, i.e. ``time_limit >=
+                # 180`` s). Below that the reform is pure cost: measured on
+                # ex1252@60 s the reformed tree dual collapses 9273 -> 0 (heavier
+                # LPs halve node throughput and the floor pass is skipped) and the
+                # incumbent is lost, versus the flag-off spatial path's 9273. So on
+                # the config class, keep the flag-off path until the budget affords
+                # the payoff. A non-config reform (nvs05: payoff is the direct
+                # node-LP tightening, +0.19 dual at equal nodes @60 s) and a
+                # pure-MILP reform (MILP-engine route, cheap+exact) are unaffected.
+                if _iml_adopt and not _iml_pure_milp:
+                    _iml_config = getattr(_iml, "_ipx_config_indicators", None) or ()
+                    if _iml_config and min(0.25 * float(time_limit), 150.0) < 45.0:
+                        _iml_adopt = False
+                if _iml_adopt:
+                    _did_multilinear_reform = True
+                    model = _iml
+                    model._convexity_classification_cache = None
+                    clear_declared_box_cache(model)
+                    model._convexity_time_budget = _convexity_time_budget
+                    model._solve_deadline = _solve_t0 + float(time_limit)
+                    if _iml_pure_milp and classify_problem(_iml) == ProblemClass.MILP:
+                        presolve = False
+                        if nlp_solver == "pounce" and not _p3_force_cut_path_enabled():
+                            nlp_solver = "simplex"
+                    elif _tuning().disjunctive_config_bound:
+                        # #732 Stage 2 (default-OFF): root disjunctive
+                        # configuration bound for the spatial-path case.
+                        # Enumerate the reform's configuration-indicator
+                        # patterns, bound each config box (FBBT->OBBT->LP,
+                        # unit-peeling), and stash min-over-leaves as a
+                        # global-dual floor. The floor is a valid lower
+                        # bound over the ROOT box, hence over every node's
+                        # sub-box — ``MccormickLPRelaxer.solve_at_node``
+                        # max-combines it into every node bound (the
+                        # integer-ratio-partitioner precedent), so it flows
+                        # through the tree's existing bound plumbing with
+                        # no new threading. Budgeted to a fraction of the
+                        # solve's wall budget; a declined/failed pass
+                        # stashes nothing and the solve is unchanged.
+                        class _DcbSkip(Exception):
+                            pass
 
-                            try:
-                                from discopt._relax.disjunctive_config_bound import (
-                                    compute_disjunctive_config_bound,
+                        try:
+                            from discopt._relax.disjunctive_config_bound import (
+                                compute_disjunctive_config_bound,
+                            )
+                            from discopt._relax.model_utils import (
+                                flat_variable_bounds as _dcb_flat,
+                            )
+
+                            # Engagement gate (#732 Stage-5 panel): at short
+                            # budgets the pass cannot reach its productive
+                            # regime and only eats the root phase (60 s panel:
+                            # ex1252 bound 14347 -> 0.0, nvs09 loses its
+                            # certificate). Engage only when the solve budget
+                            # affords a >= 45 s pass; below that the stack is
+                            # byte-identical to flag-OFF.
+                            _dcb_budget = min(0.25 * float(time_limit), 150.0)
+                            if _dcb_budget < 45.0:
+                                raise _DcbSkip()
+                            _dcb_lb, _dcb_ub = _dcb_flat(model)
+                            _dcb = compute_disjunctive_config_bound(
+                                model,
+                                np.asarray(_dcb_lb, dtype=np.float64),
+                                np.asarray(_dcb_ub, dtype=np.float64),
+                                deadline=_role2_deadline(time.perf_counter() + _dcb_budget),
+                                # The wall deadline governs in-solve; the leaf
+                                # cap is a runaway backstop only (the module
+                                # default of 48 would stop a 150 s budget at
+                                # ~50 s, pinning the floor at the shallow
+                                # 42.7k instead of the deep-regime 63k).
+                                max_leaf_solves=1000,
+                            )
+                            if _dcb.bound is not None and np.isfinite(_dcb.bound):
+                                model._disjunctive_config_floor = float(_dcb.bound)
+                                logger.info(
+                                    "disjunctive config bound: floor %.6g "
+                                    "(%d leaf solves, %d infeasible, %.1fs, "
+                                    "stopped on %s)",
+                                    _dcb.bound,
+                                    _dcb.n_processed,
+                                    _dcb.n_pruned_infeasible,
+                                    _dcb.wall,
+                                    # Expected to be "deadline" here: in-solve
+                                    # the wall budget governs by design (the
+                                    # leaf cap above is a runaway backstop), so
+                                    # this floor is anytime, not reproducible.
+                                    _dcb.stopped_on,
                                 )
-                                from discopt._relax.model_utils import (
-                                    flat_variable_bounds as _dcb_flat,
-                                )
-
-                                # Engagement gate (#732 Stage-5 panel): at short
-                                # budgets the pass cannot reach its productive
-                                # regime and only eats the root phase (60 s panel:
-                                # ex1252 bound 14347 -> 0.0, nvs09 loses its
-                                # certificate). Engage only when the solve budget
-                                # affords a >= 45 s pass; below that the stack is
-                                # byte-identical to flag-OFF.
-                                _dcb_budget = min(0.25 * float(time_limit), 150.0)
-                                if _dcb_budget < 45.0:
-                                    raise _DcbSkip()
-                                _dcb_lb, _dcb_ub = _dcb_flat(model)
-                                _dcb = compute_disjunctive_config_bound(
-                                    model,
-                                    np.asarray(_dcb_lb, dtype=np.float64),
-                                    np.asarray(_dcb_ub, dtype=np.float64),
-                                    deadline=_role2_deadline(time.perf_counter() + _dcb_budget),
-                                    # The wall deadline governs in-solve; the leaf
-                                    # cap is a runaway backstop only (the module
-                                    # default of 48 would stop a 150 s budget at
-                                    # ~50 s, pinning the floor at the shallow
-                                    # 42.7k instead of the deep-regime 63k).
-                                    max_leaf_solves=1000,
-                                )
-                                if _dcb.bound is not None and np.isfinite(_dcb.bound):
-                                    model._disjunctive_config_floor = float(_dcb.bound)
-                                    logger.info(
-                                        "disjunctive config bound: floor %.6g "
-                                        "(%d leaf solves, %d infeasible, %.1fs, "
-                                        "stopped on %s)",
-                                        _dcb.bound,
-                                        _dcb.n_processed,
-                                        _dcb.n_pruned_infeasible,
-                                        _dcb.wall,
-                                        # Expected to be "deadline" here: in-solve
-                                        # the wall budget governs by design (the
-                                        # leaf cap above is a runaway backstop), so
-                                        # this floor is anytime, not reproducible.
-                                        _dcb.stopped_on,
-                                    )
-                            except Exception as _dcb_exc:  # pragma: no cover
-                                logger.debug("disjunctive config bound skipped: %s", _dcb_exc)
-                        # Extend a user warm start over the appended aux columns so the
-                        # (longer) reformed vector is not silently dropped. Purely primal:
-                        # the driver re-validates it, so it never affects the dual bound.
-                        # If it cannot be extended (e.g. an off-integer seed), drop it
-                        # entirely — a shorter vector against the grown model would crash
-                        # the downstream integrality check on the spatial path.
-                        if initial_point is not None:
-                            initial_point = _iml_extend(model, initial_point)
-    except Exception as _iml_exc:  # pragma: no cover - defensive
-        logger.debug("integer-multilinear reformulation skipped: %s", _iml_exc)
+                        except _DcbSkip:
+                            # #1497 (solve-time): ONLY the engagement gate above.
+                            # A failure inside the pass is a defect in a
+                            # bound-changing computation and propagates; it used
+                            # to be swallowed here at DEBUG with every other error.
+                            pass
+                    # Extend a user warm start over the appended aux columns so the
+                    # (longer) reformed vector is not silently dropped. Purely primal:
+                    # the driver re-validates it, so it never affects the dual bound.
+                    # If it cannot be extended (e.g. an off-integer seed), drop it
+                    # entirely — a shorter vector against the grown model would crash
+                    # the downstream integrality check on the spatial path.
+                    if initial_point is not None:
+                        initial_point = _iml_extend(model, initial_point)
 
     # --- Integer-bilinear exact reformulation ---
     # When a bilinear term ``x_i*x_j`` has an integer (declared or implied)
@@ -11684,200 +11773,202 @@ def solve_model(
     # that gap and routes through the MILP branch-and-bound (cover/clique/Gomory/
     # MIR cuts). Value-preserving and gated to integer-bilinear models, so it is a
     # no-op everywhere else.
-    try:
-        from discopt._relax.integer_product_reform import has_nonconvex_integer_bilinear
-        from discopt.transformations import get as _get_transformation
+    # #1497 (solve-time): no catch-all, for the same reason as the
+    # integer-multilinear block above -- ``IntegerProductNotApplicable`` is
+    # absorbed inside the pass (``_ipx is model``); anything else is a defect.
+    # The #1236 cheap-first probe reports its own failures (see
+    # ``_ipx_unlifted_probe``), so nothing here needs a blanket handler.
+    from discopt._relax.integer_product_reform import has_nonconvex_integer_bilinear
+    from discopt.transformations import get as _get_transformation
 
-        # Gate on a *distinct-variable* integer-bilinear term ``x_i*x_j`` (i != j).
-        # Its Hessian is indefinite, so this is a cheap, sound *nonconvexity*
-        # witness — and exactly the loose-relaxation structure the pass fixes.
-        # Convex MIQPs (only ``x**2`` squares, PSD curvature) have no such term
-        # and are left to the convex QP/NLP fast paths: binary-expanding them
-        # would merely bloat the model and divert it off those paths (which broke
-        # the MIQP-batch certification path). This witness is far cheaper than a
-        # full convexity classification (~6s on ex1263), so the common path and
-        # the reformulated path both stay fast.
-        if (
-            not _did_multilinear_reform
-            and _presolve_deadline.afford("integer_bilinear")
-            and has_nonconvex_integer_bilinear(model)
-        ):
-            _ipx = _get_transformation("integer.bilinear").apply(model)
-            # Adopt the reformulation ONLY when it eliminates *all* nonlinearity,
-            # i.e. yields an equivalent pure MILP. If other nonlinear terms remain
-            # (e.g. the transcendentals in gear), the model would still go through
-            # the spatial path — now merely carrying the extra big-M variables for
-            # no benefit — so the reformulation is discarded and the original model
-            # is solved unchanged. This keeps the pass a strict improvement.
-            from discopt._relax.problem_classifier import ProblemClass, classify_problem
-            from discopt._relax.term_classifier import classify_nonlinear_terms
+    # Gate on a *distinct-variable* integer-bilinear term ``x_i*x_j`` (i != j).
+    # Its Hessian is indefinite, so this is a cheap, sound *nonconvexity*
+    # witness — and exactly the loose-relaxation structure the pass fixes.
+    # Convex MIQPs (only ``x**2`` squares, PSD curvature) have no such term
+    # and are left to the convex QP/NLP fast paths: binary-expanding them
+    # would merely bloat the model and divert it off those paths (which broke
+    # the MIQP-batch certification path). This witness is far cheaper than a
+    # full convexity classification (~6s on ex1263), so the common path and
+    # the reformulated path both stay fast.
+    if (
+        not _did_multilinear_reform
+        and _presolve_deadline.afford("integer_bilinear")
+        and has_nonconvex_integer_bilinear(model)
+    ):
+        _ipx = _get_transformation("integer.bilinear").apply(model)
+        # Adopt the reformulation ONLY when it eliminates *all* nonlinearity,
+        # i.e. yields an equivalent pure MILP. If other nonlinear terms remain
+        # (e.g. the transcendentals in gear), the model would still go through
+        # the spatial path — now merely carrying the extra big-M variables for
+        # no benefit — so the reformulation is discarded and the original model
+        # is solved unchanged. This keeps the pass a strict improvement.
+        from discopt._relax.problem_classifier import ProblemClass, classify_problem
+        from discopt._relax.term_classifier import classify_nonlinear_terms
 
-            # Require the reformulation to be a *genuinely* pure MILP: classify_problem
-            # is largely extract_lp_data-based and can report MILP while nonlinear
-            # terms remain (which that linear projection silently drops). Confirm with
-            # the DAG-walking term classifier, else adopting + routing to the MILP
-            # engine would solve a lossy linear projection — falsely unbounded when a
-            # dropped nonlinear constraint was what bounded an open variable
-            # (carton7, issue #286).
-            _ipx_nl = classify_nonlinear_terms(_ipx) if _ipx is not model else None
-            _ipx_pure_milp = _ipx_nl is not None and not (
-                _ipx_nl.bilinear
-                or _ipx_nl.trilinear
-                or _ipx_nl.multilinear
-                or _ipx_nl.monomial
-                or _ipx_nl.fractional_power
-                or _ipx_nl.bilinear_with_fp
-                or _ipx_nl.ratio_of_products
-                or _ipx_nl.general_nl
-            )
-            _ipx_adopt = _ipx_pure_milp and classify_problem(_ipx) == ProblemClass.MILP
-            # #1236 cheap-first (flag-gated, default OFF): the lift is adopted
-            # today because it is *possible*, never because it was shown to help,
-            # and over the adopted population it is harmful more often than not.
-            # Give the un-lifted model a bounded probe first; if it certifies, that
-            # result IS the answer and the lift is declined. See
-            # ``_ipx_cheap_first_enabled`` for the measurement behind it.
-            if _ipx_adopt and _ipx_cheap_first_enabled():
-                if _IPX_CHEAP_FIRST_IN_PROBE.get():
-                    # We ARE the probe: the probe's whole job is to be the
-                    # un-lifted arm, so it must never adopt the lift itself.
-                    # Without this the nested solve re-adopted it and the probe
-                    # measured the lifted path (measured on nvs02: the probe
-                    # "certified" in 23.94 s with the lift's own 297 nodes).
-                    _ipx_adopt = False
+        # Require the reformulation to be a *genuinely* pure MILP: classify_problem
+        # is largely extract_lp_data-based and can report MILP while nonlinear
+        # terms remain (which that linear projection silently drops). Confirm with
+        # the DAG-walking term classifier, else adopting + routing to the MILP
+        # engine would solve a lossy linear projection — falsely unbounded when a
+        # dropped nonlinear constraint was what bounded an open variable
+        # (carton7, issue #286).
+        _ipx_nl = classify_nonlinear_terms(_ipx) if _ipx is not model else None
+        _ipx_pure_milp = _ipx_nl is not None and not (
+            _ipx_nl.bilinear
+            or _ipx_nl.trilinear
+            or _ipx_nl.multilinear
+            or _ipx_nl.monomial
+            or _ipx_nl.fractional_power
+            or _ipx_nl.bilinear_with_fp
+            or _ipx_nl.ratio_of_products
+            or _ipx_nl.general_nl
+        )
+        _ipx_adopt = _ipx_pure_milp and classify_problem(_ipx) == ProblemClass.MILP
+        # #1236 cheap-first (flag-gated, default OFF): the lift is adopted
+        # today because it is *possible*, never because it was shown to help,
+        # and over the adopted population it is harmful more often than not.
+        # Give the un-lifted model a bounded probe first; if it certifies, that
+        # result IS the answer and the lift is declined. See
+        # ``_ipx_cheap_first_enabled`` for the measurement behind it.
+        if _ipx_adopt and _ipx_cheap_first_enabled():
+            if _IPX_CHEAP_FIRST_IN_PROBE.get():
+                # We ARE the probe: the probe's whole job is to be the
+                # un-lifted arm, so it must never adopt the lift itself.
+                # Without this the nested solve re-adopted it and the probe
+                # measured the lifted path (measured on nvs02: the probe
+                # "certified" in 23.94 s with the lift's own 297 nodes).
+                _ipx_adopt = False
+            else:
+                # Named `_ipx_probe`, not `_probe`: `solve_model` already binds
+                # `_probe` to a `MccormickLPResult` in the node loop, and mypy
+                # unifies the two in one function scope.
+                #
+                # EVERY option that changes what "optimal" means is forwarded
+                # (review finding 1). The probe's result is returned as the
+                # FINAL ANSWER when it certifies, so an option dropped here is
+                # an answer certified for a different problem than the caller
+                # asked about. `test_1236_cheap_first_lift_gate` enumerates
+                # `solve_model`'s signature and fails on any parameter that is
+                # neither forwarded, blocked, nor explicitly exempt, so a
+                # parameter added later cannot silently go missing again.
+                _ipx_probe, _ipx_probe_nodes = _ipx_unlifted_probe(
+                    model,
+                    time_limit,
+                    time.perf_counter() - _solve_t0,
+                    gap_tolerance=gap_tolerance,
+                    abs_gap_tolerance=abs_gap_tolerance,
+                    threads=threads,
+                    deterministic=deterministic,
+                    batch_size=batch_size,
+                    strategy=strategy,
+                    max_nodes=max_nodes,
+                    ipopt_options=ipopt_options,
+                    nlp_solver=nlp_solver,
+                    sparse=sparse,
+                    cutting_planes=cutting_planes,
+                    psd_cuts=psd_cuts,
+                    rlt_cuts=rlt_cuts,
+                    rlt=rlt,
+                    cuts=cuts,
+                    partitions=partitions,
+                    use_learned_relaxations=use_learned_relaxations,
+                    mccormick_bounds=mccormick_bounds,
+                    gdp_method=gdp_method,
+                    decomposition=decomposition,
+                    decomposition_structure=decomposition_structure,
+                    record_decomposition=record_decomposition,
+                    lagrangian_bound=lagrangian_bound,
+                    lagrangian_frequency=lagrangian_frequency,
+                    lagrangian_method=lagrangian_method,
+                    initial_point=initial_point,
+                    warm_start=warm_start,
+                    skip_convex_check=skip_convex_check,
+                    nlp_bb=nlp_bb,
+                    lazy_constraints=lazy_constraints,
+                    incumbent_callback=incumbent_callback,
+                    node_callback=node_callback,
+                    cut_callback=cut_callback,
+                    solver=solver,
+                    presolve=presolve,
+                    presolve_polynomial=presolve_polynomial,
+                    presolve_reverse_ad=presolve_reverse_ad,
+                    in_tree_presolve_stride=in_tree_presolve_stride,
+                    eigenvalue_root_bound=eigenvalue_root_bound,
+                    relaxation_arithmetic=relaxation_arithmetic,
+                    subnlp_enabled=subnlp_enabled,
+                    subnlp_backend=subnlp_backend,
+                    subnlp_frequency=subnlp_frequency,
+                    subnlp_max_calls=subnlp_max_calls,
+                    subnlp_options=subnlp_options,
+                    structure_cuts=structure_cuts,
+                    root_cut_rounds=root_cut_rounds,
+                    root_cut_max=root_cut_max,
+                    _lns_enabled=_lns_enabled,
+                    rens=rens,
+                    **kwargs,
+                )
+                if _ipx_probe is not None:
+                    return _ipx_probe
+                if _ipx_probe_nodes > 0:
+                    # The probe lost. Charge its nodes against the caller's
+                    # budget: `max_nodes` is ONE work budget for this call, and
+                    # handing the full amount to each arm in turn lets a caller
+                    # using it as a bound get up to 2x the nodes it asked for
+                    # (review finding 6). Floored at 1 so the lifted arm still
+                    # runs -- a probe cannot silently consume the whole search.
+                    max_nodes = max(1, max_nodes - _ipx_probe_nodes)
+                    # Surfaced as `cheap_first/probe_nodes`, because the
+                    # `node_count` of the answer below covers only the winning
+                    # arm and would otherwise hide this search entirely.
+                    _IPX_PROBE_NODES.set(_IPX_PROBE_NODES.get() + _ipx_probe_nodes)
+        if _ipx_adopt:
+            model = _ipx
+            model._convexity_classification_cache = None
+            clear_declared_box_cache(model)
+            model._convexity_time_budget = _convexity_time_budget
+            model._solve_deadline = _solve_t0 + float(time_limit)  # #654 (see above)
+            # The reformulated big-M MILP is best handled by a real MILP
+            # engine. discopt's FBBT root presolve is both redundant (the MILP
+            # engines presolve internally) and pathologically slow on the
+            # lifted big-M structure (ex1263: ~10s presolve vs ~1s solve), so
+            # skip it; and route off the self-hosted IPM B&B (no MILP cuts,
+            # ~60s) onto the monolithic Rust simplex MILP engine (~1s,
+            # pure-Rust), which falls back to HiGHS / the IPM path if the
+            # simplex binding is unavailable.
+            presolve = False
+            if nlp_solver == "pounce":
+                # cert:P3.1c cut-reachability experiment (default-OFF): keep the
+                # reformulated MILP on the self-hosted _solve_milp_bb path (which
+                # has the root cut loop) instead of rerouting to the cut-less
+                # monolithic Rust _solve_milp_simplex engine, so the aggregation
+                # c-MIR / Gomory / cover separators can actually fire on this
+                # class. Math-neutral when the flag is unset. See
+                # _p3_force_cut_path_enabled / certification-gap-plan.md §7.
+                if not _p3_force_cut_path_enabled():
+                    nlp_solver = "simplex"
+            # Incumbent seeding. A user warm start (initial_solution) is over
+            # the ORIGINAL variables; the big-M lift appends aux columns
+            # (bits e_k = binary digits of x-lo, products v = e*other) that
+            # are exactly determined by it, so extend it across the lift —
+            # otherwise the reformed vector is longer than the seed and the
+            # MILP fast path's size guard silently drops it (issue #689).
+            # Purely primal: the Rust MILP driver re-validates the seed and
+            # recomputes its objective, so a bad point is dropped, never
+            # trusted (the dual bound and certified optimum are unaffected).
+            if initial_point is not None:
+                from discopt._relax.integer_product_reform import (
+                    extend_initial_point as _ipx_extend,
+                )
+
+                _ipx_x0 = _ipx_extend(model, initial_point)
+                if _ipx_x0 is not None:
+                    initial_point = _ipx_x0
                 else:
-                    # Named `_ipx_probe`, not `_probe`: `solve_model` already binds
-                    # `_probe` to a `MccormickLPResult` in the node loop, and mypy
-                    # unifies the two in one function scope.
-                    #
-                    # EVERY option that changes what "optimal" means is forwarded
-                    # (review finding 1). The probe's result is returned as the
-                    # FINAL ANSWER when it certifies, so an option dropped here is
-                    # an answer certified for a different problem than the caller
-                    # asked about. `test_1236_cheap_first_lift_gate` enumerates
-                    # `solve_model`'s signature and fails on any parameter that is
-                    # neither forwarded, blocked, nor explicitly exempt, so a
-                    # parameter added later cannot silently go missing again.
-                    _ipx_probe, _ipx_probe_nodes = _ipx_unlifted_probe(
-                        model,
-                        time_limit,
-                        time.perf_counter() - _solve_t0,
-                        gap_tolerance=gap_tolerance,
-                        abs_gap_tolerance=abs_gap_tolerance,
-                        threads=threads,
-                        deterministic=deterministic,
-                        batch_size=batch_size,
-                        strategy=strategy,
-                        max_nodes=max_nodes,
-                        ipopt_options=ipopt_options,
-                        nlp_solver=nlp_solver,
-                        sparse=sparse,
-                        cutting_planes=cutting_planes,
-                        psd_cuts=psd_cuts,
-                        rlt_cuts=rlt_cuts,
-                        rlt=rlt,
-                        cuts=cuts,
-                        partitions=partitions,
-                        use_learned_relaxations=use_learned_relaxations,
-                        mccormick_bounds=mccormick_bounds,
-                        gdp_method=gdp_method,
-                        decomposition=decomposition,
-                        decomposition_structure=decomposition_structure,
-                        record_decomposition=record_decomposition,
-                        lagrangian_bound=lagrangian_bound,
-                        lagrangian_frequency=lagrangian_frequency,
-                        lagrangian_method=lagrangian_method,
-                        initial_point=initial_point,
-                        warm_start=warm_start,
-                        skip_convex_check=skip_convex_check,
-                        nlp_bb=nlp_bb,
-                        lazy_constraints=lazy_constraints,
-                        incumbent_callback=incumbent_callback,
-                        node_callback=node_callback,
-                        cut_callback=cut_callback,
-                        solver=solver,
-                        presolve=presolve,
-                        presolve_polynomial=presolve_polynomial,
-                        presolve_reverse_ad=presolve_reverse_ad,
-                        in_tree_presolve_stride=in_tree_presolve_stride,
-                        eigenvalue_root_bound=eigenvalue_root_bound,
-                        relaxation_arithmetic=relaxation_arithmetic,
-                        subnlp_enabled=subnlp_enabled,
-                        subnlp_backend=subnlp_backend,
-                        subnlp_frequency=subnlp_frequency,
-                        subnlp_max_calls=subnlp_max_calls,
-                        subnlp_options=subnlp_options,
-                        structure_cuts=structure_cuts,
-                        root_cut_rounds=root_cut_rounds,
-                        root_cut_max=root_cut_max,
-                        _lns_enabled=_lns_enabled,
-                        rens=rens,
-                        **kwargs,
+                    logger.info(
+                        "integer-bilinear reformulation: warm-start point "
+                        "could not be extended across the lift; solving "
+                        "without a seed"
                     )
-                    if _ipx_probe is not None:
-                        return _ipx_probe
-                    if _ipx_probe_nodes > 0:
-                        # The probe lost. Charge its nodes against the caller's
-                        # budget: `max_nodes` is ONE work budget for this call, and
-                        # handing the full amount to each arm in turn lets a caller
-                        # using it as a bound get up to 2x the nodes it asked for
-                        # (review finding 6). Floored at 1 so the lifted arm still
-                        # runs -- a probe cannot silently consume the whole search.
-                        max_nodes = max(1, max_nodes - _ipx_probe_nodes)
-                        # Surfaced as `cheap_first/probe_nodes`, because the
-                        # `node_count` of the answer below covers only the winning
-                        # arm and would otherwise hide this search entirely.
-                        _IPX_PROBE_NODES.set(_IPX_PROBE_NODES.get() + _ipx_probe_nodes)
-            if _ipx_adopt:
-                model = _ipx
-                model._convexity_classification_cache = None
-                clear_declared_box_cache(model)
-                model._convexity_time_budget = _convexity_time_budget
-                model._solve_deadline = _solve_t0 + float(time_limit)  # #654 (see above)
-                # The reformulated big-M MILP is best handled by a real MILP
-                # engine. discopt's FBBT root presolve is both redundant (the MILP
-                # engines presolve internally) and pathologically slow on the
-                # lifted big-M structure (ex1263: ~10s presolve vs ~1s solve), so
-                # skip it; and route off the self-hosted IPM B&B (no MILP cuts,
-                # ~60s) onto the monolithic Rust simplex MILP engine (~1s,
-                # pure-Rust), which falls back to HiGHS / the IPM path if the
-                # simplex binding is unavailable.
-                presolve = False
-                if nlp_solver == "pounce":
-                    # cert:P3.1c cut-reachability experiment (default-OFF): keep the
-                    # reformulated MILP on the self-hosted _solve_milp_bb path (which
-                    # has the root cut loop) instead of rerouting to the cut-less
-                    # monolithic Rust _solve_milp_simplex engine, so the aggregation
-                    # c-MIR / Gomory / cover separators can actually fire on this
-                    # class. Math-neutral when the flag is unset. See
-                    # _p3_force_cut_path_enabled / certification-gap-plan.md §7.
-                    if not _p3_force_cut_path_enabled():
-                        nlp_solver = "simplex"
-                # Incumbent seeding. A user warm start (initial_solution) is over
-                # the ORIGINAL variables; the big-M lift appends aux columns
-                # (bits e_k = binary digits of x-lo, products v = e*other) that
-                # are exactly determined by it, so extend it across the lift —
-                # otherwise the reformed vector is longer than the seed and the
-                # MILP fast path's size guard silently drops it (issue #689).
-                # Purely primal: the Rust MILP driver re-validates the seed and
-                # recomputes its objective, so a bad point is dropped, never
-                # trusted (the dual bound and certified optimum are unaffected).
-                if initial_point is not None:
-                    from discopt._relax.integer_product_reform import (
-                        extend_initial_point as _ipx_extend,
-                    )
-
-                    _ipx_x0 = _ipx_extend(model, initial_point)
-                    if _ipx_x0 is not None:
-                        initial_point = _ipx_x0
-                    else:
-                        logger.info(
-                            "integer-bilinear reformulation: warm-start point "
-                            "could not be extended across the lift; solving "
-                            "without a seed"
-                        )
-    except Exception as _ipx_exc:  # pragma: no cover - defensive
-        logger.debug("integer-bilinear reformulation skipped: %s", _ipx_exc)
 
     # #1456 item 3: abstention is logged, not silent. A skipped pass means the
     # relaxation below is built from less recognized structure, so a reader
@@ -12728,7 +12819,9 @@ def solve_model(
             _root_is_convex = False
             _pure_continuous_force_spatial = True
             # Fall through to the spatial B&B below.
-        elif has_clearable_denominator(model):
+        elif has_clearable_denominator(model) and (
+            (cleared := factorable_reformulate(model, clear_only=True)) is not model
+        ):
             # (2) An ill-conditioned division whose denominator reaches toward
             # zero (like st_e17's 0.2458*x0**2/x1 with x1 down to 1e-5). If the
             # model has a sign-definite non-constant denominator — which the
@@ -12736,29 +12829,47 @@ def solve_model(
             # value-preserving) and fall back to the sound spatial B&B, which can
             # certify it. Only clearing is applied (no convexity-destroying
             # mixed-product lift).
-            cleared = factorable_reformulate(model, clear_only=True)
-            if cleared is not model:
-                logger.info(
-                    "Convex NLP did not certify (status=%s); clearing sign-definite "
-                    "denominator and retrying via spatial B&B",
-                    result.status,
-                )
-                model = cleared
-                _pure_continuous_is_convex = False
-                _root_is_convex = False
-                _root_constraint_mask = None  # stale: cleared constraint is nonconvex
-                try:
-                    from discopt._rust import model_to_repr
+            logger.info(
+                "Convex NLP did not certify (status=%s); clearing sign-definite "
+                "denominator and retrying via spatial B&B",
+                result.status,
+            )
+            model = cleared
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _root_constraint_mask = None  # stale: cleared constraint is nonconvex
+            try:
+                from discopt._rust import model_to_repr
 
-                    _model_repr = model_to_repr(model, getattr(model, "_builder", None))
-                except Exception:
-                    _model_repr = None
-                # Fall through to the spatial B&B below (rebuilt from `model`).
-            else:
-                return result
+                _model_repr = model_to_repr(model, getattr(model, "_builder", None))
+            except Exception:
+                _model_repr = None
+            # Fall through to the spatial B&B below (rebuilt from `model`).
+        elif result.status == "error" and result.x is None:
+            # (3) #1507: the single NLP failed outright and left no verified
+            # point. The typical cause on a convex model is Ipopt's code 2
+            # (``Infeasible_Problem_Detected``), which ``_IPOPT_STATUS_MAP`` maps
+            # to ``error`` because a local-infeasibility verdict is not itself a
+            # proof. Returning that bare ``error`` abandons the question; the
+            # spatial B&B's relaxation is a sound outer approximation that can
+            # prove infeasibility (an empty relaxation) or find and certify a
+            # point, so hand the model to it -- the same fall-through the
+            # convexity-unknown route takes on an NLP error (#266). The convex
+            # shortcut is dropped (``_root_is_convex = False``) so NLP-BB does
+            # not re-run the same failing NLP; only an extra sound search is
+            # added, never a verdict.
+            logger.info(
+                "Convex NLP failed (status=error) with no verified point; "
+                "retrying via spatial B&B for a sound verdict (issue #1507)"
+            )
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _pure_continuous_force_spatial = True
+            # Fall through to the spatial B&B below.
         else:
-            # Nothing clearable and the model is smooth: return the NLP result
-            # unchanged (no regression).
+            # Nothing clearable, the model is smooth, and the NLP left a verified
+            # point or stopped on a limit: return the NLP result unchanged (no
+            # regression).
             return result
 
     # --- Pure continuous: solve directly only when spatial search was not requested ---
@@ -13251,6 +13362,12 @@ def solve_model(
     )
     tree.initialize()
     rust_time += time.perf_counter() - t_rust_start
+    # #1492: the box the Rust brancher measures relative widths against (its
+    # ``global_lb``/``global_ub`` never change after construction), and the columns
+    # it partitions as spatial integers -- read by ``_may_be_tight_fathomed``.
+    _tree_global_lb = np.asarray(lb, dtype=np.float64).copy()
+    _tree_global_ub = np.asarray(ub, dtype=np.float64).copy()
+    _tree_spatial_int_cols = np.zeros(0, dtype=np.int64)
 
     # --- Compile NLP evaluator ---
     t_jax_start = time.perf_counter()
@@ -13360,7 +13477,19 @@ def solve_model(
             & _dag_nonlinear_columns(model)
         )
         if _nl_int_cols_all:
-            tree.set_spatial_integer_cols(np.asarray(_nl_int_cols_all, dtype=np.int64))
+            _tree_spatial_int_cols = np.asarray(_nl_int_cols_all, dtype=np.int64)
+            tree.set_spatial_integer_cols(_tree_spatial_int_cols)
+    # #1493 (``DISCOPT_POLE_BRANCHING``, default OFF): split an unbounded node
+    # instead of fathoming it unresolved, on the objective's pole when one is
+    # located inside the node box. Off, nothing below reads ``_pole_loci``.
+    _pole_loci: list = []
+    _pole_branching_on = not _model_is_convex and _tuning().pole_branching
+    _pole_fills = 0  # §6 firing counter for the interval fill below
+    if _pole_branching_on:
+        from discopt._relax.poles import objective_pole_loci
+
+        tree.set_pole_branching(True)
+        _pole_loci = objective_pole_loci(model)
     _gap_certified = True
     # #1500: from here on every incumbent is screened -- the batch import gate and
     # the funnel below -- so this solve's result honours the feasibility callbacks.
@@ -13758,7 +13887,8 @@ def solve_model(
                     _mc_mode = "none" if _pure_discrete else "nlp"
                 else:
                     if _nl_int_cols:
-                        tree.set_spatial_integer_cols(np.asarray(_nl_int_cols, dtype=np.int64))
+                        _tree_spatial_int_cols = np.asarray(_nl_int_cols, dtype=np.int64)
+                        tree.set_spatial_integer_cols(_tree_spatial_int_cols)
                     # Deprioritize functionally-dependent continuous columns in
                     # spatial branching. Two disjoint sources, both of which are
                     # *outputs* pinned by the independent variables, so bisecting
@@ -16246,6 +16376,36 @@ def solve_model(
                         _adaptive_nlp_state["no_improve"] = 0
         jax_time += time.perf_counter() - t_jax_start
 
+        # #1493 (``DISCOPT_POLE_BRANCHING``): a node the tree holds at a non-finite
+        # bound (no ancestor proved one -- the pole region) that this batch also
+        # left unbounded (-inf, or the failure sentinel of a skipped/failed node
+        # NLP) would stay unbounded however far it is split, because the interval
+        # enclosure the tree needs lives only on the node-NLP path. Offer it here:
+        # an outward-rounded enclosure of the objective over the node box is a
+        # valid lower bound (-inf when it cannot enclose, e.g. the box still holds
+        # the pole). Only nodes with no finite floor are touched, so every other
+        # node, and the whole flag-OFF path, is unchanged.
+        if _pole_branching_on:
+            _pb_need = [
+                i
+                for i in range(n_batch)
+                if not node_infeasible_mask[i]
+                and (not np.isfinite(result_lbs[i]) or result_lbs[i] >= _SENTINEL_THRESHOLD)
+            ]
+            if _pb_need:
+                _pb_pop = np.asarray(
+                    tree.node_lower_bounds(np.asarray(batch_ids, dtype=np.int64)),
+                    dtype=np.float64,
+                )
+                for i in _pb_need:
+                    if np.isfinite(_pb_pop[i]):
+                        continue
+                    _pb_iv = _compute_interval_bound(model, batch_lb[i], batch_ub[i], _obj_negate)
+                    if np.isfinite(_pb_iv):
+                        result_lbs[i] = _pb_iv
+                        result_feas[i] = False
+                        _pole_fills += 1
+
         # C-1 (path-agnostic, covers convex + nonconvex, batch + serial): any node
         # entering the tree with the failure sentinel but WITHOUT a rigorous
         # infeasibility certificate (``node_infeasible_mask`` — an empty McCormick/
@@ -17447,11 +17607,38 @@ def solve_model(
         # accepts only a strictly-improving feasible point and never touches the
         # dual bound, so this only ever tightens the incumbent — it cannot make
         # the search unsound, only complete.
-        if not _model_is_convex and int_offsets:
+        #
+        # #1492: the same holds for a node the tree will fathom as a TIGHT box
+        # (``_may_be_tight_fathomed``), integer or not -- it is never explored
+        # again, so its relaxation point is the last chance to record the
+        # region's value. A pure-continuous model used to skip this guard entirely.
+        # (Soundness no longer rests on this: since #1510 the tree floors its
+        # dual bound at every tight fathom. This is the completeness half -- it
+        # finds the edge optimum, so that floor can close against it and the
+        # solve still certifies.)
+        _tight_fathom = np.zeros(n_batch, dtype=bool)
+        if not _model_is_convex:
+            for i in range(n_batch):
+                if node_infeasible_mask[i] or not (result_lbs[i] < _SENTINEL_THRESHOLD):
+                    continue
+                _tb = _nr_pending.get(i) if _nr_pending else None
+                _tight_fathom[i] = _may_be_tight_fathomed(
+                    _tb[0] if _tb is not None else batch_lb[i],
+                    _tb[1] if _tb is not None else batch_ub[i],
+                    result_sols[i],
+                    bool(result_feas[i]),
+                    _tree_global_lb,
+                    _tree_global_ub,
+                    _nbb_int_mask,
+                    _tree_spatial_int_cols,
+                )
+        if not _model_is_convex and (int_offsets or np.any(_tight_fathom)):
             _cl = [c[0] for c in constraint_bounds] if constraint_bounds else None
             _cu = [c[1] for c in constraint_bounds] if constraint_bounds else None
             for i in range(n_batch):
                 if node_infeasible_mask[i] or result_lbs[i] >= _SENTINEL_THRESHOLD:
+                    continue
+                if not int_offsets and not _tight_fathom[i]:
                     continue
                 xi = np.asarray(result_sols[i], dtype=np.float64)
                 if not _is_integer_feasible_solution(xi, int_offsets, int_sizes):
@@ -17459,11 +17646,30 @@ def solve_model(
                 xr = xi.copy()
                 for _off, _sz in zip(int_offsets, int_sizes):
                     xr[_off : _off + _sz] = np.round(xr[_off : _off + _sz])
-                if _cl is not None and not _check_constraint_feasibility(evaluator, xr, _cl, _cu):
-                    continue
-                _obj_i = float(evaluator.evaluate_objective(xr))
-                if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
-                    _inject_incumbent(xr, _obj_i)
+                _cands = [xr]
+                if _tight_fathom[i]:
+                    # #1492: the relaxation point need not be the region's best
+                    # point (``min asin(x) - x/2`` on the tight box ``[-1, -1+1e-6]``
+                    # puts it at the upper end, the optimum sits at -1). Also try
+                    # the node-box vertex the objective gradient descends to,
+                    # moving continuous columns only.
+                    _tb = _nr_pending.get(i) if _nr_pending else None
+                    _vlo = np.asarray(_tb[0] if _tb is not None else batch_lb[i], np.float64)
+                    _vhi = np.asarray(_tb[1] if _tb is not None else batch_ub[i], np.float64)
+                    _xc = np.clip(xr, _vlo, _vhi)
+                    _g = np.asarray(evaluator.evaluate_gradient(_xc), dtype=np.float64)
+                    if _g.shape == _xc.shape and np.all(np.isfinite(_g)):
+                        _xv = np.where(_g > 0.0, _vlo, np.where(_g < 0.0, _vhi, _xc))
+                        _xv = np.where(_nbb_int_mask | ~np.isfinite(_xv), _xc, _xv)
+                        _cands.append(_xv)
+                for _xk in _cands:
+                    if _cl is not None and not _check_constraint_feasibility(
+                        evaluator, _xk, _cl, _cu
+                    ):
+                        continue
+                    _obj_i = float(evaluator.evaluate_objective(_xk))
+                    if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
+                        _inject_incumbent(_xk, _obj_i)
 
         # Interactive debugger: steer point — relaxations solved, results not
         # yet imported. Safe-steer (inject incumbent / branch hint) applies here;
@@ -17524,6 +17730,22 @@ def solve_model(
         # tree happens to apply them in.
         _exclusion_mask |= node_infeasible_mask
         t_rust_start = time.perf_counter()
+        if _pole_loci:
+            # #1493: where to split a node the relaxation could not bound. Branch
+            # position only -- the tree reads it solely in its pole arm.
+            from discopt._relax.poles import pole_branch_point
+
+            for _bi in range(len(batch_ids)):
+                if node_infeasible_mask[_bi] or _exclusion_mask[_bi]:
+                    continue
+                if np.isfinite(result_lbs[_bi]) and result_lbs[_bi] < _SENTINEL_THRESHOLD:
+                    continue
+                # The TREE's box, which the split partitions -- not the batch box,
+                # which node reduction may have shrunk (e.g. to x = [0, 0]).
+                _pl_lo, _pl_hi = tree.node_box(int(batch_ids[_bi]))
+                _pl = pole_branch_point(_pole_loci, np.asarray(_pl_lo), np.asarray(_pl_hi))
+                if _pl is not None:
+                    tree.set_spatial_branch_hint(int(batch_ids[_bi]), _pl.col, _pl.value)
         if _requeue_mask is not None and _requeue_mask.any():
             # A requeued node is OPEN again, so no result may be imported for it
             # (`import_results` asserts Evaluated status). Import the rest, then
@@ -17549,6 +17771,23 @@ def solve_model(
             )
         tree.process_evaluated()
         rust_time += time.perf_counter() - t_rust_start
+
+        # #1510: the tree keeps every node it fathomed as a TIGHT box (no
+        # branchable dimension left) as a permanent floor of its global dual
+        # bound, at the node's own bound -- width 1e-6 proves nothing at an
+        # infinite-slope edge (#1492). That bound can be far looser than the box
+        # warrants (a fixed-integer leaf of ``min -1.3x + sin(3y)`` on
+        # ``x = 2, y in [0, 9.3e-16]`` carries -3.6 with sin relaxed to [-1, 1],
+        # while the box holds only values near -2.6), and a floor there costs a
+        # correct certificate (test_batch_sentinel_soundness). An outward-rounded
+        # interval enclosure of the objective over the SAME box is equally valid,
+        # so offer it; the tree keeps the larger. ``_compute_interval_bound``
+        # returns -inf when it cannot enclose, which leaves the node bound.
+        for _tf_id in tree.take_tight_fathoms():
+            _tf_lo, _tf_hi = tree.node_box(int(_tf_id))
+            tree.raise_tight_fathom_floor(
+                int(_tf_id), _compute_interval_bound(model, _tf_lo, _tf_hi, _obj_negate)
+            )
 
         # Interactive debugger: prune/branch/fathom applied by the tree.
         if _debug.fire(
@@ -17887,6 +18126,14 @@ def solve_model(
 
     stats = tree.stats()
     incumbent = tree.incumbent()
+    if _pole_branching_on:
+        _pb, _pc = tree.pole_counters()
+        logger.info(
+            "pole branching (#1493): %d split(s), %d capped fathom(s), %d interval fill(s)",
+            _pb,
+            _pc,
+            _pole_fills,
+        )
     # #933: capture the tree-bound taint state NOW, before the exit-status logic
     # below overwrites ``_gap_certified`` on limit exits. "The exit is not
     # certified" (no incumbent at a time/node limit) says nothing about whether
@@ -18303,7 +18550,11 @@ def solve_model(
             # ``infeasible`` branch below would be a false certificate.
             status = "time_limit"
             _gap_certified = False
-        elif _nonrigorous_fathom:
+        elif _nonrigorous_fathom or not _tree_exhausted_with_proof(tree):
+            # #1510: a tree that drained over an UNPROVEN removal -- a tight-box
+            # fathom or a failed node with no branch direction, both recorded in
+            # the tree's ``unresolved_floor`` -- has not proved the model empty.
+            #
             # C-1: the tree exhausted with no incumbent, but at least one node was
             # fathomed on a NON-rigorous failure (its local NLP failed / diverged /
             # returned a constraint-violating iterate and it was sentinelled with no
@@ -18842,7 +19093,12 @@ _FW_LINE_SEARCH_ITERS = 50
 #: Relative size below which an exhibited "better" point is floating-point noise
 #: rather than evidence (#1499). It only decides whether the rigorous first-order
 #: bound below is REQUIRED; it can never loosen a certificate, since a point this
-#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see.
+#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see. The
+#: Lagrangian arm scales it by the cancellation magnitude of its linearized gap as
+#: well (#1508): a gain a 1e-12 relative error in ``(x, lam)`` could produce is not
+#: evidence that ``x`` is suboptimal. Measured on nlp_cvx_001_010 (box +-1.3e12):
+#: the fake gain is ~ rho * cancel_mag for a relative perturbation ``rho``, so
+#: perturbations up to 1e-13 no longer withhold, and 1e-11 still does.
 _WITNESS_NOISE_REL = 1e-12
 
 
@@ -19109,7 +19365,22 @@ def _convex_nlp_certificate(
                     e_ = a + gr * (b - a)
                     fe = _lag(e_)
                 best = min(best, fc, fe)
-            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0)):
+            # Noise floor (#1508). By convexity the gain ``L0 - best`` is at most the
+            # linearized gap ``-reduced . d``, and ``reduced = grad + J^T lam`` is a
+            # CANCELLATION: at a stationary point its entries are the rounding residue
+            # of terms of size ``|grad_j| + sum_i |lam_i J_ij|``. A relative error
+            # ``rho`` in (x, lam) therefore moves ``-reduced . d`` by up to
+            # ``rho * cancel_mag`` with ``cancel_mag = sum_j |d_j| (|grad_j| +
+            # (|J|^T |lam|)_j)``. On a huge presolve box (+-1.3e12 on nlp_cvx_001_010)
+            # ``|d|`` makes that 1e-5..1e-2 at ``rho = 1e-15`` -- a "gain" that is
+            # multiplier noise, not a better point -- so the floor scales with it. A
+            # real descent (#1499: 8.8e-5 at cancel_mag 7.9e-3) stays far above it.
+            cancel_mag = float(np.abs(d) @ np.abs(grad))
+            if m > 0:
+                cancel_mag += float(np.abs(d) @ (np.abs(jac).T @ np.abs(lam)))
+            if not np.isfinite(cancel_mag):
+                cancel_mag = 0.0  # overflow: no noise credit, keep the #1499 floor
+            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0) + cancel_mag):
                 # An in-box point beats the incumbent Lagrangian: the dual bound these
                 # multipliers support is below f(x), so f(x) is not a bound (#1499;
                 # before, only a beat by more than ``margin`` withheld). Certify only
@@ -19584,6 +19855,20 @@ def _solve_continuous(
     else:
         status = nlp_result.status.value
 
+    # #1493: ``SolveStatus.ERROR`` is where several distinct backend failures
+    # collapse (Ipopt's local-infeasibility code 2, restoration failure, diverging
+    # iterates, ...). A ``status="error"`` result with ``error=None`` gave the caller
+    # no way to tell which, so name the backend's own return code here, at the one
+    # place it is known.
+    _error_reason: Optional[str] = None
+    if status == "error":
+        from discopt.solvers.nlp_ipopt import describe_ipopt_return_code
+
+        _error_reason = (
+            f"single NLP solve ({nlp_solver}) terminated without a solution: "
+            f"{describe_ipopt_return_code(nlp_result.raw_status)}"
+        )
+
     x_dict = _unpack_solution(model, nlp_result.x) if nlp_result.x is not None else None
 
     # Negate objective back for maximization (NLPEvaluator solves minimization of -f)
@@ -19752,6 +20037,30 @@ def _solve_continuous(
             # An unverified point can never be reported as a proven optimum.
             if status == "optimal":
                 status = "unknown"
+            if _error_reason is not None:
+                _error_reason += "; its final iterate failed the feasibility screen"
+
+    # #1493: an NLP failure that nevertheless left a point which PASSED the
+    # false-primal screen above is not an error in the caller's terms -- it is a
+    # feasible incumbent without an optimality proof, which is exactly
+    # ``status="feasible"`` with no bound (``discopt.status`` state 3). Reporting it
+    # as ``"error"`` beside a feasible ``x`` (and ``error=None``) contradicted the
+    # point it returned: ``min norm(v, inf)`` s.t. ``v0 + v1 >= 1`` came back
+    # ``error`` at the feasible (0.545, 0.545). Only on the convexity-certified
+    # route: the convexity-unknown caller (#266) reads ``"error"`` as its cue to fall
+    # back to the spatial B&B, and that caller never surfaces this result.
+    # Downgrade-only in what it claims: no bound, no certificate.
+    if certify_convex and status == "error" and x_dict is not None:
+        logger.info(
+            "Convex single NLP failed (%s) but left a feasible point; reporting it "
+            "as an uncertified feasible incumbent (issue #1493).",
+            _error_reason,
+        )
+        status = "feasible"
+        _gap_certified = False
+        _c_bound = None
+        _c_gap = None
+        _error_reason = None
 
     # #1315: name the provenance of the bound this path reports. Under
     # ``certify_convex`` a local minimum of a PROVED-convex model is the global
@@ -19792,6 +20101,7 @@ def _solve_continuous(
         root_time=wall_time,
         gap_certified=_gap_certified,
         kkt=nlp_result.kkt,
+        error=_error_reason if status == "error" else None,
     )
 
 

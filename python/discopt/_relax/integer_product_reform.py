@@ -49,8 +49,9 @@ from discopt.modeling.core import (
     Model,
     Variable,
     VarType,
+    carry_validation_guards,
 )
-from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
+from discopt.mpec import carry_complementarities
 from discopt.solver_tuning import _env_flag
 
 from .factorable_reform import _collect_mul_factors
@@ -105,6 +106,18 @@ def _int_factor_range(
     if span <= 0 or span > (1 << _MAX_BITS) - 1:
         return None
     return lo_i, hi_i
+
+
+class IntegerProductNotApplicable(ValueError):
+    """The documented reasons this pass abstains mid-rewrite (#1497).
+
+    Raised only for (a) a big-M factor whose bound is unbounded or beyond
+    ``_BIGM_BOUND_CAP`` (issue #286) and (b) the integer-multilinear monomial
+    estimate exceeding its cap (#707/#732). :func:`expand_integer_products`
+    catches exactly this and returns the input model; every other exception is
+    a defect and propagates. A ``ValueError`` subclass so a caller that caught
+    the old bare ``ValueError`` still does.
+    """
 
 
 class _Expander:
@@ -225,7 +238,9 @@ class _Expander:
         # large-bound warning threshold — beyond it the big-M is numerically
         # meaningless, not just at true infinity.
         if not (abs(lo_o) <= _BIGM_BOUND_CAP and abs(hi_o) <= _BIGM_BOUND_CAP):
-            raise ValueError("cannot big-M-linearize a product with an unbounded factor")
+            raise IntegerProductNotApplicable(
+                "cannot big-M-linearize a product with an unbounded factor"
+            )
         # Reuse an identical ``e * other`` product if one was already lifted (the
         # multilinear expansion can request the same AND-aux times continuous
         # factor across several monomials). Keyed on the scalar refs. Scoped to the
@@ -561,7 +576,7 @@ def _try_expand_multilinear(node: BinaryOp, exp: _Expander) -> Optional[Expressi
         _est *= 1 + max(1, math.ceil(math.log2(_hi - _lo + 1)))
     exp._ml_est_columns += _est
     if exp._ml_est_columns > exp._ml_monomial_cap:
-        raise ValueError(
+        raise IntegerProductNotApplicable(
             "integer-multilinear reform monomial estimate "
             f"{exp._ml_est_columns} exceeds cap {exp._ml_monomial_cap}"
         )
@@ -794,16 +809,13 @@ def has_integer_product_work(model: Model, implied=frozenset(), multilinear: boo
     integer square (integer or *implied*-integer factor) this pass can linearize.
     When *multilinear* is set, also detect integer-multilinear products (issue
     #707)."""
-    try:
-        for body in _bodies(model):
-            found = []
-            _for_each_int_bilinear(body, implied, lambda ints: found.append(True))
-            if found or _has_int_square(body, implied):
-                return True
-            if multilinear and _has_int_multilinear(body, implied):
-                return True
-    except Exception:
-        return False
+    for body in _bodies(model):
+        found = []
+        _for_each_int_bilinear(body, implied, lambda ints: found.append(True))
+        if found or _has_int_square(body, implied):
+            return True
+        if multilinear and _has_int_multilinear(body, implied):
+            return True
     return False
 
 
@@ -811,10 +823,7 @@ def has_integer_multilinear_work(model: Model, implied=frozenset()) -> bool:
     """True if any constraint/objective has an integer-*multilinear* product
     (>=3 factors, <=1 continuous, >=1 integer/implied-integer) — the class the
     ``DISCOPT_INTEGER_MULTILINEAR_REFORM`` pass linearizes (issue #707)."""
-    try:
-        return any(_has_int_multilinear(body, implied) for body in _bodies(model))
-    except Exception:
-        return False
+    return any(_has_int_multilinear(body, implied) for body in _bodies(model))
 
 
 def has_nonconvex_integer_bilinear(model: Model) -> bool:
@@ -826,17 +835,14 @@ def has_nonconvex_integer_bilinear(model: Model) -> bool:
     has no distinct bilinear term and is left to the convex fast paths) without
     paying for a full convexity classification.
     """
-    try:
-        from .implied_integer import detect_implied_integers
+    from .implied_integer import detect_implied_integers
 
-        implied = frozenset(detect_implied_integers(model))
-        found: list[bool] = []
-        for body in _bodies(model):
-            _for_each_int_bilinear(body, implied, lambda ints: found.append(True))
-            if found:
-                return True
-    except Exception:
-        return False
+    implied = frozenset(detect_implied_integers(model))
+    found: list[bool] = []
+    for body in _bodies(model):
+        _for_each_int_bilinear(body, implied, lambda ints: found.append(True))
+        if found:
+            return True
     return False
 
 
@@ -860,8 +866,12 @@ def expand_integer_products(model: Model, implied=frozenset(), multilinear: bool
     is an optional set of ``(var._index, elem)`` treated as integer-valued in
     addition to declared integers. When *multilinear* is set, also exact-linearize
     integer-multilinear products (>=3 factors, <=1 continuous — issue #707).
-    Returns *model* unchanged when no such product exists or on any unexpected error
-    (never regresses)."""
+    Returns *model* unchanged when no such product exists, when the rewrite
+    abstains for a documented reason (:class:`IntegerProductNotApplicable`), or
+    when the blowup guard discards the result. Any other exception propagates:
+    returning the input on an arbitrary error made a crashed pass
+    indistinguishable from "nothing to do" -- ``transformations.check()``
+    reported such a crash as an unchanged model (#1497; CLAUDE.md §3/§7)."""
     try:
         if not has_integer_product_work(model, implied, multilinear=multilinear):
             return model
@@ -916,14 +926,11 @@ def expand_integer_products(model: Model, implied=frozenset(), multilinear: bool
         # Complementarity provenance (#1147): the rebuilt model shares the
         # original Variable objects, so every declared relation still resolves
         # against it — forward the relation set explicitly rather than dropping
-        # it, and let an unresolvable one raise past the defensive handler below.
+        # it; an unresolvable one raises (ComplementarityProvenanceError).
         carry_complementarities(model, new_model, pass_name="integer-product expansion")
+        carry_validation_guards(model, new_model)  # #1498
         return new_model
-    except ComplementarityProvenanceError:
-        # Never swallowed into "returned the model unchanged": a dropped relation
-        # is exactly the silent failure #1147 exists to stop.
-        raise
-    except Exception:
+    except IntegerProductNotApplicable:
         return model
 
 
@@ -1014,13 +1021,10 @@ def extend_initial_point(reformed: Model, x0) -> Optional[np.ndarray]:
 def has_reformulation_work(model: Model) -> bool:
     """True if the model has any integer-factor bilinear product — counting both
     declared-integer and *implied*-integer factors — that this pass can linearize."""
-    try:
-        from .implied_integer import detect_implied_integers
+    from .implied_integer import detect_implied_integers
 
-        implied = frozenset(detect_implied_integers(model))
-        return has_integer_product_work(model, implied)
-    except Exception:
-        return False
+    implied = frozenset(detect_implied_integers(model))
+    return has_integer_product_work(model, implied)
 
 
 def reformulate_integer_bilinear(model: Model) -> Model:
@@ -1028,25 +1032,19 @@ def reformulate_integer_bilinear(model: Model) -> Model:
     linearize every integer-factor bilinear product into pure-MILP form. This is
     the entry the solver calls; it is a no-op (returns *model*) when nothing
     applies and never mutates the input model's variable types."""
-    try:
-        from .implied_integer import detect_implied_integers
+    from .implied_integer import detect_implied_integers
 
-        implied = frozenset(detect_implied_integers(model))
-        return expand_integer_products(model, implied)
-    except Exception:
-        return model
+    implied = frozenset(detect_implied_integers(model))
+    return expand_integer_products(model, implied)
 
 
 def has_integer_multilinear_reformulation_work(model: Model) -> bool:
     """True if the model has an integer-*multilinear* product (>=3 factors, <=1
     continuous, >=1 declared/implied-integer) that the ``#707`` pass linearizes."""
-    try:
-        from .implied_integer import detect_implied_integers
+    from .implied_integer import detect_implied_integers
 
-        implied = frozenset(detect_implied_integers(model))
-        return has_integer_multilinear_work(model, implied)
-    except Exception:
-        return False
+    implied = frozenset(detect_implied_integers(model))
+    return has_integer_multilinear_work(model, implied)
 
 
 def reformulate_integer_multilinear(model: Model) -> Model:
@@ -1055,10 +1053,7 @@ def reformulate_integer_multilinear(model: Model) -> Model:
     (>=3 factors, <=1 continuous). A no-op (returns *model*) when nothing applies.
     Gated by ``DISCOPT_INTEGER_MULTILINEAR_REFORM``; the caller decides whether the
     result is adopted (pure-MILP → MILP engine, else kept on the spatial path)."""
-    try:
-        from .implied_integer import detect_implied_integers
+    from .implied_integer import detect_implied_integers
 
-        implied = frozenset(detect_implied_integers(model))
-        return expand_integer_products(model, implied, multilinear=True)
-    except Exception:
-        return model
+    implied = frozenset(detect_implied_integers(model))
+    return expand_integer_products(model, implied, multilinear=True)

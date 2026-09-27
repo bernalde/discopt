@@ -2906,27 +2906,28 @@ def _solve_amp_impl(
             milp_gap_tolerance if milp_gap_tolerance is not None else min(rel_gap / 2, 1e-3)
         )
 
-        try:
-            milp_result, varmap, active_oa_cuts, iter_mip_count = _solve_milp_with_oa_recovery(
-                model=model,
-                terms=terms,
-                disc_state=disc_state,
-                incumbent=incumbent,
-                oa_cuts=oa_cuts,
-                time_limit=milp_tl,
-                gap_tolerance=_milp_gap_tol,
-                convhull_formulation=convhull_mode,
-                convhull_ebd=convhull_ebd,
-                convhull_ebd_encoding=convhull_ebd_encoding,
-                bound_override=(flat_lb, flat_ub),
-                milp_solver=milp_solver,
-            )
-            mip_count += iter_mip_count
-            oa_cuts = active_oa_cuts
-        except Exception as e:
-            logger.warning("AMP: MILP build/solve failed at iteration %d: %s", iteration, e)
-            termination_reason = "error"
-            break
+        # No catch-all here (#1502). A backend that fails to solve the MILP reports
+        # it as ``milp_result.status == "error"``, handled below; an EXCEPTION out of
+        # the build is a defect in the relaxation layer. This used to be caught,
+        # logged at WARNING and turned into ``status="error"``, which hid a
+        # ``TypeError`` on integer array variables (#1502) behind an honest-looking
+        # status. Let it propagate (CLAUDE.md §3).
+        milp_result, varmap, active_oa_cuts, iter_mip_count = _solve_milp_with_oa_recovery(
+            model=model,
+            terms=terms,
+            disc_state=disc_state,
+            incumbent=incumbent,
+            oa_cuts=oa_cuts,
+            time_limit=milp_tl,
+            gap_tolerance=_milp_gap_tol,
+            convhull_formulation=convhull_mode,
+            convhull_ebd=convhull_ebd,
+            convhull_ebd_encoding=convhull_ebd_encoding,
+            bound_override=(flat_lb, flat_ub),
+            milp_solver=milp_solver,
+        )
+        mip_count += iter_mip_count
+        oa_cuts = active_oa_cuts
 
         if milp_result.status in ("infeasible", "error"):
             logger.info(

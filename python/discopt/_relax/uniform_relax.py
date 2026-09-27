@@ -356,8 +356,8 @@ def _curv_cos(lo: float, hi: float) -> Optional[str]:
 # singularity, ``nan`` outside the domain, the same quotient inside it), so every
 # downstream ``_finite`` verdict and every emitted row is unchanged.
 #
-# ``acosh`` gets the same treatment for uniformity even though its ``dom_ok``
-# (``lo > 1``) keeps the singular point out of every admitted box.
+# ``acosh`` gets the same treatment; its singular point ``t = 1`` is reached since
+# #1510 admits the closed lower domain edge (``_closed_edge_lo``).
 # --------------------------------------------------------------------------- #
 def _dsqrt(t: float) -> float:
     """``d/dt sqrt(t)`` = ``0.5/sqrt(t)``; ``+inf`` at the vertical tangent t=0."""
@@ -1371,8 +1371,18 @@ class _Builder:
             self._bounds[id(node)] = hit
             return hit
         enc = evaluate_interval(self._expr(node), self.model, self._ivbox)
-        lo = float(np.asarray(enc.lo))
-        hi = float(np.asarray(enc.hi))
+        enc_lo = np.asarray(enc.lo)
+        enc_hi = np.asarray(enc.hi)
+        if enc_lo.size != 1 or enc_hi.size != 1:
+            # Every CNode is scalar by construction; an array enclosure means an
+            # array-valued subexpression reached a scalar slot. Say so, instead of
+            # numpy's "only 0-dimensional arrays can be converted" (#1493).
+            raise ValueError(
+                f"relaxation invariant violated: {node.kind} node {self._expr(node)!r} "
+                f"has an array-valued interval enclosure of shape {enc_lo.shape}"
+            )
+        lo = float(enc_lo.reshape(()))
+        hi = float(enc_hi.reshape(()))
         if not (math.isfinite(lo)):
             lo = -math.inf
         if not (math.isfinite(hi)):
@@ -1603,10 +1613,11 @@ def _interval_box(model: Model, flat_lb: np.ndarray, flat_ub: np.ndarray) -> dic
 #
 # Which atoms actually reach that case: ``sqrt`` at ``t = 0`` (``dom_ok`` is
 # ``lo >= 0``), and ``asin``/``acos`` at ``t = +1`` (``dom_ok`` constrains only
-# ``lo``, so ``hi = 1`` is admitted). ``acosh`` and ``log`` do NOT — their
-# ``dom_ok`` is a strict inequality (``lo > 1``, ``lo > 0``), so the singular point
-# is outside every admitted box and the endpoint derivative is finite there. (A
-# finite-but-huge derivative is deliberately out of scope; see below.)
+# ``lo``, so ``hi = 1`` is admitted). Since #1510 (``_closed_edge_lo``) also
+# ``asin``/``acos`` at ``t = -1`` and ``acosh`` at ``t = 1``: the closed LOWER edge
+# is admitted too. ``log`` does NOT — its ``dom_ok`` is a strict inequality
+# (``lo > 0``) and ``log`` itself is infinite there. (A finite-but-huge derivative
+# is deliberately out of scope; see below.)
 #
 # Dropping the facet is SOUND but loose, and ``t = 0`` is frequently the
 # interesting point rather than an
@@ -2128,9 +2139,69 @@ def _build_univariate_call(ctx: _Builder, node: CNode, w: int) -> Envelope:
         return Envelope(rows=[], tight=False)  # unknown intrinsic -> interval floor
     f, fp, curv_fn, dom_ok = entry
     if not dom_ok(lo):
-        return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
+        edge_lo = _closed_edge_lo(fname, lo, hi)
+        if edge_lo is None:
+            return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
+        lo = edge_lo  # #1510: the closed lower domain edge
     tight = _emit_1d(ctx, w, lt, lo, hi, f, fp, curv_fn(lo, hi))
     return Envelope(rows=[], tight=tight)
+
+
+#: #1510: the CLOSED lower domain edge of each atom whose ``dom_ok`` is strict there
+#: although the function is finite (only its derivative diverges). ``asin``/``acos``
+#: are defined on ``[-1, 1]`` and ``acosh`` on ``[1, inf)``, but ``dom_ok`` demanded
+#: ``lo > -1`` / ``lo > 1`` while the mirror edge ``hi = +1`` of asin/acos was
+#: already admitted -- so the box that touches the edge, the very one holding an
+#: edge optimum (#1492), got only the interval floor.
+_CLOSED_LOWER_EDGE: dict[str, float] = {"asin": -1.0, "acos": -1.0, "acosh": 1.0}
+
+
+def _closed_edge_envelopes_enabled() -> bool:
+    """``DISCOPT_CLOSED_EDGE_ENVELOPES`` (#1510) -- GRADUATED default-ON;
+    ``DISCOPT_CLOSED_EDGE_ENVELOPES=0`` restores the legacy interval floor.
+
+    Bound-changing (it adds envelope rows on boxes that used to get none), so it
+    shipped behind a CLAUDE.md section-5 gate. Panel (2026-09-27, see
+    ``docs/dev/flag-retirement-audit.md``): the in-repo corpus contains no
+    asin/acos/acosh term (66/66 scanned) -- and MINLPLib has no inverse-trig
+    instance at all -- so it is cert-clean and byte-identical there; on an 88-model
+    synthetic family of closed-edge asin/acos/acosh models (1-D, affine-argument
+    epigraph, 2-D coupled, MINLP) ON vs OFF: 0 unsound on either arm, 0
+    certification regressions, 1 gain, nodes 878 -> 132 over the 87 models both
+    arms certify, wall 32.0 s -> 22.1 s.
+    """
+    return os.environ.get("DISCOPT_CLOSED_EDGE_ENVELOPES", "1").strip() != "0"
+
+
+#: How far below a closed edge an argument's lower bound may sit and still be read
+#: as that edge (#1510): interval evaluation of an affine argument rounds
+#: OUTWARD, so ``asin(x - 1)`` over ``x in [0, 1]`` arrives as ``lo = -1 - ulp``.
+_CLOSED_EDGE_TOL = 1e-12
+
+
+def _closed_edge_lo(fname: str, lo: float, hi: float) -> Optional[float]:
+    """The lower end to envelope a box over when its argument starts at (or a
+    rounding error below) the CLOSED lower domain edge of ``fname`` -- that edge --
+    or ``None`` to keep the interval floor (#1510; ``=0`` opts out).
+
+    Sound for the same reason ``hi = +1`` already is for asin/acos: ``f`` is finite
+    and continuous at the edge and has a single proven curvature on
+    ``[edge, hi]``, so the secant through ``(edge, f(edge))`` is a valid chord and
+    every finite-slope tangent is a valid facet; the one facet that does not exist
+    is the tangent AT the edge, whose slope is infinite, and ``_tangent_row``
+    already drops a non-finite slope. Clamping an outward-rounded ``lo`` up to the
+    edge removes only argument values where ``f`` is undefined, i.e. no point the
+    model can take. A ``lo`` further below the edge than ``_CLOSED_EDGE_TOL`` (a box
+    genuinely reaching outside the domain) keeps the floor, as before.
+    """
+    edge = _CLOSED_LOWER_EDGE.get(fname)
+    if edge is None or not _closed_edge_envelopes_enabled():
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= edge:
+        return None
+    if not (edge - _CLOSED_EDGE_TOL * max(1.0, abs(edge)) <= lo <= edge):
+        return None
+    return edge
 
 
 def _registered_envelope_entry(fname: str):
@@ -2200,8 +2271,19 @@ def _emit_secant_only(ctx, w, lt, lo, hi, f, sign) -> bool:
 def _pow_curv(p: float, lo: float, hi: float) -> Optional[str]:
     """Sound curvature of ``t**p`` on ``[lo,hi]`` (``f'' = p(p-1) t^(p-2)``)."""
     is_int = float(p).is_integer()
-    if is_int and int(p) % 2 == 0:
-        return "convex"  # even integer power: convex on all of R
+    if is_int and int(p) % 2 == 0 and p > 0.0:
+        return "convex"  # even POSITIVE integer power: convex on all of R
+    # #1493: a NEGATIVE even power (``t**-2``, ``t**-4``) is convex on each open
+    # half-line but has a pole at ``t = 0``, so it is convex on no interval that
+    # contains 0 -- it is not even finite there. Reading it as "convex on all of R"
+    # (the branch above, which used to admit every even integer) emitted the secant
+    # ``w <= f(hi)`` between the two finite endpoint values and the endpoint
+    # tangents as global underestimators; on ``[-3, 3]`` that is ``w <= 1/9``, which
+    # cuts off every point of ``x**-2 == 4`` and made the root LP report the
+    # feasible model infeasible. A box touching or straddling the pole has no
+    # curvature verdict; the aux keeps only its (sound) interval enclosure.
+    if p < 0.0 and lo <= 0.0 <= hi:
+        return None
     # Sign-definite box required otherwise (the only curvature change is at t=0,
     # and non-integer p needs t>=0 anyway).
     if lo < 0.0 < hi:
@@ -3622,9 +3704,44 @@ def _single_orig_affine(ctx: "_Builder", lt: "LinForm") -> Optional[tuple[int, f
     return None
 
 
-def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[float]:
+#: Most inflection points one univariate atom may inject into its partition
+#: (#1506). Each injected point splits a partition interval and costs one binary
+#: selector plus two continuous columns and ~10 rows, so the count must be bounded
+#: by something other than the box width: ``sin`` on ``[-1e9, 1e9]`` has ~6.4e8
+#: inflections, which the unbounded enumeration walked in pure Python inside the
+#: relaxation build, where no deadline is checked. 64 inflections is an argument
+#: span of ~64*pi ~ 201. This is a COST cap, not a tightness claim: below it the
+#: injected set is exactly the pre-#1506 enumeration, above it the extra pieces are
+#: simply not added (sound: see ``_univariate_inflection_args``).
+_MAX_INFLECTION_POINTS = 64
+
+
+def _periodic_inflection_range(fname: str, alo: float, ahi: float) -> Optional[tuple[int, int]]:
+    """``(k_min, k_max)`` such that the ``sin``/``cos`` inflections in ``[alo, ahi]``
+    are ``start + k*pi`` for ``k_min <= k <= k_max``, or ``None`` when an endpoint
+    is not finite (there are infinitely many; nothing can be enumerated).
+
+    O(1) whatever the width, so callers can COUNT before they enumerate.
+    """
+    if not (math.isfinite(alo) and math.isfinite(ahi)):
+        return None
+    start = 0.0 if fname == "sin" else 0.5 * math.pi
+    return math.ceil((alo - start) / math.pi), math.floor((ahi - start) / math.pi)
+
+
+def _univariate_inflection_args(
+    fname: str, alo: float, ahi: float, max_points: int = _MAX_INFLECTION_POINTS
+) -> Optional[list[float]]:
     """Curvature-change (inflection) points of ``fname`` inside ``(alo, ahi)`` in
-    ARGUMENT space, so each sub-interval is single-curvature."""
+    ARGUMENT space, so each sub-interval is single-curvature.
+
+    Returns ``None`` -- "too many to enumerate" -- when the interval is unbounded
+    or holds more than ``max_points`` inflections (#1506). ``None`` is not "no
+    inflections": the caller must not treat the interval as single-curvature. It
+    is safe to inject nothing for such an interval, because a piece that straddles
+    an inflection gets no curvature verdict and keeps only its sound interval
+    floor (``_emit_piecewise_1d`` emits no rows for ``curv is None``).
+    """
     out: list[float] = []
     # f'' has the sign of the argument -> inflection at 0.
     if fname in ("tan", "tanh", "atan", "asin", "asinh", "atanh", "erf", "sinh"):
@@ -3633,9 +3750,13 @@ def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[floa
         return out
     if fname in ("sin", "cos"):
         # sin'' = -sin (inflections at k*pi); cos'' = -cos (inflections at pi/2+k*pi).
+        rng = _periodic_inflection_range(fname, alo, ahi)
+        if rng is None:
+            return None
+        k_min, k_max = rng
+        if k_max - k_min + 1 > max_points:
+            return None
         start = 0.0 if fname == "sin" else 0.5 * math.pi
-        k_min = math.ceil((alo - start) / math.pi)
-        k_max = math.floor((ahi - start) / math.pi)
         for k in range(k_min, k_max + 1):
             p = start + k * math.pi
             if alo < p < ahi:
@@ -3643,12 +3764,57 @@ def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[floa
     return out
 
 
+def _partition_inflection_args(
+    fname: str, coeff: float, const: float, pts: list[float]
+) -> list[float]:
+    """Inflection points (ARGUMENT space) to inject into the partition ``pts`` of
+    ``x`` for the atom ``fname(coeff*x + const)``, at most
+    ``_MAX_INFLECTION_POINTS`` of them (#1506).
+
+    When the whole box holds no more than the cap, every inflection is injected --
+    the pre-#1506 behaviour, unchanged. Otherwise (a wide box) each partition
+    interval gets its own inflections when it holds at most the cap still unspent,
+    so the narrow intervals AMP refines around the incumbent become
+    single-curvature while a wide interval stays one mixed-curvature piece with
+    its sound interval floor. The work is O(len(pts) + cap), independent of the
+    box width.
+    """
+    whole = _univariate_inflection_args(
+        fname,
+        min(coeff * pts[0] + const, coeff * pts[-1] + const),
+        max(coeff * pts[0] + const, coeff * pts[-1] + const),
+    )
+    if whole is not None:
+        return whole
+    out: list[float] = []
+    budget = _MAX_INFLECTION_POINTS
+    for k in range(len(pts) - 1):
+        a0 = coeff * pts[k] + const
+        a1 = coeff * pts[k + 1] + const
+        local = _univariate_inflection_args(fname, min(a0, a1), max(a0, a1), budget)
+        if local is None:
+            continue
+        out.extend(local)
+        budget -= len(local)
+        if budget <= 0:
+            break
+    return out
+
+
 def _tan_branch_safe(alo: float, ahi: float) -> bool:
-    """True iff ``[alo, ahi]`` contains no ``tan`` asymptote (pi/2 + k*pi)."""
+    """True iff ``[alo, ahi]`` contains no ``tan`` asymptote (pi/2 + k*pi).
+
+    O(1) in the width (#1506): an unbounded interval, or one at least ``pi`` wide,
+    always contains an asymptote; a narrower one can only contain the asymptotes
+    next to ``alo``, which are tested exactly as before.
+    """
     margin = 1e-6
-    k_min = math.floor((alo - 0.5 * math.pi) / math.pi) - 1
-    k_max = math.ceil((ahi - 0.5 * math.pi) / math.pi) + 1
-    for k in range(k_min, k_max + 1):
+    if not (math.isfinite(alo) and math.isfinite(ahi)):
+        return False
+    if (ahi + margin) - (alo - margin) >= math.pi:
+        return False
+    k0 = math.floor((alo - 0.5 * math.pi) / math.pi)
+    for k in range(k0 - 1, k0 + 3):
         asymptote = 0.5 * math.pi + k * math.pi
         if alo - margin <= asymptote <= ahi + margin:
             return False
@@ -3841,11 +4007,25 @@ def _apply_partition_refinement(ctx: "_Builder", disc_state: object) -> None:
         # Inject the function's inflection points (mapped from arg space to x space)
         # so no sub-interval straddles a curvature change; without this a partition
         # refined only near the incumbent leaves the inflection interval loose.
-        infl_x: list[float] = []
-        _e0 = coeff * float(ctx.col_lb[v]) + const
-        _e1 = coeff * float(ctx.col_ub[v]) + const
-        for a_infl in _univariate_inflection_args(fname, min(_e0, _e1), max(_e0, _e1)):
-            infl_x.append((a_infl - const) / coeff)
+        # The partition is resolved first -- ``_clamped_breakpoints`` refuses a
+        # non-finite box, which ``_clamped`` below would refuse anyway -- and the
+        # injection is bounded by the partition, not by the box width (#1506: an
+        # unbounded argument crashed ``math.ceil(-inf)`` here and a 1e9-wide one
+        # hung the build in an O(width) loop). ``min_intervals=1`` so a partition
+        # that only the inflections split into >= 2 pieces is still refined, as
+        # before.
+        base_pts = _clamped_breakpoints(
+            np.asarray(parts[v], dtype=np.float64),
+            float(ctx.col_lb[v]),
+            float(ctx.col_ub[v]),
+            min_intervals=1,
+        )
+        if base_pts is None:
+            continue
+        infl_x = [
+            (a_infl - const) / coeff
+            for a_infl in _partition_inflection_args(fname, coeff, const, base_pts)
+        ]
         pts = _clamped(v, infl_x)
         if pts is None:
             continue

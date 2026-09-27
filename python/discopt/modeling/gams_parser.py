@@ -304,6 +304,17 @@ class ExprIndex:
 
 
 @dataclass
+class ExprLabel:
+    """A quoted set-element label, ``'1'`` in ``x('1')`` (#1503).
+
+    Only meaningful as an index of an indexed reference; anywhere else in an
+    expression it is refused, since a label is not a number.
+    """
+
+    value: str
+
+
+@dataclass
 class ExprBinOp:
     op: str
     left: object
@@ -1190,6 +1201,7 @@ class _Parser:
         "cosh",
         "tanh",
         "power",
+        "rpower",
         "sign",
         "signpower",
         "min",
@@ -1314,7 +1326,13 @@ class _Parser:
         self._expect(_Tok.SYMBOL, "(")
         indices: list = []
         while not self._match_sym(")"):
-            indices.append(self._parse_expr())
+            # A quoted element label, ``x('1')`` -- the form ``to_gams`` itself
+            # writes for every element of an array variable (#1503). It is an
+            # index position only; a label is never an arithmetic operand.
+            if self._cur().kind == _Tok.STRING and self._peek(1).value in (",", ")"):
+                indices.append(ExprLabel(self._advance().value))
+            else:
+                indices.append(self._parse_expr())
             if self._match_sym(","):
                 self._advance()
         self._expect(_Tok.SYMBOL, ")")
@@ -1560,7 +1578,9 @@ class _ModelBuilder:
             if expr.name in self.param_values:
                 indices = []
                 for idx in expr.indices:
-                    if isinstance(idx, ExprRef) and idx.name in env:
+                    if isinstance(idx, ExprLabel):
+                        indices.append(idx.value)
+                    elif isinstance(idx, ExprRef) and idx.name in env:
                         indices.append(env[idx.name])
                     else:
                         v = self._eval_const_expr_with_env(idx, env)
@@ -1630,6 +1650,13 @@ class _ModelBuilder:
             if fn == "abs":
                 return float(abs(fargs[0]))
             if fn == "power":
+                return float(fargs[0] ** fargs[1])
+            if fn == "rpower":
+                # GAMS rPower(x, y) = x**y, defined for x >= 0 only (a negative
+                # base is a GAMS execution error); leave that unevaluable rather
+                # than let Python return a complex number.
+                if fargs[0] < 0:
+                    return None
                 return float(fargs[0] ** fargs[1])
             if fn == "sin":
                 return math.sin(fargs[0])
@@ -1801,7 +1828,9 @@ class _ModelBuilder:
             if expr.name in self.param_values:
                 indices = []
                 for idx in expr.indices:
-                    if isinstance(idx, ExprRef) and idx.name in env:
+                    if isinstance(idx, ExprLabel):
+                        indices.append(idx.value)
+                    elif isinstance(idx, ExprRef) and idx.name in env:
                         indices.append(env[idx.name])
                     else:
                         return None
@@ -2258,6 +2287,10 @@ class _ModelBuilder:
 
         Returns a string (set element name), int (position), or Expression.
         """
+        # Quoted element label: 'e' -> the element itself
+        if isinstance(idx_ast, ExprLabel):
+            return idx_ast.value
+
         # Simple reference: i -> look up in env
         if isinstance(idx_ast, ExprRef):
             if idx_ast.name in env:
@@ -2473,6 +2506,10 @@ class _ModelBuilder:
         if fn == "sigmoid":
             return dm.sigmoid(args[0])
         if fn == "power":
+            return args[0] ** args[1]
+        if fn == "rpower":
+            # GAMS rPower(x, y) = x**y for x >= 0 -- the spelling ``to_gams``
+            # writes for a fractional or symbolic exponent (#1503).
             return args[0] ** args[1]
         if fn == "sign":
             return dm.sign(args[0])

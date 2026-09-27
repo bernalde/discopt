@@ -524,6 +524,9 @@ class MccormickLPRelaxer:
         # update it (its per-node cost is negligible by construction).
         # Pure measurement — read via :meth:`expected_build_cost`.
         self._build_wall_ema: Optional[float] = None
+        # #1493: the first relaxation-build failure of this relaxer is reported at
+        # WARNING (later ones stay at DEBUG -- this is a per-node hot path).
+        self._build_failure_reported = False
         # Count of rounds run in yield mode (#966). Read by the node loops for
         # ``solver_stats`` and by the tests to prove the mechanism fired
         # (CLAUDE.md §6: a gate that never fires must not read as a pass).
@@ -1503,12 +1506,23 @@ class MccormickLPRelaxer:
                     if self._build_wall_ema is None
                     else 0.5 * self._build_wall_ema + 0.5 * _build_wall
                 )
-        except Exception:
-            # Build failures here are otherwise invisible: the result silently
-            # becomes status="error", which propagates up to a top-level
-            # status="error" SolveResult with no diagnostic. Log the full
-            # traceback at DEBUG (this is a per-node hot path, so keep it off the
-            # default log level) so the underlying cause is recoverable.
+        except Exception as exc:
+            # Build failures here are otherwise invisible: the node silently gets
+            # no LP bound. The full traceback goes to DEBUG on every node (hot
+            # path), but the FIRST failure of this relaxer is a WARNING naming the
+            # exception: #1493's array-norm TypeError sat here at DEBUG for every
+            # node of every such solve, and the only user-visible trace was the
+            # generic "No valid dual bound" advice, which blamed a missing
+            # envelope rather than a crashed build.
+            if not self._build_failure_reported:
+                self._build_failure_reported = True
+                logger.warning(
+                    "McCormick LP relaxation build failed (%s: %s); nodes whose "
+                    "relaxation cannot be built get no LP bound. Further failures "
+                    "of this relaxer are logged at DEBUG.",
+                    type(exc).__name__,
+                    exc,
+                )
             logger.debug("McCormick LP relaxation build failed", exc_info=True)
             return MccormickLPResult(status="error")
 

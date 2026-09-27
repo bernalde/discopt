@@ -21,6 +21,7 @@ Neumaier (1990), *Interval Methods for Systems of Equations*.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Union
 
 import numpy as np
@@ -177,7 +178,7 @@ def _eval_impl(expr: Expression, model: Optional[Model], box: dict, cache: dict)
         if expr.op == "*":
             return left * right
         if expr.op == "/":
-            return left / right
+            return _divide(left, right)
         if expr.op == "**":
             return _eval_power(expr, left, right)
         return _unbounded(left.lo.shape)
@@ -376,6 +377,64 @@ def _widen_sum(
     return np.where(np.isfinite(err), widened, sign * np.inf)
 
 
+def extended_division_enabled() -> bool:
+    """``DISCOPT_EXTENDED_DIVISION=1`` (default OFF, #1493): see :func:`_divide`.
+
+    Bound-changing, so default OFF under CLAUDE.md §5; its panel ran in the PR that
+    introduced it (row in ``docs/dev/flag-retirement-audit.md``). Cert-clean on both
+    the 66-instance corpus and a 180-cell synthetic pole family. Net-positive only on
+    the family (60 -> 97 certified, 0 lost); on the corpus it fires on 6 instances
+    (4stufen, beuster, contvar, heatexch_gen1/2/3), all time-limited in both arms
+    with identical bounds and node counts, so the corpus cannot score the second bar.
+    Kept as a documented opt-in, not a stalled graduation. **What would change
+    that:** a panel over MINLPLib instances whose objective or constraint divides by
+    a denominator whose range TOUCHES 0 on the root box -- the class this serves --
+    showing certificates or bounds gained. The straddling case (``min 1/x s.t.
+    x**2 >= 1`` on ``[-3, 3]``) is not helped by this flag at all: its hull stays
+    ``(-inf, inf)`` until the B&B tree splits the pole variable AT the pole, which is
+    what ``DISCOPT_POLE_BRANCHING`` does (``SolverTuning.pole_branching``); the two
+    compose -- after the split each child's denominator only touches 0, which is
+    where this flag's one-sided reciprocal applies.
+    """
+    return os.environ.get("DISCOPT_EXTENDED_DIVISION", "0") == "1"
+
+
+def _divide(num: Interval, den: Interval) -> Interval:
+    """``num / den``; with the flag ON, a denominator TOUCHING 0 keeps one side.
+
+    Default (flag OFF): :meth:`Interval.__truediv__`, which returns ``(-inf, inf)``
+    whenever ``den`` holds 0 -- byte-identical to the historical behaviour.
+
+    Flag ON (#1493, extended-interval division): the reciprocal of a denominator
+    whose range only TOUCHES the pole is one-sided -- ``1/[0, 5] = [0.2, +inf]``,
+    ``1/[-3, 0] = [-inf, -1/3]`` -- which is the enclosure of the reciprocal over
+    every point of the box, the endpoint included (IEEE ``1/+0 = +inf``; the pole
+    is the limit ``+inf``, which the interval contains). A denominator STRADDLING
+    0 has the reciprocal ``(-inf, 1/lo] U [1/hi, +inf)``, whose hull is
+    ``(-inf, inf)``; a degenerate ``[0, 0]`` is undefined everywhere. Both stay
+    unbounded. The numerator is then multiplied in with the ordinary interval
+    product (``0 * inf -> 0`` convention, C-36). Outward rounding on the finite
+    endpoint. A denominator that excludes 0 takes the default path unchanged.
+    """
+    if not bool(np.any(den.contains_zero())) or not extended_division_enabled():
+        return num / den
+    d_lo = np.asarray(den.lo, dtype=np.float64)
+    d_hi = np.asarray(den.hi, dtype=np.float64)
+    with np.errstate(divide="ignore"):
+        pos = (d_lo >= 0.0) & (d_hi > 0.0)  # touches 0 from above
+        neg = (d_hi <= 0.0) & (d_lo < 0.0)  # touches 0 from below
+        excl = ~((d_lo <= 0.0) & (d_hi >= 0.0))  # 0 not in this element's range
+        inv_hi_pos = np.where(pos, 1.0 / np.where(pos, d_hi, 1.0), 0.0)
+        inv_lo_neg = np.where(neg, 1.0 / np.where(neg, d_lo, 1.0), 0.0)
+        inv_lo_ex = np.where(excl, 1.0 / np.where(excl, d_hi, 1.0), 0.0)
+        inv_hi_ex = np.where(excl, 1.0 / np.where(excl, d_lo, 1.0), 0.0)
+    ex_lo = np.where(excl, iv._round_down_exact0(inv_lo_ex), -np.inf)
+    ex_hi = np.where(excl, iv._round_up_exact0(inv_hi_ex), np.inf)
+    r_lo = np.where(pos, iv._round_down_exact0(inv_hi_pos), ex_lo)
+    r_hi = np.where(neg, iv._round_up_exact0(inv_lo_neg), ex_hi)
+    return num * Interval(r_lo, r_hi)
+
+
 def _unbounded(shape) -> Interval:
     return Interval(
         np.full(shape, -np.inf, dtype=np.float64),
@@ -395,6 +454,9 @@ def _eval_power(expr: BinaryOp, left: Interval, right: Interval) -> Interval:
     n = float(raw)
     n_int = int(n)
     if np.isclose(n, float(n_int)):
+        if n_int < 0:
+            # x**-k = 1 / x**k, through the same (optionally extended) division.
+            return _divide(Interval.point(1.0), left ** (-n_int))
         return left**n_int
     # Fractional: base must be nonneg; use exp(n log(x)).
     if np.any(left.lo < 0):
@@ -447,6 +509,8 @@ def _eval_function_call(
 
     arg = args[0]
     name = expr.func_name
+    if name.startswith("norm"):
+        return _norm_interval(name, arg)
     if name == "exp":
         return iv.exp(arg)
     if name == "log":
@@ -506,6 +570,57 @@ def _eval_function_call(
     # will refuse to prove convexity for expressions that hit this
     # path, preserving soundness.
     return _unbounded(arg.lo.shape)
+
+
+def _norm_interval(name: str, arg: Interval) -> Interval:
+    """Sound SCALAR enclosure of ``norm{p}(arg)`` (#1493).
+
+    A norm is a reduction, so its enclosure is 0-d whatever ``arg``'s shape.
+    The generic arm below used to return an unbounded interval of ``arg``'s
+    shape, i.e. an ARRAY enclosure for a scalar node, which the relaxation
+    builder then failed on with ``TypeError``.
+
+    For a 0-d or 1-D argument (the vector p-norm of the tape lowering) the
+    enclosure is composed from outward-rounded interval operations on
+    ``|arg_i|``: exact composition for ``p`` in {1, 2, inf}, and the
+    norm-equivalence sandwich ``||x||_inf <= ||x||_p <= ||x||_1`` for any other
+    ``p >= 1``. A >=2-D argument is ``jnp.linalg.norm``'s induced MATRIX norm,
+    which the entrywise bounds above do NOT enclose (``||I_3||_2 = 1`` while the
+    entrywise 2-norm is ``sqrt(3)``), so it gets only ``[0, +inf)`` -- true of
+    every norm.
+    """
+    lo_arr = np.asarray(arg.lo, dtype=np.float64)
+    if lo_arr.ndim >= 2 or lo_arr.size == 0:
+        return Interval(np.asarray(0.0), np.asarray(np.inf))
+    suffix = name[len("norm") :]
+    if suffix == "inf":
+        p = np.inf
+    elif suffix == "":
+        p = 2.0
+    else:
+        try:
+            p = float(suffix)
+        except ValueError:
+            return Interval(np.asarray(0.0), np.asarray(np.inf))
+    a = iv.absolute(arg)
+    a_lo = np.asarray(a.lo, dtype=np.float64).reshape(-1)
+    a_hi = np.asarray(a.hi, dtype=np.float64).reshape(-1)
+    parts = [Interval(np.asarray(lo), np.asarray(hi)) for lo, hi in zip(a_lo, a_hi)]
+    if p == np.inf:
+        # max selects existing doubles: exact, no rounding.
+        return Interval(np.asarray(np.max(a_lo)), np.asarray(np.max(a_hi)))
+    if p == 2.0:
+        acc = parts[0] ** 2
+        for part in parts[1:]:
+            acc = acc + part**2
+        return iv.sqrt(acc)
+    one = parts[0]
+    for part in parts[1:]:
+        one = one + part
+    if p == 1.0:
+        return one
+    # ||x||_inf <= ||x||_p <= ||x||_1 for every p >= 1.
+    return Interval(np.asarray(np.max(a_lo)), np.asarray(one.hi))
 
 
 def _registered_interval(name, expr, model, box, cache):

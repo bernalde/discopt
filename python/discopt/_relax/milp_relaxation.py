@@ -33,7 +33,11 @@ import scipy.sparse as sp
 from discopt._relax._numeric import is_effectively_finite as _is_effectively_finite
 from discopt._relax.discretization import DiscretizationState
 from discopt._relax.model_utils import flat_variable_bounds
-from discopt._relax.scalarize import sum_is_full_reduction
+from discopt._relax.scalarize import (
+    scalar_elements,
+    scalar_matmul_contraction,
+    sum_is_full_reduction,
+)
 from discopt._relax.term_classifier import (
     NonlinearTerms,
     _compute_var_offset,
@@ -46,6 +50,7 @@ from discopt.modeling.core import (
     Expression,
     FunctionCall,
     IndexExpression,
+    MatMulExpression,
     Model,
     SumExpression,
     SumOverExpression,
@@ -1856,9 +1861,21 @@ def _linearize_affine_expr_sparse(
     coeff: dict[int, float] = {}
     const_acc: list[float] = [0.0]
 
+    def scalar_value(c: Constant) -> float:
+        # An array-valued constant is not a scalar coefficient: ``c * x`` with a
+        # vector ``c`` stands for one product PER ELEMENT. ``float()`` on it raised
+        # a ``TypeError`` that escaped this walk's ``ValueError`` "not affine"
+        # contract, crashed AMP's MILP build and surfaced as ``status="error"``
+        # (#1502). Array operands reach this walk only through the element-wise
+        # expansion below; one found here is refused the documented way.
+        values = np.asarray(c.value, dtype=np.float64)
+        if values.size != 1:
+            raise ValueError(f"Array constant of shape {values.shape} is not a scalar: {c}")
+        return float(values.reshape(-1)[0])
+
     def visit(e: Expression, scale: float) -> None:
         if isinstance(e, Constant):
-            const_acc[0] += scale * float(e.value)
+            const_acc[0] += scale * scalar_value(e)
             return
 
         if isinstance(e, Variable):
@@ -1890,20 +1907,20 @@ def _linearize_affine_expr_sparse(
                 return
             if e.op == "*":
                 if isinstance(e.left, Constant):
-                    visit(e.right, scale * float(e.left.value))
+                    visit(e.right, scale * scalar_value(e.left))
                     return
                 if isinstance(e.right, Constant):
-                    visit(e.left, scale * float(e.right.value))
+                    visit(e.left, scale * scalar_value(e.right))
                     return
                 raise ValueError(f"Non-affine product in univariate argument: {e}")
             if e.op == "/":
                 if isinstance(e.right, Constant):
-                    visit(e.left, scale / float(e.right.value))
+                    visit(e.left, scale / scalar_value(e.right))
                     return
                 raise ValueError(f"Non-affine division in univariate argument: {e}")
             if e.op == "**":
                 if isinstance(e.right, Constant):
-                    exp = float(e.right.value)
+                    exp = scalar_value(e.right)
                     if exp == 1.0:
                         visit(e.left, scale)
                         return
@@ -1926,7 +1943,23 @@ def _linearize_affine_expr_sparse(
                 for k in range(op.size):
                     coeff[offset + k] = coeff.get(offset + k, 0.0) + scale
                 return
-            visit(op, scale)
+            # A full reduction of anything else (``sum(c * x)``) is the sum of its
+            # scalar ELEMENTS. Visiting the array-valued operand as if it were one
+            # scalar is what raised the #1502 ``TypeError``; ``None`` (shape not
+            # statically known) is refused, never guessed.
+            elems = scalar_elements(op)
+            if elems is None:
+                raise ValueError(f"Sum operand has no static scalar expansion: {e}")
+            for elem in elems:
+                visit(elem, scale)
+            return
+
+        if isinstance(e, MatMulExpression):
+            # ``c @ x`` with a scalar result is the contraction ``sum_k c_k x_k``.
+            contraction = scalar_matmul_contraction(e)
+            if contraction is None:
+                raise ValueError(f"Matmul is not a scalar contraction: {e}")
+            visit(contraction, scale)
             return
 
         if isinstance(e, SumOverExpression):

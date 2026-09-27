@@ -1968,6 +1968,20 @@ impl<'a> Simplex<'a> {
         {
             return Err(self.cols);
         }
+        // #1510: a nonbasic column on an infinite side of its box is not a vertex
+        // of this LP (see `dual::nonbasic_at_infinite_bound`); the primal prices
+        // it one-sided too, so phase 2 from it can stop at a non-optimal point.
+        if super::dual::nonbasic_at_infinite_bound(
+            &start.col_status,
+            &self.lb[..n],
+            &self.ub[..n],
+            self.tol,
+        )
+        .is_some()
+        {
+            crate::profile::incr(crate::profile::Ctr::PrimalWarmRejectInfBound);
+            return Err(self.cols);
+        }
         // Ingest nonbasic status for the real columns; pin every artificial to 0
         // (phase-2 config) and nonbasic.
         self.stat[..n].copy_from_slice(&start.col_status);

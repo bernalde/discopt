@@ -24,6 +24,7 @@ from discopt.modeling.core import (
     MatMulExpression,
     Model,
     ObjectiveSense,
+    Parameter,
     SumExpression,
     SumOverExpression,
     UnaryOp,
@@ -613,15 +614,72 @@ class _GamsWriter:
         "sigmoid": "sigmoid",
     }
 
+    @staticmethod
+    def _num_to_gams(val: float) -> str:
+        """A numeric literal, exact (``repr`` round-trips) and GAMS-legal.
+
+        A negative literal is parenthesised: GAMS rejects two operators in a row
+        (error 445), so ``(x - -2)`` must be written ``(x - (-2))``.
+        """
+        if not np.isfinite(val):
+            raise ValueError(f"Cannot write the non-finite constant {val!r} into a GAMS equation.")
+        txt = str(int(val)) if val == int(val) and abs(val) < 1e15 else repr(val)
+        return f"({txt})" if val < 0 else txt
+
+    @staticmethod
+    def _parameter_element(param: Parameter, index) -> float:
+        """The current value of ``param`` (or of ``param[index]``) as a scalar.
+
+        A ``Parameter`` is "a value fixed during a single solve", and GAMS
+        export -- like ``.nl`` export -- writes a SNAPSHOT at its current value.
+        This used to fall through to ``<unsupported:Parameter>`` and write that
+        text into the equation (#1503). A non-scalar selection is refused rather
+        than truncated to one element.
+        """
+        val = np.asarray(param.value, dtype=np.float64)
+        if index is None:
+            if val.size != 1:
+                raise ValueError(
+                    f"Cannot write array parameter {param.name!r} of shape "
+                    f"{val.shape} to GAMS without indexing; index it element-wise "
+                    f"(e.g. p[i]) so each use is scalar."
+                )
+            return float(val.reshape(-1)[0])
+        if val.shape in ((), (1,)):
+            flat = index[0] if isinstance(index, tuple) and len(index) == 1 else index
+            if flat != 0:
+                raise ValueError(f"Index {index!r} is out of range for parameter {param.name!r}")
+            return float(val.reshape(-1)[0])
+        try:
+            elem = np.asarray(val[index])
+        except (IndexError, TypeError) as exc:
+            raise ValueError(
+                f"Cannot resolve parameter index {param.name}[{index!r}]: shape {val.shape}"
+            ) from exc
+        if elem.ndim != 0:
+            raise ValueError(
+                f"Parameter index {param.name}[{index!r}] selects a non-scalar of "
+                f"shape {elem.shape}; index it element-wise so each use is scalar."
+            )
+        return float(elem)
+
     def _expr_to_gams(self, expr: Expression) -> str:
         if isinstance(expr, Constant):
-            val = float(expr.value)
-            if val == int(val) and abs(val) < 1e15:
-                return str(int(val))
-            return f"{val}"
+            if expr.value.ndim != 0:
+                raise ValueError(
+                    f"Cannot write an array constant of shape {expr.value.shape} "
+                    "into a scalar GAMS equation."
+                )
+            return self._num_to_gams(float(expr.value))
+
+        if isinstance(expr, Parameter):
+            return self._num_to_gams(self._parameter_element(expr, None))
 
         if isinstance(expr, Variable):
             return expr.name
+
+        if isinstance(expr, IndexExpression) and isinstance(expr.base, Parameter):
+            return self._num_to_gams(self._parameter_element(expr.base, expr.index))
 
         if isinstance(expr, IndexExpression):
             base = self._expr_to_gams(expr.base)
@@ -735,4 +793,7 @@ class _GamsWriter:
             # flatten matmul to explicit sum of products
             return f"({self._expr_to_gams(expr.left)} * {self._expr_to_gams(expr.right)})"
 
-        return f"<unsupported:{type(expr).__name__}>"
+        # Refuse anything else (e.g. an opaque ``dm.custom`` node) instead of
+        # writing a placeholder into the equation text: a ``.gms`` file that is
+        # not the model is worse than no file (#1503).
+        raise ValueError(f"Cannot write expression type {type(expr).__name__} to GAMS: {expr!r}")

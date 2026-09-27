@@ -1402,6 +1402,44 @@ def _point_is_integer_feasible(sf: "StdForm", x: np.ndarray, tol: float = 1e-6) 
     return True
 
 
+def _verified_mip_point(
+    sf: "StdForm", x: Optional[np.ndarray]
+) -> Optional[tuple[np.ndarray, float]]:
+    """``(point, objective)`` when ``x`` passes the incumbent verifier, else ``None``.
+
+    The same two gates every HiGHS incumbent passes (:func:`readback_problem`, then
+    :func:`feasibility_problem` with integrality), and the point is returned at its
+    integral realisation -- the one those gates tested (#1380) -- with the objective
+    recomputed from it. So a point this returns is evidence of exactly the standing a
+    HiGHS incumbent has.
+    """
+    if x is None:
+        return None
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if readback_problem(x, sf) or feasibility_problem(x, sf, check_integrality=True):
+        return None
+    from discopt.validation.feasibility import snap_integer_columns
+
+    x = snap_integer_columns(x, sf.int_idx)
+    return x, float(sf.c @ x) + sf.obj_const
+
+
+def _fixed_integer_lp(sf: "StdForm", x: np.ndarray, time_limit: Optional[float]) -> HighsOutcome:
+    """The NS-safe LP of ``sf`` with every integer column fixed at ``round(x_j)``.
+
+    #1509: a HiGHS ``kOptimal`` claims in particular that its incumbent is optimal
+    for its OWN integer assignment. That claim is checkable at one LP's cost -- and
+    the check does not route through HiGHS's MIP presolve/propagation, which is where
+    the #1509 false optimum came from.
+    """
+    xl = sf.xl.copy()
+    xu = sf.xu.copy()
+    xi = np.round(np.asarray(x, dtype=np.float64)[sf.int_idx])
+    xl[sf.int_idx] = xi
+    xu[sf.int_idx] = xi
+    return solve_lp_std(dataclasses.replace(sf, xl=xl, xu=xu), time_limit=time_limit)
+
+
 def solve_milp_std(
     sf: StdForm,
     *,
@@ -1624,6 +1662,110 @@ def solve_milp_std(
         labels["milp/certificate"] = "declined"
         labels["milp/bound_provenance"] = "root-ns" if out.bound is not None else "none"
 
+    def _refutation_check(out: HighsOutcome, lp: HighsOutcome) -> bool:
+        """#1509: hold the reported bound against every VERIFIED point in hand.
+
+        The root cross-check above only compares two numbers, and the #1410 dual
+        check only asks whether HiGHS's LP arithmetic certifies an LP. Neither can see
+        a tree whose MIP presolve/propagation cut the optimum off: on the #1509
+        surrogate the root LP, its duals, and every scaling ratio are clean, HiGHS
+        still certifies ``9000012.455`` while ``9e6`` is feasible -- and the root LP
+        point itself is that feasible ``9e6`` point.
+
+        A bound above a verified feasible point is false by definition, so the check
+        is "no verified point lies below the bound", over the points available at an
+        LP's cost: the root LP point (already solved); the NS-safe LP over the
+        incumbent's own integer assignment (a ``kOptimal`` incumbent must be optimal
+        for its own integers, and that LP never enters HiGHS's MIP presolve); and,
+        when the root LP point is fractional, the same LP over its rounding. Every
+        candidate passes the incumbent verifier before it counts as evidence.
+
+        This is a falsifier, not a proof: it catches a false bound whenever one of
+        those points lies below it, which on the 180-instance #1509 family was every
+        one of the 60 false certificates. A false bound with no such point in reach
+        is not caught, and the route's standing there is what it was before.
+
+        Returns ``False`` when ``out`` was decertified for want of a verdict and the
+        caller should stop; ``True`` otherwise (refuted results are repaired in place).
+        """
+        cands: list[tuple[np.ndarray, float]] = []
+        root_pt = _verified_mip_point(sf, lp.x) if lp.status == "optimal" else None
+        if root_pt is not None:
+            cands.append(root_pt)
+        if out.x is not None and sf.int_idx.size:
+            rem_fx = remaining()
+            if rem_fx is not None and rem_fx <= 0.0:
+                stats["milp/fixed_int_check_skipped"] = 1.0
+                decertify_root_check("no time budget left to run the fixed-integer LP check")
+                return False
+            fx = _fixed_integer_lp(sf, out.x, rem_fx)
+            stats["milp/fixed_int_check_ran"] = 1.0
+            pt = _verified_mip_point(sf, fx.x) if fx.status == "optimal" else None
+            if pt is None:
+                # The LP over a verified incumbent's own integers is feasible (the
+                # incumbent is a point of it), so a non-verdict here is numerical
+                # trouble on this matrix -- the #1320 rule: an unsettled check is not
+                # a passed one.
+                stats["milp/fixed_int_check_inconclusive"] = 1.0
+                decertify_root_check(
+                    f"the fixed-integer LP check was inconclusive (LP {fx.status}: {fx.message})"
+                )
+                return False
+            cands.append(pt)
+        if root_pt is None and lp.status == "optimal" and lp.x is not None and sf.int_idx.size:
+            # The root LP point is not itself integer-feasible: its rounding, with the
+            # continuous part re-optimised, is the other point an LP buys. Measured on
+            # the #1509 family, HiGHS's own integers can be the wrong ones (a gap-limit
+            # stop whose bound is above the optimum) while the root LP sits within
+            # 1.2e-5 of the optimal assignment. A failed or infeasible rounding is no
+            # evidence either way, so it is simply not a candidate.
+            rem_rd = remaining()
+            if rem_rd is None or rem_rd > 0.0:
+                rd = _fixed_integer_lp(sf, lp.x, rem_rd)
+                stats["milp/rounded_root_check_ran"] = 1.0
+                pt = _verified_mip_point(sf, rd.x) if rd.status == "optimal" else None
+                if pt is not None:
+                    cands.append(pt)
+        if not cands:
+            return True
+        best_x, best = min(cands, key=lambda p: p[1])
+        assert out.bound is not None
+        margin = out.bound - best
+        stats["milp/refutation_margin"] = float(margin)
+        # The yardstick the route already uses to call an LP objective equal to its
+        # NS bound (CERT_ABS + CERT_REL*|v|): a point below the bound by more than
+        # that is a contradiction, not round-off.
+        if margin <= CERT_ABS + CERT_REL * abs(out.bound):
+            return True
+        stats["milp/certificate_refuted"] = 1.0
+        labels["milp/highs_certificate"] = "refuted"
+        was = out.bound
+        if out.objective is None or best < out.objective:
+            out.x, out.objective = best_x, best
+            stats["milp/incumbent_from_refutation"] = 1.0
+        # HiGHS's tree bound is now known false, so nothing it derived stands; the
+        # NS-safe root bound is the only bound left, and it certifies the gap only if
+        # it closes it by the route's own convergence test (the HiGHS stop rule).
+        rb = out.root_bound
+        out.bound = None if rb is None else min(rb, out.objective)
+        labels["milp/bound_provenance"] = "root-ns" if out.bound is not None else "none"
+        closed = False
+        if out.bound is not None:
+            gap = max(0.0, out.objective - out.bound)
+            closed = gap <= (1e-6 if abs_gap_tolerance is None else abs_gap_tolerance) or (
+                gap / max(abs(out.objective), abs(out.bound), 1e-10) <= gap_tolerance
+            )
+        out.gap_certified = closed
+        out.status = "optimal" if closed else "feasible"
+        if not closed:
+            labels["milp/certificate"] = "declined"
+        out.message = (
+            f"HiGHS MILP {name}: bound {was:.12g} refuted by a verified point of "
+            f"objective {best:.12g} (#1509); reporting the NS-safe root bound"
+        )
+        logger.warning("HiGHS MILP route: %s", out.message)
+        return True
+
     # Root LP relaxation, NS-safe: supplies root_bound, decides an unbounded-or-
     # infeasible label, upgrades an infeasible claim to a Farkas proof, and catches a
     # tree bound that is already wrong at the root (§3.2.5).
@@ -1730,6 +1872,8 @@ def solve_milp_std(
             # bound is a valid one, so report it rather than nothing.
             out.bound = lp.bound if obj is None else min(lp.bound, obj)
             stats["milp/bound_from_root_ns"] = 1.0
+        if out.bound is not None and not _refutation_check(out, lp):
+            return done(out)
     else:
         # The check RAN but settled nothing (``solve_lp_std`` hit its own time
         # limit, or errored — a kUnknown / sentinel-magnitude readback refusal).

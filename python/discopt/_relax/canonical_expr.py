@@ -45,19 +45,26 @@ from typing import Any, Optional
 
 import numpy as np
 
-from discopt._relax.scalarize import scalar_elements, sum_is_full_reduction
+from discopt._relax.scalarize import (
+    scalar_elements,
+    scalar_matmul_contraction,
+    static_shape,
+    sum_is_full_reduction,
+)
 from discopt.modeling.core import (
     BinaryOp,
     Constant,
     Expression,
     FunctionCall,
     IndexExpression,
+    MatMulExpression,
     Model,
     Parameter,
     SumExpression,
     SumOverExpression,
     UnaryOp,
     Variable,
+    maximum,
 )
 
 __all__ = [
@@ -486,6 +493,17 @@ class _Canonicalizer:
                 raise UnsupportedCanonicalization("sum reduction")
             return self._sum([(1.0, self.canon(e)) for e in elems], 0.0)
 
+        if isinstance(expr, MatMulExpression):
+            # A scalar-valued ``c @ x`` is the affine contraction ``sum_k c_k x_k``.
+            # Left opaque, it had no envelope and an unbounded aux column, so a
+            # trivial integer MILP written ``minimize(c @ x)`` got no dual bound
+            # from AMP (#1502) while the same model with scalar terms certified.
+            # ``None`` (array-valued, unknown shape, over the cap) keeps it opaque.
+            contraction = scalar_matmul_contraction(expr)
+            if contraction is None:
+                raise UnsupportedCanonicalization("matmul")
+            return self.canon(contraction)
+
         raise UnsupportedCanonicalization(type(expr).__name__)
 
     def _canon_binary(self, expr: BinaryOp) -> CNode:
@@ -539,11 +557,83 @@ class _Canonicalizer:
         # sign is discontinuous — no sound continuous envelope; keep it opaque.
         if name == "sign":
             raise UnsupportedCanonicalization("sign")
+        if name.startswith("norm") and len(args) == 1:
+            # ``dm.norm`` of a VECTOR is a reduction over its elements, spelled out
+            # here exactly as the POUNCE tape lowers it (``_nl_expr_compiler.
+            # _lower_norm``): ``norm1 = sum|e_i|``, ``norminf = max|e_i|``,
+            # ``norm2 = sqrt(sum e_i*e_i)``, ``normp = (sum |e_i|**p)**(1/p)``. The
+            # canonical node is then the one the user's own scalar spelling of the
+            # same norm produces, so it relaxes through the existing abs / max /
+            # square / sqrt envelopes and no new envelope is introduced (#1493).
+            # Before, the vector argument became an array-valued opaque child and
+            # the relaxation build raised ``TypeError`` on it, so no norm of a
+            # vector ever had a dual bound.
+            spelled = _norm_scalar_spelling(name, args[0])
+            if spelled is not None:
+                return self.canon(spelled)
+        if any(_array_valued(a) for a in args):
+            # A call over an array-valued argument has no scalar canonical form
+            # (a 2-D ``norm`` is jnp's MATRIX norm, not a fold over elements).
+            # Keep the WHOLE call opaque -- a scalar node with its interval
+            # enclosure -- rather than handing the builder an array-valued child
+            # (#1493: that raised ``TypeError`` deep in the relaxation build).
+            raise UnsupportedCanonicalization(f"call {name} of an array-valued argument")
         if len(args) == 1:
             return self._call(name, self.canon(args[0]))
         if len(args) >= 2:
             return self._callN(name, tuple(self.canon(a) for a in args))
         raise UnsupportedCanonicalization(f"call {name}/{len(args)}")
+
+
+def _array_valued(expr: Expression) -> bool:
+    """True when ``expr`` is statically known to be non-scalar."""
+    shape = static_shape(expr)
+    return shape is not None and shape != ()
+
+
+def _norm_order(name: str) -> Optional[float]:
+    """The ``p`` of a ``norm{p}`` call name, or ``None`` if it is not one."""
+    suffix = name[len("norm") :]
+    if suffix == "inf":
+        return math.inf
+    if suffix == "":
+        return 2.0
+    try:
+        p = float(suffix)
+    except ValueError:
+        return None
+    return p if p >= 1.0 else None
+
+
+def _norm_scalar_spelling(name: str, arg: Expression) -> Optional[Expression]:
+    """Value-preserving scalar spelling of ``norm{p}(arg)`` for a 1-D ``arg``.
+
+    Mirrors ``_nl_expr_compiler._lower_norm`` term for term, including what it
+    refuses: a 0-d argument (``jnp.linalg.norm`` raises on it) and a >=2-D one
+    (``jnp.linalg.norm``'s induced MATRIX norm, not a fold over elements). Both
+    return ``None`` and the caller keeps the call opaque.
+    """
+    p = _norm_order(name)
+    if p is None:
+        return None
+    shape = static_shape(arg)
+    if shape is None or len(shape) != 1 or shape[0] == 0:
+        return None
+    elems = scalar_elements(arg)
+    if elems is None:
+        return None
+    absolutes: list[Expression] = [UnaryOp("abs", e) for e in elems]
+    if p == math.inf:
+        if len(absolutes) == 1:
+            return absolutes[0]
+        # ``dm.maximum``'s balanced binary fold: the tape's ``max`` is binary.
+        return maximum(*absolutes)
+    if p == 1.0:
+        return SumOverExpression(absolutes)
+    if p == 2.0:
+        return FunctionCall("sqrt", SumOverExpression([e * e for e in elems]))
+    powered: list[Expression] = [BinaryOp("**", a, Constant(float(p))) for a in absolutes]
+    return BinaryOp("**", SumOverExpression(powered), Constant(1.0 / p))
 
 
 @dataclasses.dataclass

@@ -779,6 +779,46 @@ def check_constraints(model, x_flat: np.ndarray, evaluator=None) -> VerifyResult
     return VerifyResult(True)
 
 
+def max_constraint_violation(model, x_flat, evaluator=None) -> float:
+    """Largest constraint-row violation of ``x_flat``, each row over ``max(1, |rhs|)``.
+
+    A *ranking* measure, not a feasibility test: :func:`verify_point` decides
+    whether a point may be an incumbent, and this says how much of the tolerance
+    that decision allowed the point to use. Two points that both pass
+    ``verify_point`` can differ by orders of magnitude here, and the more violated
+    one can buy an objective past every truly feasible point (#1496). Satisfied
+    rows count as ``0``; a non-finite residual, or an evaluator that cannot produce
+    every row its own map declares, is ``inf`` -- the worst rank, never a pass.
+    Variable bounds and integrality are not included; callers that rank points
+    place them in the box first.
+    """
+    if evaluator is None:
+        from discopt._tape_nlp_evaluator import make_evaluator
+
+        evaluator = make_evaluator(model)
+    if evaluator.n_constraints <= 0:
+        return 0.0
+    x_flat = np.asarray(x_flat, dtype=np.float64)
+    g = np.asarray(evaluator.evaluate_constraints(x_flat), dtype=np.float64)
+    row_map = evaluator.constraint_row_map()
+    n_rows = row_map[-1][1] if row_map else 0
+    if g.shape[0] < n_rows:
+        return math.inf
+    worst = 0.0
+    for start, stop, con in row_map:
+        sense = _sense_str(con)
+        if sense is None:
+            return math.inf
+        rhs = float(getattr(con, "rhs", 0.0) or 0.0)
+        anchor = max(1.0, abs(rhs))
+        for i in range(start, stop):
+            val = float(g[i]) - rhs
+            if not math.isfinite(val):
+                return math.inf
+            worst = max(worst, _row_violation(val, sense) / anchor)
+    return worst
+
+
 def verify_point(
     model,
     x_flat,

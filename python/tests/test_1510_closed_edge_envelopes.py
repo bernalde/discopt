@@ -1,0 +1,255 @@
+"""Closed lower domain edge envelopes for asin/acos/acosh (issue #1510, item 3).
+
+``uniform_relax._UNIVARIATE_FN``'s domain guard admitted ``hi = +1`` for
+``asin``/``acos`` but demanded ``lo > -1`` (and ``lo > 1`` for ``acosh``), so a box
+whose argument starts exactly at the closed lower edge -- the box holding an edge
+optimum (#1492) -- got no envelope at all, only the aux column's interval floor.
+``DISCOPT_CLOSED_EDGE_ENVELOPES`` admits the edge (an outward-rounded ``lo``
+within 1e-12 below it reads as the edge); it graduated default-ON, and ``=0``
+keeps the legacy interval floor. This file locks the CLAUDE.md section-5
+properties for that bound-changing gate:
+
+1. **Unset is ON**, ``=0`` is the legacy path, and the flag is a no-op on a box
+   that does not touch an edge (or reaches genuinely outside the domain).
+2. **Soundness -- no feasible point is cut**: every row of the flag-ON relaxation
+   holds at the exact lifted graph point ``(t, f(t))``, densely sampled over the
+   box including the edge itself.
+3. **Differential bound**: over a sweep of objective directions, flag-ON bound
+   ``>=`` flag-OFF bound AND ``<=`` the true optimum over the same fixed box, with
+   at least one direction strictly improved (the gate is not a no-op).
+"""
+
+from __future__ import annotations
+
+import os
+
+import discopt.modeling as dm
+import numpy as np
+import pytest
+import scipy.sparse as sp
+from discopt._relax.uniform_relax import build_uniform_relaxation
+from scipy.optimize import linprog
+
+pytestmark = [pytest.mark.relaxation]
+
+FLAG = "DISCOPT_CLOSED_EDGE_ENVELOPES"
+
+#: ``(label, atom, numpy f, lo, hi)`` -- boxes that START at a closed lower edge.
+EDGE_CASES = [
+    ("asin[-1,0]", dm.asin, np.arcsin, -1.0, 0.0),
+    ("asin[-1,-0.5]", dm.asin, np.arcsin, -1.0, -0.5),
+    ("asin[-1,-1+1e-6]", dm.asin, np.arcsin, -1.0, -1.0 + 1e-6),
+    ("acos[-1,0]", dm.acos, np.arccos, -1.0, 0.0),
+    ("acosh[1,2]", dm.acosh, np.arccosh, 1.0, 2.0),
+    ("acosh[1,50]", dm.acosh, np.arccosh, 1.0, 50.0),
+    ("acosh[1,1+1e-6]", dm.acosh, np.arccosh, 1.0, 1.0 + 1e-6),
+    # Outward rounding puts an affine argument's lower bound one ulp BELOW the
+    # edge (``asin(x - 1)`` over ``x in [0, 1]``); read as the edge.
+    ("asin[-1-ulp,0]", dm.asin, np.arcsin, np.nextafter(-1.0, -2.0), 0.0),
+    ("acosh[1-ulp,2]", dm.acosh, np.arccosh, np.nextafter(1.0, 0.0), 2.0),
+]
+
+#: Boxes where the flag must change nothing: interior boxes, the already-admitted
+#: upper edge, a box reaching genuinely OUTSIDE the domain (beyond rounding), and
+#: an edge box straddling the inflection at 0 (no single curvature -> no envelope
+#: either way).
+NOOP_CASES = [
+    ("asin[-1,1]", dm.asin, np.arcsin, -1.0, 1.0),
+    ("acos[-1,0.7]", dm.acos, np.arccos, -1.0, 0.7),
+    ("asin[-0.9,0.5]", dm.asin, np.arcsin, -0.9, 0.5),
+    ("asin[0.2,1]", dm.asin, np.arcsin, 0.2, 1.0),
+    ("asin[-1.001,0]", dm.asin, np.arcsin, -1.001, 0.0),
+    ("acos[-0.5,1]", dm.acos, np.arccos, -0.5, 1.0),
+    ("acosh[1.5,3]", dm.acosh, np.arccosh, 1.5, 3.0),
+    ("acosh[0.999,2]", dm.acosh, np.arccosh, 0.999, 2.0),
+]
+
+
+@pytest.fixture
+def flag():
+    prev = os.environ.get(FLAG)
+
+    def _set(value):
+        if value is None:
+            os.environ.pop(FLAG, None)
+        else:
+            os.environ[FLAG] = value
+
+    yield _set
+    if prev is None:
+        os.environ.pop(FLAG, None)
+    else:
+        os.environ[FLAG] = prev
+
+
+def _atom_model(atom, lo, hi, obj=(0.0, -1.0)):
+    """``y == atom(x)`` over ``x in [lo, hi]``, minimizing ``a*x + b*y``."""
+    m = dm.Model()
+    span = max(abs(lo), abs(hi), 1.0)
+    x = m.continuous("x", lb=lo, ub=hi)
+    y = m.continuous("y", lb=-1e3 * span, ub=1e3 * span)
+    m.subject_to(y == atom(x))
+    m.minimize(obj[0] * x + obj[1] * y)
+    return m
+
+
+def _rows(model):
+    rel = build_uniform_relaxation(model)
+    A = sp.csr_matrix(rel.model._A_ub, dtype=float)
+    A.sort_indices()
+    return rel, A.toarray(), np.asarray(rel.model._b_ub, dtype=float).ravel()
+
+
+def _lp_bound(model):
+    rel = build_uniform_relaxation(model)
+    M = rel.model
+    bnds = [
+        (float(lo) if np.isfinite(lo) else None, float(hi) if np.isfinite(hi) else None)
+        for lo, hi in np.asarray(M._bounds, dtype=float)
+    ]
+    res = linprog(
+        np.asarray(M._c, dtype=float).ravel(),
+        A_ub=sp.csr_matrix(M._A_ub),
+        b_ub=np.asarray(M._b_ub, dtype=float).ravel(),
+        bounds=bnds,
+        method="highs",
+    )
+    assert res.status == 0, res.message
+    return float(res.fun)
+
+
+def _graph_point(rel, t, fval):
+    specs = list(rel.univariate_atom_specs)
+    assert len(specs) == 1, f"expected a single univariate atom, got {specs}"
+    _fname, w, _var, _coeff, _cst = specs[0]
+    z = np.zeros(len(rel.model._bounds), dtype=float)
+    z[0] = t
+    z[1] = fval
+    z[int(w)] = fval
+    return z
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", EDGE_CASES + NOOP_CASES)
+def test_flag_unset_equals_flag_one(flag, label, atom, fnp, lo, hi):
+    """Graduated: the default is the closed-edge envelope."""
+    flag(None)
+    _r0, a0, b0 = _rows(_atom_model(atom, lo, hi))
+    flag("1")
+    _r1, a1, b1 = _rows(_atom_model(atom, lo, hi))
+    assert np.array_equal(a0, a1) and np.array_equal(b0, b1)
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", EDGE_CASES)
+def test_opt_out_restores_the_interval_floor(flag, label, atom, fnp, lo, hi):
+    """``=0`` is the legacy path: an edge box gets no envelope rows for the atom
+    (the aux column keeps only its interval floor), i.e. fewer rows than the
+    default."""
+    flag("0")
+    _r0, a0, _ = _rows(_atom_model(atom, lo, hi))
+    flag(None)
+    _r1, a1, _ = _rows(_atom_model(atom, lo, hi))
+    assert a0.shape[0] < a1.shape[0], f"{label}: {a0.shape[0]} vs {a1.shape[0]} rows"
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", NOOP_CASES)
+def test_flag_is_a_noop_off_the_edge(flag, label, atom, fnp, lo, hi):
+    flag("0")
+    _r0, a0, b0 = _rows(_atom_model(atom, lo, hi))
+    flag("1")
+    _r1, a1, b1 = _rows(_atom_model(atom, lo, hi))
+    assert np.array_equal(a0, a1) and np.array_equal(b0, b1)
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", EDGE_CASES)
+def test_edge_box_gains_envelope_rows(flag, label, atom, fnp, lo, hi):
+    flag("0")
+    _r0, a0, _ = _rows(_atom_model(atom, lo, hi))
+    flag("1")
+    _r1, a1, _ = _rows(_atom_model(atom, lo, hi))
+    assert a1.shape[0] > a0.shape[0], f"{label}: {a0.shape[0]} -> {a1.shape[0]} rows"
+    assert np.isfinite(a1).all(), f"{label}: non-finite coefficient"
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", EDGE_CASES)
+def test_no_graph_point_is_cut(flag, label, atom, fnp, lo, hi):
+    flag("1")
+    rel = build_uniform_relaxation(_atom_model(atom, lo, hi))
+    A = sp.csr_matrix(rel.model._A_ub, dtype=float)
+    b = np.asarray(rel.model._b_ub, dtype=float).ravel()
+    ts = [lo, hi, 0.5 * (lo + hi)] + list(np.linspace(lo, hi, 400))
+    for k in range(1, 40):
+        d = 0.5 * 2.0**-k
+        ts += [lo + d * (hi - lo), hi - d * (hi - lo)]
+    checked = 0
+    for t in ts:
+        if not (lo <= t <= hi):
+            continue
+        with np.errstate(invalid="ignore"):
+            fval = float(fnp(t))
+        if not np.isfinite(fval):
+            continue
+        resid = A @ _graph_point(rel, t, fval) - b
+        viol = float(np.max(resid / np.maximum(1.0, np.abs(b))))
+        assert viol <= 1e-9, f"{label}: graph point t={t!r} cut by {viol:.3e}"
+        checked += 1
+    assert checked >= 400, f"{label}: only {checked} graph points evaluated"
+
+
+@pytest.mark.parametrize("label,atom,fnp,lo,hi", EDGE_CASES)
+def test_bound_tightens_and_never_crosses(flag, label, atom, fnp, lo, hi):
+    """``bound_ON >= bound_OFF`` and ``bound_ON <= true box optimum`` over 32
+    normalized objective directions; at least one direction strictly improves."""
+    # The graph over the DOMAIN part of the box (an outward-rounded ``lo`` one ulp
+    # outside it has no graph point there).
+    with np.errstate(invalid="ignore"):
+        grid = np.append(np.linspace(lo, hi, 200001), np.nextafter(lo, hi))
+        fv = fnp(grid)
+    keep = np.isfinite(fv)
+    grid, fv = grid[keep], fv[keep]
+    assert grid.size >= 200001
+    xs = max(hi - lo, 1e-300)
+    fs = max(float(np.max(fv) - np.min(fv)), 1e-300)
+    compared = improved = 0
+    for k in range(32):
+        th = 2.0 * np.pi * k / 32.0
+        cx, cy = float(np.cos(th)) / xs, float(np.sin(th)) / fs
+        flag("0")
+        off = _lp_bound(_atom_model(atom, lo, hi, (cx, cy)))
+        flag("1")
+        on = _lp_bound(_atom_model(atom, lo, hi, (cx, cy)))
+        true_min = float(np.min(cx * grid + cy * fv))
+        assert on >= off - 1e-9 * (1.0 + abs(off)), f"{label} dir={k}: loosened {off} -> {on}"
+        assert on <= true_min + 1e-6 * (1.0 + abs(true_min)), (
+            f"{label} dir={k}: bound {on:.12g} crossed the true optimum {true_min:.12g}"
+        )
+        compared += 1
+        improved += on > off + 1e-9 * (1.0 + abs(off))
+    assert compared == 32
+    assert improved > 0, f"{label}: the closed-edge envelope never moved the bound (no-op)"
+
+
+def test_affine_argument_reaching_the_edge_is_enveloped(flag):
+    """The class member the exact-edge test alone would miss: ``asin(x - 1)`` over
+    ``x in [0, 1]`` reaches -1 only through outward-rounded interval arithmetic
+    (``lo = -1 - ulp``). With the flag the edge box is enveloped and the bound of
+    ``min asin(x - 1) + x/2`` (true optimum -pi/2 at x = 0) tightens without
+    crossing it."""
+    import math
+
+    def model():
+        m = dm.Model()
+        x = m.continuous("x", lb=0.0, ub=1.0)
+        y = m.continuous("y", lb=-10.0, ub=10.0)
+        m.subject_to(y == dm.asin(x - 1.0))
+        m.minimize(y + 0.5 * x)
+        return m
+
+    flag("0")
+    _r0, a0, _ = _rows(model())
+    off = _lp_bound(model())
+    flag("1")
+    _r1, a1, _ = _rows(model())
+    on = _lp_bound(model())
+    opt = -math.pi / 2
+    assert a1.shape[0] > a0.shape[0]
+    assert off - 1e-9 <= on <= opt + 1e-9, (off, on, opt)

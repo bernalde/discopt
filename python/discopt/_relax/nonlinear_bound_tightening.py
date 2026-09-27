@@ -2922,6 +2922,20 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
             return []
 
         def walk(expr):
+            if (frac_base := _fractional_power_base(expr)) is not None:
+                # ``b ** p`` with a constant NON-integer ``p`` is undefined (NaN in
+                # every evaluator) for ``b < 0`` -- the same ``b >= 0`` domain as
+                # ``sqrt(b)``, which ``x ** 0.5`` is. Without this the two
+                # spellings of one model disagreed: ``sqrt(x) <= 1.5`` on
+                # ``[-5, 5]`` certified ``min x = 0`` while ``x ** 0.5 <= 1.5``
+                # returned an uncertified 1.25 with bound -5 (#1493).
+                match = _match_affine_var(frac_base, 1.0, metadata)
+                if match is not None:
+                    flat_idx, coeff, offset = match
+                    if flat_idx is not None and abs(coeff) > 1e-12:
+                        _tighten_affine_argument_interval(
+                            lb, ub, metadata, flat_idx, coeff, offset, arg_lb=0.0
+                        )
             if (
                 isinstance(expr, FunctionCall)
                 and expr.func_name in _MONOTONE_DOMAINS
@@ -2958,6 +2972,19 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
         except Exception:
             return np.asarray(flat_lb, dtype=np.float64), np.asarray(flat_ub, dtype=np.float64)
         return lb, ub
+
+
+def _fractional_power_base(expr):
+    """The base ``b`` of ``b ** p`` for a constant scalar non-integer ``p``, else None."""
+    if not (isinstance(expr, BinaryOp) and expr.op == "**"):
+        return None
+    rexp = expr.right
+    if not isinstance(rexp, Constant) or np.asarray(rexp.value).ndim != 0:
+        return None
+    p = float(rexp.value)
+    if not np.isfinite(p) or float(p).is_integer():
+        return None
+    return expr.left
 
 
 _PERIODIC_FUNCS = frozenset({"sin", "cos"})

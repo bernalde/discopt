@@ -55,16 +55,19 @@ it) and ``_last_solve_result``.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import gc
+import hashlib
 import importlib
 import sys
 import types
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Literal, Mapping, Optional, Union
 
 import numpy as np
 
-from discopt.modeling.core import Model, Parameter, Variable
+from discopt.modeling.core import Model, Parameter, Variable, missing_validation_guards
 
 __all__ = [
     "ModelDiff",
@@ -154,6 +157,17 @@ class Transformation:
                 f"transformation {self.name!r} is registered functional but its "
                 f"function returned {type(out).__name__}, not a Model"
             )
+        if out is not model:
+            # A rebuilt model that lost a validation guard (an atan2 sign
+            # precondition, a piecewise domain) turns a later bound widening
+            # from a refusal into a silent clamp (#1498). Refuse the result.
+            missing = missing_validation_guards(model, out)
+            if missing:
+                raise RuntimeError(
+                    f"transformation {self.name!r} returned a model without the "
+                    f"validation guards {missing} of its input; the pass must "
+                    f"forward them with discopt.modeling.core.carry_validation_guards"
+                )
         return out
 
     def apply_to(self, model: Model, **options: Any) -> Model:
@@ -237,6 +251,131 @@ def _invalidate_source_records(model: Model) -> None:
         model._last_solve_result = None
 
 
+# ── Canonical (exact) serialisation of model data ─────────────────────────
+#
+# The fingerprint and the diff are the instrument ``check()`` verifies a
+# reformulation with, so they must see every number the solver sees. They were
+# built from the *display* ``repr`` of the expression tree, which prints a scalar
+# ``Constant`` with ``.6g``, an array constant as its shape only and a
+# ``SumOverExpression`` as its term count -- so a coefficient change in the 7th
+# digit, or anywhere inside an array, was invisible and a pass that mutated its
+# input passed ``check()`` (#1497). ``_canon`` renders the same tree exactly:
+# floats by ``repr`` (shortest round-trip, so ``-0.0`` and ``1.0000001`` are
+# kept), arrays by their full contents (or a SHA-256 of their bytes when large),
+# and every node kind explicitly. An object it does not know is refused rather
+# than printed approximately.
+
+_ARRAY_INLINE_MAX = 16
+
+
+def _canon_array(a: np.ndarray) -> str:
+    a = np.ascontiguousarray(a)
+    head = f"array<{a.dtype.str}{tuple(a.shape)}>"
+    if a.dtype.kind == "f" and a.size <= _ARRAY_INLINE_MAX:
+        return head + "[" + ", ".join(repr(float(v)) for v in a.ravel()) + "]"
+    if a.dtype.kind in "biu" and a.size <= _ARRAY_INLINE_MAX:
+        return head + "[" + ", ".join(repr(int(v)) for v in a.ravel()) + "]"
+    if a.dtype.kind == "O":
+        return head + "[" + ", ".join(_canon(v) for v in a.ravel()) + "]"
+    return head + "#" + hashlib.sha256(a.tobytes()).hexdigest()
+
+
+def _canon_sparse(s: Any) -> str:
+    coo = s.tocoo()
+    order = np.lexsort((coo.col, coo.row))
+    return (
+        f"sparse{tuple(s.shape)}("
+        f"{_canon_array(np.asarray(coo.row, dtype=np.int64)[order])}, "
+        f"{_canon_array(np.asarray(coo.col, dtype=np.int64)[order])}, "
+        f"{_canon_array(np.asarray(coo.data, dtype=np.float64)[order])})"
+    )
+
+
+def _canon_callable(fn: Any) -> str:
+    code = getattr(fn, "__code__", None)
+    qual = f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__qualname__', type(fn).__qualname__)}"
+    # Identity of the code object: deep copies share functions, so a copy
+    # fingerprints equal, while a different function with the same name does not.
+    return f"fn<{qual}#{id(code if code is not None else fn):x}>"
+
+
+def _canon(obj: Any) -> str:
+    """Exact, deterministic text of a model datum (expression, row, record)."""
+    from discopt.modeling import core as _c
+
+    t = type(obj)
+    if obj is None or t in (bool, int, str):
+        return repr(obj)
+    if t is float or isinstance(obj, np.floating):
+        return repr(float(obj))
+    if isinstance(obj, np.integer):
+        return repr(int(obj))
+    if isinstance(obj, np.bool_):
+        return repr(bool(obj))
+    if isinstance(obj, Enum):
+        return f"{t.__name__}.{obj.name}"
+    if isinstance(obj, np.ndarray):
+        return _canon_array(obj)
+    if t is tuple:
+        return "(" + ", ".join(_canon(v) for v in obj) + ",)"
+    if t is list:
+        return "[" + ", ".join(_canon(v) for v in obj) + "]"
+    if t is slice:
+        return f"slice({_canon(obj.start)}, {_canon(obj.stop)}, {_canon(obj.step)})"
+    if obj is Ellipsis:
+        return "..."
+    # Expression nodes. Variable before Parameter/Constant: leaves by name
+    # (their data -- bounds, values -- is keyed separately by ``_var_key`` /
+    # ``_param_key``), except a Parameter's value, which is also inlined so the
+    # diff reports the rows it enters.
+    if isinstance(obj, _c.Variable):
+        return f"var({obj.name})"
+    if isinstance(obj, _c.Parameter):
+        return f"param({obj.name}={_canon_array(np.asarray(obj.value))})"
+    if isinstance(obj, _c.Constant):
+        v = obj.value
+        return repr(float(v)) if v.ndim == 0 else _canon_array(v)
+    if isinstance(obj, _c.IndexExpression):
+        return f"{_canon(obj.base)}[{_canon(obj.index)}]"
+    if isinstance(obj, _c.BinaryOp):
+        return f"({_canon(obj.left)} {obj.op} {_canon(obj.right)})"
+    if isinstance(obj, _c.UnaryOp):
+        return f"{obj.op}({_canon(obj.operand)})"
+    if isinstance(obj, _c.FunctionCall):
+        return f"{obj.func_name}({', '.join(_canon(a) for a in obj.args)})"
+    if isinstance(obj, _c.CustomCall):
+        args = ", ".join(_canon(a) for a in obj.args)
+        return f"custom:{obj.name}<{_canon_callable(obj.fn)}>({args})"
+    if isinstance(obj, _c.MatMulExpression):
+        return f"({_canon(obj.left)} @ {_canon(obj.right)})"
+    if isinstance(obj, _c.SumExpression):
+        return f"sum({_canon(obj.operand)}, axis={_canon(obj.axis)})"
+    if isinstance(obj, _c.SumOverExpression):
+        return "sumover[" + ", ".join(_canon(v) for v in obj.terms) + "]"
+    if isinstance(obj, _c.Expression):
+        raise TypeError(
+            f"discopt.transformations cannot fingerprint expression node "
+            f"{t.__qualname__}; add it to transformations._canon"
+        )
+    if isinstance(obj, _c.Constraint):
+        return f"{_canon(obj.body)} {obj.sense} {_canon(obj.rhs)}"
+    if isinstance(obj, _c.BooleanVar):
+        return f"bool({_canon(obj.variable)})"
+    if hasattr(obj, "tocoo") and hasattr(obj, "nnz"):
+        return _canon_sparse(obj)
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        parts = ", ".join(
+            f"{f.name}={_canon(getattr(obj, f.name))}" for f in dataclasses.fields(obj)
+        )
+        return f"{t.__name__}({parts})"
+    if isinstance(obj, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
+        return _canon_callable(obj)
+    raise TypeError(
+        f"discopt.transformations cannot fingerprint a {t.__qualname__} exactly; "
+        f"add it to transformations._canon rather than falling back to its repr"
+    )
+
+
 # ── Structural fingerprint and diff ───────────────────────────────────────
 
 
@@ -255,7 +394,7 @@ def _param_key(p: Parameter) -> tuple:
 
 
 def _con_key(c: Any) -> tuple:
-    return (type(c).__name__, getattr(c, "name", None), repr(c))
+    return (type(c).__name__, getattr(c, "name", None), _canon(c))
 
 
 def _block_key(block: tuple) -> tuple:
@@ -276,12 +415,15 @@ def model_fingerprint(model: Model) -> tuple:
     """A hashable structural snapshot of ``model``.
 
     Covers the variables (name, type, shape, bounds), parameters (name, value),
-    every constraint (type, name, full expression text), the objective, the
+    every constraint (type, name, exact expression text), the objective, the
     builder-resident linear rows and objective, and the complementarity
     records. Two models with equal fingerprints state the same problem in the
     same order; a fingerprint that changes across a call means the call
-    mutated the model. Arrays are printed in full (no numpy summarization), so
-    a change deep inside a large constant is not hidden behind ``...``.
+    mutated the model. Expressions are rendered by ``_canon``, not the display
+    ``repr``: every float at full precision and every array constant by its
+    full contents (or a SHA-256 of its bytes when large), so a change in the
+    last digit of a coefficient or deep inside a large constant changes the
+    fingerprint (#1497).
     """
     with np.printoptions(threshold=sys.maxsize):
         obj = model._objective
@@ -292,11 +434,11 @@ def model_fingerprint(model: Model) -> tuple:
             tuple(_var_key(v) for v in model._variables),
             tuple(_param_key(p) for p in model._parameters),
             tuple(_con_key(c) for c in model._constraints),
-            None if obj is None else (repr(obj.expression), obj.sense.value),
+            None if obj is None else (_canon(obj.expression), obj.sense.value),
             tuple(_block_key(b) for b in model._builder_linear_blocks),
-            None if lin_obj is None else repr(lin_obj),
-            None if quad_obj is None else repr(quad_obj),
-            tuple(repr(c) for c in model._complementarities),
+            None if lin_obj is None else _canon(lin_obj),
+            None if quad_obj is None else _canon(quad_obj),
+            tuple(_canon(c) for c in model._complementarities),
             tuple(sorted(str(v) for v in model._lowered_complementarities.values())),
         )
 
@@ -305,7 +447,8 @@ def model_fingerprint(model: Model) -> tuple:
 class ModelDiff:
     """What a transformation changed, by name and expression text.
 
-    Constraints are compared as multisets of their printed form, so a
+    Constraints are compared as multisets of their exact canonical text (see
+    ``_canon``: full-precision floats, full array contents), so a
     constraint that moved position is not reported, and one that was replaced
     by a textually identical copy (as every rebuilding pass does) is not either.
     """
@@ -336,7 +479,7 @@ def _multiset_minus(a: list[str], b: list[str]) -> tuple[str, ...]:
 
 
 def _row_texts(model: Model) -> list[str]:
-    rows = [repr(c) for c in model._constraints]
+    rows = [_canon(c) for c in model._constraints]
     rows += [repr(_block_key(b)) for b in model._builder_linear_blocks]
     return rows
 
@@ -492,6 +635,12 @@ register(
     "discopt._relax.binary_multilinear_reform:reformulate_binary_multilinear",
     style="functional",
     summary="Fortet/Glover-linearize binary multilinear monomials",
+)
+register(
+    "nonsmooth.epigraph",
+    "discopt._relax.nonsmooth_lift:lift_nonsmooth_atoms",
+    style="functional",
+    summary="Exactly lift monotone-position abs/max/min atoms to smooth epigraph rows (#1501)",
 )
 register(
     "mpec.gdp",

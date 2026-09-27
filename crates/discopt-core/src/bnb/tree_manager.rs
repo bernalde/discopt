@@ -316,6 +316,23 @@ pub struct TreeManager {
     /// search only certify) if every such removed subtree is provably within
     /// tolerance of the incumbent — which is exactly the rigorous criterion.
     unresolved_floor: f64,
+    /// Per-node floors of nodes fathomed as TIGHT boxes (#1510): a nonconvex
+    /// node with a finite, trusted-or-inherited bound and no branchable
+    /// dimension left (every continuous column below `SPATIAL_MIN_WIDTH` of its
+    /// root width, every spatial-integer column narrower than 1). Such a node
+    /// is not *proved* within tolerance of the incumbent: a relative width of
+    /// 1e-6 makes the relaxation gap negligible only for a Lipschitz objective,
+    /// and at an infinite-slope edge (`asin`/`acos` at -1, `acosh` at 1, `sqrt`
+    /// at 0) the objective still moves by `O(sqrt(1e-6))` over the box. So its
+    /// bound — valid for its box — keeps flooring the global dual bound
+    /// permanently, exactly like [`Self::unresolved_floor`]. Keyed by node so a
+    /// driver can raise one to a tighter valid bound for the same box
+    /// ([`Self::raise_tight_fathom_floor`]), e.g. an interval enclosure of the
+    /// objective, when the node's relaxation bound is loose.
+    tight_floors: HashMap<NodeId, f64>,
+    /// Tight-fathomed node ids not yet handed to the driver by
+    /// [`Self::take_tight_fathoms`].
+    tight_unread: Vec<NodeId>,
     /// See [`TreeStats::bound_contradicted`] (#1296). Never cleared within a solve.
     bound_contradicted: bool,
     /// R3a measurement counter (temporary, behavior-neutral): per-variable
@@ -342,6 +359,49 @@ pub struct TreeManager {
     /// at it unconditionally. `-inf` (never seeded) keeps every computation
     /// byte-identical to the pre-#933 behavior.
     root_seed: f64,
+    /// #1493 pole branching (`DISCOPT_POLE_BRANCHING`, default OFF). When set,
+    /// a nonconvex node whose bound is UNTRUSTED (non-finite after the
+    /// parent-bound floor — e.g. `1/x` on a box straddling `x = 0`, whose hull is
+    /// `(-inf, inf)`) and that has no integer branch direction is split
+    /// spatially instead of being fathomed `bound_unresolved`, so a box that
+    /// excludes the pole (by a split exactly at it, then FBBT) can earn a finite
+    /// bound. `false` keeps the pre-#1493 fathom byte-identical.
+    pole_branching: bool,
+    /// Spatial branch points supplied by the driver for untrusted nodes
+    /// (`node -> (column, value)`), consumed by the pole arm only. A hint that
+    /// is not strictly inside the node's range for that column, or that names
+    /// an integer column, is ignored (the default longest-edge bisection runs).
+    pole_hints: HashMap<NodeId, (usize, f64)>,
+    /// Number of consecutive pole splits on each node's lineage (absent = 0).
+    /// A node at [`POLE_MAX_DEPTH`] is not split again: it takes the legacy
+    /// `bound_unresolved` fathom, so a genuinely reachable pole terminates.
+    pole_depth: HashMap<NodeId, u32>,
+    /// Pole splits performed so far in this solve (§6 firing counter; also the
+    /// width cap: at [`POLE_MAX_BRANCHES`] every further untrusted node takes
+    /// the legacy fathom).
+    pole_branches: usize,
+    /// Untrusted nodes that took the legacy fathom because a pole cap was hit
+    /// (or no branchable dimension remained) while pole branching was ON.
+    pole_capped: usize,
+}
+
+/// Max consecutive pole splits along one root-to-leaf lineage (#1493). A pole
+/// the objective genuinely reaches keeps one child untrusted per split (the
+/// half-box touching it), so this bounds the depth of that chain.
+pub const POLE_MAX_DEPTH: u32 = 24;
+/// Max pole splits in one solve (#1493): bounds the width when several
+/// dimensions of an untrusted box are split in turn.
+pub const POLE_MAX_BRANCHES: usize = 512;
+/// A driver-supplied pole branch point must sit at least this fraction of the
+/// column's root width inside the node's range (#1493) — the same relative
+/// floor the spatial selector uses for "tight".
+const SPATIAL_MIN_WIDTH_POLE: f64 = 1e-6;
+
+/// A pole split (#1493): a continuous split at a point (shared endpoint), or a
+/// disjoint spatial-integer partition `x <= bp` / `x >= bp + 1`.
+enum PoleSplit {
+    Continuous(BranchDecision),
+    Integer(usize, f64),
 }
 
 impl TreeManager {
@@ -384,11 +444,101 @@ impl TreeManager {
             obj_lattice: None,
             bound_unresolved: false,
             unresolved_floor: f64::INFINITY,
+            tight_floors: HashMap::new(),
+            tight_unread: Vec::new(),
             bound_contradicted: false,
             branch_var_counts: vec![0; n_vars],
             sos1_selector_cols: Vec::new(),
             root_seed: f64::NEG_INFINITY,
+            pole_branching: false,
+            pole_hints: HashMap::new(),
+            pole_depth: HashMap::new(),
+            pole_branches: 0,
+            pole_capped: 0,
         }
+    }
+
+    /// Enable #1493 pole branching (see [`Self::pole_branching`]). Default off.
+    pub fn set_pole_branching(&mut self, on: bool) {
+        self.pole_branching = on;
+    }
+
+    /// Supply the branch point for an untrusted node's pole split (#1493):
+    /// split column `var_index` at `value`. Consumed (one-shot) when the node
+    /// is processed; only the pole arm reads it. For a continuous column the
+    /// hint is authoritative: `value` strictly inside the node's range (by
+    /// `1e-6` of the root width) is the split; otherwise the column is taken as
+    /// exhausted and the node takes the legacy unresolved fathom. A hint on an
+    /// integer column is ignored (default selection).
+    pub fn set_spatial_branch_hint(&mut self, node_id: NodeId, var_index: usize, value: f64) {
+        if var_index < self.global_lb.len() && value.is_finite() {
+            self.pole_hints.insert(node_id, (var_index, value));
+        }
+    }
+
+    /// `(pole_branches, pole_capped)` counters (#1493, §6 firing evidence).
+    pub fn pole_counters(&self) -> (usize, usize) {
+        (self.pole_branches, self.pole_capped)
+    }
+
+    /// The pole split for an untrusted node, or `None` when a cap is hit or no
+    /// finite, non-tight continuous (or spatial-integer) dimension remains.
+    /// Children of the returned split partition the parent's box (shared
+    /// endpoint), so they cover it; they inherit its bound in
+    /// `create_children_spatial`, never anything tighter.
+    fn pole_split(&mut self, node_id: NodeId) -> Option<PoleSplit> {
+        let hint = self.pole_hints.remove(&node_id);
+        let depth = self.pole_depth.get(&node_id).copied().unwrap_or(0);
+        if depth >= POLE_MAX_DEPTH || self.pole_branches >= POLE_MAX_BRANCHES {
+            return None;
+        }
+        let node = self.pool.get(node_id);
+        let (nlb, nub) = (&node.lb, &node.ub);
+        if let Some((idx, v)) = hint {
+            let is_int = self
+                .integer_vars
+                .iter()
+                .any(|iv| idx >= iv.offset && idx < iv.offset + iv.size);
+            let gw = self.global_ub[idx] - self.global_lb[idx];
+            // Strictly interior, by a margin relative to the column's root width
+            // so neither child is a sliver the selector would call tight.
+            let margin = SPATIAL_MIN_WIDTH_POLE * gw;
+            if !is_int && gw.is_finite() {
+                if v > nlb[idx] + margin && v < nub[idx] - margin {
+                    return Some(PoleSplit::Continuous(BranchDecision {
+                        var_index: idx,
+                        branch_point: v,
+                    }));
+                }
+                // The driver attributes this node's missing bound to column
+                // `idx` (a denominator affine in it alone vanishes in the box),
+                // and that column can no longer be split: no split of any OTHER
+                // column removes the pole, so stop here (legacy fathom) rather
+                // than bisect irrelevant dimensions up to the caps.
+                return None;
+            }
+        }
+        for allow_dependent in [false, true] {
+            if let Some((d, _)) = select_spatial_branch_variable(
+                nlb,
+                nub,
+                &self.global_lb,
+                &self.global_ub,
+                &self.integer_vars,
+                &self.branch_deprioritized,
+                allow_dependent,
+            ) {
+                return Some(PoleSplit::Continuous(d));
+            }
+        }
+        select_spatial_integer_branch_variable(
+            nlb,
+            nub,
+            &self.global_lb,
+            &self.global_ub,
+            &self.spatial_integer_cols,
+        )
+        .map(|(idx, bp, _)| PoleSplit::Integer(idx, bp))
     }
 
     /// Install an externally-proved rigorous lower bound for the root box
@@ -1011,6 +1161,24 @@ impl TreeManager {
                         );
                         if !bound_established || !box_tight {
                             self.bound_unresolved = true;
+                        } else {
+                            // #1510: a TIGHT box is removed without a proof that
+                            // its bound is within tolerance of the incumbent —
+                            // width 1e-6 bounds the relaxation gap only for a
+                            // Lipschitz objective, and at an infinite-slope edge
+                            // it does not (`min asin(x) - x/2` was certified
+                            // 1.4e-3 above its optimum, #1492). Keep its valid
+                            // bound as a permanent floor of the global dual bound;
+                            // the gap then closes only when the removed box is
+                            // provably within tolerance of the incumbent. A node
+                            // carrying the 1e30 sentinel proved no bound (a
+                            // callback exclusion, as in the #598 arm below) and
+                            // owes no floor.
+                            let tight_lb = self.pool.get(result.node_id).local_lower_bound;
+                            if tight_lb < SENTINEL_THRESHOLD {
+                                self.tight_floors.insert(result.node_id, tight_lb);
+                                self.tight_unread.push(result.node_id);
+                            }
                         }
                         self.pool.get_mut(result.node_id).status = NodeStatus::Fathomed;
                         stats.fathomed += 1;
@@ -1053,6 +1221,49 @@ impl TreeManager {
                 // Flag the tree bound unresolved so `update_global_lower_bound`
                 // pins the global bound at -inf (gap = ∞ → feasible/unknown). A
                 // trusted (finite-bound) node here IS resolved and stays certifiable.
+                //
+                // #1493 (`DISCOPT_POLE_BRANCHING`): before giving up on an
+                // untrusted nonconvex node, split it spatially. Its bound is
+                // non-finite typically because a denominator's range straddles
+                // 0 (hull of `1/x` over `[-3, 3]` is `(-inf, inf)`); a split AT
+                // the pole (a driver hint) lets each child's FBBT/relaxation see
+                // a one-signed denominator and prove a finite bound. Soundness:
+                // the two children cover the parent box, each inherits the
+                // parent's bound (here non-finite — nothing tighter), and while
+                // any of them stays open `update_global_lower_bound` takes the
+                // min over open nodes, so the global bound stays unresolved until
+                // every piece of the box is bounded. A capped or unbranchable node
+                // takes the legacy fathom below, which still sets
+                // `bound_unresolved` — never a certificate over it.
+                if !trusted && self.pole_branching && self.nonconvex {
+                    if let Some(split) = self.pole_split(result.node_id) {
+                        let parent = self.pool.get(result.node_id).clone();
+                        self.pool.get_mut(result.node_id).status = NodeStatus::Branched;
+                        let (left, right, var) = match split {
+                            PoleSplit::Continuous(d) => {
+                                let (l, r) =
+                                    create_children_spatial(&parent, &d, || self.next_id());
+                                (l, r, d.var_index)
+                            }
+                            PoleSplit::Integer(idx, bp) => {
+                                let (l, r) = create_children_spatial_int(&parent, idx, bp, || {
+                                    self.next_id()
+                                });
+                                (l, r, idx)
+                            }
+                        };
+                        let d = self.pole_depth.get(&result.node_id).copied().unwrap_or(0) + 1;
+                        self.pole_depth.insert(left.id, d);
+                        self.pole_depth.insert(right.id, d);
+                        self.pool.add(left);
+                        self.pool.add(right);
+                        self.pole_branches += 1;
+                        stats.branched += 1;
+                        self.record_branch_var(var);
+                        continue;
+                    }
+                    self.pole_capped += 1;
+                }
                 if !trusted {
                     self.bound_unresolved = true;
                 } else if !result.bound_trusted && node_lb < SENTINEL_THRESHOLD {
@@ -1101,6 +1312,10 @@ impl TreeManager {
             }
         }
 
+        // #1493: pole hints are per batch; any not consumed by the pole arm
+        // (the node was pruned, branched on an integer, or trusted) expire.
+        self.pole_hints.clear();
+
         self.update_global_lower_bound();
 
         stats
@@ -1126,7 +1341,7 @@ impl TreeManager {
         // subtree removed without proof still constrains the global dual bound
         // at its valid inherited bound, permanently. `+inf` (no such fathom)
         // leaves the computation unchanged.
-        let mut min_lb = self.unresolved_floor;
+        let mut min_lb = self.unresolved_floor.min(self.tight_floor());
         for i in 0..self.pool.total_count() {
             let node = self.pool.get(NodeId(i));
             match node.status {
@@ -1221,9 +1436,49 @@ impl TreeManager {
             global_lower_bound: self.global_lower_bound,
             gap: self.gap(),
             bound_unresolved: self.bound_unresolved,
-            unresolved_floor: self.unresolved_floor,
+            // Both kinds of unproven removal (#598 failed-node, #1510 tight box)
+            // report through one floor: a driver must not certify an empty tree
+            // over either.
+            unresolved_floor: self.unresolved_floor.min(self.tight_floor()),
             bound_contradicted: self.bound_contradicted,
         }
+    }
+
+    /// Minimum over the tight-fathom floors (#1510); `+inf` when none.
+    fn tight_floor(&self) -> f64 {
+        self.tight_floors
+            .values()
+            .fold(f64::INFINITY, |acc, &v| acc.min(v))
+    }
+
+    /// Drain the ids of nodes fathomed as TIGHT boxes since the last call
+    /// (#1510), in fathom order, so the driver can offer each a tighter valid
+    /// bound via [`Self::raise_tight_fathom_floor`] and record its point.
+    pub fn take_tight_fathoms(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.tight_unread)
+    }
+
+    /// Raise the floor a tight-fathomed node (#1510) holds on the global dual
+    /// bound to `bound`, which the caller asserts is a valid lower bound of the
+    /// (internally minimized) objective over that node's box — e.g. an
+    /// outward-rounded interval enclosure. Monotone: a lower or non-finite
+    /// `bound` is ignored. The global lower bound is recomputed.
+    ///
+    /// Errors when `node_id` was not tight-fathomed: raising any other node's
+    /// bound through this entry point would be a caller bug, and silently
+    /// accepting it would hide one.
+    pub fn raise_tight_fathom_floor(&mut self, node_id: NodeId, bound: f64) -> Result<(), String> {
+        let Some(floor) = self.tight_floors.get_mut(&node_id) else {
+            return Err(format!(
+                "raise_tight_fathom_floor: node {} was not fathomed as a tight box",
+                node_id.0
+            ));
+        };
+        if bound.is_finite() && bound > *floor {
+            *floor = bound;
+            self.update_global_lower_bound();
+        }
+        Ok(())
     }
 
     /// A node's stored `local_lower_bound`, or `None` when the id was never
@@ -1241,6 +1496,16 @@ impl TreeManager {
     pub fn node_lower_bound(&self, id: NodeId) -> Option<f64> {
         if id.0 < self.pool.total_count() {
             Some(self.pool.get(id).local_lower_bound)
+        } else {
+            None
+        }
+    }
+
+    /// A node's box `(lb, ub)`, or `None` for an id never allocated.
+    pub fn node_box(&self, id: NodeId) -> Option<(Vec<f64>, Vec<f64>)> {
+        if id.0 < self.pool.total_count() {
+            let n = self.pool.get(id);
+            Some((n.lb.clone(), n.ub.clone()))
         } else {
             None
         }
@@ -2969,5 +3234,230 @@ mod tests {
             off, 5.0,
             "an excluded region leaves the incumbent certified"
         );
+    }
+
+    /// A nonconvex root narrowed to a TIGHT box `[0, 1e-7]` of `[0, 1]`, with
+    /// relaxation bound `lb` and (unless `lb` is the sentinel, which an
+    /// incumbent would prune first) an injected incumbent `-1`.
+    fn tight_fathom_tree(lb: f64) -> TreeManager {
+        let mut tm = TreeManager::new(
+            1,
+            vec![0.0],
+            vec![1.0],
+            vec![],
+            SelectionStrategy::BestFirst,
+        );
+        tm.set_nonconvex(true);
+        tm.initialize();
+        if lb < SENTINEL_THRESHOLD {
+            assert!(tm.inject_incumbent(vec![1e-7], -1.0));
+        }
+        let batch = tm.export_batch(1);
+        let id = batch.node_ids[0];
+        tm.set_node_bounds(id, vec![0.0], vec![1e-7]);
+        tm.import_results(&[NodeResult {
+            node_id: id,
+            lower_bound: lb,
+            solution: vec![5e-8],
+            is_feasible: true,
+            certified_infeasible: false,
+            sentinel_is_exclusion: lb >= SENTINEL_THRESHOLD,
+        }]);
+        tm
+    }
+
+    #[test]
+    fn test_tight_fathom_floors_global_bound_1510() {
+        // #1510: before the fix the tight box was fathomed and its bound -2
+        // dropped, so the drained tree reported global_lower_bound = incumbent
+        // (-1) — a certificate for a box it never proved (#1492's asin edge).
+        let mut tm = tight_fathom_tree(-2.0);
+        let ps = tm.process_evaluated();
+        assert_eq!(ps.fathomed, 1);
+        assert_eq!(tm.stats().open_nodes, 0);
+        assert_eq!(
+            tm.global_lower_bound, -2.0,
+            "tight box must floor the bound"
+        );
+        assert_eq!(tm.stats().unresolved_floor, -2.0);
+        assert!(!tm.stats().bound_unresolved);
+        assert!(tm.gap() > 0.5, "gap must stay open over the unproven box");
+
+        let ids = tm.take_tight_fathoms();
+        assert_eq!(ids.len(), 1);
+        assert!(tm.take_tight_fathoms().is_empty(), "drained");
+
+        // A tighter valid bound for the same box (e.g. an interval enclosure)
+        // raises the floor; a lower or non-finite one is ignored.
+        tm.raise_tight_fathom_floor(ids[0], -3.0).unwrap();
+        tm.raise_tight_fathom_floor(ids[0], f64::NAN).unwrap();
+        assert_eq!(tm.global_lower_bound, -2.0);
+        tm.raise_tight_fathom_floor(ids[0], -1.0).unwrap();
+        assert_eq!(tm.global_lower_bound, -1.0);
+        assert!(tm.gap() < 1e-12);
+        // Raised past the incumbent: the reported bound stays capped at it.
+        tm.raise_tight_fathom_floor(ids[0], 5.0).unwrap();
+        assert_eq!(tm.global_lower_bound, -1.0);
+
+        // Only a tight-fathomed node may be raised through this entry point.
+        assert!(tm.raise_tight_fathom_floor(NodeId(99), 0.0).is_err());
+    }
+
+    #[test]
+    fn test_tight_fathom_sentinel_owes_no_floor_1510() {
+        // A callback exclusion (1e30 sentinel) proved no bound; it keeps the
+        // pre-#1510 treatment and does not pin a floor at 1e30.
+        let mut tm = tight_fathom_tree(1e30);
+        let ps = tm.process_evaluated();
+        assert_eq!(ps.fathomed, 1, "reached the tight arm, not the prune");
+        assert_eq!(tm.stats().unresolved_floor, f64::INFINITY);
+        assert!(tm.take_tight_fathoms().is_empty());
+    }
+
+    // ---- #1493 pole branching ----------------------------------------------
+
+    /// A 1-var nonconvex tree on `[-3, 3]` with an incumbent, whose root is
+    /// imported UNTRUSTED (raw bound `-inf`), as for `min 1/x` over a box
+    /// straddling the pole.
+    fn pole_tree(on: bool) -> (TreeManager, NodeId) {
+        let mut tm = TreeManager::new(
+            1,
+            vec![-3.0],
+            vec![3.0],
+            vec![],
+            SelectionStrategy::BestFirst,
+        );
+        tm.set_nonconvex(true);
+        tm.set_pole_branching(on);
+        tm.initialize();
+        assert!(tm.inject_incumbent(vec![-1.0], -1.0));
+        let id = tm.export_batch(1).node_ids[0];
+        (tm, id)
+    }
+
+    fn import_untrusted(tm: &mut TreeManager, id: NodeId) {
+        tm.import_results(&[NodeResult {
+            node_id: id,
+            lower_bound: f64::NEG_INFINITY,
+            solution: vec![0.5],
+            is_feasible: true,
+            certified_infeasible: false,
+            sentinel_is_exclusion: false,
+        }]);
+    }
+
+    #[test]
+    fn test_pole_branching_off_keeps_unresolved_fathom_1493() {
+        let (mut tm, id) = pole_tree(false);
+        tm.set_spatial_branch_hint(id, 0, 0.0);
+        import_untrusted(&mut tm, id);
+        let ps = tm.process_evaluated();
+        assert_eq!((ps.fathomed, ps.branched), (1, 0));
+        assert!(tm.stats().bound_unresolved);
+        assert_eq!(tm.global_lower_bound, f64::NEG_INFINITY);
+        assert_eq!(tm.pole_counters(), (0, 0));
+    }
+
+    #[test]
+    fn test_pole_branching_splits_at_hint_children_inherit_1493() {
+        let (mut tm, id) = pole_tree(true);
+        tm.set_spatial_branch_hint(id, 0, 0.0);
+        import_untrusted(&mut tm, id);
+        let ps = tm.process_evaluated();
+        assert_eq!((ps.fathomed, ps.branched), (0, 1));
+        assert!(!tm.stats().bound_unresolved);
+        assert_eq!(tm.pole_counters(), (1, 0));
+        // Children cover the parent box, split exactly at the hint, and carry
+        // the parent's (non-finite) bound -- nothing tighter.
+        let (l0, u0) = tm.node_box(NodeId(1)).unwrap();
+        let (l1, u1) = tm.node_box(NodeId(2)).unwrap();
+        assert_eq!((l0[0], u0[0], l1[0], u1[0]), (-3.0, 0.0, 0.0, 3.0));
+        for c in [NodeId(1), NodeId(2)] {
+            assert_eq!(tm.pool.get(c).local_lower_bound, f64::NEG_INFINITY);
+        }
+        // An open untrusted child keeps the global bound unresolved.
+        assert_eq!(tm.global_lower_bound, f64::NEG_INFINITY);
+        assert!(!tm.is_finished());
+
+        // Both children get finite bounds (the pole is on their boundary): the
+        // tree then certifies from those children alone.
+        let b = tm.export_batch(2);
+        let res: Vec<NodeResult> = b
+            .node_ids
+            .iter()
+            .map(|&n| NodeResult {
+                node_id: n,
+                lower_bound: if n == NodeId(1) { -1.0 } else { 1.0 / 3.0 },
+                solution: vec![if n == NodeId(1) { -1.0 } else { 3.0 }],
+                is_feasible: true,
+                certified_infeasible: false,
+                sentinel_is_exclusion: false,
+            })
+            .collect();
+        tm.import_results(&res);
+        tm.process_evaluated();
+        assert!((tm.global_lower_bound + 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_pole_without_hint_bisects_1493() {
+        let (mut tm, id) = pole_tree(true);
+        import_untrusted(&mut tm, id);
+        tm.process_evaluated();
+        let (_, u0) = tm.node_box(NodeId(1)).unwrap();
+        assert_eq!(u0[0], 0.0, "midpoint of [-3, 3]");
+        // Hints are one-shot per batch: an unconsumed one expires.
+        tm.set_spatial_branch_hint(NodeId(77), 0, 1.0);
+        tm.process_evaluated();
+        assert!(tm.pole_hints.is_empty());
+    }
+
+    #[test]
+    fn test_pole_hint_on_exhausted_column_takes_legacy_fathom_1493() {
+        // The hint names the pole column but its value is not strictly inside
+        // the box (the column is exhausted): no other split can remove the
+        // pole, so the node is fathomed unresolved, not bisected elsewhere.
+        let (mut tm, id) = pole_tree(true);
+        tm.set_spatial_branch_hint(id, 0, 3.0);
+        import_untrusted(&mut tm, id);
+        let ps = tm.process_evaluated();
+        assert_eq!((ps.fathomed, ps.branched), (1, 0));
+        assert!(tm.stats().bound_unresolved);
+        assert_eq!(tm.pole_counters(), (0, 1));
+    }
+
+    #[test]
+    fn test_pole_branching_depth_cap_terminates_unresolved_1493() {
+        // A genuinely reachable pole: every node stays untrusted. The search
+        // must terminate (cap), end `bound_unresolved`, and never certify.
+        let (mut tm, id) = pole_tree(true);
+        import_untrusted(&mut tm, id);
+        tm.process_evaluated();
+        let mut rounds = 0;
+        while !tm.is_finished() {
+            rounds += 1;
+            assert!(rounds < 100_000, "pole branching must terminate");
+            let b = tm.export_batch(8);
+            for &n in &b.node_ids {
+                import_untrusted(&mut tm, n);
+            }
+            tm.process_evaluated();
+        }
+        let (branches, capped) = tm.pole_counters();
+        assert!(branches > 0 && branches <= POLE_MAX_BRANCHES);
+        assert!(capped > 0);
+        assert!(tm.stats().bound_unresolved);
+        assert_eq!(tm.global_lower_bound, f64::NEG_INFINITY);
+        assert_eq!(tm.gap(), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_pole_branching_requires_nonconvex_1493() {
+        let (mut tm, id) = pole_tree(true);
+        tm.set_nonconvex(false);
+        import_untrusted(&mut tm, id);
+        let ps = tm.process_evaluated();
+        assert_eq!((ps.fathomed, ps.branched), (1, 0));
+        assert!(tm.stats().bound_unresolved);
     }
 }

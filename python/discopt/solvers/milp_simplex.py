@@ -574,10 +574,21 @@ def _dual_start_slack_basis(
     need_ub = c_arr < 0.0
     if ((need_lb & (lb <= -_INF)) | (need_ub & (ub >= _INF))).any():
         return None  # a selected side is open → dual-infeasible → keep the primal
+    # #1492: a ``c_j = 0`` column is dual-feasible at EITHER side, but it must sit
+    # at a FINITE one -- a nonbasic column at an infinite bound is no basic
+    # solution. It used to be put at lower unconditionally; with ``lb = -inf`` (an
+    # aux whose interval floor is open below, ``w = asin(x - 1)`` on ``x in [0,1]``)
+    # the engine then returned ``optimal`` at -0.5 for an LP whose optimum is
+    # -2.07, and ``trusted_vertex`` certified it: ``min y s.t. y >= asin(x-1) - x/2``
+    # was reported optimal at -0.5 against a true -pi/2. Put it at its upper bound
+    # when only that side is finite. (A FREE zero-cost column at "lower" is the
+    # engine's free-nonbasic encoding and solves correctly -- measured against
+    # HiGHS on both row orientations -- so it is left as it was.)
+    zero_at_ub = ~need_lb & ~need_ub & (lb <= -_INF) & (ub < _INF)
     n = c_arr.shape[0]
     # Rust basis encoding: AT_LOWER=0, BASIC=1, AT_UPPER=2 (crate::lp::basis).
     col_status = np.concatenate(
-        [np.where(need_ub, 2, 0).astype(np.int8), np.ones(m, dtype=np.int8)]
+        [np.where(need_ub | zero_at_ub, 2, 0).astype(np.int8), np.ones(m, dtype=np.int8)]
     )
     basic_vars = np.arange(n, n + m, dtype=np.int64)
     return col_status, basic_vars

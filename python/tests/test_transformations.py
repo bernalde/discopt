@@ -23,7 +23,12 @@ import discopt.transformations as dt
 import numpy as np
 import pytest
 from discopt import mpec
-from discopt._relax import binary_multilinear_reform, gdp_reformulate, integer_product_reform
+from discopt._relax import (
+    binary_multilinear_reform,
+    gdp_reformulate,
+    integer_product_reform,
+    nonsmooth_lift,
+)
 from discopt.modeling.core import from_nl
 
 CORPUS = sorted((pathlib.Path(__file__).parent / "data" / "minlplib_nl").glob("*.nl"))
@@ -133,6 +138,7 @@ EXPECTED = {
     "mpec.gdp": mpec.reformulate_gdp,
     "mpec.sos1": mpec.reformulate_sos1,
     "mpec.scholtes": mpec.reformulate_scholtes,
+    "nonsmooth.epigraph": nonsmooth_lift.lift_nonsmooth_atoms,
 }
 
 
@@ -358,3 +364,264 @@ def test_a_module_monkeypatch_still_reaches_the_call_site(monkeypatch):
     monkeypatch.setattr(gdp_reformulate, "reformulate_gdp", spy)
     _gdp_model().solve(time_limit=30)
     assert seen
+
+
+# ── #1497: the fingerprint and the diff see every coefficient ────────────
+
+
+def _coef_model(rhs, a):
+    m = dm.Model("m")
+    x = m.continuous("x", shape=(3,), lb=0, ub=10)
+    m.minimize(np.array(a) @ x)
+    m.subject_to(x[0] + x[1] + x[2] >= rhs)
+    return m
+
+
+def test_fingerprint_sees_a_seventh_digit_coefficient_change():
+    """A scalar ``Constant`` displays with ``.6g``; the fingerprint must not."""
+    m1, m2 = _coef_model(1.0000001, [1.0, 2.0, 3.0]), _coef_model(1.0000004, [1.0, 2.0, 3.0])
+    assert dt.model_fingerprint(m1) != dt.model_fingerprint(m2)
+    d = dt.diff_models(m1, m2)
+    assert not d.unchanged
+    assert len(d.added_constraints) == 1 and "1.0000004" in d.added_constraints[0]
+    assert len(d.removed_constraints) == 1 and "1.0000001" in d.removed_constraints[0]
+    assert not d.objective_changed
+
+
+def test_fingerprint_sees_one_element_of_an_array_constant():
+    """An array ``Constant`` displays as its shape; the fingerprint must see its data."""
+    m1, m2 = _coef_model(1.0, [1.0, 2.0, 3.0]), _coef_model(1.0, [1.0, 2.0, 3.5])
+    assert dt.model_fingerprint(m1) != dt.model_fingerprint(m2)
+    d = dt.diff_models(m1, m2)
+    assert d.objective_changed and not d.added_constraints and not d.removed_constraints
+
+
+def test_fingerprint_sees_a_change_inside_a_large_array_and_a_sum_over():
+    def build(k, bump):
+        m = dm.Model("big")
+        x = m.continuous("x", shape=(100,), lb=0, ub=1)
+        c = np.linspace(0.0, 1.0, 100)
+        c[k] += bump
+        m.minimize(c @ x)
+        m.subject_to(dm.sum(lambda i: (1.0 + bump * (i == k)) * x[i], over=range(3)) <= 2)
+        return m
+
+    base = dt.model_fingerprint(build(57, 0.0))
+    assert dt.model_fingerprint(build(57, 0.0)) == base
+    assert dt.model_fingerprint(build(57, 1e-12)) != base
+
+
+def test_fingerprint_equal_for_a_deep_copy_with_array_constants():
+    m = _coef_model(1.0000001, [1.0, 2.0, 3.0])
+    assert dt.model_fingerprint(copy.deepcopy(m)) == dt.model_fingerprint(m)
+    assert dt.diff_models(m, copy.deepcopy(m)).unchanged
+
+
+def test_apply_to_detects_a_pass_that_only_changes_coefficients(monkeypatch):
+    """``apply_to`` clears the source records exactly when the fingerprint moves;
+    a coefficient-only mutation must count as a change."""
+
+    def rescale(model):
+        model._objective.expression.left.value = np.array([9.0, 9.0, 9.0])
+        return model
+
+    t = dt.Transformation("test.rescale", rescale, "functional", "mutates coefficients")
+    monkeypatch.setitem(dt._REGISTRY, "test.rescale", t)
+    m = _coef_model(1.0, [1.0, 2.0, 3.0])
+    m._source_nl_path = "/nonexistent/source.nl"
+    before = dt.model_fingerprint(m)
+    dt.apply_to("test.rescale", m)
+    assert dt.model_fingerprint(m) != before
+    assert "_source_nl_path" not in m.__dict__
+
+
+# ── #1498: rebuilding passes keep the model's validation guards ──────────
+
+
+def _piecewise_sos2_model():
+    m = dm.Model("s")
+    x = m.continuous("x", lb=0, ub=4)
+    m.piecewise(x, [0, 1, 2, 4], [0, 3, 1, 5], method="sos2", name="y")
+    m.maximize(x)
+    return m
+
+
+def _widen_x(model, ub=6.0):
+    next(v for v in model._variables if v.name == "x").ub = ub
+
+
+@pytest.mark.parametrize("name", ["gdp", "gdp.bigm", "gdp.hull", "gdp.auto"])
+def test_gdp_copy_of_a_piecewise_model_still_refuses_a_widened_bound(name):
+    """Pre-#1498 the lowered copy had no ``_piecewise_domains`` and solved a
+    widened ``x <= 6`` to 4.0, the breakpoint span, instead of refusing."""
+    from discopt.modeling._piecewise import PiecewiseDomainError
+
+    m = _piecewise_sos2_model()
+    out = dt.create_using(name, m)
+    assert out is not m
+    assert len(out._piecewise_domains) == len(m._piecewise_domains) == 1
+    _widen_x(out)
+    with pytest.raises(PiecewiseDomainError):
+        out.validate()
+
+
+def test_apply_to_keeps_the_piecewise_guard():
+    from discopt.modeling._piecewise import PiecewiseDomainError
+
+    m = _piecewise_sos2_model()
+    dt.apply_to("gdp", m)
+    assert not any(type(c).__name__ == "_SOSConstraint" for c in m._constraints)
+    _widen_x(m)
+    with pytest.raises(PiecewiseDomainError):
+        m.validate()
+
+
+def _guarded_model(nonlinear: bool):
+    """A model carrying one piecewise domain (and, if nonlinear, one atan2
+    precondition) plus the structure each rebuilding pass acts on."""
+    m = dm.Model("g")
+    x = m.continuous("x", lb=0, ub=4)
+    a = m.integer("a", lb=0, ub=5)
+    c = m.integer("c", lb=0, ub=5)
+    b = m.binary("b")
+    d = m.binary("d")
+    f = m.binary("f")
+    y = m.piecewise(x, [0, 1, 2, 4], [0, 3, 1, 5], method="sos2", name="y")
+    m.subject_to(b * d * f <= 0.5)
+    if nonlinear:
+        q = m.continuous("q", lb=0.5, ub=3)
+        r = m.continuous("r", lb=-2, ub=2)
+        m.subject_to(dm.atan2(r, q) <= 1.0)
+        m.subject_to(a * c <= 10)
+        e = m.continuous("e", lb=0.1, ub=2)
+        m.subject_to(x / q + e * dm.log(e) <= 20)
+        assert len(m._atan2_preconditions) == 1
+    m.minimize(-y - x + a + c)
+    assert len(m._piecewise_domains) == 1
+    return m
+
+
+def _assert_guards_carried(src, out, label):
+    assert out is not src, f"{label} did not rebuild the model; the probe is void"
+    for attr in ("_atan2_preconditions", "_piecewise_domains"):
+        want = [id(t) for t in getattr(src, attr)]
+        assert [id(t) for t in getattr(out, attr)] == want, (label, attr)
+
+
+def test_every_rebuilding_pass_carries_atan2_and_piecewise_guards():
+    """Each pass that rebuilds a model into a fresh ``Model`` must forward both
+    guard lists (#1498). Every pass must actually rebuild here, or the probe
+    would pass vacuously (CLAUDE.md §6)."""
+    from discopt._relax.factorable_reform import canonicalize_entropy, factorable_reformulate
+
+    fired = 0
+    m = _guarded_model(nonlinear=True)
+    for name in ("gdp", "integer.bilinear", "integer.multilinear"):
+        _assert_guards_carried(m, dt.get(name).apply(m), name)
+        fired += 1
+    for fn in (factorable_reformulate, canonicalize_entropy):
+        _assert_guards_carried(m, fn(m), fn.__name__)
+        fired += 1
+    # binary.multilinear only fires on a pure MILP without SOS records: lower first.
+    milp = dt.get("gdp").apply(_guarded_model(nonlinear=False))
+    _assert_guards_carried(milp, dt.get("binary.multilinear").apply(milp), "binary.multilinear")
+    fired += 1
+    assert fired == 6
+
+
+def test_a_pass_that_drops_a_guard_is_refused(monkeypatch):
+    def rebuild_without_guards(model):
+        out = dm.Model(model.name)
+        out._variables = list(model._variables)
+        out._rebuild_name_index()
+        out._constraints = list(model._constraints)
+        out._objective = model._objective
+        return out
+
+    t = dt.Transformation("test.drop", rebuild_without_guards, "functional", "drops guards")
+    monkeypatch.setitem(dt._REGISTRY, "test.drop", t)
+    with pytest.raises(RuntimeError, match="_piecewise_domains"):
+        dt.create_using("test.drop", _piecewise_sos2_model())
+
+
+# ── #1497 (related): a crashing pass must not read as "unchanged" ─────────
+
+
+def _int_bilinear_model():
+    m = dm.Model("ib")
+    a = m.integer("a", lb=0, ub=5)
+    c = m.integer("c", lb=0, ub=5)
+    m.minimize(-(a * c) + 2 * a + c)
+    m.subject_to(a * c <= 10)
+    return m
+
+
+def _bin_trilinear_model():
+    m = dm.Model("bt")
+    b = m.binary("b", shape=(3,))
+    m.minimize(-(b[0] * b[1] * b[2]) + b[0])
+    return m
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("injected defect")
+
+
+@pytest.mark.parametrize(
+    "name, module, attr, build",
+    [
+        ("integer.bilinear", integer_product_reform, "_rewrite", _int_bilinear_model),
+        ("integer.multilinear", integer_product_reform, "_rewrite", _int_bilinear_model),
+        (
+            "integer.bilinear",
+            integer_product_reform,
+            "has_integer_product_work",
+            _int_bilinear_model,
+        ),
+        ("binary.multilinear", binary_multilinear_reform, "_process_body", _bin_trilinear_model),
+    ],
+)
+def test_a_crash_inside_a_pass_propagates_through_check(monkeypatch, name, module, attr, build):
+    """Pre-fix, the passes' ``except Exception: return model`` turned an injected
+    defect into ``check(...).diff.unchanged is True``."""
+    m = build()
+    # The unpatched pass does act on this model, so "unchanged" would be a lie.
+    assert not dt.check(name, m).diff.unchanged
+    monkeypatch.setattr(module, attr, _boom)
+    with pytest.raises(RuntimeError, match="injected defect"):
+        dt.check(name, m)
+
+
+def test_binary_multilinear_gate_does_not_swallow_a_scan_crash(monkeypatch):
+    assert binary_multilinear_reform.has_binary_multilinear_work(_bin_trilinear_model())
+    monkeypatch.setattr(binary_multilinear_reform, "_witness_scan", _boom)
+    with pytest.raises(RuntimeError, match="injected defect"):
+        binary_multilinear_reform.has_binary_multilinear_work(_bin_trilinear_model())
+
+
+def test_documented_abstention_still_returns_the_input_model(monkeypatch):
+    """An unbounded continuous factor is the #286 "cannot big-M" case: the pass
+    abstains (``IntegerProductNotApplicable``) and returns the model unchanged."""
+    m = dm.Model("unb")
+    a = m.integer("a", lb=0, ub=5)
+    x = m.continuous("x", lb=0, ub=1e30)
+    m.minimize(a * x - a)
+    m.subject_to(a * x <= 3)
+    assert integer_product_reform.has_integer_product_work(m)
+
+    abstained = []
+    real = integer_product_reform._Expander.bigm_product
+
+    def spy(self, *args, **kwargs):
+        try:
+            return real(self, *args, **kwargs)
+        except integer_product_reform.IntegerProductNotApplicable:
+            abstained.append(True)
+            raise
+
+    monkeypatch.setattr(integer_product_reform._Expander, "bigm_product", spy)
+    for name in ("integer.bilinear", "integer.multilinear"):
+        abstained.clear()
+        assert dt.get(name).apply(m) is m
+        assert abstained, f"{name} did not reach the documented abstention"
+        assert dt.check(name, m).diff.unchanged
