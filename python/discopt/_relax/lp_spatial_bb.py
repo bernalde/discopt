@@ -240,39 +240,39 @@ def _relax_bound(model, terms, lb, ub, deadline=None):
         _remaining = deadline - time.perf_counter()
         if _remaining <= 0.0:
             return None
-    try:
-        relax, info = build_milp_relaxation(
-            model,
-            terms,
-            DiscretizationState(),
-            bound_override=(lb, ub),
-            build_deadline=deadline,
-        )
-        if not relax._objective_bound_valid:
-            return None
-        # Solve the LP RELAXATION, not the MILP. ``build_milp_relaxation`` hands back
-        # a model that still carries integrality (30 integer columns on ball_mk2_30,
-        # 48 on tln6), so ``solve()`` was running a full branch-and-bound at every
-        # node of *this* engine's own branch-and-bound -- duplicating the integer
-        # branching the engine exists to perform. Measured: 32.85 s -> 0.00 s on
-        # ball_mk2_30 (21,220x) and 4.24 s -> 0.00 s on tln6 (2,340x).
-        #
-        # Sound: dropping integrality only enlarges the feasible set, so the LP
-        # optimum is <= the MILP optimum and remains a valid lower bound for a
-        # minimize (verified on both instances: -29.88 <= -24.90 and 3.22 <= 4.60).
-        # The bound is weaker per node, which is precisely the trade this engine is
-        # built to make -- it recovers the tightness by branching on the integers
-        # itself, which is what the module docstring means by "one LP, no NLP" per
-        # node. The incremental path already solves a pure LP; this aligns the cold
-        # path with it.
-        relax._integrality = None
-        if _remaining is not None:
-            _remaining = deadline - time.perf_counter()
-            if _remaining <= 0.0:
-                return None
-        res = relax.solve(time_limit=_remaining)
-    except Exception:
+    # #1520: no except. ``build_milp_relaxation`` has no documented decline and ``relax.solve``
+    # declines by status (no bound -> ``None`` below -> "unresolved", never a fathom); a raise is a
+    # defect.
+    relax, info = build_milp_relaxation(
+        model,
+        terms,
+        DiscretizationState(),
+        bound_override=(lb, ub),
+        build_deadline=deadline,
+    )
+    if not relax._objective_bound_valid:
         return None
+    # Solve the LP RELAXATION, not the MILP. ``build_milp_relaxation`` hands back
+    # a model that still carries integrality (30 integer columns on ball_mk2_30,
+    # 48 on tln6), so ``solve()`` was running a full branch-and-bound at every
+    # node of *this* engine's own branch-and-bound -- duplicating the integer
+    # branching the engine exists to perform. Measured: 32.85 s -> 0.00 s on
+    # ball_mk2_30 (21,220x) and 4.24 s -> 0.00 s on tln6 (2,340x).
+    #
+    # Sound: dropping integrality only enlarges the feasible set, so the LP
+    # optimum is <= the MILP optimum and remains a valid lower bound for a
+    # minimize (verified on both instances: -29.88 <= -24.90 and 3.22 <= 4.60).
+    # The bound is weaker per node, which is precisely the trade this engine is
+    # built to make -- it recovers the tightness by branching on the integers
+    # itself, which is what the module docstring means by "one LP, no NLP" per
+    # node. The incremental path already solves a pure LP; this aligns the cold
+    # path with it.
+    relax._integrality = None
+    if _remaining is not None:
+        _remaining = deadline - time.perf_counter()
+        if _remaining <= 0.0:
+            return None
+    res = relax.solve(time_limit=_remaining)
     if res is None or res.bound is None or res.x is None:
         return None
     return float(res.bound), np.asarray(res.x, dtype=float), info
@@ -327,13 +327,13 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
     ``coeffs·x <= rhs`` is a valid MIR/GMI inequality of the node relaxation, hence
     valid for every integer-feasible point in the node's box (and its subtree)."""
     cuts: list = []
-    try:
-        from discopt._relax.cmir_cuts import separate_cmir
-        from discopt._relax.crossover import crossover_to_vertex
-        from discopt._relax.problem_classifier import LPData
-        from discopt.solver import _separate_gomory_cuts
-    except Exception:
-        return cuts
+    # #1520: no except. in-package imports; no failure mode.
+    import scipy.sparse as sp
+
+    from discopt._relax.cmir_cuts import separate_cmir
+    from discopt._relax.crossover import crossover_to_vertex
+    from discopt._relax.problem_classifier import LPData
+    from discopt.solver import _separate_gomory_cuts
 
     # This GMI/crossover cut separator is dense by construction (``np.hstack([A,
     # np.eye])``, ``LPData``, the crossover vertex solve), and its dense ``A_eq`` is
@@ -341,7 +341,6 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
     # now returns a SPARSE ``A``, so densify once here to preserve the exact prior
     # contract (only this bounded per-node cut path densifies; the node LP solve stays
     # sparse).
-    import scipy.sparse as sp
 
     if sp.issparse(A):
         A = A.toarray()
@@ -350,37 +349,34 @@ def _separate_node_cuts(A, b, bounds, x, ncol, c, max_cuts=12):
     ub = bounds[:, 1]
     is_int = np.ones(ncol, dtype=bool)  # original + product aux are integer-valued
     # GMI from the optimal basis (equality standard form with explicit slacks)
-    try:
-        m = A.shape[0]
-        A_eq = np.hstack([A, np.eye(m)])
-        b_eq = b.copy()
-        cc = np.concatenate([np.asarray(c, dtype=np.float64)[:ncol], np.zeros(m)])
-        xl = np.concatenate([lb, np.zeros(m)])
-        xu = np.concatenate([ub, np.full(m, 1e20)])
-        xrelax = np.concatenate([x, b - A @ x])
-        xv = crossover_to_vertex(xrelax, A_eq, b_eq, cc, xl, xu)
-        lp = LPData(cc, A_eq, b_eq, xl, xu, 0.0)
-        gc = _separate_gomory_cuts(lp, xv, ncol, list(range(ncol)), max_cuts=max_cuts)
-        if gc is not None:
-            for i in range(len(gc[1])):  # GMI returns coeffs·x >= rhs -> negate to <=
-                row = -np.asarray(gc[0][i])[:ncol]
-                # GMI validity holds only up to machine precision (gomory.rs:31); the
-                # raw crossover vertex the cut separates carries ~1e-12 float error, so
-                # a cut whose boundary passes through a feasible integer point could
-                # shave it. Relax the <= rhs outward by the same safe margin every
-                # other GMI consumer uses (solver.py _augment_lpdata_with_gomory_cuts,
-                # cmir_cuts.py) — C-10. Sound: it only ever moves the cut AWAY from the
-                # feasible region, never removing a feasible point.
-                margin = 1e-7 * (1.0 + float(np.abs(row).sum()))
-                cuts.append((row, -float(gc[1][i]) + margin))
-    except Exception as exc:  # cuts are optional: a missing cut is always safe
-        logger.debug("lp_spatial GMI separation skipped: %s: %s", type(exc).__name__, exc)
+    # #1520: no except. ``crossover_to_vertex`` returns ``x`` when it cannot move and
+    # ``_separate_gomory_cuts`` returns ``None``; a raise is a defect, not "no cut".
+    m = A.shape[0]
+    A_eq = np.hstack([A, np.eye(m)])
+    b_eq = b.copy()
+    cc = np.concatenate([np.asarray(c, dtype=np.float64)[:ncol], np.zeros(m)])
+    xl = np.concatenate([lb, np.zeros(m)])
+    xu = np.concatenate([ub, np.full(m, 1e20)])
+    xrelax = np.concatenate([x, b - A @ x])
+    xv = crossover_to_vertex(xrelax, A_eq, b_eq, cc, xl, xu)
+    lp = LPData(cc, A_eq, b_eq, xl, xu, 0.0)
+    gc = _separate_gomory_cuts(lp, xv, ncol, list(range(ncol)), max_cuts=max_cuts)
+    if gc is not None:
+        for i in range(len(gc[1])):  # GMI returns coeffs·x >= rhs -> negate to <=
+            row = -np.asarray(gc[0][i])[:ncol]
+            # GMI validity holds only up to machine precision (gomory.rs:31); the
+            # raw crossover vertex the cut separates carries ~1e-12 float error, so
+            # a cut whose boundary passes through a feasible integer point could
+            # shave it. Relax the <= rhs outward by the same safe margin every
+            # other GMI consumer uses (solver.py _augment_lpdata_with_gomory_cuts,
+            # cmir_cuts.py) — C-10. Sound: it only ever moves the cut AWAY from the
+            # feasible region, never removing a feasible point.
+            margin = 1e-7 * (1.0 + float(np.abs(row).sum()))
+            cuts.append((row, -float(gc[1][i]) + margin))
     # complemented-MIR (multi-row aggregation)
-    try:
-        mc = separate_cmir(A, b, x, lb, ub, is_int, max_cuts=max_cuts)
-        cuts.extend(mc)
-    except Exception as exc:  # cuts are optional: a missing cut is always safe
-        logger.debug("lp_spatial c-MIR separation skipped: %s: %s", type(exc).__name__, exc)
+    # #1520: no except. ``separate_cmir`` declines by returning no cuts.
+    mc = separate_cmir(A, b, x, lb, ub, is_int, max_cuts=max_cuts)
+    cuts.extend(mc)
     return cuts
 
 
@@ -469,16 +465,16 @@ def solve_lp_spatial_bb(
     # Verifying against the evaluator restores ``bound <= incumbent`` unconditionally.
     # If we cannot build a verifier we cannot safely accept any incumbent, so bail to
     # the sound default path (return None) rather than risk an unverified certificate.
-    try:
-        from discopt._tape_nlp_evaluator import make_evaluator
-        from discopt.solver import _check_constraint_feasibility, _infer_constraint_bounds
+    # #1520: no except. ``make_evaluator`` and ``_infer_constraint_bounds`` have no documented
+    # decline; an evaluator that cannot be built is a defect the default path would hit too, not a
+    # reason to decline this engine silently.
+    from discopt._tape_nlp_evaluator import make_evaluator
+    from discopt.solver import _check_constraint_feasibility, _infer_constraint_bounds
 
-        # #75: dispatcher, not a direct NLPEvaluator -- this incumbent verifier
-        # runs on the spatial B&B path and imported JAX unconditionally.
-        _ev = make_evaluator(model)
-        _cl, _cu = _infer_constraint_bounds(model, _ev)
-    except Exception:
-        return None
+    # #75: dispatcher, not a direct NLPEvaluator -- this incumbent verifier
+    # runs on the spatial B&B path and imported JAX unconditionally.
+    _ev = make_evaluator(model)
+    _cl, _cu = _infer_constraint_bounds(model, _ev)
     _FEAS_TOL = 1e-6
 
     def _pt_feasible(xr: np.ndarray) -> bool:
@@ -499,62 +495,58 @@ def solve_lp_spatial_bb(
     # infinite upper bound in ~0.2-0.4 s and the McCormick LP then returns a valid
     # bound (syn05m -1165.78, syn05hfsg -1335.50 minimize-equivalent).
     if use_obbt or _inf_box:
-        try:
-            from discopt._relax.obbt import obbt_tighten_root
+        # #1520: no except. ``obbt_tighten_root`` returns the input (or soundly tightened) box when
+        # it cannot proceed and reports ``infeasible`` only on proof; a raise is a defect, not
+        # "root OBBT skipped".
+        from discopt._relax.obbt import obbt_tighten_root
 
-            # Budget the root OBBT against the caller's deadline. Without this it
-            # runs |vars| x 2 x rounds LPs at up to time_limit_per_lp each, entirely
-            # outside time_limit -- on ball_mk2_30 (30 integers) that alone is up to
-            # 150 s against a 30 s budget. Cap it at a third of the remaining time so
-            # the node loop always gets the majority of the budget.
-            # #1153: saturate the carve. A third of the caller's budget keeps
-            # growing with it, so a generous ``time_limit`` buys more root OBBT
-            # rather than more tree — the coupling #1153 measured. The pass has
-            # its own deterministic cap (``rounds=5``); this only stops the wall
-            # grant from tracking the caller's budget upward without end.
-            #
-            # NOTE on the ``frac`` argument, which the helper documents as "the
-            # fraction of ``time_limit`` this carve was taken from": the value
-            # here is a third of what REMAINS, not of the engine's full
-            # ``time_limit``, so the ceiling it derives (50 s) is an upper bound
-            # on the carve rather than the exact 1/3-of-limit the contract
-            # implies. The effective grant, ``min(remaining / 3, 50)``, is sound
-            # and never looser than the un-saturated original — but anyone
-            # re-tuning ``ROLE2_SATURATION_S`` should read this site as "capped at
-            # 50 s", not as "capped at a third of the limit".
-            _obbt_budget = saturate_role2(
-                max(0.0, time_limit - (time.perf_counter() - t0)) / 3.0, 1.0 / 3.0
-            )
-            r = obbt_tighten_root(
-                model,
-                lb0,
-                ub0,
-                rounds=5,
-                deadline=time.perf_counter() + _obbt_budget,
-                time_limit_per_lp=min(0.5, max(0.05, _obbt_budget / 10.0)),
-            )
-            if not r.infeasible:
-                # Integrality rounding applies to INTEGER columns only. Flooring a
-                # continuous variable's tightened lower bound would push it BELOW the
-                # value OBBT proved (widening, merely wasteful) while ceiling its upper
-                # bound would do the same — but rounding a continuous bound the wrong
-                # way on a narrow box can also erase the tightening entirely. Keep the
-                # exact continuous bounds and round only where integrality permits.
-                _rlb = np.asarray(r.lb, dtype=float)
-                _rub = np.asarray(r.ub, dtype=float)
-                lb0 = np.maximum(lb0, np.where(is_int, np.floor(_rlb + 1e-9), _rlb))
-                ub0 = np.minimum(ub0, np.where(is_int, np.ceil(_rub - 1e-9), _rub))
-                _inf_box = not (np.all(np.isfinite(lb0)) and np.all(np.isfinite(ub0)))
-        except Exception as exc:
-            # Never let root tightening break the solve -- but never hide it either.
-            # A silently-skipped capability is precisely the failure mode that cost
-            # #844 several wrong conclusions (a swallowed TypeError made a whole
-            # fallback an invisible no-op).
-            logger.debug("lp_spatial root OBBT skipped: %s: %s", type(exc).__name__, exc)
+        # Budget the root OBBT against the caller's deadline. Without this it
+        # runs |vars| x 2 x rounds LPs at up to time_limit_per_lp each, entirely
+        # outside time_limit -- on ball_mk2_30 (30 integers) that alone is up to
+        # 150 s against a 30 s budget. Cap it at a third of the remaining time so
+        # the node loop always gets the majority of the budget.
+        # #1153: saturate the carve. A third of the caller's budget keeps
+        # growing with it, so a generous ``time_limit`` buys more root OBBT
+        # rather than more tree — the coupling #1153 measured. The pass has
+        # its own deterministic cap (``rounds=5``); this only stops the wall
+        # grant from tracking the caller's budget upward without end.
+        #
+        # NOTE on the ``frac`` argument, which the helper documents as "the
+        # fraction of ``time_limit`` this carve was taken from": the value
+        # here is a third of what REMAINS, not of the engine's full
+        # ``time_limit``, so the ceiling it derives (50 s) is an upper bound
+        # on the carve rather than the exact 1/3-of-limit the contract
+        # implies. The effective grant, ``min(remaining / 3, 50)``, is sound
+        # and never looser than the un-saturated original — but anyone
+        # re-tuning ``ROLE2_SATURATION_S`` should read this site as "capped at
+        # 50 s", not as "capped at a third of the limit".
+        _obbt_budget = saturate_role2(
+            max(0.0, time_limit - (time.perf_counter() - t0)) / 3.0, 1.0 / 3.0
+        )
+        r = obbt_tighten_root(
+            model,
+            lb0,
+            ub0,
+            rounds=5,
+            deadline=time.perf_counter() + _obbt_budget,
+            time_limit_per_lp=min(0.5, max(0.05, _obbt_budget / 10.0)),
+        )
+        if not r.infeasible:
+            # Integrality rounding applies to INTEGER columns only. Flooring a
+            # continuous variable's tightened lower bound would push it BELOW the
+            # value OBBT proved (widening, merely wasteful) while ceiling its upper
+            # bound would do the same — but rounding a continuous bound the wrong
+            # way on a narrow box can also erase the tightening entirely. Keep the
+            # exact continuous bounds and round only where integrality permits.
+            _rlb = np.asarray(r.lb, dtype=float)
+            _rub = np.asarray(r.ub, dtype=float)
+            lb0 = np.maximum(lb0, np.where(is_int, np.floor(_rlb + 1e-9), _rlb))
+            ub0 = np.minimum(ub0, np.where(is_int, np.ceil(_rub - 1e-9), _rub))
+            _inf_box = not (np.all(np.isfinite(lb0)) and np.all(np.isfinite(ub0)))
 
     # Fast path: incremental McCormick LP (structure built once, box-dependent rows
     # patched per node, warm-started). Guarded by its own validation against
-    # build_milp_relaxation; on any failure fall back to the trusted per-node
+    # build_milp_relaxation; on a structure decline fall back to the trusted per-node
     # builder (correct, ~30x slower). This is what gives the throughput to close by
     # branching (the no-cut-SCIP regime).
     from discopt._relax.incremental_mccormick import IncrementalMcCormickLP

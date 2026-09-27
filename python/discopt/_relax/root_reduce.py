@@ -21,9 +21,10 @@ Soundness (the load-bearing invariant, §0.2/§0.3):
 
   * **Tighten-only.** Every stage intersects its result into the running box
     (``lb = max(lb, new_lb)``, ``ub = min(ub, new_ub)`` — the solver.py:3914
-    pattern). A stage NEVER loosens a bound; a stage failure returns the box
-    unchanged. The reduced box is therefore always a subset of the input box, so no
-    feasible point is ever removed by the loop itself.
+    pattern). A stage NEVER loosens a bound; a stage that declines returns the box
+    unchanged (an exception is a defect and propagates, #1520). The reduced box is
+    therefore always a subset of the input box, so no feasible point
+    is ever removed by the loop itself.
   * **NS-safe bounds only (the C-15 rule).** S3 uses ``obbt_tighten_root``, whose
     tightenings go through the Neumaier–Shcherbina safe vertex clamp; S2 is pure
     interval FBBT. Neither uses a raw LP vertex objective as a bound.
@@ -113,48 +114,50 @@ def _stage_fbbt_with_cutoff(
     ``fbbt_with_cutoff`` reads the model's declared per-block bounds, so the box is
     applied by temporarily setting ``v.lb``/``v.ub`` on the model (the obbt.py:1496
     save/restore pattern), building a fresh Rust repr, and restoring afterwards.
-    Returns ``(lb, ub, n_tightened, infeasible)``; any failure returns the box
-    unchanged (tightening-only, never unsound). Only scalar (size-1) variable
+    Returns ``(lb, ub, n_tightened, infeasible)``; a model with no Rust repr or a
+    misaligned repr layout returns the box unchanged (tightening-only, never
+    unsound). Only scalar (size-1) variable
     blocks are mapped, mirroring the existing Phase-C3 FBBT site (solver.py:7142)."""
     lb = np.asarray(lb, dtype=np.float64).copy()
     ub = np.asarray(ub, dtype=np.float64).copy()
     n = lb.size
 
-    try:
-        from discopt._rust import model_to_repr
-    except Exception:
-        return lb, ub, 0, False
+    # #1520: no except around the import (``discopt._rust`` is the core extension,
+    # not an optional dependency).
+    from discopt._rust import model_to_repr
 
     # Bounds are restored by ``saved_bounds`` on every exit path, the
     # ``return`` in the except arm included -- this pass must leave the
     # search tree exactly as it found it (C-41).
     with model.saved_bounds():
+        off = 0
+        for v in model._variables:
+            sz = v.size
+            if off + sz <= n:
+                v.lb = lb[off : off + sz].reshape(v.lb.shape)
+                v.ub = ub[off : off + sz].reshape(v.ub.shape)
+            off += sz
         try:
-            off = 0
-            for v in model._variables:
-                sz = v.size
-                if off + sz <= n:
-                    v.lb = lb[off : off + sz].reshape(v.lb.shape)
-                    v.ub = ub[off : off + sz].reshape(v.ub.shape)
-                off += sz
             repr_ = model_to_repr(model, getattr(model, "_builder", None))
-            # #1373: ``incumbent_cutoff`` is in the INTERNAL minimization space
-            # (the convention for every cutoff parameter in this layer -- see the
-            # module docstring), while ``fbbt_with_cutoff`` builds the cutoff row
-            # against the repr's own objective under the repr's declared sense.
-            # ``repr_space_cutoff`` converts; ``None`` means the spaces could not
-            # be shown to agree, and cutoff-free FBBT is a looser, sound box.
-            fbbt_lbs, fbbt_ubs = repr_.fbbt_with_cutoff(
-                max_iter=max_iter,
-                tol=tol,
-                incumbent_bound=repr_space_cutoff(repr_, incumbent_cutoff),
-            )
-        except Exception as exc:
-            # C-41: surface, never silently swallow — a swallowed error here is the
-            # exact compounding smell behind C-40 (a misaligned map that corrupts a
-            # box, then eats the resulting IndexError). Tighten-only: keep the box.
-            logger.debug("root cutoff-FBBT skipped (build/solve failed): %s", exc)
+        except ValueError as exc:
+            # #1520: narrowed. ``model_to_repr``'s documented decline (the model has
+            # no Rust repr). Tighten-only: keep the box. Box writes, the cutoff
+            # conversion and ``fbbt_with_cutoff`` (no error return in Rust) are
+            # outside the handler, so a defect there propagates (C-41: a swallowed
+            # IndexError from a misaligned map is how C-40 hid).
+            logger.debug("root cutoff-FBBT skipped (no Rust repr): %s", exc)
             return lb, ub, 0, False
+        # #1373: ``incumbent_cutoff`` is in the INTERNAL minimization space
+        # (the convention for every cutoff parameter in this layer -- see the
+        # module docstring), while ``fbbt_with_cutoff`` builds the cutoff row
+        # against the repr's own objective under the repr's declared sense.
+        # ``repr_space_cutoff`` converts; ``None`` means the spaces could not
+        # be shown to agree, and cutoff-free FBBT is a looser, sound box.
+        fbbt_lbs, fbbt_ubs = repr_.fbbt_with_cutoff(
+            max_iter=max_iter,
+            tol=tol,
+            incumbent_bound=repr_space_cutoff(repr_, incumbent_cutoff),
+        )
 
     fbbt_lbs = np.asarray(fbbt_lbs, dtype=np.float64)
     fbbt_ubs = np.asarray(fbbt_ubs, dtype=np.float64)
@@ -205,21 +208,21 @@ def _stage_fbbt_with_cutoff(
 def _root_lp_bound(model: Model, lb: np.ndarray, ub: np.ndarray) -> Optional[float]:
     """The McCormick-LP root dual bound over the box, for fixpoint convergence
     detection only (never used as a certificate here). Returns None if no bound."""
-    try:
-        from discopt._relax.mccormick_lp import MccormickLPRelaxer
+    # #1520: no except. ``solve_at_node`` declines by status (a build failure is
+    # reported at WARNING inside it and comes back as ``status="error"``), so a raise
+    # is a defect, not "no bound".
+    from discopt._relax.mccormick_lp import MccormickLPRelaxer
 
-        relaxer = MccormickLPRelaxer(model, build_incremental=False)
-        if not relaxer.has_relaxable_nonlinearity:
-            return None
-        res = relaxer.solve_at_node(
-            np.asarray(lb, dtype=np.float64),
-            np.asarray(ub, dtype=np.float64),
-            separate=True,
-        )
-        if res.status == "optimal" and res.lower_bound is not None:
-            return float(res.lower_bound)
-    except Exception:
+    relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    if not relaxer.has_relaxable_nonlinearity:
         return None
+    res = relaxer.solve_at_node(
+        np.asarray(lb, dtype=np.float64),
+        np.asarray(ub, dtype=np.float64),
+        separate=True,
+    )
+    if res.status == "optimal" and res.lower_bound is not None:
+        return float(res.lower_bound)
     return None
 
 
@@ -267,8 +270,8 @@ def run_root_fixpoint(
         Fraction of the *remaining* per-round budget handed to S3 OBBT (R1: S3≈85%,
         S2≈15%).
 
-    Returns a :class:`RootReduceResult`. Tighten-only and deadline-safe: any failure
-    or timeout returns the best box tightened so far, never a loosened one.
+    Returns a :class:`RootReduceResult`. Tighten-only and deadline-safe: a declining
+    stage or a timeout returns the best box tightened so far, never a loosened one.
     """
     lb = np.asarray(lb, dtype=np.float64).copy()
     ub = np.asarray(ub, dtype=np.float64).copy()
@@ -384,7 +387,7 @@ def _stage_obbt(
     Delegates to :func:`obbt_tighten_root`, which already runs a ≤``rounds`` internal
     reduce↔rebuild fixpoint, DBBT-first (one objective LP → reduced costs tighten all
     vars) then OBBT (2n min/max probes), all through the NS-safe vertex clamp. It is
-    tighten-only and returns the input box on any failure. ``cascade_aux`` (the #208
+    tighten-only and returns the input box when it cannot proceed. ``cascade_aux`` (the #208
     reverse-FBBT aux cascade) is ``DISCOPT_OBBT_CASCADE_AUX``, default **ON**
     (GRADUATED per #208 under the one-successful-graduation-gate-run policy —
     CLAUDE.md §5). The graduation gate (``design/ab_cascade_aux.py``, 65-instance
@@ -398,25 +401,22 @@ def _stage_obbt(
     extra probes are ~87 % fewer than a blanket cascade and it runs root-only (no
     per-node cost). Set ``DISCOPT_OBBT_CASCADE_AUX=0`` to restore the old default
     OFF."""
-    try:
-        from discopt._relax.obbt import obbt_tighten_root
-    except Exception:
-        return lb, ub, False, 0
+    # #1520: no except (both former handlers). ``obbt`` is in-package, and
+    # ``obbt_tighten_root`` returns the input box when it cannot proceed, so a raise
+    # is a defect, not "OBBT tightened nothing".
+    from discopt._relax.obbt import obbt_tighten_root
 
     cascade_aux = os.environ.get("DISCOPT_OBBT_CASCADE_AUX", "1") != "0"
-    try:
-        res = obbt_tighten_root(
-            model,
-            np.asarray(lb, dtype=np.float64),
-            np.asarray(ub, dtype=np.float64),
-            rounds=rounds,
-            deadline=deadline,
-            incumbent_cutoff=cutoff,
-            prefer_pounce=prefer_pounce,
-            cascade_aux=cascade_aux,
-        )
-    except Exception:
-        return lb, ub, False, 0
+    res = obbt_tighten_root(
+        model,
+        np.asarray(lb, dtype=np.float64),
+        np.asarray(ub, dtype=np.float64),
+        rounds=rounds,
+        deadline=deadline,
+        incumbent_cutoff=cutoff,
+        prefer_pounce=prefer_pounce,
+        cascade_aux=cascade_aux,
+    )
 
     if res.infeasible:
         return lb, ub, True, 0

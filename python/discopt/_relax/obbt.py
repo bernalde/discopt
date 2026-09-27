@@ -1157,22 +1157,21 @@ def run_obbt_on_relaxation(
         width_arr = ub_arr - lb_arr
         rc = None
         if c_obj is not None:
-            try:
-                _score_res = _lp(
-                    c=np.asarray(c_obj, dtype=np.float64),
-                    A_ub=A_ub,
-                    b_ub=b_ub,
-                    bounds=[(float(lb_arr[i]), float(ub_arr[i])) for i in range(n_total)],
-                    time_limit=time_limit_per_lp,
-                )
-                total_lp_time += getattr(_score_res, "wall_time", 0.0) or 0.0
-                n_lp_solves += 1
-                if _score_res.status == SolveStatus.OPTIMAL:
-                    _rc = getattr(_score_res, "reduced_costs", None)
-                    if _rc is not None:
-                        rc = np.asarray(_rc, dtype=np.float64)
-            except Exception:
-                rc = None
+            # #1520: no except. the exact LP oracle declines by status (reduced costs are read only
+            # on ``OPTIMAL``), so a raise is a defect, not "no scoring duals".
+            _score_res = _lp(
+                c=np.asarray(c_obj, dtype=np.float64),
+                A_ub=A_ub,
+                b_ub=b_ub,
+                bounds=[(float(lb_arr[i]), float(ub_arr[i])) for i in range(n_total)],
+                time_limit=time_limit_per_lp,
+            )
+            total_lp_time += getattr(_score_res, "wall_time", 0.0) or 0.0
+            n_lp_solves += 1
+            if _score_res.status == SolveStatus.OPTIMAL:
+                _rc = getattr(_score_res, "reduced_costs", None)
+                if _rc is not None:
+                    rc = np.asarray(_rc, dtype=np.float64)
 
         def _score(i: int) -> float:
             w = float(width_arr[i]) if np.isfinite(width_arr[i]) else 0.0
@@ -1566,7 +1565,7 @@ def propagate_equality_defined_bounds(
     variables reachable from *linear* constraints, which then become finite
     inputs to the ``g`` expressions this pass propagates through.
 
-    Returns ``(lb, ub, n_finitized)``.  Any failure leaves the box unchanged.
+    Returns ``(lb, ub, n_finitized)``.  A row it cannot bound is skipped.
     """
     lb = np.asarray(lb, dtype=np.float64).copy()
     ub = np.asarray(ub, dtype=np.float64).copy()
@@ -1575,112 +1574,122 @@ def propagate_equality_defined_bounds(
     if np.all(np.isfinite(lb)) and np.all(np.isfinite(ub)):
         return lb, ub, 0
 
-    try:
-        from discopt._relax.gdp_reformulate import _bound_expression
-        from discopt.modeling.core import Constraint, VarType
+    # #1520: no except around the pass. ``_bound_expression`` answers ``(-inf, inf)`` for
+    # anything it cannot bound; its one numeric failure (a Python-float ``**`` overflow) is
+    # narrowed at the call below, and the model's bounds are restored by the ``finally`` on
+    # every exit. Any other raise is a defect and propagates.
+    from discopt._relax.gdp_reformulate import _bound_expression
+    from discopt.modeling.core import Constraint, VarType
 
-        # _bound_expression reads bounds off the model's Variable nodes, so drive
-        # it with the current box by temporarily writing (lb, ub) onto the model
-        # and restoring the originals afterwards.
-        saved = [(v.lb, v.ub) for v in model._variables]
-        is_int = np.zeros(n_vars, dtype=bool)
+    # _bound_expression reads bounds off the model's Variable nodes, so drive
+    # it with the current box by temporarily writing (lb, ub) onto the model
+    # and restoring the originals afterwards.
+    saved = [(v.lb, v.ub) for v in model._variables]
+    is_int = np.zeros(n_vars, dtype=bool)
 
-        def _apply_box() -> None:
-            off = 0
-            for v in model._variables:
-                sz = v.size
-                v.lb = lb[off : off + sz].reshape(v.lb.shape)
-                v.ub = ub[off : off + sz].reshape(v.ub.shape)
-                off += sz
-
+    def _apply_box() -> None:
         off = 0
         for v in model._variables:
-            flag = v.var_type in (VarType.BINARY, VarType.INTEGER)
-            for _ in range(v.size):
-                if off < n_vars:
-                    is_int[off] = flag
-                off += 1
+            sz = v.size
+            v.lb = lb[off : off + sz].reshape(v.lb.shape)
+            v.ub = ub[off : off + sz].reshape(v.ub.shape)
+            off += sz
 
-        eq_constraints = [
-            c for c in model._constraints if isinstance(c, Constraint) and c.sense == "=="
-        ]
+    off = 0
+    for v in model._variables:
+        flag = v.var_type in (VarType.BINARY, VarType.INTEGER)
+        for _ in range(v.size):
+            if off < n_vars:
+                is_int[off] = flag
+            off += 1
 
-        n_finitized = 0
-        try:
-            for _ in range(max(1, max_passes)):
-                _apply_box()
-                changed = False
-                for c in eq_constraints:
-                    terms = _additive_terms(c.body)
-                    rhs = float(c.rhs) if np.ndim(c.rhs) == 0 else None
-                    if rhs is None:
+    eq_constraints = [
+        c for c in model._constraints if isinstance(c, Constraint) and c.sense == "=="
+    ]
+
+    n_finitized = 0
+    try:
+        for _ in range(max(1, max_passes)):
+            _apply_box()
+            changed = False
+            for c in eq_constraints:
+                terms = _additive_terms(c.body)
+                rhs = float(c.rhs) if np.ndim(c.rhs) == 0 else None
+                if rhs is None:
+                    continue
+                for pos, (coeff, sub) in enumerate(terms):
+                    if abs(coeff) < 1e-30:
                         continue
-                    for pos, (coeff, sub) in enumerate(terms):
-                        if abs(coeff) < 1e-30:
-                            continue
-                        vi = _scalar_flat_index(sub, model)
-                        if vi is None or vi >= n_vars:
-                            continue
-                        if np.isfinite(lb[vi]) and np.isfinite(ub[vi]):
-                            continue
-                        # v must not appear in any other term of the row.
-                        others = [t for k, t in enumerate(terms) if k != pos]
-                        if any(vi in _flat_indices(t[1], model) for t in others):
-                            continue
-                        # v == (rhs - sum(others)) / coeff
-                        rest_lo, rest_hi = 0.0, 0.0
-                        ok = True
-                        for ocoeff, oexpr in others:
+                    vi = _scalar_flat_index(sub, model)
+                    if vi is None or vi >= n_vars:
+                        continue
+                    if np.isfinite(lb[vi]) and np.isfinite(ub[vi]):
+                        continue
+                    # v must not appear in any other term of the row.
+                    others = [t for k, t in enumerate(terms) if k != pos]
+                    if any(vi in _flat_indices(t[1], model) for t in others):
+                        continue
+                    # v == (rhs - sum(others)) / coeff
+                    rest_lo, rest_hi = 0.0, 0.0
+                    ok = True
+                    for ocoeff, oexpr in others:
+                        try:
                             elo, ehi = _bound_expression(oexpr, model)
-                            if ocoeff >= 0:
-                                rest_lo += ocoeff * elo
-                                rest_hi += ocoeff * ehi
-                            else:
-                                rest_lo += ocoeff * ehi
-                                rest_hi += ocoeff * elo
-                            if not (np.isfinite(rest_lo) and np.isfinite(rest_hi)):
-                                ok = False
-                                break
-                        if not ok:
-                            continue
-                        num_lo = rhs - rest_hi
-                        num_hi = rhs - rest_lo
-                        if coeff > 0:
-                            v_lo, v_hi = num_lo / coeff, num_hi / coeff
+                        except OverflowError:
+                            # #1520: narrowed. ``_bound_expression`` evaluates integer
+                            # powers as Python floats, and ``1e200 ** 2`` raises instead
+                            # of returning ``inf``. A range past float is unbounded for
+                            # this purpose: skip the row (no tightening), exactly as the
+                            # non-finite check below does.
+                            ok = False
+                            break
+                        if ocoeff >= 0:
+                            rest_lo += ocoeff * elo
+                            rest_hi += ocoeff * ehi
                         else:
-                            v_lo, v_hi = num_hi / coeff, num_lo / coeff
-                        if not (np.isfinite(v_lo) and np.isfinite(v_hi)):
-                            continue
-                        margin = 1e-6 * (1.0 + max(abs(v_lo), abs(v_hi)))
-                        v_lo -= margin
-                        v_hi += margin
-                        if is_int[vi]:
-                            v_lo = np.ceil(v_lo - 1e-7)
-                            v_hi = np.floor(v_hi + 1e-7)
-                        new_lb = max(lb[vi], v_lo) if np.isfinite(lb[vi]) else v_lo
-                        new_ub = min(ub[vi], v_hi) if np.isfinite(ub[vi]) else v_hi
-                        if (
-                            new_lb > lb[vi] + 1e-12
-                            or new_ub < ub[vi] - 1e-12
-                            or (not np.isfinite(lb[vi]) or not np.isfinite(ub[vi]))
+                            rest_lo += ocoeff * ehi
+                            rest_hi += ocoeff * elo
+                        if not (np.isfinite(rest_lo) and np.isfinite(rest_hi)):
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    num_lo = rhs - rest_hi
+                    num_hi = rhs - rest_lo
+                    if coeff > 0:
+                        v_lo, v_hi = num_lo / coeff, num_hi / coeff
+                    else:
+                        v_lo, v_hi = num_hi / coeff, num_lo / coeff
+                    if not (np.isfinite(v_lo) and np.isfinite(v_hi)):
+                        continue
+                    margin = 1e-6 * (1.0 + max(abs(v_lo), abs(v_hi)))
+                    v_lo -= margin
+                    v_hi += margin
+                    if is_int[vi]:
+                        v_lo = np.ceil(v_lo - 1e-7)
+                        v_hi = np.floor(v_hi + 1e-7)
+                    new_lb = max(lb[vi], v_lo) if np.isfinite(lb[vi]) else v_lo
+                    new_ub = min(ub[vi], v_hi) if np.isfinite(ub[vi]) else v_hi
+                    if (
+                        new_lb > lb[vi] + 1e-12
+                        or new_ub < ub[vi] - 1e-12
+                        or (not np.isfinite(lb[vi]) or not np.isfinite(ub[vi]))
+                    ):
+                        if (np.isfinite(new_lb) != np.isfinite(lb[vi])) or (
+                            np.isfinite(new_ub) != np.isfinite(ub[vi])
                         ):
-                            if (np.isfinite(new_lb) != np.isfinite(lb[vi])) or (
-                                np.isfinite(new_ub) != np.isfinite(ub[vi])
-                            ):
-                                changed = True
-                            lb[vi] = new_lb
-                            ub[vi] = new_ub
-                            n_finitized += 1
-                if not changed:
-                    break
-        finally:
-            for v, (olb, oub) in zip(model._variables, saved):
-                v.lb = olb
-                v.ub = oub
+                            changed = True
+                        lb[vi] = new_lb
+                        ub[vi] = new_ub
+                        n_finitized += 1
+            if not changed:
+                break
+    finally:
+        for v, (olb, oub) in zip(model._variables, saved):
+            v.lb = olb
+            v.ub = oub
 
-        return lb, ub, n_finitized
-    except Exception:
-        return lb, ub, 0
+    return lb, ub, n_finitized
 
 
 def bootstrap_finite_bounds(
@@ -1716,8 +1725,8 @@ def bootstrap_finite_bounds(
     error) becomes the new finite bound; an unbounded direction leaves the
     bound open.  Integer bounds are rounded inward.
 
-    Returns ``(lb, ub, n_finitized, total_lp_time)``.  Any internal failure
-    returns the input box unchanged — it can never make the solve unsound.
+    Returns ``(lb, ub, n_finitized, total_lp_time)``.  An LP that does not reach
+    ``OPTIMAL`` leaves that bound open — it can never make the solve unsound.
     """
     lb = np.asarray(lb, dtype=np.float64).copy()
     ub = np.asarray(ub, dtype=np.float64).copy()
@@ -1736,117 +1745,115 @@ def bootstrap_finite_bounds(
     if _lp is None:
         return lb, ub, 0, 0.0
 
-    try:
-        from discopt.modeling.core import VarType
+    # #1520: no except. ``_extract_linear_constraints`` is structural and the exact LP oracle
+    # declines by status; a raise is a defect, not "nothing to finitize".
+    from discopt.modeling.core import VarType
 
-        A_ub, b_ub, A_eq, b_eq, _ = _extract_linear_constraints(model)
+    A_ub, b_ub, A_eq, b_eq, _ = _extract_linear_constraints(model)
 
-        # Optimality-based finitization: fold the incumbent cutoff into the
-        # polytope so an open variable that can only grow by worsening the
-        # objective gets a finite bound from the cutoff alone.
-        if incumbent_cutoff is not None and model._objective is not None:
-            obj_coeffs = _extract_linear_objective(model, n_vars)
-            if obj_coeffs is not None and np.any(obj_coeffs):
-                # Internal minimization space, exactly as in ``run_obbt`` (#1373).
-                cutoff_row = _internal_cutoff_row(model, obj_coeffs)
-                cutoff_rhs = np.array([float(incumbent_cutoff)])
-                if A_ub is not None and b_ub is not None:
-                    A_ub = np.vstack([A_ub, cutoff_row])
-                    b_ub = np.concatenate([b_ub, cutoff_rhs])
-                else:
-                    A_ub = cutoff_row
-                    b_ub = cutoff_rhs
+    # Optimality-based finitization: fold the incumbent cutoff into the
+    # polytope so an open variable that can only grow by worsening the
+    # objective gets a finite bound from the cutoff alone.
+    if incumbent_cutoff is not None and model._objective is not None:
+        obj_coeffs = _extract_linear_objective(model, n_vars)
+        if obj_coeffs is not None and np.any(obj_coeffs):
+            # Internal minimization space, exactly as in ``run_obbt`` (#1373).
+            cutoff_row = _internal_cutoff_row(model, obj_coeffs)
+            cutoff_rhs = np.array([float(incumbent_cutoff)])
+            if A_ub is not None and b_ub is not None:
+                A_ub = np.vstack([A_ub, cutoff_row])
+                b_ub = np.concatenate([b_ub, cutoff_rhs])
+            else:
+                A_ub = cutoff_row
+                b_ub = cutoff_rhs
 
-        if A_ub is None and A_eq is None:
-            # No linear structure to bound against.
-            return lb, ub, 0, 0.0
-
-        is_int = np.zeros(n_vars, dtype=bool)
-        flat_idx = 0
-        for v in model._variables:
-            flag = v.var_type in (VarType.BINARY, VarType.INTEGER)
-            for _ in range(v.size):
-                if flat_idx < n_vars:
-                    is_int[flat_idx] = flag
-                flat_idx += 1
-
-        bounds_list = [(float(lb[i]), float(ub[i])) for i in range(n_vars)]
-        n_finitized = 0
-        total_lp_time = 0.0
-        warm_basis = None
-
-        # Only variables that are open in at least one direction are targets.
-        targets = np.where(open_lb | open_ub)[0]
-        for var_idx in targets:
-            if deadline is not None and time.perf_counter() >= deadline:
-                break
-
-            # Lower bound: minimize x_i (only when currently open below).
-            if open_lb[var_idx]:
-                c = np.zeros(n_vars, dtype=np.float64)
-                c[var_idx] = 1.0
-                result = _lp(
-                    c=c,
-                    A_ub=A_ub,
-                    b_ub=b_ub,
-                    A_eq=A_eq,
-                    b_eq=b_eq,
-                    bounds=bounds_list,
-                    warm_basis=warm_basis,
-                    time_limit=time_limit_per_lp,
-                )
-                total_lp_time += result.wall_time
-                if (
-                    result.status == SolveStatus.OPTIMAL
-                    and result.objective is not None
-                    and np.isfinite(result.objective)
-                ):
-                    warm_basis = result.basis
-                    margin = 1e-6 * (1.0 + abs(result.objective))
-                    new_lb = result.objective - margin
-                    if is_int[var_idx]:
-                        new_lb = np.ceil(new_lb - eps)
-                    lb[var_idx] = new_lb
-                    bounds_list[var_idx] = (float(lb[var_idx]), float(ub[var_idx]))
-                    n_finitized += 1
-
-            if deadline is not None and time.perf_counter() >= deadline:
-                break
-
-            # Upper bound: maximize x_i (minimize -x_i) when currently open above.
-            if open_ub[var_idx]:
-                c = np.zeros(n_vars, dtype=np.float64)
-                c[var_idx] = -1.0
-                result = _lp(
-                    c=c,
-                    A_ub=A_ub,
-                    b_ub=b_ub,
-                    A_eq=A_eq,
-                    b_eq=b_eq,
-                    bounds=bounds_list,
-                    warm_basis=warm_basis,
-                    time_limit=time_limit_per_lp,
-                )
-                total_lp_time += result.wall_time
-                if (
-                    result.status == SolveStatus.OPTIMAL
-                    and result.objective is not None
-                    and np.isfinite(result.objective)
-                ):
-                    warm_basis = result.basis
-                    new_ub = -result.objective
-                    margin = 1e-6 * (1.0 + abs(new_ub))
-                    new_ub = new_ub + margin
-                    if is_int[var_idx]:
-                        new_ub = np.floor(new_ub + eps)
-                    ub[var_idx] = new_ub
-                    bounds_list[var_idx] = (float(lb[var_idx]), float(ub[var_idx]))
-                    n_finitized += 1
-
-        return lb, ub, n_finitized, total_lp_time
-    except Exception:
-        # Bootstrap is best-effort: never let it break the solve.
+    if A_ub is None and A_eq is None:
+        # No linear structure to bound against.
         return lb, ub, 0, 0.0
+
+    is_int = np.zeros(n_vars, dtype=bool)
+    flat_idx = 0
+    for v in model._variables:
+        flag = v.var_type in (VarType.BINARY, VarType.INTEGER)
+        for _ in range(v.size):
+            if flat_idx < n_vars:
+                is_int[flat_idx] = flag
+            flat_idx += 1
+
+    bounds_list = [(float(lb[i]), float(ub[i])) for i in range(n_vars)]
+    n_finitized = 0
+    total_lp_time = 0.0
+    warm_basis = None
+
+    # Only variables that are open in at least one direction are targets.
+    targets = np.where(open_lb | open_ub)[0]
+    for var_idx in targets:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+
+        # Lower bound: minimize x_i (only when currently open below).
+        if open_lb[var_idx]:
+            c = np.zeros(n_vars, dtype=np.float64)
+            c[var_idx] = 1.0
+            result = _lp(
+                c=c,
+                A_ub=A_ub,
+                b_ub=b_ub,
+                A_eq=A_eq,
+                b_eq=b_eq,
+                bounds=bounds_list,
+                warm_basis=warm_basis,
+                time_limit=time_limit_per_lp,
+            )
+            total_lp_time += result.wall_time
+            if (
+                result.status == SolveStatus.OPTIMAL
+                and result.objective is not None
+                and np.isfinite(result.objective)
+            ):
+                warm_basis = result.basis
+                margin = 1e-6 * (1.0 + abs(result.objective))
+                new_lb = result.objective - margin
+                if is_int[var_idx]:
+                    new_lb = np.ceil(new_lb - eps)
+                lb[var_idx] = new_lb
+                bounds_list[var_idx] = (float(lb[var_idx]), float(ub[var_idx]))
+                n_finitized += 1
+
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+
+        # Upper bound: maximize x_i (minimize -x_i) when currently open above.
+        if open_ub[var_idx]:
+            c = np.zeros(n_vars, dtype=np.float64)
+            c[var_idx] = -1.0
+            result = _lp(
+                c=c,
+                A_ub=A_ub,
+                b_ub=b_ub,
+                A_eq=A_eq,
+                b_eq=b_eq,
+                bounds=bounds_list,
+                warm_basis=warm_basis,
+                time_limit=time_limit_per_lp,
+            )
+            total_lp_time += result.wall_time
+            if (
+                result.status == SolveStatus.OPTIMAL
+                and result.objective is not None
+                and np.isfinite(result.objective)
+            ):
+                warm_basis = result.basis
+                new_ub = -result.objective
+                margin = 1e-6 * (1.0 + abs(new_ub))
+                new_ub = new_ub + margin
+                if is_int[var_idx]:
+                    new_ub = np.floor(new_ub + eps)
+                ub[var_idx] = new_ub
+                bounds_list[var_idx] = (float(lb[var_idx]), float(ub[var_idx]))
+                n_finitized += 1
+
+    return lb, ub, n_finitized, total_lp_time
 
 
 def obbt_tighten_root(
@@ -1883,8 +1890,10 @@ def obbt_tighten_root(
 
     The pass is purely a tightening: the returned box is always a subset of the
     input box (intersected, never loosened), integer bounds are rounded inward,
-    and any internal failure returns the input box unchanged (``n_tightened=0``)
-    rather than raising — it can never make the solve unsound.
+    and a pass that cannot proceed (no exact oracle, an open box, a failed
+    envelope build -- reported at WARNING) returns the box tightened so far. An
+    exception from inside is a defect and propagates (#1520) rather than reading
+    as "OBBT tightened nothing".
 
     Parameters
     ----------
@@ -2015,237 +2024,242 @@ def obbt_tighten_root(
         if n_boot == 0 and n_prop == 0:
             break
 
-    try:
-        from discopt._relax.mccormick_lp import (
-            MccormickLPRelaxer,
-            build_milp_relaxation,
-        )
+    # #1520: no except. ``obbt_tighten_root`` returns the input (or partially tightened, every step
+    # sound) box whenever it cannot proceed; each LP, the DBBT pass and the envelope builds decline
+    # on their own terms, so an exception reaching here is a defect and propagates rather than
+    # reading as "OBBT tightened nothing".
+    from discopt._relax.mccormick_lp import (
+        MccormickLPRelaxer,
+        build_milp_relaxation,
+    )
 
-        # OBBT uses only the relaxer's model/terms/disc to cold-build the envelope
-        # (it never calls ``solve_at_node``), so skip the incremental fast-path
-        # structure build + its row-for-row validation (a wasted handful of cold
-        # builds — they re-derive the relaxation only to validate it).
-        relaxer = MccormickLPRelaxer(model, build_incremental=False)
-        if not relaxer.has_relaxable_nonlinearity:
-            return RootObbtResult(lb, ub, 0, 0, 0.0)
+    # OBBT uses only the relaxer's model/terms/disc to cold-build the envelope
+    # (it never calls ``solve_at_node``), so skip the incremental fast-path
+    # structure build + its row-for-row validation (a wasted handful of cold
+    # builds — they re-derive the relaxation only to validate it).
+    relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    if not relaxer.has_relaxable_nonlinearity:
+        return RootObbtResult(lb, ub, 0, 0, 0.0)
 
-        # #208 cascade: carry OBBT-tightened auxiliary-column bounds across rounds,
-        # keyed by (stable) column index. The aux columns are a fixed function of
-        # the model's nonlinear terms, so their indices are identical across
-        # rebuilds even as the original box shrinks. Intersecting a previously
-        # captured (valid) aux bound into a freshly built relaxation keeps it a
-        # valid outer approximation and lets the tighter aux box cascade onto the
-        # original variables via the McCormick rows.
-        carried_aux: dict[int, list[float]] = {}
+    # #208 cascade: carry OBBT-tightened auxiliary-column bounds across rounds,
+    # keyed by (stable) column index. The aux columns are a fixed function of
+    # the model's nonlinear terms, so their indices are identical across
+    # rebuilds even as the original box shrinks. Intersecting a previously
+    # captured (valid) aux bound into a freshly built relaxation keeps it a
+    # valid outer approximation and lets the tighter aux box cascade onto the
+    # original variables via the McCormick rows.
+    carried_aux: dict[int, list[float]] = {}
 
-        def _apply_carried_aux(milp) -> None:
-            if not (cascade_aux and carried_aux):
-                return
-            # #1152: the index correspondence above holds only across WHOLE builds.
-            # A ``build_deadline``-truncated build stopped part-way through the
-            # constraint loop, so its lifted columns are a prefix of the full layout
-            # and column ``c`` need not be the same quantity it was last round.
-            # Applying a carried bound by index there could tighten the wrong
-            # column — an unsound cut, not merely a weaker one — so skip it.
-            if bool(getattr(milp, "_build_truncated", False)):
-                return
-            n_total = len(milp._bounds)
-            for col, (alb, aub) in carried_aux.items():
-                if n_orig <= col < n_total:
-                    lo, hi = milp._bounds[col]
-                    milp._bounds[col] = (max(float(lo), alb), min(float(hi), aub))
+    def _apply_carried_aux(milp) -> None:
+        if not (cascade_aux and carried_aux):
+            return
+        # #1152: the index correspondence above holds only across WHOLE builds.
+        # A ``build_deadline``-truncated build stopped part-way through the
+        # constraint loop, so its lifted columns are a prefix of the full layout
+        # and column ``c`` need not be the same quantity it was last round.
+        # Applying a carried bound by index there could tighten the wrong
+        # column — an unsound cut, not merely a weaker one — so skip it.
+        if bool(getattr(milp, "_build_truncated", False)):
+            return
+        n_total = len(milp._bounds)
+        for col, (alb, aub) in carried_aux.items():
+            if n_orig <= col < n_total:
+                lo, hi = milp._bounds[col]
+                milp._bounds[col] = (max(float(lo), alb), min(float(hi), aub))
 
-        def _capture_aux(milp, res) -> None:
-            if not cascade_aux:
-                return
-            # #1152, the mirror of ``_apply_carried_aux``: never record an aux bound
-            # against a column index that a truncated build assigned.
-            if bool(getattr(milp, "_build_truncated", False)):
-                return
-            n_total = len(milp._bounds)
-            tl, tu = res.tightened_lb, res.tightened_ub
-            if len(tl) < n_total:  # not a full_result run; nothing to capture
-                return
-            for col in range(n_orig, n_total):
-                alo, ahi = float(tl[col]), float(tu[col])
-                if not (np.isfinite(alo) and np.isfinite(ahi)):
-                    continue
-                if col in carried_aux:
-                    cur = carried_aux[col]
-                    carried_aux[col] = [max(cur[0], alo), min(cur[1], ahi)]
-                else:
-                    carried_aux[col] = [alo, ahi]
-
-        for _ in range(max(1, rounds)):
-            if deadline is not None and time.perf_counter() >= deadline:
-                break
-            # OBBT requires a finite box to build the envelopes; bail (return
-            # whatever tightening prior rounds achieved) if any bound is open.
-            if not (np.all(np.isfinite(lb)) and np.all(np.isfinite(ub))):
-                break
-            # Box width at the start of this sweep, for the #282 min-improvement
-            # convergence early-stop (measured only when the caller opts in).
-            _width_before = _finite_box_width() if min_improvement is not None else 0.0
-            try:
-                milp, varmap = build_milp_relaxation(
-                    relaxer._model,
-                    relaxer._terms,
-                    relaxer._disc,
-                    bound_override=(lb, ub),
-                    build_deadline=build_deadline,
-                )
-            except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
-                # Capability-disabling: without an envelope there is no OBBT round
-                # at all, so a silent break makes "OBBT tightened nothing" a
-                # statement about the builder, not about the model.
-                logger.debug(
-                    "OBBT envelope build failed, ending root OBBT: %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                break
-            _apply_carried_aux(milp)
-
-            # Duality-based bound tightening first: one objective LP yields
-            # reduced costs that tighten every variable at once (cheap), before
-            # OBBT's 2n min/max solves. Both tighten against the same relaxation,
-            # so their results intersect soundly. DBBT only fires with a cutoff.
-            if incumbent_cutoff is not None:
-                try:
-                    dbbt_res = dbbt_on_relaxation(
-                        milp,
-                        relaxer._n_orig,
-                        incumbent_cutoff,
-                        eps=eps,
-                        time_limit_per_lp=time_limit_per_lp,
-                    )
-                    total_lp_time += dbbt_res.total_lp_time
-                    if dbbt_res.n_tightened > 0:
-                        m = min(n_orig, len(dbbt_res.tightened_lb))
-                        new_lb = dbbt_res.tightened_lb[:m]
-                        new_ub = dbbt_res.tightened_ub[:m]
-                        if np.any(is_int[:m]):
-                            new_lb = np.where(is_int[:m], np.ceil(new_lb - eps), new_lb)
-                            new_ub = np.where(is_int[:m], np.floor(new_ub + eps), new_ub)
-                        lb[:m] = np.maximum(lb[:m], new_lb)
-                        ub[:m] = np.minimum(ub[:m], new_ub)
-                        total_tight += int(dbbt_res.n_tightened)
-                        if np.any(lb[:m] > ub[:m] + 1e-9):
-                            return RootObbtResult(
-                                lb, ub, total_tight, n_rounds, total_lp_time, True
-                            )
-                        # Rebuild the envelope at the DBBT-tightened box so OBBT
-                        # below sees the strengthened relaxation.
-                        try:
-                            milp, _ = build_milp_relaxation(
-                                relaxer._model,
-                                relaxer._terms,
-                                relaxer._disc,
-                                bound_override=(lb, ub),
-                                build_deadline=build_deadline,
-                            )
-                            _apply_carried_aux(milp)
-                        except Exception as exc:  # noqa: BLE001 - keeps the bounds already found
-                            logger.debug(
-                                "DBBT envelope rebuild failed, ending the round: %s: %s",
-                                type(exc).__name__,
-                                exc,
-                            )
-                            break
-                except Exception as exc:  # noqa: BLE001 - OBBT continues on the untightened box
-                    # Capability-disabling: a swallowed failure silently drops the
-                    # whole DBBT pass, so "DBBT tightened nothing" can be an artifact
-                    # of code that never ran rather than a measurement.
-                    logger.debug("root DBBT pass skipped: %s: %s", type(exc).__name__, exc)
-
-            # Include the aux columns as OBBT candidates (and request the full
-            # column vector) when cascading, so their tightening is captured and
-            # carried instead of discarded. Budget the extra probes (#208): only the
-            # aux columns whose reverse-FBBT can actually reach an original variable
-            # at the current box are candidates — probing the rest spends min/max LPs
-            # whose tightening can never cascade (bound-neutral to skip, ~87% of aux
-            # probes on the vendored corpus), which is what made the blanket cascade
-            # net-negative on integer-heavy instances.
-            n_total = len(milp._bounds)
-            if cascade_aux:
-                reach = cascade_reachable_aux(varmap, lb, ub, n_orig, n_total, eps=eps)
-                obbt_candidates = list(range(n_orig)) + reach
+    def _capture_aux(milp, res) -> None:
+        if not cascade_aux:
+            return
+        # #1152, the mirror of ``_apply_carried_aux``: never record an aux bound
+        # against a column index that a truncated build assigned.
+        if bool(getattr(milp, "_build_truncated", False)):
+            return
+        n_total = len(milp._bounds)
+        tl, tu = res.tightened_lb, res.tightened_ub
+        if len(tl) < n_total:  # not a full_result run; nothing to capture
+            return
+        for col in range(n_orig, n_total):
+            alo, ahi = float(tl[col]), float(tu[col])
+            if not (np.isfinite(alo) and np.isfinite(ahi)):
+                continue
+            if col in carried_aux:
+                cur = carried_aux[col]
+                carried_aux[col] = [max(cur[0], alo), min(cur[1], ahi)]
             else:
-                obbt_candidates = None
-            res = run_obbt_on_relaxation(
+                carried_aux[col] = [alo, ahi]
+
+    for _ in range(max(1, rounds)):
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        # OBBT requires a finite box to build the envelopes; bail (return
+        # whatever tightening prior rounds achieved) if any bound is open.
+        if not (np.all(np.isfinite(lb)) and np.all(np.isfinite(ub))):
+            break
+        # Box width at the start of this sweep, for the #282 min-improvement
+        # convergence early-stop (measured only when the caller opts in).
+        _width_before = _finite_box_width() if min_improvement is not None else 0.0
+        try:
+            milp, varmap = build_milp_relaxation(
+                relaxer._model,
+                relaxer._terms,
+                relaxer._disc,
+                bound_override=(lb, ub),
+                build_deadline=build_deadline,
+            )
+        except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
+            # #1520: kept as a sound fallback, aligned with the node relaxer's cold
+            # build (``MccormickLPRelaxer._solve_at_node_impl`` reports the same
+            # builder failure at WARNING and returns no bound). Ending OBBT keeps only
+            # tightenings already proven, so the box is looser, never wrong. What made
+            # this a defect was the DEBUG log: "OBBT tightened nothing" read as a
+            # statement about the model when it was a crashed builder.
+            from discopt._relax._fallback import warn_fallback_once
+
+            warn_fallback_once(
+                "root OBBT envelope build (build_milp_relaxation)",
+                exc,
+                "root OBBT ends with the tightening found so far",
+            )
+            break
+        _apply_carried_aux(milp)
+
+        # Duality-based bound tightening first: one objective LP yields
+        # reduced costs that tighten every variable at once (cheap), before
+        # OBBT's 2n min/max solves. Both tighten against the same relaxation,
+        # so their results intersect soundly. DBBT only fires with a cutoff.
+        if incumbent_cutoff is not None:
+            # #1520: no except. ``dbbt_on_relaxation`` declines by return value (a no-op result
+            # on a non-optimal solve, missing reduced costs or no finite cutoff), so a raise is
+            # a defect, not "DBBT tightened nothing".
+            dbbt_res = dbbt_on_relaxation(
                 milp,
                 relaxer._n_orig,
-                candidate_idxs=obbt_candidates,
-                time_limit_per_lp=time_limit_per_lp,
-                incumbent_cutoff=incumbent_cutoff,
-                min_width=min_width,
+                incumbent_cutoff,
                 eps=eps,
-                deadline=deadline,
-                prefer_pounce=prefer_pounce,
-                full_result=cascade_aux,
-                # T2.5: probe only the top-k width×|RC| candidates when requested.
-                # Not combined with the aux-cascade candidate set (originals + the
-                # reachable aux subset) — cascade has its own full-column contract.
-                top_k=None if cascade_aux else top_k,
+                time_limit_per_lp=time_limit_per_lp,
             )
-            total_lp_time += res.total_lp_time
-            n_rounds += 1
-            _capture_aux(milp, res)
-
-            sweep_tight = 0
-            for i in range(min(n_orig, len(res.tightened_lb))):
-                new_lo = res.tightened_lb[i]
-                new_hi = res.tightened_ub[i]
-                if is_int[i]:
-                    new_lo = np.ceil(new_lo - eps)
-                    new_hi = np.floor(new_hi + eps)
-                if new_lo > lb[i] + eps:
-                    lb[i] = new_lo
-                    sweep_tight += 1
-                if new_hi < ub[i] - eps:
-                    ub[i] = new_hi
-                    sweep_tight += 1
-                if lb[i] > ub[i] + 1e-9:
-                    # The tightened box is empty -> the (sub)problem is infeasible.
-                    return RootObbtResult(
-                        lb, ub, total_tight + sweep_tight, n_rounds, total_lp_time, True
+            total_lp_time += dbbt_res.total_lp_time
+            if dbbt_res.n_tightened > 0:
+                m = min(n_orig, len(dbbt_res.tightened_lb))
+                new_lb = dbbt_res.tightened_lb[:m]
+                new_ub = dbbt_res.tightened_ub[:m]
+                if np.any(is_int[:m]):
+                    new_lb = np.where(is_int[:m], np.ceil(new_lb - eps), new_lb)
+                    new_ub = np.where(is_int[:m], np.floor(new_ub + eps), new_ub)
+                lb[:m] = np.maximum(lb[:m], new_lb)
+                ub[:m] = np.minimum(ub[:m], new_ub)
+                total_tight += int(dbbt_res.n_tightened)
+                if np.any(lb[:m] > ub[:m] + 1e-9):
+                    return RootObbtResult(lb, ub, total_tight, n_rounds, total_lp_time, True)
+                # Rebuild the envelope at the DBBT-tightened box so OBBT
+                # below sees the strengthened relaxation.
+                try:
+                    milp, _ = build_milp_relaxation(
+                        relaxer._model,
+                        relaxer._terms,
+                        relaxer._disc,
+                        bound_override=(lb, ub),
+                        build_deadline=build_deadline,
                     )
+                except Exception as exc:  # noqa: BLE001 - keeps the bounds already found
+                    # #1520: kept as a sound fallback (same builder and policy as the
+                    # root envelope build above): the DBBT bounds already applied are
+                    # proven, and ending the round only forgoes further tightening.
+                    from discopt._relax._fallback import warn_fallback_once
 
-            # #208 cascade: propagate the freshly tightened aux-column bounds back
-            # through the nonlinear term definitions (reverse FBBT). This is the
-            # step that actually shrinks the *original* box — the hyperbolic/root
-            # bounds the linear McCormick rows can't express — turning the captured
-            # aux tightening into a real reduction instead of a self-implied no-op.
-            if cascade_aux and len(res.tightened_lb) >= len(milp._bounds):
-                fb = reverse_fbbt_from_aux(
-                    lb,
-                    ub,
-                    np.asarray(res.tightened_lb, dtype=np.float64),
-                    np.asarray(res.tightened_ub, dtype=np.float64),
-                    varmap,
-                    is_int=is_int,
-                    eps=eps,
-                )
-                sweep_tight += fb
-                if np.any(lb[:n_orig] > ub[:n_orig] + 1e-9):
-                    return RootObbtResult(
-                        lb, ub, total_tight + sweep_tight, n_rounds, total_lp_time, True
+                    warn_fallback_once(
+                        "root DBBT envelope rebuild (build_milp_relaxation)",
+                        exc,
+                        "root OBBT ends with the DBBT bounds already applied",
                     )
-
-            total_tight += sweep_tight
-            if sweep_tight == 0:
-                break
-            # #282 convergence early-stop: once a sweep shrinks the box by less
-            # than ``min_improvement`` (relative, over finite-width columns) the
-            # remaining tail is not worth its 2n projection LPs. Purely bounds
-            # cost — every tightening already applied stays; only the loop stops.
-            if min_improvement is not None and _width_before > 0.0:
-                _rel = (_width_before - _finite_box_width()) / _width_before
-                if _rel < min_improvement:
                     break
-    except Exception:
-        # Never let bound tightening crash or corrupt the solve.
-        return RootObbtResult(lb, ub, total_tight, n_rounds, total_lp_time)
+                _apply_carried_aux(milp)
+
+        # Include the aux columns as OBBT candidates (and request the full
+        # column vector) when cascading, so their tightening is captured and
+        # carried instead of discarded. Budget the extra probes (#208): only the
+        # aux columns whose reverse-FBBT can actually reach an original variable
+        # at the current box are candidates — probing the rest spends min/max LPs
+        # whose tightening can never cascade (bound-neutral to skip, ~87% of aux
+        # probes on the vendored corpus), which is what made the blanket cascade
+        # net-negative on integer-heavy instances.
+        n_total = len(milp._bounds)
+        if cascade_aux:
+            reach = cascade_reachable_aux(varmap, lb, ub, n_orig, n_total, eps=eps)
+            obbt_candidates = list(range(n_orig)) + reach
+        else:
+            obbt_candidates = None
+        res = run_obbt_on_relaxation(
+            milp,
+            relaxer._n_orig,
+            candidate_idxs=obbt_candidates,
+            time_limit_per_lp=time_limit_per_lp,
+            incumbent_cutoff=incumbent_cutoff,
+            min_width=min_width,
+            eps=eps,
+            deadline=deadline,
+            prefer_pounce=prefer_pounce,
+            full_result=cascade_aux,
+            # T2.5: probe only the top-k width×|RC| candidates when requested.
+            # Not combined with the aux-cascade candidate set (originals + the
+            # reachable aux subset) — cascade has its own full-column contract.
+            top_k=None if cascade_aux else top_k,
+        )
+        total_lp_time += res.total_lp_time
+        n_rounds += 1
+        _capture_aux(milp, res)
+
+        sweep_tight = 0
+        for i in range(min(n_orig, len(res.tightened_lb))):
+            new_lo = res.tightened_lb[i]
+            new_hi = res.tightened_ub[i]
+            if is_int[i]:
+                new_lo = np.ceil(new_lo - eps)
+                new_hi = np.floor(new_hi + eps)
+            if new_lo > lb[i] + eps:
+                lb[i] = new_lo
+                sweep_tight += 1
+            if new_hi < ub[i] - eps:
+                ub[i] = new_hi
+                sweep_tight += 1
+            if lb[i] > ub[i] + 1e-9:
+                # The tightened box is empty -> the (sub)problem is infeasible.
+                return RootObbtResult(
+                    lb, ub, total_tight + sweep_tight, n_rounds, total_lp_time, True
+                )
+
+        # #208 cascade: propagate the freshly tightened aux-column bounds back
+        # through the nonlinear term definitions (reverse FBBT). This is the
+        # step that actually shrinks the *original* box — the hyperbolic/root
+        # bounds the linear McCormick rows can't express — turning the captured
+        # aux tightening into a real reduction instead of a self-implied no-op.
+        if cascade_aux and len(res.tightened_lb) >= len(milp._bounds):
+            fb = reverse_fbbt_from_aux(
+                lb,
+                ub,
+                np.asarray(res.tightened_lb, dtype=np.float64),
+                np.asarray(res.tightened_ub, dtype=np.float64),
+                varmap,
+                is_int=is_int,
+                eps=eps,
+            )
+            sweep_tight += fb
+            if np.any(lb[:n_orig] > ub[:n_orig] + 1e-9):
+                return RootObbtResult(
+                    lb, ub, total_tight + sweep_tight, n_rounds, total_lp_time, True
+                )
+
+        total_tight += sweep_tight
+        if sweep_tight == 0:
+            break
+        # #282 convergence early-stop: once a sweep shrinks the box by less
+        # than ``min_improvement`` (relative, over finite-width columns) the
+        # remaining tail is not worth its 2n projection LPs. Purely bounds
+        # cost — every tightening already applied stays; only the loop stops.
+        if min_improvement is not None and _width_before > 0.0:
+            _rel = (_width_before - _finite_box_width()) / _width_before
+            if _rel < min_improvement:
+                break
 
     return RootObbtResult(lb, ub, total_tight, n_rounds, total_lp_time)
 
