@@ -41,13 +41,14 @@ pub const FEAS_TOL: f64 = 1e-6;
 /// obtained here for *every* even power: the sum node's backward step already
 /// yields their `q_j` (Lemma 1), and only the hole was missing.
 ///
-/// Bound-changing (CLAUDE.md §5). Panel run 2026-09-27
+/// Bound-changing (CLAUDE.md §5). Panel re-run 2026-09-27 on the tree with #1513
 /// (`discopt_benchmarks/scripts/even_pow_hole_panel.py`): **cert-clean** on all
-/// 66 in-repo corpus instances and 5 unit-square point-dispersion models, 0
-/// violations. **Net-positive only on the min-distance class**: the corpus has
-/// no minimum-distance constraints, and there the rule never fires, so node counts
-/// are identical. On dispersion it fires (disp3 247 -> 85 nodes, disp4 311 -> 181),
-/// but those are generated probes, not a corpus. **Not the default because** its
+/// 66 in-repo corpus instances and 10 unit-square point-dispersion models (n = 2..6,
+/// built from scalars and from arrays), 0 violations. **Net-positive only on the
+/// min-distance class**: the corpus has no minimum-distance constraints, so the rule
+/// never fires there and node counts match. On dispersion it fires in both
+/// forms (disp3/adisp3 247 -> 57 nodes, disp4/adisp4 311 -> 175/173), but those
+/// are generated probes, not a corpus. **Not the default because** its
 /// net-positive bar has only been scored on synthetic instances (the #727
 /// lesson). **What would change that:** the same panel over the MINLPLib
 /// instances with minimum-distance constraints (Hojny & Liberti's 46-instance
