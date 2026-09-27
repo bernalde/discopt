@@ -239,10 +239,9 @@ def _is_polynomial_impl(expr: Expression, memo: dict) -> bool:
 
 
 def _is_nonneg_int_constant(expr: Constant) -> bool:
-    try:
-        v = np.asarray(expr.value)
-    except Exception:
-        return False
+    # #1520: no except. ``Constant.value`` is always an ndarray (the constructor
+    # coerces it), so ``np.asarray`` on it cannot fail.
+    v = np.asarray(expr.value)
     if v.ndim != 0:
         return False
     f = float(v)
@@ -262,14 +261,18 @@ def _hash_index(index: object) -> object:
         # Mixed subscripts like ``x[1:, 0]`` arrive as a tuple whose elements
         # may themselves be unhashable (slices/arrays); surrogate element-wise.
         return tuple(_hash_index(i) for i in index)
+    # #1520: narrowed. ``np.asarray`` refuses a ragged or otherwise
+    # non-array-like index with ``ValueError``/``TypeError``; the identity key is
+    # then the sound surrogate (it can only make two nodes compare unequal, never
+    # equal). Anything else is a defect and propagates.
     try:
         arr = np.asarray(index)
-        if arr.dtype == object:
-            # tolist() would smuggle unhashable elements back into the key.
-            return ("id", id(index))
-        return ("arr", arr.shape, tuple(arr.ravel().tolist()))
-    except Exception:
+    except (ValueError, TypeError):
         return ("id", id(index))
+    if arr.dtype == object:
+        # tolist() would smuggle unhashable elements back into the key.
+        return ("id", id(index))
+    return ("arr", arr.shape, tuple(arr.ravel().tolist()))
 
 
 def _struct_hash(expr: Expression, hcache: dict) -> int:
@@ -1306,12 +1309,12 @@ def classify_constraint(
     # (the MINLPTests ``nlp_cvx_108_*`` family) directly at the
     # constraint level — their convexity is provable from a
     # rearrangement that the expression-level walker cannot see.
-    try:
-        from .patterns import classify_fractional_epigraph_constraint
+    # #1520: no except. The recognizer declines by returning ``None``/``False``
+    # (its one extraction step absorbs only ``_NotLinearError``), so an exception
+    # is a defect, not an abstention.
+    from .patterns import classify_fractional_epigraph_constraint
 
-        frac = classify_fractional_epigraph_constraint(constraint, model)
-    except Exception:
-        frac = None
+    frac = classify_fractional_epigraph_constraint(constraint, model)
     if frac is True:
         return True
 
@@ -1319,12 +1322,10 @@ def classify_constraint(
         return syntactic
 
     # Fall back to the sound numerical certificate.
-    try:
-        from .certificate import certify_convex
+    # #1520: no except. ``certify_convex`` abstains by returning ``None``.
+    from .certificate import certify_convex
 
-        cert = certify_convex(constraint.body, model)
-    except Exception:
-        return syntactic
+    cert = certify_convex(constraint.body, model)
     if cert is None:
         return syntactic
     return _constraint_convex_from_curvature(cert, constraint.sense)
@@ -1380,16 +1381,10 @@ def _recursion_headroom_need(model: Model) -> int:
     classification result.
     """
     size = len(getattr(model, "_constraints", []) or [])
-    try:
-        size += sum(int(np.size(v.lb)) for v in model._variables)
-    except Exception as exc:  # noqa: BLE001 - the constraint count alone still gates the estimate
-        # Under-counting only risks *not* engaging the deep-stack path, so the
-        # failure shows up later as a RecursionError with no obvious cause.
-        logger.debug(
-            "variable-size term of the recursion estimate unavailable: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
+    # #1520: no except. ``Variable.lb`` is always an ndarray, so ``np.size`` cannot
+    # fail; the old handler could only hide a defect (and under-counting here turns
+    # it into an unexplained RecursionError later).
+    size += sum(int(np.size(v.lb)) for v in model._variables)
     if size <= _DEEP_RECURSION_SIZE_GATE:
         return 0
     return min(2000 + 60 * size, _DEEP_RECURSION_LIMIT_CAP)
@@ -1527,12 +1522,10 @@ def _objective_is_convex(
         need_curv_for_obj = Curvature.CONCAVE
 
     if not obj_convex and use_certificate:
-        try:
-            from .certificate import certify_convex
+        # #1520: no except. ``certify_convex`` abstains by returning ``None``.
+        from .certificate import certify_convex
 
-            cert = certify_convex(model._objective.expression, model)
-        except Exception:
-            cert = None
+        cert = certify_convex(model._objective.expression, model)
         if cert == need_curv_for_obj:
             obj_convex = True
 

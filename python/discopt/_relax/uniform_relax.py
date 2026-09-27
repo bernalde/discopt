@@ -994,10 +994,10 @@ class _Builder:
             return v
         from discopt._relax.convexity import classify_expr
 
-        try:
-            v = classify_expr(self._expr(node), self.model)
-        except Exception:
-            v = None
+        # #1520: no except. ``classify_expr`` answers ``Curvature.UNKNOWN`` for
+        # anything it cannot prove; its only raise is the deadline abort, which
+        # needs a caller-armed cache (none here). An exception is a defect.
+        v = classify_expr(self._expr(node), self.model)
         cache[nid] = v
         return v
 
@@ -1101,12 +1101,18 @@ class _Builder:
 
         from discopt._relax.dag_compiler import compile_expression
 
+        # #1520: narrowed. ``compile_expression`` refuses an operator it has no
+        # lowering for with ``ValueError`` (unknown op/function/norm) or
+        # ``TypeError`` (unhandled expression type); the node then abstains from the
+        # lift, which only ever ADDS rows, so the relaxation stays valid. ``jax.grad``
+        # and ``_TracedEvalFn`` are lazy wrappers that trace nothing here.
         try:
             f = compile_expression(self._expr(node), self.model)
+        except (ValueError, TypeError):
+            v = None
+        else:
             grad_f = jax.grad(lambda xv: jnp.reshape(f(xv), ()))
             v = (_TracedEvalFn(f), _TracedEvalFn(grad_f))
-        except Exception:
-            v = None
         cache[nid] = v
         return v
 
@@ -1197,92 +1203,99 @@ class _Builder:
         JAX-free on the hot path. Returns ``None`` if the atom set isn't covered
         (caller falls back to JAX). Gated by ``DISCOPT_ANALYTIC_SEPGRAD``.
         """
+        import numpy as _np
+
+        from discopt._relax.convexity.interval import Interval as _Ivl
+        from discopt._relax.convexity.interval_ad import _flat_size, interval_hessian
+
+        expr = self._expr(node)
+        model = self.model
+        variables = model._variables
+        # Prefix-sum flat offsets (mirrors interval_ad._offset_map).
+        offs: list[int] = []
+        acc = 0
+        for _v in variables:
+            offs.append(acc)
+            acc += _v.size
+        n_flat = _flat_size(model)
+
+        # Probe once at the box midpoint so an uncovered atom (unbounded/NaN
+        # gradient) is caught HERE and we fall back to JAX, rather than silently
+        # emitting no cut deep in the tree.
+        probe = self._analytic_probe_point(variables)
+
+        def _box_at(xv):
+            xa = _np.asarray(xv, dtype=_np.float64).ravel()
+            box = {}
+            for _v, off in zip(variables, offs):
+                sl = xa[off : off + _v.size]
+                box[_v] = _Ivl(sl.astype(_np.float64), sl.astype(_np.float64))
+            return box
+
+        def _eval(xv):
+            ad = interval_hessian(expr, model, _box_at(xv))
+            val = float(_np.asarray(ad.value.lo).ravel()[0])
+            g = _np.asarray(ad.grad.lo, dtype=_np.float64).ravel()
+            return val, g
+
+        # Reject an atom the interval-AD table does not COVER; do not reject a
+        # covered atom merely because this one probe point is out of its domain.
+        #
+        # The two look alike at a glance — both give a non-finite probe value —
+        # but they are different failures and only the first is ours. An
+        # abstention (`interval_ad._unbounded`) densifies to the exact signature
+        # ``value = (-inf, +inf)``; a covered atom evaluated on a *point* box
+        # yields a degenerate interval, NaN at worst (``log`` of a box that
+        # straddles zero, measured on gkocis/oaer). Rejecting the second case
+        # sent covered atoms to JAX for no reason.
+        #
+        # Accepting it is sound: the consumer already drops any cut whose value
+        # or gradient is non-finite (``mccormick_lp._separate_convex``, "a
+        # missing cut is always safe"), so a bad point costs a cut, never
+        # correctness. The uncovered-atom guard itself is unchanged.
+        # #1520: narrowed. The probe is the only call here with a documented
+        # decline -- ``interval_hessian``'s ``ValueError`` (array variables or
+        # leaves, multi-dim indexing, ``IntervalHessianTooLarge``) -- and the node
+        # then abstains from the analytic path and falls through to the tape. The
+        # rest of this method (imports, the offset map, the closures) cannot fail on
+        # a valid model, so a defect in it propagates instead of reading as
+        # "atom not covered".
         try:
-            import numpy as _np
-
-            from discopt._relax.convexity.interval import Interval as _Ivl
-            from discopt._relax.convexity.interval_ad import _flat_size, interval_hessian
-
-            expr = self._expr(node)
-            model = self.model
-            variables = model._variables
-            # Prefix-sum flat offsets (mirrors interval_ad._offset_map).
-            offs: list[int] = []
-            acc = 0
-            for _v in variables:
-                offs.append(acc)
-                acc += _v.size
-            n_flat = _flat_size(model)
-
-            # Probe once at the box midpoint so an uncovered atom (unbounded/NaN
-            # gradient) is caught HERE and we fall back to JAX, rather than silently
-            # emitting no cut deep in the tree.
-            probe = self._analytic_probe_point(variables)
-
-            def _box_at(xv):
-                xa = _np.asarray(xv, dtype=_np.float64).ravel()
-                box = {}
-                for _v, off in zip(variables, offs):
-                    sl = xa[off : off + _v.size]
-                    box[_v] = _Ivl(sl.astype(_np.float64), sl.astype(_np.float64))
-                return box
-
-            def _eval(xv):
-                ad = interval_hessian(expr, model, _box_at(xv))
-                val = float(_np.asarray(ad.value.lo).ravel()[0])
-                g = _np.asarray(ad.grad.lo, dtype=_np.float64).ravel()
-                return val, g
-
-            # Reject an atom the interval-AD table does not COVER; do not reject a
-            # covered atom merely because this one probe point is out of its domain.
-            #
-            # The two look alike at a glance — both give a non-finite probe value —
-            # but they are different failures and only the first is ours. An
-            # abstention (`interval_ad._unbounded`) densifies to the exact signature
-            # ``value = (-inf, +inf)``; a covered atom evaluated on a *point* box
-            # yields a degenerate interval, NaN at worst (``log`` of a box that
-            # straddles zero, measured on gkocis/oaer). Rejecting the second case
-            # sent covered atoms to JAX for no reason.
-            #
-            # Accepting it is sound: the consumer already drops any cut whose value
-            # or gradient is non-finite (``mccormick_lp._separate_convex``, "a
-            # missing cut is always safe"), so a bad point costs a cut, never
-            # correctness. The uncovered-atom guard itself is unchanged.
             ad_probe = interval_hessian(expr, model, _box_at(probe))
-            lo0 = float(_np.asarray(ad_probe.value.lo).ravel()[0])
-            hi0 = float(_np.asarray(ad_probe.value.hi).ravel()[0])
-            if _np.isneginf(lo0) and _np.isposinf(hi0):
-                return None  # atom not covered by interval_ad → JAX fallback
-
-            pg = _np.asarray(ad_probe.grad.lo, dtype=_np.float64).ravel()
-            if pg.size != n_flat:
-                return None  # gradient shape disagrees with the flat layout
-
-            # One shared eval per (value_fn, grad_fn) pair: _separate_convex calls
-            # value_fn(xv) then grad_fn(xv) with the SAME xv each round. Key the
-            # 1-entry memo on the point's CONTENT (not id(xv) — object ids are
-            # recycled after GC, so a later round could collide with a freed xv and
-            # return a stale point's (value, grad)).
-            _memo: dict = {}
-
-            def _shared(xv):
-                k = _np.asarray(xv, dtype=_np.float64).tobytes()
-                hit = _memo.get(k)
-                if hit is None:
-                    hit = _eval(xv)
-                    _memo.clear()
-                    _memo[k] = hit
-                return hit
-
-            def value_fn(xv):
-                return _shared(xv)[0]
-
-            def grad_fn(xv):
-                return _shared(xv)[1]
-
-            return (value_fn, grad_fn)
-        except Exception:
+        except ValueError:
             return None
+        lo0 = float(_np.asarray(ad_probe.value.lo).ravel()[0])
+        hi0 = float(_np.asarray(ad_probe.value.hi).ravel()[0])
+        if _np.isneginf(lo0) and _np.isposinf(hi0):
+            return None  # atom not covered by interval_ad → JAX fallback
+
+        pg = _np.asarray(ad_probe.grad.lo, dtype=_np.float64).ravel()
+        if pg.size != n_flat:
+            return None  # gradient shape disagrees with the flat layout
+
+        # One shared eval per (value_fn, grad_fn) pair: _separate_convex calls
+        # value_fn(xv) then grad_fn(xv) with the SAME xv each round. Key the
+        # 1-entry memo on the point's CONTENT (not id(xv) — object ids are
+        # recycled after GC, so a later round could collide with a freed xv and
+        # return a stale point's (value, grad)).
+        _memo: dict = {}
+
+        def _shared(xv):
+            k = _np.asarray(xv, dtype=_np.float64).tobytes()
+            hit = _memo.get(k)
+            if hit is None:
+                hit = _eval(xv)
+                _memo.clear()
+                _memo[k] = hit
+            return hit
+
+        def value_fn(xv):
+            return _shared(xv)[0]
+
+        def grad_fn(xv):
+            return _shared(xv)[1]
+
+        return (value_fn, grad_fn)
 
     def _support_box_key(self, node: CNode) -> tuple:
         """Box-dependent cache key ``(id(node), lb.bytes, ub.bytes)`` restricted to
@@ -1453,15 +1466,14 @@ class _Builder:
         """
         if not self._lift_eligible(node):
             return None
-        try:
-            from discopt._relax.convexity import Curvature
-            from discopt._relax.milp_relaxation import (
-                _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE,
-                CompositeMultivarRelaxation,
-                _build_convexity_box,
-            )
-        except Exception:
-            return None
+        # #1520: no except. These are in-package modules, not optional
+        # dependencies; failing to import them is a broken install, not a decline.
+        from discopt._relax.convexity import Curvature
+        from discopt._relax.milp_relaxation import (
+            _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE,
+            CompositeMultivarRelaxation,
+            _build_convexity_box,
+        )
 
         idxs = sorted(int(j) for j in var_support(node))
         if len(idxs) < 2 or any(j >= self.n_orig for j in idxs):

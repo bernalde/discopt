@@ -381,7 +381,9 @@ def _refuse_sym(model):
 
 def _refuse_alg(model):
     _reached["alg"] += 1
-    raise RuntimeError("test: forcing the autodiff fallback")
+    # #1520: the ladder absorbs only its documented declines; any other
+    # exception from a rung is a defect and propagates.
+    raise pc._NotQuadraticError("test: forcing the autodiff fallback")
 
 
 pc._extract_qp_data_symbolic = _refuse_sym

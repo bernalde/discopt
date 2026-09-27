@@ -77,23 +77,20 @@ def classify_problem(model: Model) -> ProblemClass:
     """
     has_integer = any(v.var_type in (VarType.BINARY, VarType.INTEGER) for v in model._variables)
 
+    # #1520: narrowed. Only ``model_to_repr``'s documented declines (plus a missing
+    # extension, which the docstring promises to survive) fall back to NLP/MINLP,
+    # the always-valid class. The degree queries below are infallible Rust calls, so
+    # they sit outside the try: a defect there must not read as "not an LP".
+    if _repr_needs_objective(model):
+        # No objective to classify: NLP/MINLP, exactly what the pre-#1520 blanket
+        # handler answered for the AttributeError ``model_to_repr`` raises here.
+        return ProblemClass.MINLP if has_integer else ProblemClass.NLP
     try:
         from discopt._rust import model_to_repr
 
         _builder = getattr(model, "_builder", None)
         repr = model_to_repr(model, _builder)
-        obj_linear = repr.is_objective_linear()
-        obj_quadratic = repr.is_objective_quadratic()
-        all_constraints_linear = all(
-            repr.is_constraint_linear(i) for i in range(repr.n_constraints)
-        )
-        if hasattr(repr, "is_constraint_quadratic"):
-            all_constraints_quadratic = all(
-                repr.is_constraint_quadratic(i) for i in range(repr.n_constraints)
-            )
-        else:
-            all_constraints_quadratic = all_constraints_linear
-    except Exception as exc:  # noqa: BLE001 - NLP/MINLP is the always-valid fallback class
+    except (ImportError, *_MODEL_TO_REPR_DECLINES) as exc:
         # Not merely an optimization: misrouting an LP/QP to the MINLP path is the
         # difference between the fast family and full spatial B&B, so a silent
         # degradation here reads as "the fast family didn't trigger".
@@ -103,6 +100,16 @@ def classify_problem(model: Model) -> ProblemClass:
             exc,
         )
         return ProblemClass.MINLP if has_integer else ProblemClass.NLP
+
+    obj_linear = repr.is_objective_linear()
+    obj_quadratic = repr.is_objective_quadratic()
+    all_constraints_linear = all(repr.is_constraint_linear(i) for i in range(repr.n_constraints))
+    if hasattr(repr, "is_constraint_quadratic"):
+        all_constraints_quadratic = all(
+            repr.is_constraint_quadratic(i) for i in range(repr.n_constraints)
+        )
+    else:
+        all_constraints_quadratic = all_constraints_linear
 
     if all_constraints_linear:
         if obj_linear:
@@ -365,6 +372,44 @@ class _NotLinearError(Exception):
 
 class _NotQuadraticError(Exception):
     """Raised when an expression is not quadratic (at most degree 2)."""
+
+
+#: The documented declines of every rung of the ``extract_*_data`` ladders (#1520).
+#: Each rung raises one of these when it cannot represent the model; anything else
+#: is a defect in the rung and propagates rather than silently falling through.
+_EXTRACTION_DECLINES = (_NotLinearError, _NotQuadraticError)
+
+#: What ``discopt._rust.model_to_repr`` raises for a model it cannot represent
+#: (#1520): ``ValueError`` for an unrepresentable construct (a disjunctive row, a
+#: bad sense, a shape it cannot lower) and ``TypeError`` for an expression type
+#: its converter has no arm for (``CustomCall``, an unsupported index component).
+_MODEL_TO_REPR_DECLINES = (ValueError, TypeError)
+
+
+def _repr_needs_objective(model: Model) -> bool:
+    """True when ``model_to_repr`` cannot be asked about ``model`` at all: it has
+    no Python objective and no fast-API builder that could carry one.
+
+    ``model_to_repr`` reads ``model._objective.expression`` unconditionally on
+    that path and fails with a bare ``AttributeError`` on ``None`` -- not one of
+    :data:`_MODEL_TO_REPR_DECLINES`, and too generic to catch without hiding
+    defects -- so callers test for it up front (#1520).
+    """
+    return getattr(model, "_objective", None) is None and getattr(model, "_builder", None) is None
+
+
+def _model_repr_or_decline(model: Model, decline: type[Exception]):
+    """``model_to_repr(model, model._builder)``, re-raising its documented declines
+    as ``decline`` (one of :data:`_EXTRACTION_DECLINES`) so an extraction ladder can
+    absorb exactly the declines and nothing else (#1520)."""
+    from discopt._rust import model_to_repr
+
+    if _repr_needs_objective(model):
+        raise decline("model has no objective, so it has no Rust repr")
+    try:
+        return model_to_repr(model, getattr(model, "_builder", None))
+    except _MODEL_TO_REPR_DECLINES as exc:
+        raise decline(f"model has no Rust repr: {type(exc).__name__}: {exc}") from exc
 
 
 def _extract_linear_coefficients(expr, model: Model, n: int):
@@ -1558,9 +1603,7 @@ def _extract_lp_data_from_repr(model: Model, *, for_qp: bool = False) -> LPData:
     fast-API and ``from_nl`` models alike, where Python expression trees don't
     exist for the algebraic walk to traverse.
     """
-    from discopt._rust import model_to_repr
-
-    repr_ = model_to_repr(model, getattr(model, "_builder", None))
+    repr_ = _model_repr_or_decline(model, _NotLinearError)
     n_orig = repr_.n_vars
 
     rows = _lp_rows_from_repr(model, repr_, for_qp=for_qp)
@@ -1629,10 +1672,7 @@ def _extract_qp_data_symbolic(model: Model) -> QPData:
     its coefficients would not fit the term budget. The walk never approximates,
     so a decline is the only failure mode and the dispatcher falls through.
     """
-    from discopt._rust import model_to_repr
-
-    _builder = getattr(model, "_builder", None)
-    repr_ = model_to_repr(model, _builder)
+    repr_ = _model_repr_or_decline(model, _NotQuadraticError)
     n_orig = repr_.n_vars
 
     form = repr_.objective_quadratic_form()
@@ -1870,10 +1910,7 @@ def _assemble_qp_from_repr(model, repr_, n_orig: int, Q, c_vec, d: float) -> QPD
 def _extract_qcp_data_from_repr(model: Model) -> QCPData:
     """Extract QCP/QCQP data by evaluating the Rust ModelRepr."""
 
-    from discopt._rust import model_to_repr
-
-    _builder = getattr(model, "_builder", None)
-    repr_ = model_to_repr(model, _builder)
+    repr_ = _model_repr_or_decline(model, _NotQuadraticError)
 
     n_orig = repr_.n_vars
 
@@ -1982,16 +2019,20 @@ def extract_lp_data(model: Model, *, for_qp: bool = False) -> LPData:
     # arena now (see ``_linear_terms_from_repr``), so it is O(nodes) either way
     # and there is exactly one rung. The ``_builder`` gate was never about
     # correctness: ``model_to_repr`` accepts ``_builder=None``.
+    # #1520: narrowed. Each rung raises one of ``_EXTRACTION_DECLINES`` when it
+    # cannot represent the model (``model_to_repr``'s own refusals are re-raised as
+    # one); any other exception is a defect in the rung and propagates.
     try:
         return _extract_lp_data_from_repr(model, for_qp=for_qp)
-    except Exception as exc:  # noqa: BLE001 - falls through to the algebraic extractor
+    except _EXTRACTION_DECLINES as exc:
         # Each rung of this ladder is a *fast path*: a silent fall-through turns
         # "the repr extractor declined" into an unexplained measurement.
         logger.debug("LP repr extraction declined: %s: %s", type(exc).__name__, exc)
 
+    # #1520: narrowed (see above).
     try:
         return extract_lp_data_algebraic(model, for_qp=for_qp)
-    except Exception as exc:  # noqa: BLE001 - falls through to the tape/autodiff extractors
+    except _EXTRACTION_DECLINES as exc:
         logger.debug("LP algebraic extraction declined: %s: %s", type(exc).__name__, exc)
 
     # #75: the last JAX-free rung. The three above all reduce a constraint to one
@@ -2344,16 +2385,19 @@ def extract_qp_data(model: Model) -> QPData:
     """
     # The symbolic walk needs neither a ``_builder`` nor Python-level expression
     # objects, so it covers both the API-built and the ``from_nl`` arms.
+    # #1520: narrowed. A rung that cannot represent the model raises one of
+    # ``_EXTRACTION_DECLINES``; anything else is a defect and propagates.
     try:
         return _extract_qp_data_symbolic(model)
-    except Exception as exc:  # noqa: BLE001 - falls through to the algebraic walk
+    except _EXTRACTION_DECLINES as exc:
         # Logged, never silent: a fast path that disappears without evidence that
         # it did is how the probe stayed the default for as long as it did.
         logger.debug("QP symbolic extraction declined: %s: %s", type(exc).__name__, exc)
 
+    # #1520: narrowed (see above).
     try:
         return extract_qp_data_algebraic(model)
-    except Exception as exc:  # noqa: BLE001 - falls through to the autodiff extractor
+    except _EXTRACTION_DECLINES as exc:
         logger.debug("QP algebraic extraction declined: %s: %s", type(exc).__name__, exc)
 
     return _extract_qp_data_autodiff(model)
@@ -2363,9 +2407,12 @@ def extract_qcp_data(model: Model) -> QCPData:
     """Extract QCP/QCQP data from a model classified as QCP/QCQP/MIQCP/MIQCQP."""
     _builder = getattr(model, "_builder", None)
     if _builder is not None:
+        # #1520: narrowed. The repr rung declines with ``_NotQuadraticError`` (a row
+        # neither the arena walk nor the tape can read, or no Rust repr); any other
+        # exception is a defect and propagates.
         try:
             return _extract_qcp_data_from_repr(model)
-        except Exception as exc:  # noqa: BLE001 - falls through to the algebraic extractor
+        except _EXTRACTION_DECLINES as exc:
             logger.debug("QCP repr extraction failed: %s: %s", type(exc).__name__, exc)
 
     return extract_qcp_data_algebraic(model)

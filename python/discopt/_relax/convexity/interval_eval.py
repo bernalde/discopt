@@ -576,10 +576,23 @@ def _registered_interval(name, expr, model, box, cache):
     fn = get_registered(name)
     if fn is None or len(expr.args) != 1:
         return None
+    # #1520: kept as a sound fallback. ``interval_expr`` is the user's registered
+    # lowering (``discopt.operators``), i.e. user code with no documented failure
+    # mode; when it raises, the caller keeps the unbounded enclosure, which contains
+    # every value and so can never tighten a bound or prove a curvature. Only the
+    # user call is guarded: our own enclosure of the lowering declines by value.
     try:
-        return evaluate_interval(fn.interval_expr(expr.args[0]), model, box, cache)
-    except Exception:  # noqa: BLE001 - abstaining leaves the unbounded enclosure
+        lowered = fn.interval_expr(expr.args[0])
+    except Exception as exc:  # noqa: BLE001 - user-supplied lowering; see above
+        from discopt._relax._fallback import warn_fallback_once
+
+        warn_fallback_once(
+            f"registered operator {name!r} interval lowering",
+            exc,
+            "its enclosure stays unbounded (no tightening, no curvature claim)",
+        )
         return None
+    return evaluate_interval(lowered, model, box, cache)
 
 
 def _eval_matmul(

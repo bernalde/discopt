@@ -124,15 +124,14 @@ def _solve_relaxation_with_pounce(
         )
         return float("-inf")
 
-    # Mirror the POUNCE/Ipopt acceptance set: optimal, acceptable, stalled
-    # (Search_Direction_Becomes_Too_Small → UNBOUNDED in the discopt enum),
-    # and max-iterations are all valid B&B lower bounds because the
-    # McCormick underestimator is convex.
-    if result.status not in (
-        SolveStatus.OPTIMAL,
-        SolveStatus.ITERATION_LIMIT,
-        SolveStatus.UNBOUNDED,
-    ):
+    # #1520: only a CONVERGED solve is a lower bound. Convexity of the McCormick
+    # underestimator makes its *minimum* a valid bound, but an interior-point
+    # iterate stopped at ``max_iter`` (``ITERATION_LIMIT``) or on a stalled
+    # search direction (mapped to ``UNBOUNDED``) is not a minimum: its objective
+    # can sit anywhere above it (and, primal-infeasible, anywhere at all). This
+    # used to accept both, handing the tree a node bound nothing proved. The
+    # node now keeps its inherited bound (``-inf`` here), which is always valid.
+    if result.status != SolveStatus.OPTIMAL:
         return float("-inf")
     if result.objective is None:
         return float("-inf")

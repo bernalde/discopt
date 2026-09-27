@@ -626,6 +626,53 @@ def test_mccormick_nlp_pounce_failure_warns_and_returns_no_bound(monkeypatch, ca
     assert len(_warnings_from(caplog, "McCormick relaxation NLP (POUNCE) solve failed")) == 1
 
 
+@pytest.mark.parametrize("status", ["iteration_limit", "unbounded"])
+def test_mccormick_nlp_unconverged_solve_is_not_a_bound(monkeypatch, status):
+    """An IPM iterate stopped short of convergence is not the relaxation's minimum,
+    so its objective is not a lower bound. It used to be returned as one (the
+    acceptance set included ``ITERATION_LIMIT`` and the stall-mapped ``UNBOUNDED``).
+    The injected objective 1e3 is far ABOVE the true relaxation minimum (0 at the
+    origin): accepting it would be a false node bound."""
+    import discopt.solvers.nlp_pounce as nlp_pounce
+    from discopt._relax.mccormick_nlp import solve_mccormick_relaxation_nlp
+    from discopt._relax.relaxation_compiler import compile_objective_relaxation
+    from discopt.solvers import NLPResult, SolveStatus
+
+    m = dm.Model("mcnlp_unconv_1520")
+    x = m.continuous("x", lb=0.0, ub=4.0)
+    y = m.continuous("y", lb=0.0, ub=4.0)
+    m.minimize(x * x + y * y)
+    relax_fn = compile_objective_relaxation(m)
+    calls: list[int] = []
+
+    def _fake(ev, x0, constraint_bounds=None, options=None):
+        calls.append(1)
+        return NLPResult(status=SolveStatus(status), x=np.asarray(x0), objective=1e3)
+
+    monkeypatch.setattr(nlp_pounce, "solve_nlp", _fake)
+    val = solve_mccormick_relaxation_nlp(
+        relax_fn, None, None, jnp.array([0.0, 0.0]), jnp.array([4.0, 4.0])
+    )
+    assert calls
+    assert val == float("-inf")
+
+
+def test_mccormick_nlp_converged_solve_is_still_a_bound():
+    """Control: the real converged solve still returns a finite bound <= the true
+    minimum (0, at the origin)."""
+    from discopt._relax.mccormick_nlp import solve_mccormick_relaxation_nlp
+    from discopt._relax.relaxation_compiler import compile_objective_relaxation
+
+    m = dm.Model("mcnlp_conv_1520")
+    x = m.continuous("x", lb=0.0, ub=4.0)
+    y = m.continuous("y", lb=0.0, ub=4.0)
+    m.minimize(x * x + y * y)
+    val = solve_mccormick_relaxation_nlp(
+        compile_objective_relaxation(m), None, None, jnp.array([0.0, 0.0]), jnp.array([4.0, 4.0])
+    )
+    assert np.isfinite(val) and val <= 1e-6
+
+
 # ── mccormick_subgradient.py ────────────────────────────────────────────────
 
 

@@ -2241,16 +2241,12 @@ def _multivar_box_curvature(
                 )
             try:
                 ad = interval_hessian(expr, model, box=box)
-            except (ValueError, RecursionError):
+            except ValueError:
                 # #1520: narrowed. ``interval_hessian``'s documented decline (array-
                 # shaped values, ``IntervalHessianTooLarge``) is "no verdict", the
-                # conservative answer. ``RecursionError`` is the same "DAG too big"
-                # decline arriving by another route: the walk recurses once per
-                # node, so a left-folded sum of ~900 products (the synthetic QAP in
-                # ``test_rlt_root_bound``) exhausts the stack before the size guard
-                # fires. The real fix is an iterative walk / depth guard raising
-                # ``IntervalHessianTooLarge`` in ``interval_ad``; until then an
-                # abstention is the sound answer. Anything else propagates.
+                # conservative answer; anything else propagates. (A deep left-folded
+                # body used to arrive here as ``RecursionError``; ``interval_hessian``
+                # now runs deep walks on a large stack instead.)
                 return None
             h_lo = np.asarray(ad.hess.lo, dtype=np.float64)[ix]
             h_hi = np.asarray(ad.hess.hi, dtype=np.float64)[ix]
