@@ -17607,6 +17607,24 @@ def solve_model(
             _tf_pop = None
             for i in (int(_q) for _q in np.flatnonzero(_tight_fathom)):
                 _tf_lb = float(result_lbs[i])
+                # The node's own bound can be far looser than the box warrants: a
+                # fixed-integer leaf of ``min -1.3x + sin(3y)`` on
+                # x = 2, y in [0, 9.3e-16] carries -3.6 (sin relaxed to [-1, 1])
+                # while the box holds only values near -2.6, and flooring at -3.6
+                # decertified a correct optimum. An outward-rounded interval
+                # enclosure of the objective over the same box is equally valid;
+                # keep the larger. ``_compute_interval_bound`` returns -inf when it
+                # cannot enclose, which leaves the node bound in charge.
+                _tb_iv = _nr_pending.get(i) if _nr_pending else None
+                _tf_lb = max(
+                    _tf_lb,
+                    _compute_interval_bound(
+                        model,
+                        _tb_iv[0] if _tb_iv is not None else batch_lb[i],
+                        _tb_iv[1] if _tb_iv is not None else batch_ub[i],
+                        _obj_negate,
+                    ),
+                )
                 if _gap_values_converged(_tf_inc_val, _tf_lb, gap_tolerance, abs_gap_tol):
                     continue
                 if _tf_lb >= _tf_inc_val:
