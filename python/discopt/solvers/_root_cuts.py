@@ -245,6 +245,17 @@ def _row_senses(evaluator) -> list[str]:
     return senses  # type: ignore[return-value]
 
 
+class RootCutsNotApplicable(ValueError):
+    """The root-cut stage does not apply to this model (#1514).
+
+    Raised for the structural inapplicability ``generate_root_cuts`` documents --
+    an objective the LP cannot represent (nonlinear, or affine only on samples) --
+    so the solver can decline exactly this and let every other exception, the
+    invariant refusals in :func:`separate_gmi` included, fail the solve. A
+    ``ValueError`` subclass so a caller that caught the old ``ValueError`` still does.
+    """
+
+
 # ── linearised root view ─────────────────────────────────────────────────────
 
 
@@ -270,7 +281,7 @@ class _RootLP:
         ga = np.asarray(evaluator.evaluate_gradient(xa), float)
         gb = np.asarray(evaluator.evaluate_gradient(xb), float)
         if not np.allclose(ga, gb, atol=1e-9):
-            raise ValueError("nonlinear objective — root-cut LP bound would be invalid")
+            raise RootCutsNotApplicable("nonlinear objective — root-cut LP bound would be invalid")
         # NLPEvaluator compiles a minimize-internal objective: it NEGATES the
         # declared objective for MAXIMIZE models (``NLPEvaluator._negate``).
         # Recover the DECLARED objective coefficients so the LP bound is in the
@@ -301,7 +312,9 @@ class _RootLP:
         if not (np.isfinite(_c0a) and np.isfinite(_c0b)) or abs(_c0a - _c0b) > 1e-9 * max(
             1.0, abs(_c0a), abs(_c0b)
         ):
-            raise ValueError("objective is not affine - root-cut LP bound would be invalid")
+            raise RootCutsNotApplicable(
+                "objective is not affine - root-cut LP bound would be invalid"
+            )
         self.c0 = -_c0a if negate else _c0a
         self.c0_negate = negate
 
@@ -696,8 +709,9 @@ def generate_root_cuts(
 
     Caller contract: the model is CONVEX-certified and routed to NLP-BB;
     ``lb``/``ub`` are the FBBT-tightened root bounds; ``is_int``/``is_bin``
-    are flat masks. Raises on structural inapplicability (nonlinear objective,
-    missing highspy) — the caller wraps and degrades to no-op.
+    are flat masks. Raises :class:`RootCutsNotApplicable` on structural
+    inapplicability (nonlinear objective) and ``ImportError`` for a missing
+    highspy — the caller catches exactly those and degrades to no-op (#1514).
 
     The returned ``cuts`` are only those BINDING at the final LP optimum (they
     are the ones carrying the bound); the rest served their purpose inside the

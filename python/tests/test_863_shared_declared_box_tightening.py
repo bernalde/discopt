@@ -202,16 +202,22 @@ def test_infeasibility_proof_is_still_reported(monkeypatch):
         _check_finite_bounds(m, shared)
 
 
-def test_a_raising_pass_degrades_to_no_information(monkeypatch):
-    """A failing tightening must not break the solve: both helpers treat ``None``
-    as 'no information', which is what each of their own ``except`` blocks did."""
+def test_a_raising_pass_propagates_and_none_is_no_information(monkeypatch):
+    """#1514: a RAISING tightening pass is a defect and propagates -- it used to be
+    logged at DEBUG and read as 'no information'. ``None`` handed to the two
+    consumers still means 'no information' (that contract is unchanged)."""
     m = _unbounded_model()
 
     def _boom(*a, **k):
         raise RuntimeError("synthetic tightening failure")
 
     monkeypatch.setattr(nbt, "tighten_nonlinear_bounds", _boom)
-    assert _declared_box_tightening(m) is None
+    with pytest.raises(RuntimeError, match="synthetic tightening failure"):
+        _declared_box_tightening(m)
+    with pytest.raises(RuntimeError, match="synthetic tightening failure"):
+        _detect_nonlinear_bound_infeasibility(m, None)
+    monkeypatch.undo()
+    # With a working pass, ``None`` makes each consumer compute the box itself.
     assert _detect_nonlinear_bound_infeasibility(m, None) is None
     with pytest.warns(UserWarning, match="very large or infinite declared bounds"):
         _check_finite_bounds(m, None)

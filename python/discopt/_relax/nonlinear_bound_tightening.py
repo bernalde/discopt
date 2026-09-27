@@ -132,7 +132,7 @@ def build_flat_variable_metadata(model: Model) -> FlatVariableMetadata:
     return FlatVariableMetadata(base_offsets=base_offsets, flat_var_types=tuple(flat_var_types))
 
 
-def _model_structural_token(model: Model) -> tuple[int, int]:
+def _model_structural_token(model: Model) -> tuple[int, int, int, int]:
     """Identity token for a model's constraint set, used to validate caches.
 
     Nonlinear tightening runs once per branch-and-bound node on the *same* model
@@ -142,7 +142,13 @@ def _model_structural_token(model: Model) -> tuple[int, int]:
     caches are dropped rather than reused stale.
     """
     constraints = model._constraints
-    return (id(constraints), len(constraints))
+    # #1514: the variable list is part of the structure too. ``metadata`` maps each
+    # variable to its flat offset, and a caller that adds a variable and then
+    # restores the constraint list (``epsilon_constraint`` does) left a token equal
+    # to the cached one over a stale offset map -> ``KeyError`` in a rule. A
+    # catch-all at the call site used to turn that into "no tightening".
+    variables = model._variables
+    return (id(constraints), len(constraints), id(variables), len(variables))
 
 
 def _get_struct_cache(model: Model) -> dict:
@@ -236,11 +242,19 @@ def _cached_row_structure(model: Model, rule_name: str, constraint, metadata, bu
     read entries derived from a different one. Such a caller bypasses the cache
     rather than being trusted to match it.
     """
+    body = getattr(constraint, "body", None)
+    if body is None:
+        # #1514: a non-algebraic row (a disjunction, a logical or SOS constraint)
+        # has no body to decompose. Every rule using this cache is row-independent
+        # (``row_scan_is_anytime``), so skipping the row -- ``None`` is each rule's
+        # "no structure here" -- only forgoes a tightening. It used to raise
+        # ``AttributeError`` and abort the whole pass.
+        return None
     cache = _get_struct_cache(model)
     if metadata is not cache["metadata"]:
         return build()
     rowstruct = cache["rowstruct"]
-    key = (rule_name, id(constraint.body))
+    key = (rule_name, id(body))
     value = rowstruct.get(key, _ROWSTRUCT_MISS)
     if value is _ROWSTRUCT_MISS:
         value = build()
