@@ -542,3 +542,86 @@ def test_a_pass_that_drops_a_guard_is_refused(monkeypatch):
     monkeypatch.setitem(dt._REGISTRY, "test.drop", t)
     with pytest.raises(RuntimeError, match="_piecewise_domains"):
         dt.create_using("test.drop", _piecewise_sos2_model())
+
+
+# ── #1497 (related): a crashing pass must not read as "unchanged" ─────────
+
+
+def _int_bilinear_model():
+    m = dm.Model("ib")
+    a = m.integer("a", lb=0, ub=5)
+    c = m.integer("c", lb=0, ub=5)
+    m.minimize(-(a * c) + 2 * a + c)
+    m.subject_to(a * c <= 10)
+    return m
+
+
+def _bin_trilinear_model():
+    m = dm.Model("bt")
+    b = m.binary("b", shape=(3,))
+    m.minimize(-(b[0] * b[1] * b[2]) + b[0])
+    return m
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("injected defect")
+
+
+@pytest.mark.parametrize(
+    "name, module, attr, build",
+    [
+        ("integer.bilinear", integer_product_reform, "_rewrite", _int_bilinear_model),
+        ("integer.multilinear", integer_product_reform, "_rewrite", _int_bilinear_model),
+        (
+            "integer.bilinear",
+            integer_product_reform,
+            "has_integer_product_work",
+            _int_bilinear_model,
+        ),
+        ("binary.multilinear", binary_multilinear_reform, "_process_body", _bin_trilinear_model),
+    ],
+)
+def test_a_crash_inside_a_pass_propagates_through_check(monkeypatch, name, module, attr, build):
+    """Pre-fix, the passes' ``except Exception: return model`` turned an injected
+    defect into ``check(...).diff.unchanged is True``."""
+    m = build()
+    # The unpatched pass does act on this model, so "unchanged" would be a lie.
+    assert not dt.check(name, m).diff.unchanged
+    monkeypatch.setattr(module, attr, _boom)
+    with pytest.raises(RuntimeError, match="injected defect"):
+        dt.check(name, m)
+
+
+def test_binary_multilinear_gate_does_not_swallow_a_scan_crash(monkeypatch):
+    assert binary_multilinear_reform.has_binary_multilinear_work(_bin_trilinear_model())
+    monkeypatch.setattr(binary_multilinear_reform, "_witness_scan", _boom)
+    with pytest.raises(RuntimeError, match="injected defect"):
+        binary_multilinear_reform.has_binary_multilinear_work(_bin_trilinear_model())
+
+
+def test_documented_abstention_still_returns_the_input_model(monkeypatch):
+    """An unbounded continuous factor is the #286 "cannot big-M" case: the pass
+    abstains (``IntegerProductNotApplicable``) and returns the model unchanged."""
+    m = dm.Model("unb")
+    a = m.integer("a", lb=0, ub=5)
+    x = m.continuous("x", lb=0, ub=1e30)
+    m.minimize(a * x - a)
+    m.subject_to(a * x <= 3)
+    assert integer_product_reform.has_integer_product_work(m)
+
+    abstained = []
+    real = integer_product_reform._Expander.bigm_product
+
+    def spy(self, *args, **kwargs):
+        try:
+            return real(self, *args, **kwargs)
+        except integer_product_reform.IntegerProductNotApplicable:
+            abstained.append(True)
+            raise
+
+    monkeypatch.setattr(integer_product_reform._Expander, "bigm_product", spy)
+    for name in ("integer.bilinear", "integer.multilinear"):
+        abstained.clear()
+        assert dt.get(name).apply(m) is m
+        assert abstained, f"{name} did not reach the documented abstention"
+        assert dt.check(name, m).diff.unchanged

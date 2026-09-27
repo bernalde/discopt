@@ -119,7 +119,7 @@ from discopt.modeling.core import (
     VarType,
     carry_validation_guards,
 )
-from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
+from discopt.mpec import carry_complementarities
 
 # A monomial is a frozenset of scalar-variable keys ``(var._index, elem)``;
 # the empty frozenset is the constant term. Binary factors collapse via set
@@ -217,17 +217,15 @@ def has_binary_multilinear_work(model: Model) -> bool:
     binary-valued — the witness that the exact Fortet/Glover linearization has
     something to gain. Cheap (one iterative pass over each DAG, O(1) per node)
     and safe: ``False`` means the pass is skipped, never that a model is
-    mis-rewritten. Returns ``False`` on any error."""
-    try:
-        if model._objective is None:
-            return False
-        bodies = [model._objective.expression]
-        for c in model._constraints:
-            if isinstance(c, Constraint):
-                bodies.append(c.body)
-        return any(_witness_scan(b) for b in bodies)
-    except Exception:
+    mis-rewritten. An error in the scan propagates (#1497): answering ``False``
+    on a crash made a broken scan indistinguishable from "nothing to do"."""
+    if model._objective is None:
         return False
+    bodies = [model._objective.expression]
+    for c in model._constraints:
+        if isinstance(c, Constraint):
+            bodies.append(c.body)
+    return any(_witness_scan(b) for b in bodies)
 
 
 def _gate_children(node: Expression) -> Optional[list[Expression]]:
@@ -963,17 +961,13 @@ def reformulate_binary_multilinear(model: Model) -> Model:
     """Return an equivalent pure-MILP model with every binary multilinear
     monomial exactly Fortet/Glover-linearized (and objective squares of
     integer-valued forms secant-encoded), or *model* unchanged when the
-    structure is out of scope, a budget is exceeded, or anything errs — the
-    pass never regresses a model it cannot handle exactly."""
+    structure is out of scope or a budget is exceeded (both signalled by
+    ``_Unsupported``). Any other exception -- a broken complementarity
+    provenance chain (#1147) or a defect -- propagates: returning the input on an
+    arbitrary error made a crashed pass read as "nothing to do" (#1497)."""
     try:
         return _reformulate(model)
-    except ComplementarityProvenanceError:
-        # A relation that cannot be resolved against the rebuilt model is a
-        # broken provenance chain, not an out-of-scope model: raise (#1147).
-        raise
     except _Unsupported:
-        return model
-    except Exception:  # pragma: no cover - defensive
         return model
 
 
