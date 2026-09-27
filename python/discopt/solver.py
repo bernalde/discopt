@@ -5630,6 +5630,63 @@ def _gap_values_converged(
     return abs_gap / denom <= gap_tolerance
 
 
+#: The Rust spatial brancher's ``SPATIAL_MIN_WIDTH`` (``branching.rs``) doubled, so
+#: :func:`_may_be_tight_fathomed` errs toward "may be fathomed" (#1492).
+_TIGHT_FATHOM_REL_WIDTH = 2e-6
+#: ``INTEGRALITY_TOL`` of the Rust ``is_integer_feasible`` (``branching.rs``).
+_TREE_INTEGRALITY_TOL = 1e-5
+
+
+def _may_be_tight_fathomed(
+    node_lb: np.ndarray,
+    node_ub: np.ndarray,
+    sol: np.ndarray,
+    is_feasible: bool,
+    global_lb: np.ndarray,
+    global_ub: np.ndarray,
+    int_mask: np.ndarray,
+    spatial_int_cols: np.ndarray,
+) -> bool:
+    """Whether the Rust tree may fathom this node as a TIGHT box (#1492).
+
+    In nonconvex mode ``process_evaluated`` fathoms an integer-feasible node when no
+    dimension is branchable any more -- every continuous column narrower than
+    ``SPATIAL_MIN_WIDTH`` (1e-6) of its root width, every spatial-integer column
+    narrower than 1 -- and, when its bound is finite and its box finite, it drops
+    the node WITHOUT flooring the global bound at the node's lower bound. That is
+    sound only if a relative width of 1e-6 makes the node's relaxation gap
+    negligible, which fails wherever the objective is not Lipschitz: ``asin`` at
+    ``-1`` changes by ``sqrt(2*1e-6) = 1.4e-3`` over such a box, and the region's
+    optimum was certified away (bound 1.4e-3 above ``min asin(x) - x/2``).
+
+    A conservative mirror of that test: every condition the Rust arm needs is
+    checked with the same or a looser threshold, so any node the tree can fathom
+    this way reads True here (a spurious True only costs a floor that is a valid
+    bound anyway). Unbounded dimensions are treated as tight -- the tree marks
+    those unresolved itself.
+    """
+    if not is_feasible:
+        x = np.asarray(sol, dtype=np.float64)
+        xi = x[int_mask]
+        frac = xi - np.floor(xi)
+        # NaN compares False here, as it does in the Rust test (reads integral).
+        if np.any((frac > _TREE_INTEGRALITY_TOL) & (frac < 1.0 - _TREE_INTEGRALITY_TOL)):
+            return False  # the tree integer-branches instead
+    w = np.asarray(node_ub, dtype=np.float64) - np.asarray(node_lb, dtype=np.float64)
+    gw = np.asarray(global_ub, dtype=np.float64) - np.asarray(global_lb, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = w / gw
+    cont = (~int_mask) & (gw >= 1e-15) & np.isfinite(rel)
+    if np.any(rel[cont] >= _TIGHT_FATHOM_REL_WIDTH):
+        return False  # a continuous column is still bisected
+    if spatial_int_cols.size:
+        s = spatial_int_cols
+        s_branch = (w[s] >= 1.0 - 1e-9) & (gw[s] >= 1e-15) & np.isfinite(rel[s])
+        if np.any(s_branch):
+            return False  # a spatial-integer column is still partitioned
+    return True
+
+
 def _objective_at_reported_point(
     x: np.ndarray,
     c: np.ndarray,
@@ -13271,6 +13328,12 @@ def solve_model(
     )
     tree.initialize()
     rust_time += time.perf_counter() - t_rust_start
+    # #1492: the box the Rust brancher measures relative widths against (its
+    # ``global_lb``/``global_ub`` never change after construction), and the columns
+    # it partitions as spatial integers -- read by ``_may_be_tight_fathomed``.
+    _tree_global_lb = np.asarray(lb, dtype=np.float64).copy()
+    _tree_global_ub = np.asarray(ub, dtype=np.float64).copy()
+    _tree_spatial_int_cols = np.zeros(0, dtype=np.int64)
 
     # --- Compile NLP evaluator ---
     t_jax_start = time.perf_counter()
@@ -13380,7 +13443,8 @@ def solve_model(
             & _dag_nonlinear_columns(model)
         )
         if _nl_int_cols_all:
-            tree.set_spatial_integer_cols(np.asarray(_nl_int_cols_all, dtype=np.int64))
+            _tree_spatial_int_cols = np.asarray(_nl_int_cols_all, dtype=np.int64)
+            tree.set_spatial_integer_cols(_tree_spatial_int_cols)
     _gap_certified = True
     # #1500: from here on every incumbent is screened -- the batch import gate and
     # the funnel below -- so this solve's result honours the feasibility callbacks.
@@ -13778,7 +13842,8 @@ def solve_model(
                     _mc_mode = "none" if _pure_discrete else "nlp"
                 else:
                     if _nl_int_cols:
-                        tree.set_spatial_integer_cols(np.asarray(_nl_int_cols, dtype=np.int64))
+                        _tree_spatial_int_cols = np.asarray(_nl_int_cols, dtype=np.int64)
+                        tree.set_spatial_integer_cols(_tree_spatial_int_cols)
                     # Deprioritize functionally-dependent continuous columns in
                     # spatial branching. Two disjoint sources, both of which are
                     # *outputs* pinned by the independent variables, so bisecting
@@ -17467,11 +17532,34 @@ def solve_model(
         # accepts only a strictly-improving feasible point and never touches the
         # dual bound, so this only ever tightens the incumbent — it cannot make
         # the search unsound, only complete.
-        if not _model_is_convex and int_offsets:
+        #
+        # #1492: the same holds for a node the tree will fathom as a TIGHT box
+        # (``_may_be_tight_fathomed``), integer or not -- it is removed with its
+        # bound dropped, so its relaxation point is the last chance to record the
+        # region's value. A pure-continuous model used to skip this guard entirely.
+        _tight_fathom = np.zeros(n_batch, dtype=bool)
+        if not _model_is_convex:
+            for i in range(n_batch):
+                if node_infeasible_mask[i] or not (result_lbs[i] < _SENTINEL_THRESHOLD):
+                    continue
+                _tb = _nr_pending.get(i) if _nr_pending else None
+                _tight_fathom[i] = _may_be_tight_fathomed(
+                    _tb[0] if _tb is not None else batch_lb[i],
+                    _tb[1] if _tb is not None else batch_ub[i],
+                    result_sols[i],
+                    bool(result_feas[i]),
+                    _tree_global_lb,
+                    _tree_global_ub,
+                    _nbb_int_mask,
+                    _tree_spatial_int_cols,
+                )
+        if not _model_is_convex and (int_offsets or np.any(_tight_fathom)):
             _cl = [c[0] for c in constraint_bounds] if constraint_bounds else None
             _cu = [c[1] for c in constraint_bounds] if constraint_bounds else None
             for i in range(n_batch):
                 if node_infeasible_mask[i] or result_lbs[i] >= _SENTINEL_THRESHOLD:
+                    continue
+                if not int_offsets and not _tight_fathom[i]:
                     continue
                 xi = np.asarray(result_sols[i], dtype=np.float64)
                 if not _is_integer_feasible_solution(xi, int_offsets, int_sizes):
@@ -17479,11 +17567,66 @@ def solve_model(
                 xr = xi.copy()
                 for _off, _sz in zip(int_offsets, int_sizes):
                     xr[_off : _off + _sz] = np.round(xr[_off : _off + _sz])
-                if _cl is not None and not _check_constraint_feasibility(evaluator, xr, _cl, _cu):
+                _cands = [xr]
+                if _tight_fathom[i]:
+                    # #1492: the relaxation point need not be the region's best
+                    # point (``min asin(x) - x/2`` on the tight box ``[-1, -1+1e-6]``
+                    # puts it at the upper end, the optimum sits at -1). Also try
+                    # the node-box vertex the objective gradient descends to,
+                    # moving continuous columns only.
+                    _tb = _nr_pending.get(i) if _nr_pending else None
+                    _vlo = np.asarray(_tb[0] if _tb is not None else batch_lb[i], np.float64)
+                    _vhi = np.asarray(_tb[1] if _tb is not None else batch_ub[i], np.float64)
+                    _xc = np.clip(xr, _vlo, _vhi)
+                    _g = np.asarray(evaluator.evaluate_gradient(_xc), dtype=np.float64)
+                    if _g.shape == _xc.shape and np.all(np.isfinite(_g)):
+                        _xv = np.where(_g > 0.0, _vlo, np.where(_g < 0.0, _vhi, _xc))
+                        _xv = np.where(_nbb_int_mask | ~np.isfinite(_xv), _xc, _xv)
+                        _cands.append(_xv)
+                for _xk in _cands:
+                    if _cl is not None and not _check_constraint_feasibility(
+                        evaluator, _xk, _cl, _cu
+                    ):
+                        continue
+                    _obj_i = float(evaluator.evaluate_objective(_xk))
+                    if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
+                        _inject_incumbent(_xk, _obj_i)
+
+        # #1492: a tight-box fathom drops the node's lower bound from the tree's
+        # dual bound (``_may_be_tight_fathomed``). When that bound is NOT within
+        # the certification gap of the incumbent, the removed region is unproven:
+        # keep it in the reported bound through the taint floor (the node's own
+        # bound and its pop-time bound are both valid for its box; the larger is
+        # kept) and decertify, exactly like a non-rigorous sentinel fathom -- the
+        # SPATIAL-CERT block re-earns the label if the floor-inclusive gap closes
+        # against a later incumbent. A tight node inside the gap needs nothing,
+        # which keeps every Lipschitz model on its existing path.
+        if np.any(_tight_fathom):
+            _tf_inc = tree.incumbent()
+            _tf_inc_val = float(_tf_inc[1]) if _tf_inc is not None else np.inf
+            _tf_pop = None
+            for i in (int(_q) for _q in np.flatnonzero(_tight_fathom)):
+                _tf_lb = float(result_lbs[i])
+                if _gap_values_converged(_tf_inc_val, _tf_lb, gap_tolerance, abs_gap_tol):
                     continue
-                _obj_i = float(evaluator.evaluate_objective(xr))
-                if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
-                    _inject_incumbent(xr, _obj_i)
+                if _tf_lb >= _tf_inc_val:
+                    continue  # pruned against the incumbent by the tree
+                if _tf_pop is None:
+                    _tf_pop = np.asarray(
+                        tree.node_lower_bounds(np.asarray(result_ids, dtype=np.int64)),
+                        dtype=np.float64,
+                    )
+                _tf_floor = max(_tf_lb, float(_tf_pop[i]))
+                _nonrigorous_fathom = True
+                _gap_certified = False
+                _taint_floor_internal = min(_taint_floor_internal, _tf_floor)
+                logger.debug(
+                    "Tight-box fathom at node %d with bound %.10g outside the gap of "
+                    "incumbent %.10g: kept as a floor of the reported bound (#1492)",
+                    int(result_ids[i]),
+                    _tf_floor,
+                    _tf_inc_val,
+                )
 
         # Interactive debugger: steer point — relaxations solved, results not
         # yet imported. Safe-steer (inject incumbent / branch hint) applies here;
