@@ -1051,6 +1051,9 @@ class PWLTransformation:
         maximize = self._maximize
         best_obj: Optional[float] = None
         best_x: Optional[np.ndarray] = None
+        # (point, verified objective, max scaled constraint violation) -- see
+        # ``_prefer_candidate`` for why the violation takes part in the choice.
+        best: Optional[tuple[np.ndarray, float, float]] = None
         best_bound: Optional[float] = None
         bound_source: Optional[str] = None
         nodes = 0
@@ -1059,9 +1062,6 @@ class PWLTransformation:
         last_status = None
         polish_notes: list[str] = []
         feas_tol = 1e-6
-
-        def better(a: float, b: Optional[float]) -> bool:
-            return b is None or (a > b if maximize else a < b)
 
         rounds_allowed = max_rounds if self.mode == "outer" else 1
         certified = False
@@ -1122,10 +1122,16 @@ class PWLTransformation:
                     best_bound = rb
                     bound_source = r.bound_source or "bnb_tree"
             if r.x is not None:
-                cand = self._verified_candidate(r.x, polish, polish_notes)
-                if cand is not None and better(cand[1], best_obj):
-                    best_x, best_obj = cand
-                entry["verified_objective"] = None if cand is None else cand[1]
+                cands = self._verified_candidates(r.x, polish, polish_notes)
+                for cand in cands:
+                    if _prefer_candidate(
+                        cand, best, maximize=maximize, rel=gap_tolerance, abs_tol=abs_tol
+                    ):
+                        best = cand
+                if best is not None:
+                    best_x, best_obj, _ = best
+                entry["verified_objective"] = [c[1] for c in cands] or None
+                entry["verified_violation"] = [c[2] for c in cands] or None
             if self.mode != "outer":
                 break
             if best_obj is not None and best_bound is not None:
@@ -1165,50 +1171,51 @@ class PWLTransformation:
             polish_notes=polish_notes,
         )
 
-    def _verified_candidate(
+    def _verified_candidates(
         self, x: dict, polish: bool, notes: list[str]
-    ) -> Optional[tuple[np.ndarray, float]]:
-        """Map a transformed solution to the original; return its best verified form.
+    ) -> list[tuple[np.ndarray, float, float]]:
+        """Map a transformed solution to the original; return its verified forms.
 
         Candidates are the mapped point itself and, with *polish*, a local NLP
         solution of the original from it (integers fixed). Each must pass
         :func:`~discopt.validation.feasibility.verify_point` on the ORIGINAL model
         -- the independent check is the only thing that makes a point an
-        incumbent. The better verified candidate wins.
+        incumbent. Each verified candidate comes back as ``(point, objective,
+        violation)``; the choice among them (and against earlier rounds) is
+        :func:`_prefer_candidate`'s.
         """
-        from discopt.validation.feasibility import verify_point
+        from discopt.validation.feasibility import max_constraint_violation, verify_point
 
         orig = self.original
-        maximize = self._maximize
         flat = np.concatenate(
             [np.asarray(x[v.name], dtype=np.float64).reshape(-1) for v in orig._variables]
         )
-        found: list[tuple[np.ndarray, float]] = []
-        # #1496: ``verify_point`` accepts a point up to tolerance OUTSIDE the box, and
-        # the objective there can beat every in-box point -- an incumbent below the
-        # certified bound (``min (x-0.3)**2`` at x = 1e4 - 1e-4), or one that trips
-        # the tripwire on a valid bound (``max exp(x)`` at x = 18 + eps). The point
-        # published is therefore the one clipped into the box with integers rounded,
-        # and it is that point which is verified and whose objective is used.
-        res = verify_point(orig, cand := _into_box(orig, flat), with_objective=True)
-        if res.ok:
+        found: list[tuple[np.ndarray, float, float]] = []
+
+        def admit(point: np.ndarray, label: str) -> None:
+            # #1496: ``verify_point`` accepts a point up to tolerance OUTSIDE the
+            # box, and the objective there can beat every in-box point -- an
+            # incumbent below the certified bound (``min (x-0.3)**2`` at
+            # x = 1e4 - 1e-4), or one that trips the tripwire on a valid bound
+            # (``max exp(x)`` at x = 18 + eps). The point published is therefore
+            # the one clipped into the box with integers rounded, and it is that
+            # point which is verified and whose objective is used.
+            point = _into_box(orig, point)
+            res = verify_point(orig, point, with_objective=True)
+            if not res.ok:
+                notes.append(f"{label} failed verification: {res.reason}")
+                return
             assert res.objective is not None  # with_objective=True on an ok result
-            found.append((cand, float(res.objective)))
-        else:
-            notes.append(f"transformed point not feasible for the original: {res.reason}")
+            found.append(
+                (point, float(res.objective), float(max_constraint_violation(orig, point)))
+            )
+
+        admit(flat, "transformed point")
         if polish:
             polished = _polish(orig, flat, notes)
             if polished is not None:
-                polished = _into_box(orig, polished)
-                res2 = verify_point(orig, polished, with_objective=True)
-                if res2.ok:
-                    assert res2.objective is not None
-                    found.append((polished, float(res2.objective)))
-                else:
-                    notes.append(f"polished point failed verification: {res2.reason}")
-        if not found:
-            return None
-        return (max if maximize else min)(found, key=lambda c: c[1])
+                admit(polished, "polished point")
+        return found
 
     def _result(self, *, status, t0, nodes, rounds, history, polish_notes, **kw) -> "SolveResult":
         from discopt.modeling.core import SolveResult
@@ -1307,6 +1314,41 @@ class PWLTransformation:
 def _gap_closed(obj: float, bound: float, rel: float, abs_tol: float) -> bool:
     diff = abs(obj - bound)
     return diff <= abs_tol or diff / max(abs(obj), abs(bound), 1e-10) <= rel
+
+
+def _prefer_candidate(
+    new: tuple[np.ndarray, float, float],
+    best: Optional[tuple[np.ndarray, float, float]],
+    *,
+    maximize: bool,
+    rel: float,
+    abs_tol: float,
+) -> bool:
+    """Should verified candidate *new* ``(x, objective, violation)`` replace *best*?
+
+    #1496: choosing purely by objective among points that all pass
+    ``verify_point`` systematically picks the one that uses the most of the
+    feasibility tolerance, because violating a binding row is exactly how a point
+    beats the true optimum. Measured before this rule (``y == x**3/(1+c)**2``,
+    ``min y - 2x``, ``c = 1e3``): the PWL-mapped point, violation ``3.0e-5``, won
+    over the polished point, violation ``1.0e-11``, on an objective ``3e-5`` better
+    -- and ``3e-5`` BELOW the certified bound; 9 of 24 equality-constrained runs
+    picked the more violated candidate.
+
+    So objective decides only when the two objectives are distinguishable at the
+    solve's own certification tolerances (the ones :func:`_gap_closed` applies to
+    the certificate). Inside them the objective difference is invisible to the
+    certificate while the violation is real, and the less violated point wins
+    (ties in violation fall back to the objective).
+    """
+    if best is None:
+        return True
+    _, o_new, v_new = new
+    _, o_best, v_best = best
+    if _gap_closed(o_new, o_best, rel, abs_tol):
+        if v_new != v_best:
+            return v_new < v_best
+    return o_new > o_best if maximize else o_new < o_best
 
 
 def _polish(model: "Model", x0: np.ndarray, notes: list[str]) -> Optional[np.ndarray]:
