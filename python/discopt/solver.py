@@ -12728,7 +12728,9 @@ def solve_model(
             _root_is_convex = False
             _pure_continuous_force_spatial = True
             # Fall through to the spatial B&B below.
-        elif has_clearable_denominator(model):
+        elif has_clearable_denominator(model) and (
+            (cleared := factorable_reformulate(model, clear_only=True)) is not model
+        ):
             # (2) An ill-conditioned division whose denominator reaches toward
             # zero (like st_e17's 0.2458*x0**2/x1 with x1 down to 1e-5). If the
             # model has a sign-definite non-constant denominator — which the
@@ -12736,29 +12738,47 @@ def solve_model(
             # value-preserving) and fall back to the sound spatial B&B, which can
             # certify it. Only clearing is applied (no convexity-destroying
             # mixed-product lift).
-            cleared = factorable_reformulate(model, clear_only=True)
-            if cleared is not model:
-                logger.info(
-                    "Convex NLP did not certify (status=%s); clearing sign-definite "
-                    "denominator and retrying via spatial B&B",
-                    result.status,
-                )
-                model = cleared
-                _pure_continuous_is_convex = False
-                _root_is_convex = False
-                _root_constraint_mask = None  # stale: cleared constraint is nonconvex
-                try:
-                    from discopt._rust import model_to_repr
+            logger.info(
+                "Convex NLP did not certify (status=%s); clearing sign-definite "
+                "denominator and retrying via spatial B&B",
+                result.status,
+            )
+            model = cleared
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _root_constraint_mask = None  # stale: cleared constraint is nonconvex
+            try:
+                from discopt._rust import model_to_repr
 
-                    _model_repr = model_to_repr(model, getattr(model, "_builder", None))
-                except Exception:
-                    _model_repr = None
-                # Fall through to the spatial B&B below (rebuilt from `model`).
-            else:
-                return result
+                _model_repr = model_to_repr(model, getattr(model, "_builder", None))
+            except Exception:
+                _model_repr = None
+            # Fall through to the spatial B&B below (rebuilt from `model`).
+        elif result.status == "error" and result.x is None:
+            # (3) #1507: the single NLP failed outright and left no verified
+            # point. The typical cause on a convex model is Ipopt's code 2
+            # (``Infeasible_Problem_Detected``), which ``_IPOPT_STATUS_MAP`` maps
+            # to ``error`` because a local-infeasibility verdict is not itself a
+            # proof. Returning that bare ``error`` abandons the question; the
+            # spatial B&B's relaxation is a sound outer approximation that can
+            # prove infeasibility (an empty relaxation) or find and certify a
+            # point, so hand the model to it -- the same fall-through the
+            # convexity-unknown route takes on an NLP error (#266). The convex
+            # shortcut is dropped (``_root_is_convex = False``) so NLP-BB does
+            # not re-run the same failing NLP; only an extra sound search is
+            # added, never a verdict.
+            logger.info(
+                "Convex NLP failed (status=error) with no verified point; "
+                "retrying via spatial B&B for a sound verdict (issue #1507)"
+            )
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _pure_continuous_force_spatial = True
+            # Fall through to the spatial B&B below.
         else:
-            # Nothing clearable and the model is smooth: return the NLP result
-            # unchanged (no regression).
+            # Nothing clearable, the model is smooth, and the NLP left a verified
+            # point or stopped on a limit: return the NLP result unchanged (no
+            # regression).
             return result
 
     # --- Pure continuous: solve directly only when spatial search was not requested ---
