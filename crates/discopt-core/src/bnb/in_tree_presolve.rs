@@ -336,7 +336,12 @@ fn single_element_flat(spec: &IndexSpec, shape: &[usize]) -> Option<usize> {
             for e in elems {
                 match e {
                     IndexElem::Scalar(i) => v.push(*i),
-                    IndexElem::Slice { .. } => return None,
+                    // A newaxis makes the result array-shaped; an ellipsis is
+                    // resolved against the base rank elsewhere (#1516). Both
+                    // take the conservative array-reference (proxy) route.
+                    IndexElem::Slice { .. } | IndexElem::NewAxis | IndexElem::Ellipsis => {
+                        return None
+                    }
                 }
             }
             v

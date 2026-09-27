@@ -419,6 +419,8 @@ impl PyModelRepr {
                                 IndexElem::Slice { start, stop, step } => {
                                     parts.append(format_slice(*start, *stop, *step))?
                                 }
+                                IndexElem::NewAxis => parts.append(py.None())?,
+                                IndexElem::Ellipsis => parts.append(py.Ellipsis())?,
                             }
                         }
                         dict.set_item("index_spec", parts)?;
@@ -2217,7 +2219,21 @@ fn normalize_scalar_index(item: &Bound<'_, PyAny>, axis_len: Option<usize>) -> P
             "boolean index is not supported in an expression subscript",
         ));
     }
-    let raw: isize = item.extract()?;
+    // Only a Python/numpy integer is a scalar subscript. Anything else -- an
+    // integer or boolean array (numpy advanced indexing), a float, an
+    // expression -- has no `IndexSpec` form and is refused by name rather than
+    // with pyo3's bare integer-conversion error (#1516).
+    let raw: isize = item.extract().map_err(|_| {
+        let tname = item
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "unsupported index component of type '{tname}' in an expression subscript: \
+             only integers, slices, None (np.newaxis) and '...' are representable"
+        ))
+    })?;
     if raw >= 0 {
         return Ok(raw as usize);
     }
@@ -2235,48 +2251,100 @@ fn normalize_scalar_index(item: &Bound<'_, PyAny>, axis_len: Option<usize>) -> P
     Ok(shifted as usize)
 }
 
-/// Convert a Python index (int, slice, or tuple of ints/slices) to an
-/// IndexSpec.
+/// Convert a Python index (int, slice, `None`/`np.newaxis`, `...`, or a tuple
+/// of those) to an IndexSpec.
 ///
 /// `base_shape` is the shape of the expression being subscripted, used to turn
 /// Python's negative indices into the non-negative ones `IndexSpec` stores.
+///
+/// Every form numpy's *basic* indexing admits is represented exactly. Anything
+/// else (integer / boolean arrays -- numpy's advanced indexing -- floats,
+/// strings, expressions) is refused with a `TypeError` naming the offending
+/// component. Before #1516 a `None` reached `isize` extraction and failed with
+/// `'NoneType' object cannot be interpreted as an integer`, which every caller
+/// read as "no Rust repr for this model" -- so presolve and FBBT silently never
+/// ran on any collocation model with a control (`u[:, None]`).
 fn convert_index_spec(obj: &Bound<'_, PyAny>, base_shape: Option<&[usize]>) -> PyResult<IndexSpec> {
     let axis_len = |axis: usize| base_shape.and_then(|s| s.get(axis).copied());
-    if obj.is_instance_of::<PyTuple>() {
+    let is_tuple = obj.is_instance_of::<PyTuple>();
+    let items: Vec<Bound<'_, PyAny>> = if is_tuple {
         let tuple: &Bound<'_, PyTuple> = obj.downcast()?;
-        // If every element is a plain int, keep the simple Tuple form.
-        // Otherwise (any slice present), build a Multi spec.
-        let mut all_scalar = true;
-        for item in tuple.iter() {
-            if item.is_instance_of::<PySlice>() {
-                all_scalar = false;
-                break;
-            }
-        }
-        if all_scalar {
-            let indices: Vec<usize> = tuple
-                .iter()
-                .enumerate()
-                .map(|(axis, item)| normalize_scalar_index(&item, axis_len(axis)))
-                .collect::<PyResult<Vec<_>>>()?;
-            return Ok(IndexSpec::Tuple(indices));
-        }
-        let mut elems: Vec<IndexElem> = Vec::with_capacity(tuple.len());
-        for (axis, item) in tuple.iter().enumerate() {
-            if item.is_instance_of::<PySlice>() {
-                elems.push(slice_to_index_elem(&item)?);
-            } else {
-                elems.push(IndexElem::Scalar(normalize_scalar_index(
-                    &item,
-                    axis_len(axis),
-                )?));
-            }
-        }
-        Ok(IndexSpec::Multi(elems))
-    } else if obj.is_instance_of::<PySlice>() {
-        Ok(IndexSpec::Multi(vec![slice_to_index_elem(obj)?]))
+        tuple.iter().collect()
     } else {
-        Ok(IndexSpec::Scalar(normalize_scalar_index(obj, axis_len(0))?))
+        vec![obj.clone()]
+    };
+    let ellipsis = obj.py().Ellipsis();
+    let is_ellipsis = |item: &Bound<'_, PyAny>| item.is(&ellipsis);
+
+    if items.iter().filter(|it| is_ellipsis(it)).count() > 1 {
+        return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
+            "an index can only have a single ellipsis ('...')",
+        ));
+    }
+    // Elements that address a base axis: everything but `None` and `...`.
+    let n_base_addressing = items
+        .iter()
+        .filter(|it| !it.is_none() && !is_ellipsis(it))
+        .count();
+
+    let mut elems: Vec<IndexElem> = Vec::with_capacity(items.len());
+    let mut all_scalar = true;
+    // The BASE axis the next element addresses, used only to normalize a
+    // negative scalar. A `None` inserts an output axis and consumes none, so it
+    // must not use the element's position in the tuple (`x[None, -1]` indexes
+    // base axis 0). After a `...` the axis is known only when the base's rank
+    // is; otherwise `None`, and a negative index there is refused.
+    let mut base_axis: Option<usize> = Some(0);
+    for item in &items {
+        if item.is_none() {
+            elems.push(IndexElem::NewAxis);
+            all_scalar = false;
+        } else if is_ellipsis(item) {
+            // Kept symbolic: consumers resolve it against the base shape they
+            // hold, which the modelling layer does not always know here (a
+            // matmul's shape is untracked, and `h[..., 0]` squeezes one).
+            elems.push(IndexElem::Ellipsis);
+            base_axis = match (base_axis, base_shape) {
+                (Some(ax), Some(s)) => {
+                    let fill = s.len().checked_sub(n_base_addressing).ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
+                            "too many indices for an expression of rank {}",
+                            s.len()
+                        ))
+                    })?;
+                    Some(ax + fill)
+                }
+                _ => None,
+            };
+            all_scalar = false;
+        } else if item.is_instance_of::<PySlice>() {
+            elems.push(slice_to_index_elem(item)?);
+            base_axis = base_axis.map(|a| a + 1);
+            all_scalar = false;
+        } else {
+            elems.push(IndexElem::Scalar(normalize_scalar_index(
+                item,
+                base_axis.and_then(axis_len),
+            )?));
+            base_axis = base_axis.map(|a| a + 1);
+        }
+    }
+
+    if !all_scalar {
+        return Ok(IndexSpec::Multi(elems));
+    }
+    // Pure integer index: keep the simple Scalar / Tuple forms.
+    let ints: Vec<usize> = elems
+        .into_iter()
+        .map(|e| match e {
+            IndexElem::Scalar(i) => i,
+            _ => unreachable!("all_scalar"),
+        })
+        .collect();
+    if is_tuple {
+        Ok(IndexSpec::Tuple(ints))
+    } else {
+        Ok(IndexSpec::Scalar(ints[0]))
     }
 }
 

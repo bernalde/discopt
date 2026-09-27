@@ -12090,8 +12090,11 @@ def solve_model(
     except Exception as exc:  # noqa: BLE001 - the solve proceeds without Rust FBBT
         # Capability-disabling and high-value: no ``ModelRepr`` means no FBBT,
         # no root presolve and no in-tree propagation. A silent skip here is
-        # exactly how "presolve doesn't help" becomes a fake measurement.
-        logger.debug(
+        # exactly how "presolve doesn't help" becomes a fake measurement --
+        # and how every collocation model with a control ran without any of
+        # them for as long as `u[:, None]` was unconvertible (#1516). So it is a
+        # WARNING, not a debug line: the solve still proceeds, but visibly.
+        logger.warning(
             "Rust model repr unavailable — FBBT/presolve disabled: %s: %s",
             type(exc).__name__,
             exc,

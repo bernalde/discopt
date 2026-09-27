@@ -157,6 +157,23 @@ pub enum IndexElem {
         /// Stride. `None` means 1; must be non-zero.
         step: Option<isize>,
     },
+    /// numpy's `np.newaxis` / `None` (e.g. the `None` in `x[:, None]`): inserts
+    /// a length-1 axis into the result at this position and consumes **no**
+    /// axis of the base. It selects nothing, so the elements an index picks --
+    /// and their row-major order -- are exactly those of the same spec with every
+    /// `NewAxis` removed; only the result's shape differs (see
+    /// [`IndexSpec::base_elems`]). Collocation emits it for piecewise-constant
+    /// controls (`u[:, None]` broadcasting over collocation points); before it
+    /// existed the whole model failed to convert (#1516).
+    NewAxis,
+    /// numpy's `...` (`Ellipsis`): as many full slices as the base axes not
+    /// addressed by the other elements. Kept symbolic rather than expanded at
+    /// conversion because the base's rank is not always known there -- a
+    /// trainable network squeezes its output with `h[..., 0]` where `h` is a
+    /// matmul whose shape the modelling layer does not track (#1516). Every
+    /// consumer resolves it against the base shape it already holds, through
+    /// [`IndexSpec::base_elems`]. At most one per spec.
+    Ellipsis,
 }
 
 impl IndexElem {
@@ -178,6 +195,48 @@ pub enum IndexSpec {
     /// Mixed scalar/slice indexing: `x[i, :]`, `x[:, j]`, etc. The result is
     /// array-valued unless every element is `Scalar`.
     Multi(Vec<IndexElem>),
+}
+
+impl IndexSpec {
+    /// The elements of this spec as seen by a base of rank `rank`: one per base
+    /// axis the index addresses, in order, containing only `Scalar` and `Slice`.
+    ///
+    /// An [`IndexElem::Ellipsis`] is replaced by the full slices it stands for
+    /// and every [`IndexElem::NewAxis`] is dropped. Element *selection* (which
+    /// base elements, in which order) depends only on these: a `NewAxis` inserts
+    /// a length-1 output axis, which changes the result's shape but neither the
+    /// selected elements nor their row-major order. Every consumer that maps an
+    /// index to base positions must go through this, so a `NewAxis` is never
+    /// mistaken for a base axis and an `Ellipsis` never for one axis.
+    ///
+    /// Unindexed trailing axes are NOT padded here (callers differ in whether
+    /// they want them), and an arity above `rank` is returned as-is for the
+    /// caller to refuse.
+    pub fn base_elems(&self, rank: usize) -> Vec<IndexElem> {
+        match self {
+            IndexSpec::Scalar(i) => vec![IndexElem::Scalar(*i)],
+            IndexSpec::Tuple(v) => v.iter().map(|i| IndexElem::Scalar(*i)).collect(),
+            IndexSpec::Multi(v) => {
+                let addressed = v
+                    .iter()
+                    .filter(|e| matches!(e, IndexElem::Scalar(_) | IndexElem::Slice { .. }))
+                    .count();
+                let mut out = Vec::with_capacity(rank.max(addressed));
+                for e in v {
+                    match e {
+                        IndexElem::NewAxis => {}
+                        IndexElem::Ellipsis => {
+                            for _ in 0..rank.saturating_sub(addressed) {
+                                out.push(IndexElem::FULL);
+                            }
+                        }
+                        other => out.push(other.clone()),
+                    }
+                }
+                out
+            }
+        }
+    }
 }
 
 /// A single node in the expression DAG.
@@ -1772,12 +1831,16 @@ fn index_spec_to_flat(spec: &IndexSpec, shape: &[usize]) -> usize {
     match spec {
         IndexSpec::Scalar(i) => *i,
         IndexSpec::Tuple(indices) => tuple_to_flat(indices, shape),
-        IndexSpec::Multi(elems) => {
+        IndexSpec::Multi(_) => {
+            let elems = spec.base_elems(shape.len());
             let mut indices: Vec<usize> = Vec::with_capacity(elems.len());
-            for elem in elems {
+            for elem in &elems {
                 match elem {
                     IndexElem::Scalar(i) => indices.push(*i),
                     IndexElem::Slice { .. } => return 0,
+                    IndexElem::NewAxis | IndexElem::Ellipsis => {
+                        unreachable!("base_elems() resolves NewAxis and Ellipsis")
+                    }
                 }
             }
             tuple_to_flat(&indices, shape)
@@ -1803,7 +1866,18 @@ pub fn index_spec_collect_flat(spec: &IndexSpec, shape: &[usize]) -> Vec<usize> 
     match spec {
         IndexSpec::Scalar(i) => vec![*i],
         IndexSpec::Tuple(indices) => vec![tuple_to_flat(indices, shape)],
-        IndexSpec::Multi(elems) => {
+        IndexSpec::Multi(_) => {
+            // `base_elems` drops `NewAxis` and expands `Ellipsis`, so `axis`
+            // below is a BASE axis: a `NewAxis` selects nothing and must not
+            // shift the axis the following elements address (#1516).
+            let mut elems = spec.base_elems(shape.len());
+            // Unindexed trailing axes are kept whole, as numpy does (and as
+            // `expand::index_axes` does). Without the padding `tuple_to_flat`
+            // aligns the short index with the TRAILING axes and names the wrong
+            // elements -- `x[:, None]` on a 2-D base would read `x.flat[0..n]`.
+            while elems.len() < shape.len() {
+                elems.push(IndexElem::FULL);
+            }
             let mut out: Vec<Vec<usize>> = vec![Vec::new()];
             for (axis, elem) in elems.iter().enumerate() {
                 let dim = shape.get(axis).copied().unwrap_or(1);
@@ -1811,6 +1885,9 @@ pub fn index_spec_collect_flat(spec: &IndexSpec, shape: &[usize]) -> Vec<usize> 
                     IndexElem::Scalar(i) => vec![*i],
                     IndexElem::Slice { start, stop, step } => {
                         resolve_slice(*start, *stop, *step, dim)
+                    }
+                    IndexElem::NewAxis | IndexElem::Ellipsis => {
+                        unreachable!("base_elems() resolves NewAxis and Ellipsis")
                     }
                 };
                 let mut next: Vec<Vec<usize>> = Vec::with_capacity(out.len() * positions.len());
@@ -2737,6 +2814,66 @@ mod tests {
             index_spec_to_flat(&IndexSpec::Tuple(vec![1, 2]), &[3, 4]),
             6
         );
+    }
+
+    #[test]
+    fn test_newaxis_selects_like_numpy() {
+        // #1516: `x[:, None]` on x of shape (3,) selects x[0], x[1], x[2].
+        let spec = IndexSpec::Multi(vec![IndexElem::FULL, IndexElem::NewAxis]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3]), vec![0, 1, 2]);
+        // `y[:, 1, None]` on (3, 2): column 1 -> flat 1, 3, 5. A NewAxis must
+        // not shift the base axis the scalar addresses.
+        let spec = IndexSpec::Multi(vec![
+            IndexElem::FULL,
+            IndexElem::Scalar(1),
+            IndexElem::NewAxis,
+        ]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3, 2]), vec![1, 3, 5]);
+        // `y[None, 2]` on (3, 2): row 2 -> flat 4, 5 (trailing axis kept whole).
+        let spec = IndexSpec::Multi(vec![IndexElem::NewAxis, IndexElem::Scalar(2)]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3, 2]), vec![4, 5]);
+        // A scalar-only spec with a NewAxis still names one element.
+        let spec = IndexSpec::Multi(vec![
+            IndexElem::Scalar(2),
+            IndexElem::NewAxis,
+            IndexElem::Scalar(1),
+        ]);
+        assert_eq!(index_spec_to_flat(&spec, &[3, 2]), 5);
+    }
+
+    #[test]
+    fn test_ellipsis_selects_like_numpy() {
+        // #1516: `y[..., 1]` on (3, 2) is column 1 -> flat 1, 3, 5; the
+        // ellipsis spans the leading axis, not zero axes.
+        let spec = IndexSpec::Multi(vec![IndexElem::Ellipsis, IndexElem::Scalar(1)]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3, 2]), vec![1, 3, 5]);
+        // `y[2, ...]` -> row 2; `y[..., None]` -> every element, in order.
+        let spec = IndexSpec::Multi(vec![IndexElem::Scalar(2), IndexElem::Ellipsis]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3, 2]), vec![4, 5]);
+        let spec = IndexSpec::Multi(vec![IndexElem::Ellipsis, IndexElem::NewAxis]);
+        assert_eq!(
+            index_spec_collect_flat(&spec, &[3, 2]),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        // An ellipsis spanning zero axes leaves a pure scalar index.
+        let spec = IndexSpec::Multi(vec![
+            IndexElem::Scalar(1),
+            IndexElem::Ellipsis,
+            IndexElem::Scalar(0),
+        ]);
+        assert_eq!(index_spec_to_flat(&spec, &[3, 2]), 2);
+    }
+
+    #[test]
+    fn test_partial_multi_index_keeps_trailing_axes() {
+        // `y[:1]` on (3, 2) is row 0 -- both of its elements. Before the padding
+        // the short index aligned with the TRAILING axis and returned [0] only.
+        let spec = IndexSpec::Multi(vec![IndexElem::Slice {
+            start: None,
+            stop: Some(1),
+            step: None,
+        }]);
+        assert_eq!(index_spec_collect_flat(&spec, &[3, 2]), vec![0, 1]);
     }
 
     #[test]
