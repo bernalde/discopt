@@ -179,38 +179,30 @@ def probe_box(
 
     Notes
     -----
-    Reductions are applied at *block* granularity through the Rust in-tree
-    kernel (exact for scalar variables); the returned per-scalar bounds are
-    always intersected with the model's current bounds, so the result is a sound
-    subset of the input box regardless of block structure.
+    Reductions are applied PER SCALAR through the Rust in-tree kernel (#1513):
+    each element of an array variable is propagated and probed individually.
+    (Before #1513 this passed one hull interval per block, which lost every
+    per-element bound and -- with probing -- fixed a whole binary array block at
+    once, so ``z[0] + z[1] == 1`` over a binary ``z`` of shape ``(2,)`` was
+    reported infeasible.) The returned bounds are intersected with the model's
+    current bounds, so the result is a sound subset of the input box.
     """
     from discopt._rust import model_to_repr
 
     repr_ = model_to_repr(model, getattr(model, "_builder", None))
     n_blocks = repr_.n_var_blocks
-    shapes = repr_.var_shapes()
-    sizes = _block_sizes(shapes)
 
-    # Original per-scalar bounds, and a valid per-block outer seed (union of the
-    # block's scalar bounds — a sound outer interval for every element; the final
-    # intersect with the scalar originals restores per-element tightness).
     orig_lb: list[float] = []
     orig_ub: list[float] = []
-    block_seed_lb: list[float] = []
-    block_seed_ub: list[float] = []
     for i in range(n_blocks):
-        lbs = [float(v) for v in repr_.var_lb(i)]
-        ubs = [float(v) for v in repr_.var_ub(i)]
-        orig_lb.extend(lbs)
-        orig_ub.extend(ubs)
-        block_seed_lb.append(min(lbs) if lbs else -math.inf)
-        block_seed_ub.append(max(ubs) if ubs else math.inf)
+        orig_lb.extend(float(v) for v in repr_.var_lb(i))
+        orig_ub.extend(float(v) for v in repr_.var_ub(i))
     orig_lb_arr = np.asarray(orig_lb, dtype=np.float64)
     orig_ub_arr = np.asarray(orig_ub, dtype=np.float64)
 
     delta = repr_.in_tree_presolve(
-        np.asarray(block_seed_lb, dtype=np.float64),
-        np.asarray(block_seed_ub, dtype=np.float64),
+        orig_lb_arr,
+        orig_ub_arr,
         node_depth=0,
         depth_stride=1,
         max_iter=max_iter,
@@ -223,20 +215,8 @@ def probe_box(
     if delta["infeasible"]:
         return BoundTightening(lb=orig_lb_arr, ub=orig_ub_arr, infeasible=True, n_tightened=0)
 
-    block_lb = np.asarray(delta["lb"], dtype=np.float64)
-    block_ub = np.asarray(delta["ub"], dtype=np.float64)
-
-    new_lb = orig_lb_arr.copy()
-    new_ub = orig_ub_arr.copy()
-    offset = 0
-    for i in range(n_blocks):
-        size = sizes[i]
-        lo = block_lb[i] if i < len(block_lb) else -math.inf
-        hi = block_ub[i] if i < len(block_ub) else math.inf
-        sl = slice(offset, offset + size)
-        new_lb[sl] = np.maximum(new_lb[sl], lo)
-        new_ub[sl] = np.minimum(new_ub[sl], hi)
-        offset += size
+    new_lb = np.maximum(orig_lb_arr, np.asarray(delta["lb"], dtype=np.float64))
+    new_ub = np.minimum(orig_ub_arr, np.asarray(delta["ub"], dtype=np.float64))
 
     infeasible = bool(np.any(new_lb > new_ub + tol))
     tightened = int(np.count_nonzero((new_lb > orig_lb_arr + tol) | (new_ub < orig_ub_arr - tol)))

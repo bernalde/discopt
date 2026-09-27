@@ -955,7 +955,14 @@ impl PyModelRepr {
     /// Run persistent in-tree FBBT at a B&B node (item B3 of issue #51).
     ///
     /// `node_lb` / `node_ub` override the model's declared variable
-    /// bounds with the node's branched-on bounds. The pass is gated by
+    /// bounds with the node's branched-on bounds. They are PER SCALAR
+    /// variable (length `n_vars`, the flat B&B node box), not per block
+    /// (#1513): an array block's elements are propagated individually through a
+    /// per-scalar view of the model, so `x[i]` reads and tightens element `i`.
+    /// For a model whose blocks are all scalars the two layouts coincide and
+    /// the kernel is exactly the per-block one. A box of any other length, or a
+    /// repr whose variable layout is not contiguous, raises `ValueError`.
+    /// The pass is gated by
     /// `depth_stride`: it runs only when `node_depth % depth_stride == 0`,
     /// or skips and echoes the input bounds back unchanged. Setting
     /// `depth_stride = 0` disables the pass entirely.
@@ -997,14 +1004,7 @@ impl PyModelRepr {
         probing: bool,
         probe_max_vars: usize,
     ) -> PyResult<PyObject> {
-        use discopt_core::bnb::{run_in_tree_presolve, InTreePresolveOptions};
-        if node_lb.len() != self.inner.variables.len()
-            || node_ub.len() != self.inner.variables.len()
-        {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "node_lb/node_ub length must match number of variable blocks",
-            ));
-        }
+        use discopt_core::bnb::{run_in_tree_presolve_scalar, InTreePresolveOptions};
         let opts = InTreePresolveOptions {
             depth_stride,
             max_iter,
@@ -1012,14 +1012,17 @@ impl PyModelRepr {
             probing,
             probe_max_vars,
         };
-        let delta = run_in_tree_presolve(
+        // #1513: per-SCALAR box (length `n_vars`), the B&B node box as-is. A
+        // wrong length or an unscalarizable repr is a loud ValueError.
+        let delta = run_in_tree_presolve_scalar(
             &self.inner,
             &node_lb,
             &node_ub,
             node_depth,
             incumbent,
             &opts,
-        );
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("in_tree_presolve: {e}")))?;
         let out = PyDict::new(py);
         out.set_item(
             "lb",

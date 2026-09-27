@@ -2075,6 +2075,92 @@ def _in_tree_presolve_global_calls() -> int:
     return _IN_TREE_PRESOLVE_GLOBAL_CALLS
 
 
+# #1513: firings on the NLP-BB node loop (``_solve_nlp_bb``), and node boxes the
+# in-tree kernel was NOT run on, per reason. Before #1513 both loops skipped the
+# kernel for any model with an array variable (``shape=(n,)``) because the box is
+# per scalar and the kernel took one interval per block -- a ``continue`` with no
+# log at all, so no array model ever got in-tree FBBT and nothing said so. The
+# kernel now takes the per-scalar box; what remains skippable is counted here and
+# logged once per solve at WARNING (never at DEBUG). Reset with the global count.
+_IN_TREE_PRESOLVE_NLPBB_CALLS = 0
+_IN_TREE_PRESOLVE_SKIPPED: dict[str, int] = {}
+
+
+def _in_tree_presolve_nlpbb_calls() -> int:
+    """Firings of the in-tree presolve kernel on the NLP-BB node loop."""
+    return _IN_TREE_PRESOLVE_NLPBB_CALLS
+
+
+def _in_tree_presolve_skipped() -> dict[str, int]:
+    """Node boxes the in-tree kernel was not run on this solve, by reason."""
+    return dict(_IN_TREE_PRESOLVE_SKIPPED)
+
+
+def _in_tree_array_fbbt_enabled() -> bool:
+    """Whether in-tree FBBT runs on models with array variable blocks (#1513).
+
+    ``DISCOPT_IN_TREE_ARRAY_FBBT`` -- **graduated default ON** (#1513); ``=0``
+    restores the legacy skip, now counted and warned about instead of silent.
+
+    The in-tree kernel takes the per-scalar B&B node box and propagates each
+    array element individually (``run_in_tree_presolve_scalar`` over a
+    per-scalar view of the repr). On a model whose variable blocks are all
+    scalars the per-scalar and per-block layouts are the same vector and the
+    kernel is the per-block one by construction, so this flag changes nothing
+    there -- measured: the 66-instance in-repo ``.nl`` corpus (all scalar
+    blocks) is identical old tree vs new tree. It gates only models with an
+    array block, which before #1513 never ran the kernel at all -- bound-changing
+    on that class (CLAUDE.md §5).
+
+    §5 panel (16 array-variable models: dispersion n=3..6, the tutorial_minlp /
+    nlp_bb / problem_classes notebook models, dae/ collocation fits and control,
+    ml/ relu_bigm / full_space / reduced_space embeddings; deterministic, OFF/ON
+    interleaved per model). Cert-clean: no status or certification change, every
+    incumbent verified by ``warm_start.check_feasibility``, no bound past the
+    incumbent. Net-positive: nodes 2159->247 (disp3), 2639->311 (disp4),
+    147->29 (facility_sqrt), 31->23 (exp_facility, NLP-BB loop), 2071->2047
+    (ml_sigmoid_reduced); never more nodes on an uncapped run; total wall over
+    the panel 1035 s -> 830 s (single shot, host load 20-38 on 4 cores, so the
+    per-model wall of the node-capped runs is not a measurement).
+    """
+    return os.environ.get("DISCOPT_IN_TREE_ARRAY_FBBT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _in_tree_presolve_refusal(repr_, n_box: int) -> str | None:
+    """Why the in-tree kernel cannot take an ``n_box``-long node box, or None.
+
+    A node box is one interval per SCALAR variable; the kernel takes exactly
+    that (``repr_.n_vars`` entries). A repr whose scalar count differs from the
+    box (e.g. one carrying reformulation aux variables the node box does not
+    have) cannot be patched with the box, and says so.
+    """
+    n_scalar = int(repr_.n_vars)
+    if n_scalar != n_box:
+        return f"repr has {n_scalar} scalar variables but the node box has {n_box}"
+    if int(repr_.n_var_blocks) != n_scalar and not _in_tree_array_fbbt_enabled():
+        return "array variable blocks with DISCOPT_IN_TREE_ARRAY_FBBT=0"
+    return None
+
+
+def _note_in_tree_presolve_skip(reason: str, n_nodes: int, loop: str) -> None:
+    """Count ``n_nodes`` skipped boxes; WARN the first time a reason is seen."""
+    first = reason not in _IN_TREE_PRESOLVE_SKIPPED
+    _IN_TREE_PRESOLVE_SKIPPED[reason] = _IN_TREE_PRESOLVE_SKIPPED.get(reason, 0) + n_nodes
+    if first:
+        logger.warning(
+            "in-tree presolve (FBBT / branch-and-reduce) is NOT running on the %s node "
+            "loop: %s (#1513). The solve stays sound -- this is a missing reduction, "
+            "not a wrong bound.",
+            loop,
+            reason,
+        )
+
+
 # Root branch-and-reduce fixpoint (cert:T2.3) no-offtarget gate: skip the loop when
 # the relative gap between the root dual bound and the incumbent cutoff is at/below
 # this — an already-tight root has nothing to close, so running it would only add
@@ -11991,8 +12077,10 @@ def solve_model(
         )
 
     # --- Build Rust model representation for FBBT ---
-    global _IN_TREE_PRESOLVE_GLOBAL_CALLS
+    global _IN_TREE_PRESOLVE_GLOBAL_CALLS, _IN_TREE_PRESOLVE_NLPBB_CALLS
     _IN_TREE_PRESOLVE_GLOBAL_CALLS = 0  # PF1 telemetry reset (issue #632)
+    _IN_TREE_PRESOLVE_NLPBB_CALLS = 0  # #1513
+    _IN_TREE_PRESOLVE_SKIPPED.clear()  # #1513
     _model_repr = None
     try:
         from discopt._rust import model_to_repr
@@ -15414,13 +15502,12 @@ def solve_model(
         # applied as an INTERSECTION with the current box (``run_in_tree_presolve``
         # never loosens); a proven-empty box fathoms the node. A reduced box thus
         # always still contains the entire feasible region — no feasible point,
-        # and never the optimum, is ever excluded. Best-effort: silently skipped
-        # when the repr's block count doesn't match the node box (e.g. a
-        # polynomial-reformulated repr with extra aux vars) — the intersect-only
-        # floor keeps it sound even then.
+        # and never the optimum, is ever excluded. The kernel takes the node box
+        # as-is -- one interval per SCALAR (#1513); a box it cannot take is
+        # counted and warned about (``_note_in_tree_presolve_skip``), not skipped
+        # silently as it was before #1513 for every model with an array variable.
         if in_tree_presolve_stride and _model_repr is not None:
             try:
-                _itp_n_blocks = _model_repr.n_var_blocks
                 _itp_probing = _node_probing_enabled()
                 _itp_probe_max = _node_probe_max_vars()
                 _itp_inc = tree.incumbent()
@@ -15450,7 +15537,9 @@ def solve_model(
                 for i in range(n_batch):
                     if node_infeasible_mask[i]:
                         continue
-                    if len(batch_lb[i]) != _itp_n_blocks:
+                    _itp_refusal = _in_tree_presolve_refusal(_model_repr, len(batch_lb[i]))
+                    if _itp_refusal is not None:
+                        _note_in_tree_presolve_skip(_itp_refusal, 1, "global spatial")
                         continue
                     _itp_delta = _model_repr.in_tree_presolve(
                         np.asarray(batch_lb[i], dtype=np.float64),
@@ -20591,12 +20680,11 @@ def _solve_nlp_bb(
                 batch_ub[i] = t_ub.tolist()
 
         # B3: persistent in-tree FBBT via the Rust kernel, gated by
-        # depth-stride. Best-effort — silently skipped if shape doesn't
-        # match (models with array variable blocks aren't supported by
-        # the kernel yet).
+        # depth-stride. The kernel takes the node box as-is -- one interval per
+        # SCALAR (#1513), so array-variable models run it too; a box it cannot
+        # take is counted and warned about, never skipped silently.
         if in_tree_presolve_stride and in_tree_presolve_repr is not None:
             try:
-                n_blocks = in_tree_presolve_repr.n_var_blocks
                 # P3 branch-and-reduce: enable per-node probing (default OFF) and
                 # feed the current incumbent as a cutoff so both the in-tree FBBT
                 # and the probing pass are optimality-aware. The incumbent value
@@ -20624,7 +20712,11 @@ def _solve_nlp_bb(
                 # (fires everywhere either way); it only matters for stride > 1.
                 _itp_depths = tree.node_depths(np.asarray(batch_ids, dtype=np.int64))
                 for i in range(n_batch):
-                    if len(batch_lb[i]) != n_blocks:
+                    _itp_refusal = _in_tree_presolve_refusal(
+                        in_tree_presolve_repr, len(batch_lb[i])
+                    )
+                    if _itp_refusal is not None:
+                        _note_in_tree_presolve_skip(_itp_refusal, 1, "NLP-BB")
                         continue
                     delta = in_tree_presolve_repr.in_tree_presolve(
                         np.asarray(batch_lb[i], dtype=np.float64),
@@ -20635,6 +20727,9 @@ def _solve_nlp_bb(
                         probing=_itp_probing,
                         probe_max_vars=_itp_probe_max,
                     )
+                    if delta["ran"]:
+                        global _IN_TREE_PRESOLVE_NLPBB_CALLS
+                        _IN_TREE_PRESOLVE_NLPBB_CALLS += 1
                     if delta["ran"] and delta["infeasible"]:
                         # Rigorous fathom: the node box is empty (FBBT/probing
                         # proof). Mark infeasible so the node is pruned soundly.
