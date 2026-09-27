@@ -58,16 +58,20 @@ _TOL_ABS = 1e-6
 DISP_OPT = {2: 2.0, 3: 8.0 - 4.0 * math.sqrt(3.0), 4: 1.0, 5: 0.5, 6: 13.0 / 36.0}
 
 
-def _dispersion(n: int):
+def _dispersion(n: int, arrays: bool = False):
+    """``disp<n>`` builds the points from scalars, ``adisp<n>`` from shape-(n,)
+    arrays. Both forms are kept: before #1513 the array form never ran in-tree
+    FBBT (disp4: 0 in-tree calls, 2639 nodes vs 255 / 311 as scalars), so the two
+    must agree now that it does."""
     import discopt.modeling as dm
 
-    m = dm.Model(f"disp{n}")
-    # Scalar variables on purpose: the Python spatial loop skips in-tree FBBT for
-    # any node box whose length differs from the repr's block count, so a model
-    # built from shape-(n,) arrays never runs in-tree FBBT at all (measured on
-    # disp4: 0 in-tree calls, 2639 nodes, vs 255 calls / 311 nodes as scalars).
-    x = [m.continuous(f"x{i}", lb=0.0, ub=1.0) for i in range(n)]
-    y = [m.continuous(f"y{i}", lb=0.0, ub=1.0) for i in range(n)]
+    m = dm.Model(f"{'a' if arrays else ''}disp{n}")
+    if arrays:
+        x = m.continuous("x", shape=(n,), lb=0.0, ub=1.0)
+        y = m.continuous("y", shape=(n,), lb=0.0, ub=1.0)
+    else:
+        x = [m.continuous(f"x{i}", lb=0.0, ub=1.0) for i in range(n)]
+        y = [m.continuous(f"y{i}", lb=0.0, ub=1.0) for i in range(n)]
     t = m.continuous("t", lb=0.0, ub=2.0)
     for i in range(n):
         for j in range(i + 1, n):
@@ -80,8 +84,9 @@ def _load(name: str):
     import discopt.modeling as dm
 
     # Exact match: the corpus has ``dispatch``, which a prefix test would take.
-    if re.fullmatch(r"disp\d+", name):
-        return _dispersion(int(name[4:]))
+    hit = re.fullmatch(r"(a?)disp(\d+)", name)
+    if hit:
+        return _dispersion(int(hit.group(2)), arrays=bool(hit.group(1)))
     return dm.from_nl(str(_NL_DIR / f"{name}.nl"))
 
 
@@ -151,7 +156,7 @@ def main() -> int:
         return 0
 
     optima = json.loads(_OPTIMA.read_text()) if _OPTIMA.exists() else {}
-    optima.update({f"disp{n}": v for n, v in DISP_OPT.items()})
+    optima.update({f"{p}disp{n}": v for n, v in DISP_OPT.items() for p in ("", "a")})
     sets = set(args.set.split(","))
     if args.instances:
         names = [s.strip() for s in args.instances.split(",") if s.strip()]
@@ -159,6 +164,7 @@ def main() -> int:
         names = []
         if "disp" in sets:
             names += [f"disp{n}" for n in sorted(DISP_OPT)]
+            names += [f"adisp{n}" for n in sorted(DISP_OPT)]
         if "corpus" in sets:
             names += sorted(p.stem for p in _NL_DIR.glob("*.nl"))
 
