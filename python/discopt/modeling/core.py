@@ -8685,6 +8685,10 @@ class Model:
                     # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was
                     # shown to be invalid, and the dual bound remains rigorous.
                     result.status = "error"
+                    result.error = (
+                        "the incumbent the solver returned is infeasible in the original "
+                        "model (false-primal guard, #772); it was withheld"
+                    )
             except Exception as _ver_exc:
                 # A swallowed exception here does not "skip verification" -- it
                 # DELETES the soundness guard while leaving every caller believing
@@ -8742,6 +8746,20 @@ class Model:
             except Exception:
                 result.validation_report = None
 
+        # --- #1493: an ``error`` status always says what failed ---------------- #
+        # ``error`` is documented as "why this solve failed", yet only
+        # ``solve_batch`` ever set it, so every in-process ``status="error"``
+        # arrived with ``error=None`` and the caller could not tell a backend
+        # failure from a withheld incumbent from a crashed relaxation. Routes that
+        # know their cause now record it at the source (the single-NLP route, the
+        # false-primal guard above); this is the backstop for every other route, so
+        # the invariant holds for all of them rather than for the ones audited.
+        if isinstance(result, SolveResult) and result.status == "error" and not result.error:
+            result.error = (
+                "the solve route ended with status='error' without recording a cause; "
+                "the discopt.solver log for this solve has the details"
+            )
+
         # --- No dual bound at all: say so (#1256) ---------------------------- #
         # A solve that produces no valid relaxation bound returns ``bound=None``
         # and, absent this, says nothing else: the only trace was a
@@ -8753,7 +8771,18 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
-        if (
+        if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
+            # #1507: the envelope/epigraph advice below describes a relaxation that
+            # could not bound the objective. On a failed solve that diagnosis is a
+            # guess, and it was wrong on the linear-objective convex QCP #1507
+            # reported; say what is actually known instead.
+            _logging.getLogger("discopt.solver").warning(
+                "No valid dual bound was produced for model %r: the solve failed "
+                "(status=error: %s). The result cannot be certified globally optimal.",
+                self.name,
+                result.error,
+            )
+        elif (
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")

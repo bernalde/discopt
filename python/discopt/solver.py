@@ -19604,6 +19604,20 @@ def _solve_continuous(
     else:
         status = nlp_result.status.value
 
+    # #1493: ``SolveStatus.ERROR`` is where several distinct backend failures
+    # collapse (Ipopt's local-infeasibility code 2, restoration failure, diverging
+    # iterates, ...). A ``status="error"`` result with ``error=None`` gave the caller
+    # no way to tell which, so name the backend's own return code here, at the one
+    # place it is known.
+    _error_reason: Optional[str] = None
+    if status == "error":
+        from discopt.solvers.nlp_ipopt import describe_ipopt_return_code
+
+        _error_reason = (
+            f"single NLP solve ({nlp_solver}) terminated without a solution: "
+            f"{describe_ipopt_return_code(nlp_result.raw_status)}"
+        )
+
     x_dict = _unpack_solution(model, nlp_result.x) if nlp_result.x is not None else None
 
     # Negate objective back for maximization (NLPEvaluator solves minimization of -f)
@@ -19772,6 +19786,30 @@ def _solve_continuous(
             # An unverified point can never be reported as a proven optimum.
             if status == "optimal":
                 status = "unknown"
+            if _error_reason is not None:
+                _error_reason += "; its final iterate failed the feasibility screen"
+
+    # #1493: an NLP failure that nevertheless left a point which PASSED the
+    # false-primal screen above is not an error in the caller's terms -- it is a
+    # feasible incumbent without an optimality proof, which is exactly
+    # ``status="feasible"`` with no bound (``discopt.status`` state 3). Reporting it
+    # as ``"error"`` beside a feasible ``x`` (and ``error=None``) contradicted the
+    # point it returned: ``min norm(v, inf)`` s.t. ``v0 + v1 >= 1`` came back
+    # ``error`` at the feasible (0.545, 0.545). Only on the convexity-certified
+    # route: the convexity-unknown caller (#266) reads ``"error"`` as its cue to fall
+    # back to the spatial B&B, and that caller never surfaces this result.
+    # Downgrade-only in what it claims: no bound, no certificate.
+    if certify_convex and status == "error" and x_dict is not None:
+        logger.info(
+            "Convex single NLP failed (%s) but left a feasible point; reporting it "
+            "as an uncertified feasible incumbent (issue #1493).",
+            _error_reason,
+        )
+        status = "feasible"
+        _gap_certified = False
+        _c_bound = None
+        _c_gap = None
+        _error_reason = None
 
     # #1315: name the provenance of the bound this path reports. Under
     # ``certify_convex`` a local minimum of a PROVED-convex model is the global
@@ -19812,6 +19850,7 @@ def _solve_continuous(
         root_time=wall_time,
         gap_certified=_gap_certified,
         kkt=nlp_result.kkt,
+        error=_error_reason if status == "error" else None,
     )
 
 

@@ -2200,8 +2200,19 @@ def _emit_secant_only(ctx, w, lt, lo, hi, f, sign) -> bool:
 def _pow_curv(p: float, lo: float, hi: float) -> Optional[str]:
     """Sound curvature of ``t**p`` on ``[lo,hi]`` (``f'' = p(p-1) t^(p-2)``)."""
     is_int = float(p).is_integer()
-    if is_int and int(p) % 2 == 0:
-        return "convex"  # even integer power: convex on all of R
+    if is_int and int(p) % 2 == 0 and p > 0.0:
+        return "convex"  # even POSITIVE integer power: convex on all of R
+    # #1493: a NEGATIVE even power (``t**-2``, ``t**-4``) is convex on each open
+    # half-line but has a pole at ``t = 0``, so it is convex on no interval that
+    # contains 0 -- it is not even finite there. Reading it as "convex on all of R"
+    # (the branch above, which used to admit every even integer) emitted the secant
+    # ``w <= f(hi)`` between the two finite endpoint values and the endpoint
+    # tangents as global underestimators; on ``[-3, 3]`` that is ``w <= 1/9``, which
+    # cuts off every point of ``x**-2 == 4`` and made the root LP report the
+    # feasible model infeasible. A box touching or straddling the pole has no
+    # curvature verdict; the aux keeps only its (sound) interval enclosure.
+    if p < 0.0 and lo <= 0.0 <= hi:
+        return None
     # Sign-definite box required otherwise (the only curvature change is at t=0,
     # and non-integer p needs t>=0 anyway).
     if lo < 0.0 < hi:
