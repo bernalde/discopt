@@ -32,6 +32,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+# SymPy-free (discopt.symbolic defers its SymPy import), so importing the refusal
+# type here keeps the recognizer's module import SymPy-free (OVERHEAD-1).
+import numpy as np
+
+from discopt.symbolic import SymbolicTranslationError
+
 if TYPE_CHECKING:
     import sympy as sp
 
@@ -129,7 +135,11 @@ def _to_sympy(node, syms: dict):
     from discopt.modeling import core
 
     if isinstance(node, core.Constant):
-        return sp.Float(float(node.value))
+        if np.ndim(node.value) != 0 and np.size(node.value) != 1:
+            # #1514: an array-valued constant has no scalar SymPy image; ``float()``
+            # raised a bare TypeError for it.
+            raise SymbolicTranslationError("cut recognizer: array-valued constant")
+        return sp.Float(float(np.asarray(node.value).reshape(-1)[0]))
     if isinstance(node, (core.Variable, core.IndexExpression)):
         key = _var_key(node)
         if key is None:
@@ -148,14 +158,27 @@ def _to_sympy(node, syms: dict):
             if hi.is_number and float(hi) == int(float(hi)):
                 hi = sp.Integer(int(float(hi)))
             return lo**hi
+        if node.op not in ("+", "-", "*", "/"):
+            raise SymbolicTranslationError(f"cut recognizer: binary op {node.op!r}")
         return {"+": lo + hi, "-": lo - hi, "*": lo * hi, "/": lo / hi}[node.op]
     if isinstance(node, core.UnaryOp):
         x = _to_sympy(node.operand, syms)
-        return {"neg": -x, "abs": sp.Abs(x)}[node.op]
+        if node.op == "neg":
+            return -x
+        if node.op == "abs":
+            return sp.Abs(x)
+        raise SymbolicTranslationError(f"cut recognizer: unary op {node.op!r}")
     if isinstance(node, core.FunctionCall):
         args = [_to_sympy(a, syms) for a in node.args]
-        return getattr(sp, node.func_name)(*args)
-    raise TypeError(f"unsupported node {type(node).__name__}")
+        fn = getattr(sp, node.func_name, None)
+        if fn is None:
+            raise SymbolicTranslationError(f"cut recognizer: function {node.func_name!r}")
+        return fn(*args)
+    # #1514: the documented "this model is outside the recognizer" signal. It used to
+    # be a bare TypeError (and a KeyError/AttributeError for an op or function the
+    # tables above do not name), which the solver could only absorb with a catch-all
+    # that also hid real defects; a dedicated type lets the solver catch exactly this.
+    raise SymbolicTranslationError(f"cut recognizer: node type {type(node).__name__}")
 
 
 @dataclass
@@ -178,6 +201,10 @@ def model_to_sympy(model) -> SympyModel:
     eqs = []
     ineqs = []
     for c in model._constraints:
+        if not isinstance(c, core.Constraint):
+            # #1514: a non-algebraic row the recognizer cannot reason about; its
+            # documented decline (formerly an AttributeError on ``c.sense``).
+            raise SymbolicTranslationError(f"cut recognizer: non-algebraic row {type(c).__name__}")
         if c.sense == "==":
             eqs.append((c.name, sp.Eq(_to_sympy(c.body, syms), sp.Float(c.rhs))))
         elif c.sense == "<=":
@@ -235,11 +262,19 @@ def model_to_sympy(model) -> SympyModel:
 
 def _linear_terms(expr: sp.Expr):
     """Return (coeff_dict, const) for an affine ``expr``, or None if nonlinear."""
-    poly = (
-        sp.Poly(sp.expand(expr), *sorted(expr.free_symbols, key=str)) if expr.free_symbols else None
-    )
-    if poly is None:
+    if not expr.free_symbols:
         return ({}, float(expr))
+    try:
+        poly = sp.Poly(sp.expand(expr), *sorted(expr.free_symbols, key=str))
+    except sp.PolynomialError as exc:
+        # #1514: ``sp.Poly`` raises on a NON-polynomial body (``sqrt``, ``exp``, ...),
+        # e.g. nvs01's ``sqrt(x0**2 + 900)`` equality. That used to escape as an
+        # untyped SymPy error which the solver's catch-all read as "recognizer
+        # skipped". It is now the recognizer's documented decline, so the model is
+        # declined exactly as before; treating such a row as merely "nonlinear" and
+        # carrying on would let the recognizer inject cuts it never injected --
+        # a bound-changing capability, not part of this fix.
+        raise SymbolicTranslationError(f"cut recognizer: non-polynomial row {expr}") from exc
     if poly.total_degree() > 1:
         return None
     coeffs = {}
@@ -446,8 +481,11 @@ def has_square_difference_candidate(model) -> bool:
     match, so we can skip the ~1 s ``model_to_sympy`` translation of a dense
     objective entirely. This is a microsecond native-DAG scan, not a SymPy build.
     """
+    # #1514: ``getattr`` -- a disjunctive / logical / SOS row has no ``sense`` or
+    # ``body``, and reading them raised AttributeError on every such model.
     return any(
-        c.sense == "==" and _expr_is_nonlinear(c.body) for c in getattr(model, "_constraints", [])
+        getattr(c, "sense", None) == "==" and _expr_is_nonlinear(c.body)
+        for c in getattr(model, "_constraints", [])
     )
 
 
@@ -587,8 +625,17 @@ def _handle_map(model) -> dict:
         if size == 1:
             handles[v.name] = v
         else:
-            for i in range(size):
-                handles[f"{v.name}[{i}]"] = v[i]
+            try:
+                for i in range(size):
+                    handles[f"{v.name}[{i}]"] = v[i]
+            except IndexError as exc:
+                # #1514: ``v[i]`` on an N-D variable indexes the first axis, so it
+                # runs out of range before ``size``. ``_var_key`` refuses N-D
+                # references, so no cut can name one; this is the recognizer's
+                # decline (the IndexError used to be swallowed as "no cuts").
+                raise SymbolicTranslationError(
+                    f"cut recognizer: cannot map N-D variable {v.name!r}"
+                ) from exc
     return handles
 
 
@@ -601,6 +648,8 @@ def inject_cuts(model, cuts, *, samples=(8, 15, 25, 35, 45, 55, 65, 72)) -> int:
     unchanged (``u == term``), but its relaxation is bounded below by the convex
     ``K*h(w)`` — closing the gap.
     """
+    if not cuts:
+        return 0
     handles = _handle_map(model)
     obj = model._objective.expression
     applied = 0

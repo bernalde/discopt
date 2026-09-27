@@ -512,40 +512,6 @@ impl PyTreeManager {
         Ok(())
     }
 
-    /// Enable #1493 pole branching (`DISCOPT_POLE_BRANCHING`, default off): an
-    /// untrusted (non-finite-bound) nonconvex node with no integer branch
-    /// direction is split spatially instead of being fathomed
-    /// `bound_unresolved`, up to a depth/width cap.
-    fn set_pole_branching(&mut self, on: bool) {
-        self.inner.set_pole_branching(on);
-    }
-
-    /// Branch point for an untrusted node's pole split (#1493): split column
-    /// `var_index` at `value`. One-shot, expires after the next
-    /// `process_evaluated`; ignored unless `value` is strictly inside the
-    /// node's range for a continuous column.
-    fn set_spatial_branch_hint(
-        &mut self,
-        node_id: i64,
-        var_index: i64,
-        value: f64,
-    ) -> PyResult<()> {
-        if node_id < 0 || var_index < 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "set_spatial_branch_hint: negative id (node {node_id}, var {var_index})"
-            )));
-        }
-        self.inner
-            .set_spatial_branch_hint(NodeId(node_id as usize), var_index as usize, value);
-        Ok(())
-    }
-
-    /// `(pole_branches, pole_capped)` counters (#1493): pole splits made, and
-    /// untrusted nodes that took the legacy unresolved fathom with the flag on.
-    fn pole_counters(&self) -> (usize, usize) {
-        self.inner.pole_counters()
-    }
-
     /// Register continuous SOS1-selector columns for spatial branch precedence
     /// (issue #196, `DISCOPT_SOS1_SELECTOR_BRANCH`). Empty (the default) keeps the
     /// legacy branch path byte-identical. Out-of-range indices are ignored.

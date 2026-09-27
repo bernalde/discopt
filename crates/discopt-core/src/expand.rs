@@ -218,11 +218,10 @@ fn index_axes(
     spec: &IndexSpec,
     base_shape: &[usize],
 ) -> Result<Vec<(Vec<usize>, bool)>, ExpandError> {
-    let elems: Vec<IndexElem> = match spec {
-        IndexSpec::Scalar(i) => vec![IndexElem::Scalar(*i)],
-        IndexSpec::Tuple(v) => v.iter().map(|i| IndexElem::Scalar(*i)).collect(),
-        IndexSpec::Multi(v) => v.clone(),
-    };
+    // `NewAxis` consumes no base axis and selects nothing, so selection runs on
+    // the base-addressing elements only; `index_result_shape` puts the inserted
+    // length-1 axes back (#1516).
+    let elems: Vec<IndexElem> = spec.base_elems(base_shape.len());
     if elems.len() > base_shape.len() {
         return err(format!(
             "index of arity {} into a shape of rank {}",
@@ -244,11 +243,64 @@ fn index_axes(
             Some(IndexElem::Slice { start, stop, step }) => {
                 axes.push((slice_indices(*start, *stop, *step, *dim)?, false));
             }
+            Some(IndexElem::NewAxis | IndexElem::Ellipsis) => {
+                unreachable!("base_elems() resolves NewAxis and Ellipsis")
+            }
             // Unindexed trailing axes are kept whole, as numpy does.
             None => axes.push(((0..*dim).collect(), false)),
         }
     }
     Ok(axes)
+}
+
+/// Numpy result shape of indexing `base_shape` with `spec` (basic indexing).
+///
+/// In index order: a scalar drops its base axis, a slice keeps it at the
+/// slice's length, a `NewAxis` inserts a length-1 axis without consuming a base
+/// axis; unindexed trailing base axes follow, whole. Because a `NewAxis` only
+/// inserts length-1 axes, the element count and row-major element order equal
+/// those of the kept base axes -- which is why the Index emission in
+/// [`expand_node`] can enumerate `index_axes` and ignore `NewAxis` entirely.
+fn index_result_shape(spec: &IndexSpec, base_shape: &[usize]) -> Result<Vec<usize>, ExpandError> {
+    let axes = index_axes(spec, base_shape)?;
+    let elems: Vec<IndexElem> = match spec {
+        IndexSpec::Multi(v) => v.clone(),
+        _ => spec.base_elems(base_shape.len()),
+    };
+    let n_ellipsis = elems
+        .iter()
+        .filter(|e| matches!(e, IndexElem::Ellipsis))
+        .count();
+    if n_ellipsis > 1 {
+        return err("an index can only have a single ellipsis");
+    }
+    let addressed = elems
+        .iter()
+        .filter(|e| matches!(e, IndexElem::Scalar(_) | IndexElem::Slice { .. }))
+        .count();
+    let mut out: Vec<usize> = Vec::with_capacity(axes.len() + elems.len());
+    let mut base_axis = 0usize;
+    for e in &elems {
+        match e {
+            IndexElem::NewAxis => out.push(1),
+            IndexElem::Ellipsis => {
+                // The axes it spans are kept whole, in place.
+                for _ in 0..base_shape.len().saturating_sub(addressed) {
+                    out.push(axes[base_axis].0.len());
+                    base_axis += 1;
+                }
+            }
+            IndexElem::Scalar(_) => base_axis += 1,
+            IndexElem::Slice { .. } => {
+                out.push(axes[base_axis].0.len());
+                base_axis += 1;
+            }
+        }
+    }
+    for (sel, _) in &axes[base_axis..] {
+        out.push(sel.len());
+    }
+    Ok(out)
 }
 
 /// Static shape of every arena node, computed in one forward pass.
@@ -305,13 +357,7 @@ pub(crate) fn shapes_of(arena: &ExprArena) -> Result<Vec<Vec<usize>>, ExpandErro
                     acc
                 }
             },
-            ExprNode::Index { base, index } => {
-                let axes = index_axes(index, &shapes[base.0])?;
-                axes.iter()
-                    .filter(|(_, dropped)| !dropped)
-                    .map(|(sel, _)| sel.len())
-                    .collect()
-            }
+            ExprNode::Index { base, index } => index_result_shape(index, &shapes[base.0])?,
             ExprNode::MatMul { left, right } => matmul_shape(&shapes[left.0], &shapes[right.0])?,
             ExprNode::Sum { operand, axis } => match axis {
                 None => Vec::new(),
@@ -743,4 +789,128 @@ fn expand_node(
     }
     slots[i] = out;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape_of(spec: IndexSpec, base: &[usize]) -> Vec<usize> {
+        index_result_shape(&spec, base).expect("index is valid")
+    }
+
+    #[test]
+    fn newaxis_result_shapes_match_numpy() {
+        // #1516. Each case is numpy's `np.empty(base)[index].shape`.
+        let full = IndexElem::FULL;
+        // x[:, None], x.shape == (3,)  -> (3, 1)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![full.clone(), IndexElem::NewAxis]),
+                &[3]
+            ),
+            vec![3, 1]
+        );
+        // y[:, 1, None], y.shape == (3, 2) -> (3, 1)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![full.clone(), IndexElem::Scalar(1), IndexElem::NewAxis]),
+                &[3, 2]
+            ),
+            vec![3, 1]
+        );
+        // y[None, 2] -> (1, 2): the unindexed trailing axis follows the new one.
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![IndexElem::NewAxis, IndexElem::Scalar(2)]),
+                &[3, 2]
+            ),
+            vec![1, 2]
+        );
+        // y[:, None] -> (3, 1, 2)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![full.clone(), IndexElem::NewAxis]),
+                &[3, 2]
+            ),
+            vec![3, 1, 2]
+        );
+        // y[None, None] -> (1, 1, 3, 2)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![IndexElem::NewAxis, IndexElem::NewAxis]),
+                &[3, 2]
+            ),
+            vec![1, 1, 3, 2]
+        );
+        // Plain forms are unchanged: y[1] -> (2,), y[1, 0] -> ().
+        assert_eq!(shape_of(IndexSpec::Scalar(1), &[3, 2]), vec![2]);
+        assert_eq!(
+            shape_of(IndexSpec::Tuple(vec![1, 0]), &[3, 2]),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn ellipsis_result_shapes_match_numpy() {
+        // #1516: numpy's `np.empty(base)[index].shape`.
+        let e = IndexElem::Ellipsis;
+        // y[..., 0] -> (3,)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![e.clone(), IndexElem::Scalar(0)]),
+                &[3, 2]
+            ),
+            vec![3]
+        );
+        // y[..., None] -> (3, 2, 1)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![e.clone(), IndexElem::NewAxis]),
+                &[3, 2]
+            ),
+            vec![3, 2, 1]
+        );
+        // y[None, ..., 1] -> (1, 3)
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![IndexElem::NewAxis, e.clone(), IndexElem::Scalar(1)]),
+                &[3, 2]
+            ),
+            vec![1, 3]
+        );
+        // z[1, ..., 0] on (4, 3, 2) -> (3,); x[...] on a scalar -> ()
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![IndexElem::Scalar(1), e.clone(), IndexElem::Scalar(0)]),
+                &[4, 3, 2]
+            ),
+            vec![3]
+        );
+        assert_eq!(
+            shape_of(IndexSpec::Multi(vec![e.clone()]), &[]),
+            Vec::<usize>::new()
+        );
+        // x[..., None] on a scalar -> (1,) (`_with_trailing_axis` on a scalar)
+        assert_eq!(
+            shape_of(IndexSpec::Multi(vec![e.clone(), IndexElem::NewAxis]), &[]),
+            vec![1]
+        );
+        // Two ellipses are refused, as numpy does.
+        assert!(index_result_shape(&IndexSpec::Multi(vec![e.clone(), e]), &[3, 2]).is_err());
+    }
+
+    #[test]
+    fn newaxis_does_not_count_toward_index_arity() {
+        // x[0, None] on a 1-D base is valid numpy (shape (1,)); two SCALARS
+        // into a 1-D base are not.
+        assert_eq!(
+            shape_of(
+                IndexSpec::Multi(vec![IndexElem::Scalar(0), IndexElem::NewAxis]),
+                &[3]
+            ),
+            vec![1]
+        );
+        assert!(index_result_shape(&IndexSpec::Tuple(vec![0, 0]), &[3]).is_err());
+    }
 }
