@@ -242,6 +242,16 @@ def _try_direct_nlp(
     )
     if fallback is not None:
         return None, fallback
+    if solver_module._model_contains_nonsmooth_node(model):
+        # #1501: a single smooth NLP solve is not a certificate on an abs/min/max
+        # kink even when the model is convex; the default route declines the same
+        # way (#1297). Fall through to the method's own driver.
+        return None, _direct_attempt(
+            problem_class=problem_class,
+            candidate_strategy=strategy,
+            backend=nlp_solver,
+            fallback_reason="nonsmooth_model",
+        )
     result = solver_module._solve_continuous(
         model,
         time_limit,
@@ -249,6 +259,11 @@ def _try_direct_nlp(
         time.perf_counter(),
         nlp_solver,
         initial_point=initial_point,
+        # #1501: the model was just proved convex, so ask for the same unscaled
+        # KKT certificate gate (#849) the default convex fast path applies.
+        # Without it a solver-reported "optimal" became a certified bound with no
+        # stationarity check at all.
+        certify_convex=True,
     )
     result.convex_fast_path = True
     return (
@@ -284,12 +299,10 @@ def _try_direct_lp(
     elif backend == "simplex":
         result = None
     else:
-        result = solver_module._solve_lp(
-            model,
-            t_start,
-            time_limit,
-            prefer_pounce=nlp_solver == "pounce",
-        )
+        # ``_solve_lp`` no longer takes ``prefer_pounce`` (its engine order is
+        # fixed: simplex, then POUNCE); passing it raised TypeError on every LP
+        # under the SHOT profile (found while fixing #1501).
+        result = solver_module._solve_lp(model, t_start, time_limit)
     if isinstance(result, solver_module._DeferredUnbounded):
         # An UNBOUNDED the #850 guard would rather see confirmed by an engine that
         # honors the declared box. On this path the caller pinned the backend, so

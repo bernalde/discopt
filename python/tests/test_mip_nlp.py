@@ -2075,10 +2075,13 @@ def test_mip_nlp_shot_direct_nlp_routes_to_continuous_solver(monkeypatch):
         t_start,
         nlp_solver,
         initial_point=None,
+        certify_convex=False,
     ):
         del model, ipopt_options, t_start, initial_point
         calls["time_limit"] = time_limit
         calls["nlp_solver"] = nlp_solver
+        # #1501: the direct NLP path must request the convex KKT certificate gate.
+        calls["certify_convex"] = certify_convex
         return SolveResult(status="optimal", objective=1.0, bound=1.0, gap=0.0)
 
     monkeypatch.setattr(solver_module, "_solve_continuous", fake_solve_continuous)
@@ -2091,7 +2094,7 @@ def test_mip_nlp_shot_direct_nlp_routes_to_continuous_solver(monkeypatch):
         nlp_solver="pounce",
     )
 
-    assert calls == {"time_limit": 12.0, "nlp_solver": "pounce"}
+    assert calls == {"time_limit": 12.0, "nlp_solver": "pounce", "certify_convex": True}
     assert result.convex_fast_path is True
     assert result.mip_nlp_trace["method"] == "direct"
     assert result.mip_nlp_trace["selected_strategy"] == "direct_nlp"
@@ -4814,10 +4817,26 @@ def test_oa_no_discrete_relaxation_uses_initial_point(monkeypatch):
     initial_point = np.array([3.0], dtype=float)
 
     def fake_solve_nlp_relaxation(
-        evaluator, lb, ub, nlp_solver, initial_point=None, max_wall_time=None
+        evaluator,
+        lb,
+        ub,
+        nlp_solver,
+        initial_point=None,
+        return_attempt=False,
+        max_wall_time=None,
     ):
+        from discopt.solvers import SolveStatus
+
         assert np.asarray(initial_point, dtype=float).tolist() == pytest.approx([3.0])
-        return np.asarray(initial_point, dtype=float), 1.0
+        # #1501: the integer-free path certifies only a CONVERGED solve, so the
+        # fake reports one.
+        assert return_attempt
+        return oa_module._NLPAttempt(
+            x=np.asarray(initial_point, dtype=float),
+            objective=1.0,
+            multipliers=None,
+            status=SolveStatus.OPTIMAL,
+        )
 
     monkeypatch.setattr(oa_module, "_solve_nlp_relaxation", fake_solve_nlp_relaxation)
 

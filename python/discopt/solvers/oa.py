@@ -5188,6 +5188,53 @@ def _continuous_model_is_certified_convex(decomp: "_DecomposedProblem") -> bool:
     return all(mask)
 
 
+def _integer_free_nlp_verdict(
+    attempt: _NLPAttempt,
+    decomp: "_DecomposedProblem",
+    evaluator,
+    model: Model,
+    *,
+    heuristic_nonconvex: bool,
+) -> tuple[bool, bool]:
+    """``(certify_optimal, certify_infeasible)`` for an integer-free OA "loop" (#1501).
+
+    An integer-free OA/LP-NLP-BB run is ONE local NLP solve. Convexity of the model
+    (:func:`_continuous_model_is_certified_convex`) is necessary for that solve to
+    be a global certificate, but it is not sufficient:
+
+    * **The solve has to have converged.** :func:`_solve_nlp_attempt` also accepts
+      a primal-feasible point from an ``ITERATION_LIMIT`` / ``TIME_LIMIT`` exit
+      (right for an OA incumbent, wrong for a proof). #1501: ``min |x - 2|`` on
+      ``[-3, 3]`` stopped at the iteration limit at ``x = 2.94`` and was
+      certified ``optimal`` at ``0.9406`` (true optimum ``0``).
+    * **The model has to be smooth.** A gradient-based NLP carries one
+      subgradient at an ``abs``/``min``/``max`` kink and oscillates there; its
+      stationarity test says nothing reliable about optimality of the nonsmooth
+      model. This is the same predicate the default route (and #1297's convex
+      MINLP route) uses to refuse the single-NLP certificate on such models.
+    * **A failed solve is not an infeasibility proof.** Before #1501 *any* empty
+      attempt on a convex model was reported ``infeasible`` with
+      ``gap_certified=True`` — including ``Error_In_Step_Computation`` on the
+      feasible ``min |x-2| + |y+1|`` and ``Diverging_Iterates`` on the unbounded
+      LP ``min x``. The only failure that is a proof is the one
+      :func:`_assignment_proven_infeasible` admits: restoration converged to a
+      minimizer of the violation of a convex, smooth feasible set, with the
+      violation still positive.
+    """
+    from discopt.solver import _model_contains_nonsmooth_node
+    from discopt.solvers import SolveStatus
+
+    if heuristic_nonconvex or not _continuous_model_is_certified_convex(decomp):
+        return False, False
+    if _model_contains_nonsmooth_node(model):
+        return False, False
+    if attempt.x is not None:
+        return attempt.status == SolveStatus.OPTIMAL, False
+    if decomp.n_cons == 0:
+        return False, False
+    return False, _assignment_proven_infeasible(attempt, evaluator, decomp.oa_constraint_mask)
+
+
 def _oa_node_cuts_enabled() -> bool:
     """``DISCOPT_OA_NODE_CUTS``: separate ECP cuts at *fractional* master nodes.
 
@@ -5533,16 +5580,28 @@ def solve_lp_nlp_bb(
         callback_events.append(event)
 
     if len(decomp.int_indices) == 0:
-        x_sol, obj = _solve_nlp_relaxation(
-            evaluator,
-            decomp.lb,
-            decomp.ub,
-            nlp_solver,
-            initial_point=initial_point,
-            max_wall_time=_remaining_wall(t_start, time_limit),
+        _cont_attempt = _coerce_nlp_attempt(
+            _solve_nlp_relaxation(
+                evaluator,
+                decomp.lb,
+                decomp.ub,
+                nlp_solver,
+                initial_point=initial_point,
+                return_attempt=True,
+                max_wall_time=_remaining_wall(t_start, time_limit),
+            )
         )
+        x_sol, obj = _cont_attempt.x, _cont_attempt.objective
         wall_time = time.perf_counter() - t_start
-        certified = _continuous_model_is_certified_convex(decomp) and not heuristic_nonconvex
+        # #1501: convexity alone is not a certificate -- the solve must have
+        # converged on a smooth model, and a failed solve proves nothing.
+        certified, certified_infeasible = _integer_free_nlp_verdict(
+            _cont_attempt,
+            decomp,
+            evaluator,
+            model,
+            heuristic_nonconvex=heuristic_nonconvex,
+        )
         if x_sol is not None:
             # An integer-free OA "loop" is a single local NLP solve. That is the
             # global optimum only on a convex model; on a nonconvex one it is a
@@ -5562,7 +5621,8 @@ def solve_lp_nlp_bb(
         # A local NLP that found no point has not PROVED the model infeasible
         # either -- the same asymmetry, in the other direction.
         return SolveResult(
-            status="infeasible" if certified else "no_feasible_point",
+            status="infeasible" if certified_infeasible else "no_feasible_point",
+            gap_certified=certified_infeasible,
             objective=None,
             bound=None,
             gap=None,
@@ -7793,16 +7853,28 @@ def solve_oa(
 
     # If no integer variables, just solve the NLP directly
     if len(decomp.int_indices) == 0:
-        x_sol, obj = _solve_nlp_relaxation(
-            evaluator,
-            decomp.lb,
-            decomp.ub,
-            nlp_solver,
-            initial_point=initial_point,
-            max_wall_time=_remaining_wall(t_start, time_limit),
+        _cont_attempt = _coerce_nlp_attempt(
+            _solve_nlp_relaxation(
+                evaluator,
+                decomp.lb,
+                decomp.ub,
+                nlp_solver,
+                initial_point=initial_point,
+                return_attempt=True,
+                max_wall_time=_remaining_wall(t_start, time_limit),
+            )
         )
+        x_sol, obj = _cont_attempt.x, _cont_attempt.objective
         wall_time = time.perf_counter() - t_start
-        certified = _continuous_model_is_certified_convex(decomp) and not heuristic_nonconvex
+        # #1501: convexity alone is not a certificate -- the solve must have
+        # converged on a smooth model, and a failed solve proves nothing.
+        certified, certified_infeasible = _integer_free_nlp_verdict(
+            _cont_attempt,
+            decomp,
+            evaluator,
+            model,
+            heuristic_nonconvex=heuristic_nonconvex,
+        )
         if x_sol is not None:
             LB = float(obj)
             UB = float(obj)
@@ -7823,7 +7895,8 @@ def solve_oa(
                 ),
             )
         return SolveResult(
-            status="infeasible" if certified else "no_feasible_point",
+            status="infeasible" if certified_infeasible else "no_feasible_point",
+            gap_certified=certified_infeasible,
             objective=None,
             bound=None,
             gap=None,
