@@ -13570,17 +13570,6 @@ def solve_model(
         if _nl_int_cols_all:
             _tree_spatial_int_cols = np.asarray(_nl_int_cols_all, dtype=np.int64)
             tree.set_spatial_integer_cols(_tree_spatial_int_cols)
-    # #1493 (``DISCOPT_POLE_BRANCHING``, default OFF): split an unbounded node
-    # instead of fathoming it unresolved, on the objective's pole when one is
-    # located inside the node box. Off, nothing below reads ``_pole_loci``.
-    _pole_loci: list = []
-    _pole_branching_on = not _model_is_convex and _tuning().pole_branching
-    _pole_fills = 0  # §6 firing counter for the interval fill below
-    if _pole_branching_on:
-        from discopt._relax.poles import objective_pole_loci
-
-        tree.set_pole_branching(True)
-        _pole_loci = objective_pole_loci(model)
     _gap_certified = True
     # #1500: from here on every incumbent is screened -- the batch import gate and
     # the funnel below -- so this solve's result honours the feasibility callbacks.
@@ -16468,36 +16457,6 @@ def solve_model(
                         _adaptive_nlp_state["no_improve"] = 0
         jax_time += time.perf_counter() - t_jax_start
 
-        # #1493 (``DISCOPT_POLE_BRANCHING``): a node the tree holds at a non-finite
-        # bound (no ancestor proved one -- the pole region) that this batch also
-        # left unbounded (-inf, or the failure sentinel of a skipped/failed node
-        # NLP) would stay unbounded however far it is split, because the interval
-        # enclosure the tree needs lives only on the node-NLP path. Offer it here:
-        # an outward-rounded enclosure of the objective over the node box is a
-        # valid lower bound (-inf when it cannot enclose, e.g. the box still holds
-        # the pole). Only nodes with no finite floor are touched, so every other
-        # node, and the whole flag-OFF path, is unchanged.
-        if _pole_branching_on:
-            _pb_need = [
-                i
-                for i in range(n_batch)
-                if not node_infeasible_mask[i]
-                and (not np.isfinite(result_lbs[i]) or result_lbs[i] >= _SENTINEL_THRESHOLD)
-            ]
-            if _pb_need:
-                _pb_pop = np.asarray(
-                    tree.node_lower_bounds(np.asarray(batch_ids, dtype=np.int64)),
-                    dtype=np.float64,
-                )
-                for i in _pb_need:
-                    if np.isfinite(_pb_pop[i]):
-                        continue
-                    _pb_iv = _compute_interval_bound(model, batch_lb[i], batch_ub[i], _obj_negate)
-                    if np.isfinite(_pb_iv):
-                        result_lbs[i] = _pb_iv
-                        result_feas[i] = False
-                        _pole_fills += 1
-
         # C-1 (path-agnostic, covers convex + nonconvex, batch + serial): any node
         # entering the tree with the failure sentinel but WITHOUT a rigorous
         # infeasibility certificate (``node_infeasible_mask`` — an empty McCormick/
@@ -17822,22 +17781,6 @@ def solve_model(
         # tree happens to apply them in.
         _exclusion_mask |= node_infeasible_mask
         t_rust_start = time.perf_counter()
-        if _pole_loci:
-            # #1493: where to split a node the relaxation could not bound. Branch
-            # position only -- the tree reads it solely in its pole arm.
-            from discopt._relax.poles import pole_branch_point
-
-            for _bi in range(len(batch_ids)):
-                if node_infeasible_mask[_bi] or _exclusion_mask[_bi]:
-                    continue
-                if np.isfinite(result_lbs[_bi]) and result_lbs[_bi] < _SENTINEL_THRESHOLD:
-                    continue
-                # The TREE's box, which the split partitions -- not the batch box,
-                # which node reduction may have shrunk (e.g. to x = [0, 0]).
-                _pl_lo, _pl_hi = tree.node_box(int(batch_ids[_bi]))
-                _pl = pole_branch_point(_pole_loci, np.asarray(_pl_lo), np.asarray(_pl_hi))
-                if _pl is not None:
-                    tree.set_spatial_branch_hint(int(batch_ids[_bi]), _pl.col, _pl.value)
         if _requeue_mask is not None and _requeue_mask.any():
             # A requeued node is OPEN again, so no result may be imported for it
             # (`import_results` asserts Evaluated status). Import the rest, then
@@ -18218,14 +18161,6 @@ def solve_model(
 
     stats = tree.stats()
     incumbent = tree.incumbent()
-    if _pole_branching_on:
-        _pb, _pc = tree.pole_counters()
-        logger.info(
-            "pole branching (#1493): %d split(s), %d capped fathom(s), %d interval fill(s)",
-            _pb,
-            _pc,
-            _pole_fills,
-        )
     # #933: capture the tree-bound taint state NOW, before the exit-status logic
     # below overwrites ``_gap_certified`` on limit exits. "The exit is not
     # certified" (no incumbent at a time/node limit) says nothing about whether
