@@ -637,6 +637,12 @@ register(
     summary="Fortet/Glover-linearize binary multilinear monomials",
 )
 register(
+    "nonsmooth.epigraph",
+    "discopt._relax.nonsmooth_lift:lift_nonsmooth_atoms",
+    style="functional",
+    summary="Exactly lift monotone-position abs/max/min atoms to smooth epigraph rows (#1501)",
+)
+register(
     "mpec.gdp",
     "discopt.mpec:reformulate_gdp",
     style="in_place",

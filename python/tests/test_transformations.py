@@ -23,7 +23,12 @@ import discopt.transformations as dt
 import numpy as np
 import pytest
 from discopt import mpec
-from discopt._relax import binary_multilinear_reform, gdp_reformulate, integer_product_reform
+from discopt._relax import (
+    binary_multilinear_reform,
+    gdp_reformulate,
+    integer_product_reform,
+    nonsmooth_lift,
+)
 from discopt.modeling.core import from_nl
 
 CORPUS = sorted((pathlib.Path(__file__).parent / "data" / "minlplib_nl").glob("*.nl"))
@@ -133,6 +138,7 @@ EXPECTED = {
     "mpec.gdp": mpec.reformulate_gdp,
     "mpec.sos1": mpec.reformulate_sos1,
     "mpec.scholtes": mpec.reformulate_scholtes,
+    "nonsmooth.epigraph": nonsmooth_lift.lift_nonsmooth_atoms,
 }
 
 
