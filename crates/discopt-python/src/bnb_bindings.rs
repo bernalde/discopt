@@ -335,6 +335,51 @@ impl PyTreeManager {
         Ok(())
     }
 
+    /// Ids (int64) of the nodes fathomed as TIGHT boxes since the last call
+    /// (#1510), drained. Each still floors the global dual bound at its own
+    /// bound; see `raise_tight_fathom_floor`.
+    fn take_tight_fathoms<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        let ids: Vec<i64> = self
+            .inner
+            .take_tight_fathoms()
+            .into_iter()
+            .map(|n| n.0 as i64)
+            .collect();
+        PyArray1::from_vec(py, ids)
+    }
+
+    /// The box `(lb, ub)` a node carries in the tree (the one its branching and
+    /// tight-box test read). Raises `ValueError` for an unknown id.
+    fn node_box<'py>(
+        &self,
+        py: Python<'py>,
+        node_id: i64,
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+        match self.inner.node_box(NodeId(node_id.max(0) as usize)) {
+            Some((lb, ub)) if node_id >= 0 => {
+                Ok((PyArray1::from_vec(py, lb), PyArray1::from_vec(py, ub)))
+            }
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "node_box: unknown node id {node_id}"
+            ))),
+        }
+    }
+
+    /// Raise the floor a tight-fathomed node holds on the global dual bound
+    /// (#1510) to `bound`, a valid lower bound of the internally-minimized
+    /// objective over that node's box. Monotone; a non-finite bound is ignored.
+    /// Raises `ValueError` if the node was not tight-fathomed.
+    fn raise_tight_fathom_floor(&mut self, node_id: i64, bound: f64) -> PyResult<()> {
+        if node_id < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "raise_tight_fathom_floor: negative node id {node_id}"
+            )));
+        }
+        self.inner
+            .raise_tight_fathom_floor(NodeId(node_id as usize), bound)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
     /// Install an externally-proved rigorous lower bound for the root box
     /// (#933 part (a)): the caller asserts `bound` is a valid lower bound of
     /// the internally-minimized objective over the box the tree was created

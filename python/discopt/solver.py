@@ -5652,18 +5652,19 @@ def _may_be_tight_fathomed(
     In nonconvex mode ``process_evaluated`` fathoms an integer-feasible node when no
     dimension is branchable any more -- every continuous column narrower than
     ``SPATIAL_MIN_WIDTH`` (1e-6) of its root width, every spatial-integer column
-    narrower than 1 -- and, when its bound is finite and its box finite, it drops
-    the node WITHOUT flooring the global bound at the node's lower bound. That is
-    sound only if a relative width of 1e-6 makes the node's relaxation gap
-    negligible, which fails wherever the objective is not Lipschitz: ``asin`` at
-    ``-1`` changes by ``sqrt(2*1e-6) = 1.4e-3`` over such a box, and the region's
-    optimum was certified away (bound 1.4e-3 above ``min asin(x) - x/2``).
+    narrower than 1. Since #1510 the tree floors its dual bound at such a node's
+    bound (a width of 1e-6 makes the relaxation gap negligible only for a
+    Lipschitz objective: ``asin`` at ``-1`` still moves by ``sqrt(2e-6)``), so this
+    predicate carries no soundness weight. It only picks the nodes whose
+    relaxation point and gradient-descent vertex are offered as incumbents before
+    the region is closed for good -- which is what lets that floor close against
+    the edge optimum and the solve still certify.
 
-    A conservative mirror of that test: every condition the Rust arm needs is
-    checked with the same or a looser threshold, so any node the tree can fathom
-    this way reads True here (a spurious True only costs a floor that is a valid
-    bound anyway). Unbounded dimensions are treated as tight -- the tree marks
-    those unresolved itself.
+    A conservative mirror of the Rust test: every condition is checked with the
+    same or a looser threshold, so any node the tree can fathom this way reads
+    True here; a spurious True only costs a verified-feasible incumbent candidate.
+    Unbounded dimensions are treated as tight -- the tree marks those unresolved
+    itself.
     """
     if not is_feasible:
         x = np.asarray(sol, dtype=np.float64)
@@ -17567,9 +17568,13 @@ def solve_model(
         # the search unsound, only complete.
         #
         # #1492: the same holds for a node the tree will fathom as a TIGHT box
-        # (``_may_be_tight_fathomed``), integer or not -- it is removed with its
-        # bound dropped, so its relaxation point is the last chance to record the
+        # (``_may_be_tight_fathomed``), integer or not -- it is never explored
+        # again, so its relaxation point is the last chance to record the
         # region's value. A pure-continuous model used to skip this guard entirely.
+        # (Soundness no longer rests on this: since #1510 the tree floors its
+        # dual bound at every tight fathom. This is the completeness half -- it
+        # finds the edge optimum, so that floor can close against it and the
+        # solve still certifies.)
         _tight_fathom = np.zeros(n_batch, dtype=bool)
         if not _model_is_convex:
             for i in range(n_batch):
@@ -17624,60 +17629,6 @@ def solve_model(
                     _obj_i = float(evaluator.evaluate_objective(_xk))
                     if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
                         _inject_incumbent(_xk, _obj_i)
-
-        # #1492: a tight-box fathom drops the node's lower bound from the tree's
-        # dual bound (``_may_be_tight_fathomed``). When that bound is NOT within
-        # the certification gap of the incumbent, the removed region is unproven:
-        # keep it in the reported bound through the taint floor (the node's own
-        # bound and its pop-time bound are both valid for its box; the larger is
-        # kept) and decertify, exactly like a non-rigorous sentinel fathom -- the
-        # SPATIAL-CERT block re-earns the label if the floor-inclusive gap closes
-        # against a later incumbent. A tight node inside the gap needs nothing,
-        # which keeps every Lipschitz model on its existing path.
-        if np.any(_tight_fathom):
-            _tf_inc = tree.incumbent()
-            _tf_inc_val = float(_tf_inc[1]) if _tf_inc is not None else np.inf
-            _tf_pop = None
-            for i in (int(_q) for _q in np.flatnonzero(_tight_fathom)):
-                _tf_lb = float(result_lbs[i])
-                # The node's own bound can be far looser than the box warrants: a
-                # fixed-integer leaf of ``min -1.3x + sin(3y)`` on
-                # x = 2, y in [0, 9.3e-16] carries -3.6 (sin relaxed to [-1, 1])
-                # while the box holds only values near -2.6, and flooring at -3.6
-                # decertified a correct optimum. An outward-rounded interval
-                # enclosure of the objective over the same box is equally valid;
-                # keep the larger. ``_compute_interval_bound`` returns -inf when it
-                # cannot enclose, which leaves the node bound in charge.
-                _tb_iv = _nr_pending.get(i) if _nr_pending else None
-                _tf_lb = max(
-                    _tf_lb,
-                    _compute_interval_bound(
-                        model,
-                        _tb_iv[0] if _tb_iv is not None else batch_lb[i],
-                        _tb_iv[1] if _tb_iv is not None else batch_ub[i],
-                        _obj_negate,
-                    ),
-                )
-                if _gap_values_converged(_tf_inc_val, _tf_lb, gap_tolerance, abs_gap_tol):
-                    continue
-                if _tf_lb >= _tf_inc_val:
-                    continue  # pruned against the incumbent by the tree
-                if _tf_pop is None:
-                    _tf_pop = np.asarray(
-                        tree.node_lower_bounds(np.asarray(result_ids, dtype=np.int64)),
-                        dtype=np.float64,
-                    )
-                _tf_floor = max(_tf_lb, float(_tf_pop[i]))
-                _nonrigorous_fathom = True
-                _gap_certified = False
-                _taint_floor_internal = min(_taint_floor_internal, _tf_floor)
-                logger.debug(
-                    "Tight-box fathom at node %d with bound %.10g outside the gap of "
-                    "incumbent %.10g: kept as a floor of the reported bound (#1492)",
-                    int(result_ids[i]),
-                    _tf_floor,
-                    _tf_inc_val,
-                )
 
         # Interactive debugger: steer point — relaxations solved, results not
         # yet imported. Safe-steer (inject incumbent / branch hint) applies here;
@@ -17763,6 +17714,23 @@ def solve_model(
             )
         tree.process_evaluated()
         rust_time += time.perf_counter() - t_rust_start
+
+        # #1510: the tree keeps every node it fathomed as a TIGHT box (no
+        # branchable dimension left) as a permanent floor of its global dual
+        # bound, at the node's own bound -- width 1e-6 proves nothing at an
+        # infinite-slope edge (#1492). That bound can be far looser than the box
+        # warrants (a fixed-integer leaf of ``min -1.3x + sin(3y)`` on
+        # ``x = 2, y in [0, 9.3e-16]`` carries -3.6 with sin relaxed to [-1, 1],
+        # while the box holds only values near -2.6), and a floor there costs a
+        # correct certificate (test_batch_sentinel_soundness). An outward-rounded
+        # interval enclosure of the objective over the SAME box is equally valid,
+        # so offer it; the tree keeps the larger. ``_compute_interval_bound``
+        # returns -inf when it cannot enclose, which leaves the node bound.
+        for _tf_id in tree.take_tight_fathoms():
+            _tf_lo, _tf_hi = tree.node_box(int(_tf_id))
+            tree.raise_tight_fathom_floor(
+                int(_tf_id), _compute_interval_bound(model, _tf_lo, _tf_hi, _obj_negate)
+            )
 
         # Interactive debugger: prune/branch/fathom applied by the tree.
         if _debug.fire(
@@ -18517,7 +18485,11 @@ def solve_model(
             # ``infeasible`` branch below would be a false certificate.
             status = "time_limit"
             _gap_certified = False
-        elif _nonrigorous_fathom:
+        elif _nonrigorous_fathom or not _tree_exhausted_with_proof(tree):
+            # #1510: a tree that drained over an UNPROVEN removal -- a tight-box
+            # fathom or a failed node with no branch direction, both recorded in
+            # the tree's ``unresolved_floor`` -- has not proved the model empty.
+            #
             # C-1: the tree exhausted with no incumbent, but at least one node was
             # fathomed on a NON-rigorous failure (its local NLP failed / diverged /
             # returned a constraint-violating iterate and it was sentinelled with no
