@@ -33,6 +33,13 @@ Usage::
     python -u discopt_benchmarks/scripts/even_pow_hole_panel.py \
         [--set corpus,disp] [--time-limit 30] [--out reports/even_pow_hole_panel.json]
 
+Against a MINLPLib snapshot (the graduation test: instances with minimum distance
+constraints, e.g. the Hojny & Liberti set)::
+
+    python -u discopt_benchmarks/scripts/even_pow_hole_panel.py --set corpus \
+        --nl-dir <snapshot>/minlplib/nl --solu <snapshot>/minlplib.solu \
+        --instances <comma-separated names> --time-limit 60
+
 Exit codes: 0 = cert-clean with executed checks, 1 = violation or zero checks.
 """
 
@@ -87,7 +94,7 @@ def _load(name: str):
     hit = re.fullmatch(r"(a?)disp(\d+)", name)
     if hit:
         return _dispersion(int(hit.group(2)), arrays=bool(hit.group(1)))
-    return dm.from_nl(str(_NL_DIR / f"{name}.nl"))
+    return dm.from_nl(str(_NL_DIR / f"{name}.nl"))  # rebound by --nl-dir
 
 
 def _worker(name: str, time_limit: float) -> None:
@@ -130,7 +137,17 @@ def _worker(name: str, time_limit: float) -> None:
 def _run_arm(name: str, flag: str, time_limit: float) -> dict:
     env = dict(os.environ, **{_FLAG: flag})
     proc = subprocess.run(
-        [sys.executable, "-u", __file__, "--worker", name, "--time-limit", str(time_limit)],
+        [
+            sys.executable,
+            "-u",
+            __file__,
+            "--worker",
+            name,
+            "--time-limit",
+            str(time_limit),
+            "--nl-dir",
+            str(_NL_DIR),
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -144,18 +161,37 @@ def _run_arm(name: str, flag: str, time_limit: float) -> dict:
 
 
 def main() -> int:
+    global _NL_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", default=None)
     ap.add_argument("--set", default="corpus,disp")
     ap.add_argument("--instances", default="")
     ap.add_argument("--time-limit", type=float, default=30.0)
     ap.add_argument("--out", default=str(_REPO / "reports" / "even_pow_hole_panel.json"))
+    ap.add_argument(
+        "--nl-dir",
+        default=str(_NL_DIR),
+        help="directory of .nl files for the corpus set (e.g. a MINLPLib snapshot's minlplib/nl)",
+    )
+    ap.add_argument(
+        "--solu",
+        default="",
+        help="MINLPLib .solu file; its =opt= values extend the oracle (cert-optima.json wins)",
+    )
     args = ap.parse_args()
+    _NL_DIR = Path(args.nl_dir)
     if args.worker:
         _worker(args.worker, args.time_limit)
         return 0
 
-    optima = json.loads(_OPTIMA.read_text()) if _OPTIMA.exists() else {}
+    optima: dict[str, float] = {}
+    if args.solu:
+        for line in Path(args.solu).read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "=opt=":
+                optima[parts[1]] = float(parts[2])
+    if _OPTIMA.exists():
+        optima.update(json.loads(_OPTIMA.read_text()))
     optima.update({f"{p}disp{n}": v for n, v in DISP_OPT.items() for p in ("", "a")})
     sets = set(args.set.split(","))
     if args.instances:
