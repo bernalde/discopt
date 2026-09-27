@@ -74,7 +74,10 @@ def _solve_and_capture(m, caplog):
 
 
 @pytest.mark.parametrize("kind", ["recip", "ratio", "recip_max", "excluded_by_constraint"])
-def test_pole_solve_is_uncertified_and_names_the_pole(kind, caplog):
+def test_pole_solve_is_uncertified_and_names_the_pole(kind, caplog, monkeypatch):
+    # The default (pole branching OFF) exit. With DISCOPT_POLE_BRANCHING=1 the
+    # constraint-excluded pole certifies -1 instead (test_1493_pole_branching.py).
+    monkeypatch.setenv("DISCOPT_POLE_BRANCHING", "0")
     m, x = _one_var()
     if kind == "recip":
         m.minimize(1 / x)

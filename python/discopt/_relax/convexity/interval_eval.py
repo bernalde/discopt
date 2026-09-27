@@ -392,7 +392,9 @@ def extended_division_enabled() -> bool:
     showing certificates or bounds gained. The straddling case (``min 1/x s.t.
     x**2 >= 1`` on ``[-3, 3]``) is not helped by this flag at all: its hull stays
     ``(-inf, inf)`` until the B&B tree splits the pole variable AT the pole, which is
-    Rust tree-manager work (see the #1493 report).
+    what ``DISCOPT_POLE_BRANCHING`` does (``SolverTuning.pole_branching``); the two
+    compose -- after the split each child's denominator only touches 0, which is
+    where this flag's one-sided reciprocal applies.
     """
     return os.environ.get("DISCOPT_EXTENDED_DIVISION", "0") == "1"
 
