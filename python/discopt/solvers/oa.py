@@ -2855,41 +2855,6 @@ def _run_feasibility_pump(
 # ── Cut Generation ────────────────────────────────────────────
 
 
-def _constraint_ids_for_generated_oa_cuts(
-    evaluator,
-    x_point,
-    constraint_senses,
-    convex_mask,
-    *,
-    violated_only: bool,
-    tol: float = 1e-8,
-) -> list[int]:
-    """Return constraint ids in the same order as the OA cut generator emits cuts."""
-    m = evaluator.n_constraints
-    if m == 0:
-        return []
-    if constraint_senses is None:
-        constraint_senses = ["<="] * m
-    if not violated_only:
-        return [k for k in range(m) if convex_mask is None or bool(convex_mask[k])]
-
-    cons_vals = evaluator.evaluate_constraints(x_point)
-    ids: list[int] = []
-    for k in range(m):
-        if convex_mask is not None and not bool(convex_mask[k]):
-            continue
-        g_k = float(cons_vals[k])
-        sense = constraint_senses[k]
-        violated = (
-            (sense == "<=" and g_k > tol)
-            or (sense == ">=" and g_k < -tol)
-            or (sense == "==" and abs(g_k) > tol)
-        )
-        if violated:
-            ids.append(k)
-    return ids
-
-
 def _constraint_cut_global_valid(
     constraint_convex_mask,
     constraint_id: Optional[int],
@@ -3192,6 +3157,21 @@ def _split_or_strengthen_objective_cut(
     return coeffs, rhs
 
 
+def _convex_fallback_box(evaluator) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """The evaluator's variable box, over which OA's convexity masks are certified.
+
+    :func:`_add_oa_cuts` pulls support points into it when a convex row has no
+    tangent at the linearization point (an infinite slope, ``sqrt`` at 0; #1491):
+    dropping the row is sound, but leaves the master free to propose the same
+    point forever.
+    """
+    bounds = getattr(evaluator, "variable_bounds", None)
+    if bounds is None:
+        return None
+    lb, ub = bounds
+    return np.asarray(lb, dtype=np.float64), np.asarray(ub, dtype=np.float64)
+
+
 def _add_oa_cuts(
     evaluator,
     x_star,
@@ -3216,25 +3196,55 @@ def _add_oa_cuts(
     element being the -eta epigraph coefficient.
     """
     from discopt._relax.cutting_planes import (
-        generate_oa_cuts_from_evaluator,
+        NON_FINITE_LINEARIZATION,
+        generate_oa_cuts_from_evaluator_report,
         generate_objective_oa_cut,
+        interior_support_points,
     )
 
+    def fan_points() -> list:
+        # Built only when a tangent was actually refused, so the ordinary call pays
+        # nothing for it.
+        fallback_box = _convex_fallback_box(evaluator)
+        if fallback_box is None:
+            return []
+        return list(interior_support_points(x_star, fallback_box[0], fallback_box[1]))
+
     if n_cons > 0:
-        cuts = generate_oa_cuts_from_evaluator(
+        # The report carries each cut's row: a row can be skipped for a non-finite
+        # linearization (#1491), so re-deriving the id order would mis-attribute.
+        report = generate_oa_cuts_from_evaluator_report(
             evaluator,
             x_star,
             constraint_senses=constraint_senses,
             convex_mask=constraint_convex_mask,
         )
-        constraint_ids = _constraint_ids_for_generated_oa_cuts(
-            evaluator,
-            x_star,
-            constraint_senses,
-            constraint_convex_mask,
-            violated_only=False,
-        )
-        for constraint_id, cut in zip(constraint_ids, cuts):
+        emitted = [(k, cut, x_star) for k, cut in zip(report.rows, report.cuts, strict=True)]
+        # #1491: a CONVEX row with no tangent at x_star (infinite slope) gets the
+        # tangents at a fan of points pulled into the box instead -- each a global
+        # underestimator over the box because the row is convex there. Rows skipped
+        # for any other reason (not certified convex) stay skipped.
+        refused = {
+            skip.constraint_index
+            for skip in report.skipped
+            if skip.reason == NON_FINITE_LINEARIZATION
+            and constraint_convex_mask is not None
+            and bool(constraint_convex_mask[skip.constraint_index])
+            and constraint_senses is not None
+            and constraint_senses[skip.constraint_index] != "=="
+        }
+        if refused:
+            for p in fan_points():
+                fan = generate_oa_cuts_from_evaluator_report(
+                    evaluator,
+                    p,
+                    constraint_senses=constraint_senses,
+                    convex_mask=constraint_convex_mask,
+                )
+                emitted.extend(
+                    (k, cut, p) for k, cut in zip(fan.rows, fan.cuts, strict=True) if k in refused
+                )
+        for constraint_id, cut, support in emitted:
             coeffs = cut.coeffs.copy()
             # Filter degenerate cuts
             if np.linalg.norm(coeffs) < 1e-12:
@@ -3261,7 +3271,7 @@ def _add_oa_cuts(
                     cut_provenance=cut_provenance,
                     source=constraint_source,
                     global_valid=global_valid,
-                    supporting_point=x_star,
+                    supporting_point=support,
                     constraint_id=constraint_id,
                 )
             elif sense == ">=":
@@ -3274,7 +3284,7 @@ def _add_oa_cuts(
                     cut_provenance=cut_provenance,
                     source=constraint_source,
                     global_valid=global_valid,
-                    supporting_point=x_star,
+                    supporting_point=support,
                     constraint_id=constraint_id,
                 )
             elif sense == "==":
@@ -3288,7 +3298,7 @@ def _add_oa_cuts(
                     cut_provenance=cut_provenance,
                     source=constraint_source,
                     global_valid=global_valid,
-                    supporting_point=x_star,
+                    supporting_point=support,
                     constraint_id=constraint_id,
                 )
                 _append_master_cut(
@@ -3300,43 +3310,84 @@ def _add_oa_cuts(
                     cut_provenance=cut_provenance,
                     source=constraint_source,
                     global_valid=global_valid,
-                    supporting_point=x_star,
+                    supporting_point=support,
                     constraint_id=constraint_id,
                 )
 
     # Objective OA cut (only if nonlinear): grad^T x - eta <= rhs
     if not obj_is_linear and objective_is_convex:
         n_master = n_vars + 1
-        obj_value = float(evaluator.evaluate_objective(x_star))
-        obj_support = np.concatenate([np.asarray(x_star, dtype=np.float64), [obj_value]])
         obj_cut = generate_objective_oa_cut(evaluator, x_star, n_master, z_index=n_vars)
-        obj_coeffs_row = obj_cut.coeffs.copy()
-        obj_rhs = float(obj_cut.rhs)
-        # #1064/#1066: treat the perspective of every separable convex square
-        # over a semicontinuous variable -- either strengthening this aggregate
-        # row in place, or splitting the terms out into their own epigraph
-        # columns. Globally valid either way (see ``_relax.perspective``), so
-        # ``global_valid=True`` below is unchanged, and a no-op when the model
-        # has no such structure.
-        _split = _split_or_strengthen_objective_cut(
-            evaluator, obj_coeffs_row, obj_rhs, x_star, n_vars
-        )
-        if _split is None:
+        if obj_cut is not None:
+            _append_objective_oa_row(
+                evaluator,
+                obj_cut,
+                x_star,
+                n_vars,
+                oa_A_rows,
+                oa_b_rows,
+                oa_cut_relaxable,
+                cut_provenance,
+                objective_source,
+            )
             return
-        obj_coeffs_row, obj_rhs = _split
-        _append_master_cut(
-            oa_A_rows,
-            oa_b_rows,
-            obj_coeffs_row,
-            obj_rhs,
-            oa_cut_relaxable,
-            relaxable=False,
-            cut_provenance=cut_provenance,
-            source=objective_source,
-            global_valid=True,
-            supporting_point=obj_support,
-            objective_id="objective",
-        )
+        # #1491: no tangent at x_star (e.g. sqrt at 0). The objective is convex over
+        # the box, so the tangents at a fan of pulled-in points are valid rows.
+        for p in fan_points():
+            fan_cut = generate_objective_oa_cut(evaluator, p, n_master, z_index=n_vars)
+            if fan_cut is not None:
+                _append_objective_oa_row(
+                    evaluator,
+                    fan_cut,
+                    p,
+                    n_vars,
+                    oa_A_rows,
+                    oa_b_rows,
+                    oa_cut_relaxable,
+                    cut_provenance,
+                    objective_source,
+                )
+
+
+def _append_objective_oa_row(
+    evaluator,
+    obj_cut,
+    support,
+    n_vars,
+    oa_A_rows,
+    oa_b_rows,
+    oa_cut_relaxable,
+    cut_provenance,
+    objective_source,
+) -> None:
+    """Append one objective epigraph tangent taken at ``support``."""
+    obj_value = float(evaluator.evaluate_objective(support))
+    obj_support = np.concatenate([np.asarray(support, dtype=np.float64), [obj_value]])
+    obj_coeffs_row = obj_cut.coeffs.copy()
+    obj_rhs = float(obj_cut.rhs)
+    # #1064/#1066: treat the perspective of every separable convex square
+    # over a semicontinuous variable -- either strengthening this aggregate
+    # row in place, or splitting the terms out into their own epigraph
+    # columns. Globally valid either way (see ``_relax.perspective``), so
+    # ``global_valid=True`` below is unchanged, and a no-op when the model
+    # has no such structure.
+    _split = _split_or_strengthen_objective_cut(evaluator, obj_coeffs_row, obj_rhs, support, n_vars)
+    if _split is None:
+        return
+    obj_coeffs_row, obj_rhs = _split
+    _append_master_cut(
+        oa_A_rows,
+        oa_b_rows,
+        obj_coeffs_row,
+        obj_rhs,
+        oa_cut_relaxable,
+        relaxable=False,
+        cut_provenance=cut_provenance,
+        source=objective_source,
+        global_valid=True,
+        supporting_point=obj_support,
+        objective_id="objective",
+    )
 
 
 def _add_ecp_cuts(
@@ -3359,7 +3410,7 @@ def _add_ecp_cuts(
     """Generate ECP cuts: OA cuts only for violated constraints at x_master."""
     from discopt._relax.cutting_planes import (
         generate_objective_oa_cut,
-        separate_oa_cuts,
+        separate_oa_cuts_report,
     )
 
     n_added = 0
@@ -3387,20 +3438,13 @@ def _add_ecp_cuts(
 
     if evaluator.n_constraints > 0:
         ecp_convex_mask = None if include_local_cuts else constraint_convex_mask
-        cuts = separate_oa_cuts(
+        ecp_report = separate_oa_cuts_report(
             evaluator,
             x_master,
             constraint_senses=constraint_senses,
             convex_mask=ecp_convex_mask,
         )
-        constraint_ids = _constraint_ids_for_generated_oa_cuts(
-            evaluator,
-            x_master,
-            constraint_senses,
-            ecp_convex_mask,
-            violated_only=True,
-        )
-        for constraint_id, cut in zip(constraint_ids, cuts):
+        for constraint_id, cut in zip(ecp_report.rows, ecp_report.cuts, strict=True):
             coeffs = cut.coeffs.copy()
             if np.linalg.norm(coeffs) < 1e-12:
                 continue
@@ -3495,18 +3539,20 @@ def _add_ecp_cuts(
         obj_value = float(evaluator.evaluate_objective(x_master))
         obj_support = np.concatenate([np.asarray(x_master, dtype=np.float64), [obj_value]])
         obj_cut = generate_objective_oa_cut(evaluator, x_master, n_master, z_index=n_vars)
-        # Same perspective treatment as the OA site: an ECP objective row lands
-        # in the *same* master, so leaving a term in this row while the OA rows
-        # split it out would double-count it against the epigraph columns.
-        _split = _split_or_strengthen_objective_cut(
-            evaluator,
-            obj_cut.coeffs.copy(),
-            float(obj_cut.rhs),
-            x_master,
-            n_vars,
-            strengthen_aggregate=False,
-        )
-        _ecp_obj_coeffs, _ecp_obj_rhs = _split if _split is not None else (None, None)
+        # #1491: `None` means no finite tangent exists at x_master; add no row.
+        if obj_cut is not None:
+            # Same perspective treatment as the OA site: an ECP objective row lands
+            # in the *same* master, so leaving a term in this row while the OA rows
+            # split it out would double-count it against the epigraph columns.
+            _split = _split_or_strengthen_objective_cut(
+                evaluator,
+                obj_cut.coeffs.copy(),
+                float(obj_cut.rhs),
+                x_master,
+                n_vars,
+                strengthen_aggregate=False,
+            )
+            _ecp_obj_coeffs, _ecp_obj_rhs = _split if _split is not None else (None, None)
     if _ecp_obj_coeffs is not None:
         _append_master_cut(
             oa_A_rows,
@@ -3596,7 +3642,7 @@ def _add_esh_cuts(
 ) -> tuple[int, dict[str, object]]:
     """Generate SHOT-style extended supporting hyperplanes with ECP fallback."""
     from discopt._relax.cutting_planes import (
-        generate_oa_cuts_from_evaluator,
+        generate_oa_cuts_from_evaluator_report,
         generate_objective_oa_cut,
     )
     from discopt.solvers.mip_nlp_rootsearch import (
@@ -3664,19 +3710,16 @@ def _add_esh_cuts(
 
     support = np.asarray(root_result.point, dtype=np.float64).reshape(-1)
     master_violations, _master_signs = _constraint_violation_data(evaluator, x_master)
-    generated = generate_oa_cuts_from_evaluator(
+    generated_report = generate_oa_cuts_from_evaluator_report(
         evaluator,
         support,
         constraint_senses=constraint_senses,
         convex_mask=None,
     )
-    constraint_ids = _constraint_ids_for_generated_oa_cuts(
-        evaluator,
-        support,
-        constraint_senses,
-        convex_mask=None,
-        violated_only=False,
-    )
+    generated = generated_report.cuts
+    # Row per cut from the generator itself: rows with a non-finite linearization
+    # are skipped (#1491), so a re-derived id list would drift out of alignment.
+    constraint_ids = list(generated_report.rows)
     candidates: list[_ESHHyperplaneCandidate] = []
     local_rejected = 0
 
@@ -3771,9 +3814,18 @@ def _add_esh_cuts(
         obj_value = float(evaluator.evaluate_objective(support))
         obj_support = np.concatenate([support, [obj_value]])
         obj_cut = generate_objective_oa_cut(evaluator, support, n_master, z_index=n_vars)
-        tangent_at_master = float(np.dot(obj_cut.coeffs[:n_vars], x_master) - obj_cut.rhs)
-        objective_gap = max(0.0, float(evaluator.evaluate_objective(x_master)) - tangent_at_master)
-        if np.linalg.norm(obj_cut.coeffs[:n_vars]) >= 1e-12 and objective_gap > 1e-8:
+        # #1491: `None` -- no finite tangent at `support` -- yields no candidate.
+        objective_gap = 0.0
+        if obj_cut is not None:
+            tangent_at_master = float(np.dot(obj_cut.coeffs[:n_vars], x_master) - obj_cut.rhs)
+            objective_gap = max(
+                0.0, float(evaluator.evaluate_objective(x_master)) - tangent_at_master
+            )
+        if (
+            obj_cut is not None
+            and np.linalg.norm(obj_cut.coeffs[:n_vars]) >= 1e-12
+            and objective_gap > 1e-8
+        ):
             incumbent_point = None
             if not objective_global_valid and incumbent is not None:
                 incumbent_arr = np.asarray(incumbent, dtype=np.float64).reshape(-1)
@@ -3914,25 +3966,18 @@ def _add_feasibility_cuts(
     For each violated constraint g_k(x) <= 0 at x_feas:
         g_k(x_feas) + nabla g_k(x_feas)^T (x - x_feas) <= 0
     """
-    from discopt._relax.cutting_planes import separate_oa_cuts
+    from discopt._relax.cutting_planes import separate_oa_cuts_report
 
     if evaluator.n_constraints == 0:
         return
 
-    cuts = separate_oa_cuts(
+    feas_report = separate_oa_cuts_report(
         evaluator,
         x_feas,
         constraint_senses=constraint_senses,
         convex_mask=constraint_convex_mask,
     )
-    constraint_ids = _constraint_ids_for_generated_oa_cuts(
-        evaluator,
-        x_feas,
-        constraint_senses,
-        constraint_convex_mask,
-        violated_only=True,
-    )
-    for constraint_id, cut in zip(constraint_ids, cuts):
+    for constraint_id, cut in zip(feas_report.rows, feas_report.cuts, strict=True):
         coeffs = cut.coeffs.copy()
         if np.linalg.norm(coeffs) < 1e-12:
             continue
@@ -5188,6 +5233,53 @@ def _continuous_model_is_certified_convex(decomp: "_DecomposedProblem") -> bool:
     return all(mask)
 
 
+def _integer_free_nlp_verdict(
+    attempt: _NLPAttempt,
+    decomp: "_DecomposedProblem",
+    evaluator,
+    model: Model,
+    *,
+    heuristic_nonconvex: bool,
+) -> tuple[bool, bool]:
+    """``(certify_optimal, certify_infeasible)`` for an integer-free OA "loop" (#1501).
+
+    An integer-free OA/LP-NLP-BB run is ONE local NLP solve. Convexity of the model
+    (:func:`_continuous_model_is_certified_convex`) is necessary for that solve to
+    be a global certificate, but it is not sufficient:
+
+    * **The solve has to have converged.** :func:`_solve_nlp_attempt` also accepts
+      a primal-feasible point from an ``ITERATION_LIMIT`` / ``TIME_LIMIT`` exit
+      (right for an OA incumbent, wrong for a proof). #1501: ``min |x - 2|`` on
+      ``[-3, 3]`` stopped at the iteration limit at ``x = 2.94`` and was
+      certified ``optimal`` at ``0.9406`` (true optimum ``0``).
+    * **The model has to be smooth.** A gradient-based NLP carries one
+      subgradient at an ``abs``/``min``/``max`` kink and oscillates there; its
+      stationarity test says nothing reliable about optimality of the nonsmooth
+      model. This is the same predicate the default route (and #1297's convex
+      MINLP route) uses to refuse the single-NLP certificate on such models.
+    * **A failed solve is not an infeasibility proof.** Before #1501 *any* empty
+      attempt on a convex model was reported ``infeasible`` with
+      ``gap_certified=True`` — including ``Error_In_Step_Computation`` on the
+      feasible ``min |x-2| + |y+1|`` and ``Diverging_Iterates`` on the unbounded
+      LP ``min x``. The only failure that is a proof is the one
+      :func:`_assignment_proven_infeasible` admits: restoration converged to a
+      minimizer of the violation of a convex, smooth feasible set, with the
+      violation still positive.
+    """
+    from discopt.solver import _model_contains_nonsmooth_node
+    from discopt.solvers import SolveStatus
+
+    if heuristic_nonconvex or not _continuous_model_is_certified_convex(decomp):
+        return False, False
+    if _model_contains_nonsmooth_node(model):
+        return False, False
+    if attempt.x is not None:
+        return attempt.status == SolveStatus.OPTIMAL, False
+    if decomp.n_cons == 0:
+        return False, False
+    return False, _assignment_proven_infeasible(attempt, evaluator, decomp.oa_constraint_mask)
+
+
 def _oa_node_cuts_enabled() -> bool:
     """``DISCOPT_OA_NODE_CUTS``: separate ECP cuts at *fractional* master nodes.
 
@@ -5533,17 +5625,30 @@ def solve_lp_nlp_bb(
         callback_events.append(event)
 
     if len(decomp.int_indices) == 0:
-        x_sol, obj = _solve_nlp_relaxation(
-            evaluator,
-            decomp.lb,
-            decomp.ub,
-            nlp_solver,
-            initial_point=initial_point,
-            max_wall_time=_remaining_wall(t_start, time_limit),
+        _cont_attempt = _coerce_nlp_attempt(
+            _solve_nlp_relaxation(
+                evaluator,
+                decomp.lb,
+                decomp.ub,
+                nlp_solver,
+                initial_point=initial_point,
+                return_attempt=True,
+                max_wall_time=_remaining_wall(t_start, time_limit),
+            )
         )
+        x_sol, obj = _cont_attempt.x, _cont_attempt.objective
         wall_time = time.perf_counter() - t_start
-        certified = _continuous_model_is_certified_convex(decomp) and not heuristic_nonconvex
+        # #1501: convexity alone is not a certificate -- the solve must have
+        # converged on a smooth model, and a failed solve proves nothing.
+        certified, certified_infeasible = _integer_free_nlp_verdict(
+            _cont_attempt,
+            decomp,
+            evaluator,
+            model,
+            heuristic_nonconvex=heuristic_nonconvex,
+        )
         if x_sol is not None:
+            assert obj is not None  # an accepted NLP point carries its objective
             # An integer-free OA "loop" is a single local NLP solve. That is the
             # global optimum only on a convex model; on a nonconvex one it is a
             # local minimum, and reporting it with ``bound = objective, gap = 0``
@@ -5562,7 +5667,8 @@ def solve_lp_nlp_bb(
         # A local NLP that found no point has not PROVED the model infeasible
         # either -- the same asymmetry, in the other direction.
         return SolveResult(
-            status="infeasible" if certified else "no_feasible_point",
+            status="infeasible" if certified_infeasible else "no_feasible_point",
+            gap_certified=certified_infeasible,
             objective=None,
             bound=None,
             gap=None,
@@ -7793,17 +7899,30 @@ def solve_oa(
 
     # If no integer variables, just solve the NLP directly
     if len(decomp.int_indices) == 0:
-        x_sol, obj = _solve_nlp_relaxation(
-            evaluator,
-            decomp.lb,
-            decomp.ub,
-            nlp_solver,
-            initial_point=initial_point,
-            max_wall_time=_remaining_wall(t_start, time_limit),
+        _cont_attempt = _coerce_nlp_attempt(
+            _solve_nlp_relaxation(
+                evaluator,
+                decomp.lb,
+                decomp.ub,
+                nlp_solver,
+                initial_point=initial_point,
+                return_attempt=True,
+                max_wall_time=_remaining_wall(t_start, time_limit),
+            )
         )
+        x_sol, obj = _cont_attempt.x, _cont_attempt.objective
         wall_time = time.perf_counter() - t_start
-        certified = _continuous_model_is_certified_convex(decomp) and not heuristic_nonconvex
+        # #1501: convexity alone is not a certificate -- the solve must have
+        # converged on a smooth model, and a failed solve proves nothing.
+        certified, certified_infeasible = _integer_free_nlp_verdict(
+            _cont_attempt,
+            decomp,
+            evaluator,
+            model,
+            heuristic_nonconvex=heuristic_nonconvex,
+        )
         if x_sol is not None:
+            assert obj is not None  # an accepted NLP point carries its objective
             LB = float(obj)
             UB = float(obj)
             if certified:
@@ -7823,7 +7942,8 @@ def solve_oa(
                 ),
             )
         return SolveResult(
-            status="infeasible" if certified else "no_feasible_point",
+            status="infeasible" if certified_infeasible else "no_feasible_point",
+            gap_certified=certified_infeasible,
             objective=None,
             bound=None,
             gap=None,

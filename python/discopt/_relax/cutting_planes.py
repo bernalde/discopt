@@ -57,10 +57,98 @@ class OACutSkip(NamedTuple):
 
 
 class OACutGenerationReport(NamedTuple):
-    """Direct evaluator OA cuts plus per-row skip reasons."""
+    """Direct evaluator OA cuts plus per-row skip reasons.
+
+    ``rows[i]`` is the evaluator constraint row ``cuts[i]`` linearizes. A caller that
+    attributes cuts to constraints must read it rather than re-derive the order: a row
+    can now be skipped for a non-finite linearization (#1491), which only the
+    generator knows about, so a recomputed id list would silently mis-attribute
+    every cut after the first skip.
+    """
 
     cuts: list[LinearCut]
     skipped: list[OACutSkip]
+    rows: tuple[int, ...] = ()
+
+
+#: ``OACutSkip.reason`` for a row whose value or gradient at the linearization
+#: point is not finite (#1491).
+NON_FINITE_LINEARIZATION = "non_finite_linearization"
+
+
+class NonFiniteLinearizationError(ValueError):
+    """A tangent was requested from a non-finite value or gradient (#1491)."""
+
+
+def linearization_is_finite(grad: np.ndarray, func_val: float, x_star: np.ndarray) -> bool:
+    """Can ``(grad, func_val)`` at ``x_star`` define a tangent hyperplane at all?
+
+    A gradient entry of ``+-inf`` is an infinite one-sided slope (``sqrt`` at 0,
+    ``x**0.3`` at 0, ``asin`` at 1) and ``NaN`` is a point with no derivative
+    (``sqrt(x**2)`` at 0). Neither is a supporting hyperplane of anything: fed
+    through ``grad @ x_star`` it gives an ``inf``/``NaN`` right-hand side, and any
+    finite surrogate for it (the ``0`` the tape used to report for ``sqrt'(0)``) is
+    a cut that removes feasible points -- measured, ``max sqrt(x) - 0.3x`` over
+    integer ``x in [0, 10]`` certified ``0`` at ``x = 0`` against a true ``0.832``.
+    Refusing the cut is always sound: it only weakens the relaxation.
+    """
+    if not np.isfinite(func_val):
+        return False
+    g = np.asarray(grad, dtype=np.float64)
+    if not np.all(np.isfinite(g)):
+        return False
+    return bool(np.all(np.isfinite(np.asarray(x_star, dtype=np.float64))))
+
+
+#: Fractions ``theta`` of the way from ``x*`` toward the box interior used by
+#: :func:`interior_support_points`. Several, not one: the tangent nearest ``x*`` is
+#: the tightest there but steep (``sqrt'(p) = 0.5/sqrt(p)``), and a steep row alone
+#: lets a MILP master sit at ``x = 1e-6`` -- integral within its tolerance -- and
+#: pay almost nothing (measured on #1491's repro: the master stalled at
+#: ``x = 3.7e-6`` behind a slope-2.2e5 row for 50 iterations). The shallower
+#: tangents close that gap; all of them are valid, so adding the fan costs only rows.
+_INTERIOR_PULL_FRACTIONS = (1e-6, 1e-3, 1e-1)
+
+
+def interior_support_points(x_star: np.ndarray, lb: np.ndarray, ub: np.ndarray):
+    """Support points ``x* + theta * (c - x*)`` pulled into the box, one per theta.
+
+    The replacement for a tangent that does not exist at ``x*`` (#1491). For a
+    function convex over the box, the tangent at ANY box point where it is
+    differentiable is a global underestimator over the box, so a cut taken at a
+    point pulled slightly inside is exactly as valid as the one at ``x*`` would
+    have been -- and, for small ``theta``, nearly as tight there. ``c`` is the box
+    centre on a doubly-bounded coordinate, one unit inward on a half-bounded one,
+    and ``x*`` itself on a free or fixed coordinate. Callers use this ONLY for rows
+    they linearize as convex; for any other row a tangent anywhere is no better
+    than the one refused.
+    """
+    x = np.asarray(x_star, dtype=np.float64).reshape(-1)
+    lo = np.asarray(lb, dtype=np.float64).reshape(-1)
+    hi = np.asarray(ub, dtype=np.float64).reshape(-1)
+    if lo.shape != x.shape or hi.shape != x.shape:
+        return
+    lo_f = np.array([is_effectively_finite(float(v)) for v in lo], dtype=bool)
+    hi_f = np.array([is_effectively_finite(float(v)) for v in hi], dtype=bool)
+    target = x.copy()
+    both = lo_f & hi_f
+    target[both] = 0.5 * (lo[both] + hi[both])
+    only_lo = lo_f & ~hi_f
+    target[only_lo] = np.maximum(x[only_lo], lo[only_lo]) + 1.0
+    only_hi = hi_f & ~lo_f
+    target[only_hi] = np.minimum(x[only_hi], hi[only_hi]) - 1.0
+    direction = target - x
+    if not np.any(direction != 0.0):
+        return
+    for theta in _INTERIOR_PULL_FRACTIONS:
+        p = x + theta * direction
+        if lo_f.any():
+            p[lo_f] = np.maximum(p[lo_f], lo[lo_f])
+        if hi_f.any():
+            p[hi_f] = np.minimum(p[hi_f], hi[hi_f])
+        if np.array_equal(p, x):
+            continue
+        yield p
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +352,18 @@ def generate_oa_cut(
 
     Returns:
         A LinearCut representing the tangent hyperplane.
+
+    Raises:
+        NonFiniteLinearizationError: if ``grad``, ``func_val`` or ``x_star`` is not
+            finite. Generators check :func:`linearization_is_finite` first and skip
+            the row; this raise is the backstop so no caller can build a cut from an
+            infinite slope by accident (#1491).
     """
+    if not linearization_is_finite(grad, func_val, x_star):
+        raise NonFiniteLinearizationError(
+            "refusing an OA cut from a non-finite value/gradient (an infinite or "
+            "undefined slope is not a supporting hyperplane; #1491)"
+        )
     coeffs = np.asarray(grad, dtype=np.float64).copy()
     rhs = float(np.dot(grad, x_star)) - func_val
     return LinearCut(coeffs=coeffs, rhs=rhs, sense=sense)
@@ -320,10 +419,15 @@ def generate_oa_cuts_from_evaluator_report(
     it is skipped with the corresponding ``skip_reasons[k]`` value, or
     ``"not_certified_convex"`` when no reason is supplied. The existing
     :func:`generate_oa_cuts_from_evaluator` API returns only ``report.cuts``.
+
+    A row whose value or gradient at ``x_sol`` is not finite gets no tangent: it is
+    skipped with :data:`NON_FINITE_LINEARIZATION` (#1491). A caller that knows the
+    row is convex over a box may replace it with tangents at
+    :func:`interior_support_points`.
     """
     m = evaluator.n_constraints
     if m == 0:
-        return OACutGenerationReport(cuts=[], skipped=[])
+        return OACutGenerationReport(cuts=[], skipped=[], rows=())
 
     cons_vals = evaluator.evaluate_constraints(x_sol)
     jac = evaluator.evaluate_jacobian(x_sol)
@@ -333,6 +437,7 @@ def generate_oa_cuts_from_evaluator_report(
 
     cuts = []
     skipped = []
+    rows: list[int] = []
     for k in range(m):
         if convex_mask is not None and not convex_mask[k]:
             reason = "not_certified_convex"
@@ -343,10 +448,14 @@ def generate_oa_cuts_from_evaluator_report(
         grad_k = jac[k, :]
         g_k = float(cons_vals[k])
         sense = constraint_senses[k]
+        if not linearization_is_finite(grad_k, g_k, x_sol):
+            skipped.append(OACutSkip(constraint_index=k, reason=NON_FINITE_LINEARIZATION))
+            continue
         cut = generate_oa_cut(grad_k, g_k, x_sol, sense=sense)
         cuts.append(cut)
+        rows.append(k)
 
-    return OACutGenerationReport(cuts=cuts, skipped=skipped)
+    return OACutGenerationReport(cuts=cuts, skipped=skipped, rows=tuple(rows))
 
 
 QuadraticPolynomial = dict[tuple[int, ...], float]
@@ -667,6 +776,8 @@ def generate_alphabb_quadratic_oa_cuts_from_evaluator(
         under_val = float(cons_vals[k]) - perturbation
         under_grad = np.asarray(jac[k, :], dtype=np.float64).copy()
         under_grad[curved] -= alpha[curved] * (x_lb[curved] + x_ub[curved] - 2.0 * x_sol[curved])
+        if not linearization_is_finite(under_grad, under_val, x_sol):
+            continue  # #1491: no tangent from a non-finite slope
         cuts.append(generate_oa_cut(under_grad, under_val, x_sol, sense="<="))
 
     return cuts
@@ -677,7 +788,7 @@ def generate_objective_oa_cut(
     x_sol: np.ndarray,
     n_vars: int,
     z_index: Optional[int] = None,
-) -> LinearCut:
+) -> Optional[LinearCut]:
     """Generate an OA cut for the objective function.
 
     For min f(x), the OA cut at x* is:
@@ -696,10 +807,15 @@ def generate_objective_oa_cut(
                  or None if no epigraph variable is used.
 
     Returns:
-        A LinearCut for the objective linearization.
+        A LinearCut for the objective linearization, or ``None`` when the
+        objective's value or gradient at ``x_sol`` is not finite (#1491). An
+        infinite slope (``sqrt`` at 0) has no supporting hyperplane, so the caller
+        must add no cut there rather than any finite stand-in for one.
     """
     obj_val = evaluator.evaluate_objective(x_sol)
     grad = evaluator.evaluate_gradient(x_sol)
+    if not linearization_is_finite(grad, obj_val, x_sol):
+        return None
 
     # f(x*) + grad^T (x - x*) <= z
     # grad^T x - z <= grad^T x* - f(x*)
@@ -742,9 +858,26 @@ def separate_oa_cuts(
     Returns:
         List of LinearCut objects for violated constraints.
     """
+    return separate_oa_cuts_report(
+        evaluator, x_sol, constraint_senses=constraint_senses, tol=tol, convex_mask=convex_mask
+    ).cuts
+
+
+def separate_oa_cuts_report(
+    evaluator,
+    x_sol: np.ndarray,
+    constraint_senses: Optional[list[str]] = None,
+    tol: float = 1e-8,
+    convex_mask: Optional[list[bool]] = None,
+) -> OACutGenerationReport:
+    """:func:`separate_oa_cuts` with the constraint row of every cut in ``rows``.
+
+    Violated rows whose linearization is not finite are reported in ``skipped``
+    with :data:`NON_FINITE_LINEARIZATION` and produce no cut (#1491).
+    """
     m = evaluator.n_constraints
     if m == 0:
-        return []
+        return OACutGenerationReport(cuts=[], skipped=[], rows=())
 
     cons_vals = evaluator.evaluate_constraints(x_sol)
     jac = evaluator.evaluate_jacobian(x_sol)
@@ -753,6 +886,8 @@ def separate_oa_cuts(
         constraint_senses = ["<="] * m
 
     cuts = []
+    skipped: list[OACutSkip] = []
+    rows: list[int] = []
     for k in range(m):
         # Skip non-convex constraints when a mask is provided
         if convex_mask is not None and not convex_mask[k]:
@@ -770,10 +905,14 @@ def separate_oa_cuts(
 
         if violated:
             grad_k = jac[k, :]
+            if not linearization_is_finite(grad_k, g_k, x_sol):
+                skipped.append(OACutSkip(constraint_index=k, reason=NON_FINITE_LINEARIZATION))
+                continue
             cut = generate_oa_cut(grad_k, g_k, x_sol, sense=sense)
             cuts.append(cut)
+            rows.append(k)
 
-    return cuts
+    return OACutGenerationReport(cuts=cuts, skipped=skipped, rows=tuple(rows))
 
 
 def is_cut_violated(cut: LinearCut, x: np.ndarray, tol: float = 1e-8) -> bool:

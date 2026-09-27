@@ -7871,7 +7871,16 @@ class Model:
         # free to choose. It is NOT free here, so it does not run -- which is also
         # why ``test_explicit_mip_nlp_keeps_the_whole_limit`` means what its name says
         # again.
-        if not skip_convex_check and solver is None:
+        # #1500: the kernel neither receives nor consults ``lazy_constraints`` /
+        # ``incumbent_callback``, and it runs OUTSIDE ``solve_model``, so neither the
+        # dispatch refusal nor the unscreened-point backstop there could see a
+        # certified result it returned. Leave callback solves to the default path.
+        if (
+            not skip_convex_check
+            and solver is None
+            and lazy_constraints is None
+            and incumbent_callback is None
+        ):
             _ck_res = None
             try:
                 from discopt.solvers._convex_kernel import (

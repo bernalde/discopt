@@ -287,6 +287,143 @@ def _collect_nonlinear_pairs(expr: Expression, model: Model) -> set[tuple[int, i
     return pairs
 
 
+def _variable_indices_iterative(expr: Expression, model: Model) -> set[int]:
+    """:func:`_collect_variable_indices` without recursion on the operator spine.
+
+    Leaves (a ``Variable`` or an index into one) are resolved by
+    :func:`_collect_variable_indices` itself, so slot resolution is identical; the
+    operator nodes above them are walked with an explicit stack, so a long ``+``
+    chain cannot exhaust the interpreter's recursion limit. Unlike the recursive
+    helper, an unknown node type raises instead of contributing no variables.
+    """
+    found: set[int] = set()
+    stack: list = [expr]
+    while stack:
+        e = stack.pop()
+        if isinstance(e, Variable):
+            found |= _collect_variable_indices(e, model)
+        elif isinstance(e, IndexExpression):
+            if isinstance(e.base, Variable):
+                found |= _collect_variable_indices(e, model)
+            else:
+                stack.append(e.base)
+        elif isinstance(e, (Constant, Parameter)):
+            continue
+        elif isinstance(e, (BinaryOp, MatMulExpression)):
+            stack.append(e.left)
+            stack.append(e.right)
+        elif isinstance(e, (UnaryOp, SumExpression)):
+            stack.append(e.operand)
+        elif isinstance(e, (FunctionCall, CustomCall)):
+            stack.extend(e.args)
+        elif isinstance(e, SumOverExpression):
+            stack.extend(e.terms)
+        else:
+            raise TypeError(
+                f"nonlinear_columns: unhandled expression type {type(e).__name__}; "
+                "refusing to report its variables as absent"
+            )
+    return found
+
+
+def _collect_nonlinear_columns(expr: Expression, model: Model, out: set[int]) -> None:
+    """Add to ``out`` every flat column that ``expr`` depends on NON-affinely.
+
+    A column is nonlinear when it reaches the result through any operation other
+    than ``+``, ``-``, negation, summation, indexing, or multiplication/division
+    by a variable-free factor. Every intrinsic (``sin``, ``cos``, ``exp``, ``log``,
+    ``abs``, ...), every power with a variable base or exponent, every product of
+    two variable-bearing factors and every variable-bearing divisor makes its
+    columns nonlinear. The walk over-approximates (e.g. ``x**1`` counts), which is
+    the sound direction for its consumer: registering an extra column for spatial
+    branching can only cost nodes, whereas missing one lets the tree fathom a box
+    whose objective still varies over that column (issue #1490).
+
+    Iterative (explicit stack), so a long affine ``+`` chain is linear-time and
+    cannot hit the recursion limit. Raises ``TypeError`` on an expression type it
+    does not know, rather than silently reporting the subtree as linear.
+    """
+    stack: list = [expr]  # nodes reached through an affine path only
+    while stack:
+        e = stack.pop()
+        if isinstance(e, (Variable, Constant, Parameter)):
+            continue
+        if isinstance(e, IndexExpression):
+            if not isinstance(e.base, Variable):
+                stack.append(e.base)
+            continue
+        if isinstance(e, BinaryOp):
+            op = e.op
+            if op in ("+", "-"):
+                stack.append(e.left)
+                stack.append(e.right)
+                continue
+            left_vars = _variable_indices_iterative(e.left, model)
+            right_vars = _variable_indices_iterative(e.right, model)
+            # ``*`` / ``/`` by a variable-free factor is still affine in the other
+            # operand; every other case (``**``, a product or quotient of two
+            # variable-bearing operands, any other operator) makes every variable
+            # in the node nonlinear, and the subtree then needs no further walk.
+            affine = (op == "*" and not (left_vars and right_vars)) or (
+                op == "/" and not right_vars
+            )
+            if affine:
+                stack.append(e.left)
+                stack.append(e.right)
+            else:
+                out |= left_vars | right_vars
+            continue
+        if isinstance(e, UnaryOp):
+            if e.op == "neg":
+                stack.append(e.operand)
+            else:
+                out |= _variable_indices_iterative(e.operand, model)
+            continue
+        if isinstance(e, (FunctionCall, CustomCall)):
+            for arg in e.args:
+                out |= _variable_indices_iterative(arg, model)
+            continue
+        if isinstance(e, MatMulExpression):
+            left_vars = _variable_indices_iterative(e.left, model)
+            right_vars = _variable_indices_iterative(e.right, model)
+            if left_vars and right_vars:
+                out |= left_vars | right_vars
+            else:
+                stack.append(e.left)
+                stack.append(e.right)
+            continue
+        if isinstance(e, SumExpression):
+            stack.append(e.operand)
+            continue
+        if isinstance(e, SumOverExpression):
+            stack.extend(e.terms)
+            continue
+        raise TypeError(
+            f"nonlinear_columns: unhandled expression type {type(e).__name__}; "
+            "refusing to report its variables as linear"
+        )
+
+
+def nonlinear_columns(model: Model) -> set[int]:
+    """Flat columns that enter the objective or any constraint body non-affinely.
+
+    Unlike :attr:`MccormickLPRelaxer.nonlinear_columns` (which lists only the
+    columns of the product / monomial / fractional-power terms the LP relaxer
+    envelopes), this covers EVERY nonlinearity, including unary transcendental
+    intrinsics. It is the set of integer columns whose domain the spatial B&B tree
+    must be able to partition: at a node whose relaxation point is integral, the
+    objective can still vary over such a column's box, so the node is not resolved
+    until the column is fixed or the node's bound reaches the incumbent.
+    """
+    out: set[int] = set()
+    if model._objective is not None:
+        _collect_nonlinear_columns(model._objective.expression, model, out)
+    for c in model._constraints:
+        if isinstance(c, Constraint):
+            _collect_nonlinear_columns(c.body, model, out)
+    return out
+
+
 def detect_sparsity_dag(model: Model) -> SparsityPattern:
     """Detect Jacobian and Hessian sparsity patterns from a Model's expression DAG.
 

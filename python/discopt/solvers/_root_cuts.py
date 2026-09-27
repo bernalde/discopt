@@ -375,6 +375,9 @@ class _RootLP:
     def oa_tangent(self, row_idx, x):
         g = self.ev.evaluate_constraints(x)[row_idx]
         jrow = self.ev.evaluate_jacobian(x)[row_idx]
+        if not (np.isfinite(g) and np.all(np.isfinite(jrow))):
+            # #1491: an infinite/undefined slope (sqrt at 0) has no tangent.
+            return None
         s = self.senses[row_idx]
         if s == "<=":
             return np.asarray(jrow, float).copy(), float(jrow @ x - g)

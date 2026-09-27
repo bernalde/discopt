@@ -567,7 +567,7 @@ def _lower_outer(model, leaf, w, bps, samples, bands, prefix) -> None:
     ``b - x = h*wl_i``, so the tapers are linear rows in ``(wl_i, wr_i, z_i)``;
     with ``z_i = 0`` every term vanishes and ``d_i = 0``.
     """
-    from discopt.modeling._piecewise import _lin
+    from discopt.modeling._piecewise import _lin, _value_reference
 
     add = model.subject_to
     s = len(bps) - 1
@@ -584,10 +584,20 @@ def _lower_outer(model, leaf, w, bps, samples, bands, prefix) -> None:
     b = np.asarray(bps)
     v = np.asarray(samples)
     wterms = [wl[i] for i in range(s)] + [wr[i] for i in range(s)]
-    add(leaf == _lin(np.concatenate([b[:-1], b[1:]]), wterms), name=f"{prefix}_x")
+    # Centred on the first breakpoint and on a central sample (#1495, the #1494
+    # class): with sum(wl + wr) = sum(z) = 1 these equal the uncentred
+    # ``leaf == sum b w`` rows exactly, but a solver meets that sum only to a
+    # tolerance eps, and uncentred the leaf may then drift by |b_0| * eps -- at
+    # b_0 = 1e5 enough to certify 2.5e-5 on a problem whose minimum is 0. Centred,
+    # the drift is span * eps. ``_value_reference`` keeps a sample equal to the
+    # reference up to rounding from becoming a droppable ~1e-16 coefficient.
+    cv = _value_reference(v)
+    bx = np.concatenate([b[:-1], b[1:]]) - b[0]
+    vw = np.concatenate([v[:-1], v[1:]]) - cv
+    add(leaf == _lin(bx, wterms, b[0]), name=f"{prefix}_x")
     dterms = [d[i] for i in range(s)]
     add(
-        w == _lin(np.concatenate([v[:-1], v[1:], np.ones(s)]), wterms + dterms),
+        w == _lin(np.concatenate([vw, np.ones(s)]), wterms + dterms, cv),
         name=f"{prefix}_w",
     )
     for i, bd in enumerate(bands):
@@ -1084,6 +1094,18 @@ class PWLTransformation:
             }
             history.append(entry)
             if self.mode == "outer" and r.status == "infeasible" and r.gap_certified:
+                if best_x is not None:
+                    # The same tripwire as below, for the extreme case: an earlier
+                    # round produced a point VERIFIED on the original model, so a
+                    # relaxation claiming emptiness is not a relaxation (or its
+                    # solver's infeasible label is false). Publishing "infeasible"
+                    # next to a known feasible point would be a false certificate.
+                    raise AssertionError(
+                        "nonlinear_to_pwl: the outer approximation was reported "
+                        f"infeasible in round {rounds} after round(s) before it produced "
+                        f"a point verified on the original model (objective {best_obj}); "
+                        "the outer approximation is not a relaxation"
+                    )
                 # The relaxation is infeasible, so the original is: a certificate.
                 return self._result(
                     status="infeasible",
@@ -1162,15 +1184,22 @@ class PWLTransformation:
             [np.asarray(x[v.name], dtype=np.float64).reshape(-1) for v in orig._variables]
         )
         found: list[tuple[np.ndarray, float]] = []
-        res = verify_point(orig, flat, with_objective=True)
+        # #1496: ``verify_point`` accepts a point up to tolerance OUTSIDE the box, and
+        # the objective there can beat every in-box point -- an incumbent below the
+        # certified bound (``min (x-0.3)**2`` at x = 1e4 - 1e-4), or one that trips
+        # the tripwire on a valid bound (``max exp(x)`` at x = 18 + eps). The point
+        # published is therefore the one clipped into the box with integers rounded,
+        # and it is that point which is verified and whose objective is used.
+        res = verify_point(orig, cand := _into_box(orig, flat), with_objective=True)
         if res.ok:
             assert res.objective is not None  # with_objective=True on an ok result
-            found.append((flat, float(res.objective)))
+            found.append((cand, float(res.objective)))
         else:
             notes.append(f"transformed point not feasible for the original: {res.reason}")
         if polish:
             polished = _polish(orig, flat, notes)
             if polished is not None:
+                polished = _into_box(orig, polished)
                 res2 = verify_point(orig, polished, with_objective=True)
                 if res2.ok:
                     assert res2.objective is not None
@@ -1306,6 +1335,21 @@ def _polish(model: "Model", x0: np.ndarray, notes: list[str]) -> Optional[np.nda
         notes.append("polish NLP returned no point")
         return None
     return np.asarray(x, dtype=np.float64)
+
+
+def _into_box(model: "Model", x: np.ndarray) -> np.ndarray:
+    """*x* clipped into the declared bounds, integer columns rounded (#1496)."""
+    from discopt.modeling.core import VarType
+
+    lo, hi = _flat_bounds(model)
+    out = np.clip(np.asarray(x, dtype=np.float64), lo, hi)
+    off = 0
+    for v in model._variables:
+        if v.var_type in (VarType.INTEGER, VarType.BINARY):
+            sl = slice(off, off + v.size)
+            out[sl] = np.clip(np.round(out[sl]), lo[sl], hi[sl])
+        off += v.size
+    return out
 
 
 def _flat_bounds(model: "Model") -> tuple[np.ndarray, np.ndarray]:
