@@ -447,6 +447,8 @@ def _eval_function_call(
 
     arg = args[0]
     name = expr.func_name
+    if name.startswith("norm"):
+        return _norm_interval(name, arg)
     if name == "exp":
         return iv.exp(arg)
     if name == "log":
@@ -506,6 +508,57 @@ def _eval_function_call(
     # will refuse to prove convexity for expressions that hit this
     # path, preserving soundness.
     return _unbounded(arg.lo.shape)
+
+
+def _norm_interval(name: str, arg: Interval) -> Interval:
+    """Sound SCALAR enclosure of ``norm{p}(arg)`` (#1493).
+
+    A norm is a reduction, so its enclosure is 0-d whatever ``arg``'s shape.
+    The generic arm below used to return an unbounded interval of ``arg``'s
+    shape, i.e. an ARRAY enclosure for a scalar node, which the relaxation
+    builder then failed on with ``TypeError``.
+
+    For a 0-d or 1-D argument (the vector p-norm of the tape lowering) the
+    enclosure is composed from outward-rounded interval operations on
+    ``|arg_i|``: exact composition for ``p`` in {1, 2, inf}, and the
+    norm-equivalence sandwich ``||x||_inf <= ||x||_p <= ||x||_1`` for any other
+    ``p >= 1``. A >=2-D argument is ``jnp.linalg.norm``'s induced MATRIX norm,
+    which the entrywise bounds above do NOT enclose (``||I_3||_2 = 1`` while the
+    entrywise 2-norm is ``sqrt(3)``), so it gets only ``[0, +inf)`` -- true of
+    every norm.
+    """
+    lo_arr = np.asarray(arg.lo, dtype=np.float64)
+    if lo_arr.ndim >= 2 or lo_arr.size == 0:
+        return Interval(np.asarray(0.0), np.asarray(np.inf))
+    suffix = name[len("norm") :]
+    if suffix == "inf":
+        p = np.inf
+    elif suffix == "":
+        p = 2.0
+    else:
+        try:
+            p = float(suffix)
+        except ValueError:
+            return Interval(np.asarray(0.0), np.asarray(np.inf))
+    a = iv.absolute(arg)
+    a_lo = np.asarray(a.lo, dtype=np.float64).reshape(-1)
+    a_hi = np.asarray(a.hi, dtype=np.float64).reshape(-1)
+    parts = [Interval(np.asarray(lo), np.asarray(hi)) for lo, hi in zip(a_lo, a_hi)]
+    if p == np.inf:
+        # max selects existing doubles: exact, no rounding.
+        return Interval(np.asarray(np.max(a_lo)), np.asarray(np.max(a_hi)))
+    if p == 2.0:
+        acc = parts[0] ** 2
+        for part in parts[1:]:
+            acc = acc + part**2
+        return iv.sqrt(acc)
+    one = parts[0]
+    for part in parts[1:]:
+        one = one + part
+    if p == 1.0:
+        return one
+    # ||x||_inf <= ||x||_p <= ||x||_1 for every p >= 1.
+    return Interval(np.asarray(np.max(a_lo)), np.asarray(one.hi))
 
 
 def _registered_interval(name, expr, model, box, cache):

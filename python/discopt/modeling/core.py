@@ -3480,12 +3480,14 @@ def norm(x: Expression, ord: Union[int, float, str] = 2) -> Expression:
     -----
     ``norm`` is a **vector** norm. Given a 2-D argument the JAX evaluation path
     applies :func:`numpy.linalg.norm`'s *matrix* semantics — ``ord=2`` is then
-    the spectral norm, not ``‖vec(X)‖₂`` — while the relaxation layer bounds
-    ``norm*`` as a p-norm over the flattened components. The two agree on a
-    vector and diverge on a matrix; a matrix argument has no envelope of its own
-    and so cannot certify (it returns no dual bound rather than a wrong one).
-    Prefer building a matrix norm explicitly from ``dm.sum``/``**`` if you need
-    one on the global path.
+    the spectral norm, not ``‖vec(X)‖₂``. The relaxation layer spells a 1-D
+    norm out over its elements (``sum|x_i|``, ``max|x_i|``,
+    ``sqrt(sum x_i**2)``, ...) exactly as the evaluator computes it, so a vector
+    norm relaxes like its hand-written scalar form (#1493). A matrix argument
+    has no envelope of its own: the only claim made about it is ``norm >= 0``,
+    so it cannot certify (it gets no useful dual bound rather than a wrong
+    one). Prefer building a matrix norm explicitly from ``dm.sum``/``**`` if
+    you need one on the global path.
 
     Returns
     -------

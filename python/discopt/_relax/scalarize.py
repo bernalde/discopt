@@ -207,6 +207,9 @@ def _static_shape_uncached(expr: Expression) -> Optional[tuple[int, ...]]:
         return _broadcast(static_shape(expr.left), static_shape(expr.right))
 
     if isinstance(expr, FunctionCall):
+        if expr.func_name.startswith("norm") and len(expr.args) == 1:
+            # ``dm.norm`` is a reduction: scalar whatever its argument's shape (#1493).
+            return ()
         if expr.func_name not in _ELEMENTWISE_FUNCS:
             return None
         shape: Optional[tuple[int, ...]] = ()

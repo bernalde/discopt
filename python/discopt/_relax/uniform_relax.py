@@ -1371,8 +1371,18 @@ class _Builder:
             self._bounds[id(node)] = hit
             return hit
         enc = evaluate_interval(self._expr(node), self.model, self._ivbox)
-        lo = float(np.asarray(enc.lo))
-        hi = float(np.asarray(enc.hi))
+        enc_lo = np.asarray(enc.lo)
+        enc_hi = np.asarray(enc.hi)
+        if enc_lo.size != 1 or enc_hi.size != 1:
+            # Every CNode is scalar by construction; an array enclosure means an
+            # array-valued subexpression reached a scalar slot. Say so, instead of
+            # numpy's "only 0-dimensional arrays can be converted" (#1493).
+            raise ValueError(
+                f"relaxation invariant violated: {node.kind} node {self._expr(node)!r} "
+                f"has an array-valued interval enclosure of shape {enc_lo.shape}"
+            )
+        lo = float(enc_lo.reshape(()))
+        hi = float(enc_hi.reshape(()))
         if not (math.isfinite(lo)):
             lo = -math.inf
         if not (math.isfinite(hi)):

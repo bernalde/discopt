@@ -6645,6 +6645,17 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
     from discopt.modeling.core import FunctionCall, UnaryOp
 
     _nonsmooth_funcs = {"abs", "min", "max"}
+    # ``norm1`` / ``norminf`` of a VECTOR are sum|x_i| / max|x_i| -- the same
+    # abs/max kinks, along whole hyperplanes, and the relaxation layer spells them
+    # out through those exact envelopes (#1493: the convex single NLP stalled on
+    # ``min norm(v, inf)`` at 0.545 against the optimum 0.5 and, without this,
+    # never fell back to the B&B that certifies it). A >=2-D argument is a MATRIX
+    # norm with no relaxation, where the B&B could only discard the NLP's point,
+    # and a p-norm with 1 < p < inf is smooth away from the origin: both stay on
+    # the NLP.
+    _nonsmooth_vector_norms = {"norm1", "norm1.0", "norminf"}
+    from discopt._relax.scalarize import static_shape
+
     # Expressions are DAGs; without this a shared subexpression is walked once
     # per path, which is exponential in the sharing depth.
     seen: set[int] = set()
@@ -6656,6 +6667,14 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
         if isinstance(expr, UnaryOp) and expr.op == "abs":
             return True
         if isinstance(expr, FunctionCall) and expr.func_name in _nonsmooth_funcs:
+            return True
+        if (
+            isinstance(expr, FunctionCall)
+            and expr.func_name in _nonsmooth_vector_norms
+            and len(expr.args) == 1
+            and (shape := static_shape(expr.args[0])) is not None
+            and len(shape) <= 1
+        ):
             return True
         left = getattr(expr, "left", None)
         if left is not None and _walk(left):
