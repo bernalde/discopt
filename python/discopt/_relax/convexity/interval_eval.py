@@ -386,7 +386,12 @@ def extended_division_enabled() -> bool:
     the family (60 -> 97 certified, 0 lost); on the corpus it fires on 6 instances
     (4stufen, beuster, contvar, heatexch_gen1/2/3), all time-limited in both arms
     with identical bounds and node counts, so the corpus cannot score the second bar.
-    Kept as a documented opt-in, not a stalled graduation. **What would change
+    **MINLPLib panel (2026-09-27): bar 2 FAILS.** On the 37 ``minlp2`` instances whose
+    root-box denominator enclosure holds 0 it fires on 17 and gains 0 certificates and
+    0 bounds (cert-clean: 258 checks, 0 violations); its one real gain (``minlphi``
+    bound) needs ``DISCOPT_POLE_BRANCHING`` too, which also fails. Retirement
+    candidate, default OFF until the deletion PR (audit row). The text below is the
+    pre-panel rationale. Previously: kept as a documented opt-in. **What would change
     that:** a panel over MINLPLib instances whose objective or constraint divides by
     a denominator whose range TOUCHES 0 on the root box -- the class this serves --
     showing certificates or bounds gained. The straddling case (``min 1/x s.t.

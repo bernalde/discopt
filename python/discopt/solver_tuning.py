@@ -1153,8 +1153,10 @@ class SolverTuning:
     lineage past ``POLE_MAX_DEPTH`` (24) or a solve past ``POLE_MAX_BRANCHES``
     (512) takes the legacy unresolved fathom, so a pole the objective genuinely
     reaches still terminates with no certificate. Search-changing, so default
-    OFF under CLAUDE.md §5; see ``docs/dev/flag-retirement-audit.md`` for its
-    panel and state."""
+    OFF under CLAUDE.md §5. **MINLPLib panel (2026-09-27): bar 2 FAILS** -- 0
+    certificates on 37 pole instances + a 418-instance screen, nodes 32 -> 4620 and
+    wall 78 -> 372 s where it fires; retirement candidate, default OFF until the
+    deletion PR. See ``docs/dev/flag-retirement-audit.md`` for the numbers."""
 
     lp_warmstart: bool = field(
         default_factory=lambda: _env_flag("DISCOPT_LP_WARMSTART", default=True)
