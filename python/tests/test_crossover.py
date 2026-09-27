@@ -143,7 +143,14 @@ class TestEndToEnd:
             )
 
         r_cut = _run()
-        monkeypatch.setattr(S, "_root_cover_cut_loop", lambda ld, *a, **k: (ld, 0))
+        monkeypatch.setattr(
+            S,
+            "_root_cover_cut_loop",
+            # #1514: the loop returns (lp_data, n_cuts, by_source). A 2-tuple stub
+            # used to raise ValueError inside a swallowing ``except``, so this arm
+            # silently ran with no cuts for a different reason than it claims.
+            lambda ld, *a, **k: (ld, 0, {"cover_clique": 0, "gomory": 0, "mir": 0}),
+        )
         r_nocut = _run()
 
         assert r_cut.status == "optimal" and r_nocut.status == "optimal"

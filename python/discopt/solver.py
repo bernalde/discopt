@@ -306,7 +306,12 @@ def _affine_reduce(expr: Any, model: Model, s: float = 1.0):
 
     def _walk(e: Any, sign: float):
         if isinstance(e, Constant):
-            return ({}, sign * float(e.value))
+            if np.size(e.value) != 1:
+                # #1514: an array-valued constant is not a scalar affine term, which
+                # this walk reports as ``None``; ``float()`` raised a TypeError that
+                # the call site's catch-all used to swallow.
+                return None
+            return ({}, sign * float(np.asarray(e.value).reshape(-1)[0]))
         if isinstance(e, (Variable, IndexExpression)):
             flat = _get_flat_index(e, model)
             if flat is None:
@@ -325,10 +330,16 @@ def _affine_reduce(expr: Any, model: Model, s: float = 1.0):
                     d[k] = d.get(k, 0.0) + val
                 return (d, left[1] + right[1])
             if e.op == "*":
+                # #1514: a non-scalar constant factor is not a scalar affine term
+                # (``None``); ``float()`` on it raised a swallowed TypeError.
                 if isinstance(e.left, Constant):
-                    return _walk(e.right, sign * float(e.left.value))
+                    if np.size(e.left.value) != 1:
+                        return None
+                    return _walk(e.right, sign * float(np.asarray(e.left.value).reshape(-1)[0]))
                 if isinstance(e.right, Constant):
-                    return _walk(e.left, sign * float(e.right.value))
+                    if np.size(e.right.value) != 1:
+                        return None
+                    return _walk(e.left, sign * float(np.asarray(e.right.value).reshape(-1)[0]))
         return None
 
     return _walk(expr, s)
@@ -1832,18 +1843,18 @@ def _try_native_spatial_kernel(
         )
         _rr_internal = None
         if _fb_remaining > 0.0:
-            try:
-                _t_phase = time.perf_counter()
-                _rr_internal = _root_relaxation_lower_bound(
-                    model,
-                    np.asarray(lb, dtype=np.float64)[:n_vars],
-                    np.asarray(ub, dtype=np.float64)[:n_vars],
-                    _fb_remaining,
-                    psd_cuts=psd_cuts,
-                )
-                _native_jax_s += time.perf_counter() - _t_phase
-            except Exception as _rr_exc:  # pragma: no cover - defensive
-                logger.debug("native-kernel root-relaxation fallback failed: %s", _rr_exc)
+            # #1514: no ``except``. ``_root_relaxation_lower_bound`` returns ``None`` when
+            # no candidate bound is available; an exception from it is a defect in the
+            # relaxation layer, which the main post-search call already lets propagate.
+            _t_phase = time.perf_counter()
+            _rr_internal = _root_relaxation_lower_bound(
+                model,
+                np.asarray(lb, dtype=np.float64)[:n_vars],
+                np.asarray(ub, dtype=np.float64)[:n_vars],
+                _fb_remaining,
+                psd_cuts=psd_cuts,
+            )
+            _native_jax_s += time.perf_counter() - _t_phase
         _fb_bound, _, _ = _finalize_reported_bound(
             tree_bound_internal=None,
             tree_bound_valid=False,
@@ -3819,19 +3830,21 @@ def _reduce_node_and_stage(
     ``batch_lb[i]``/``batch_ub[i]`` (so downstream branching/hints see the tighter
     box) and records it in ``pending[i]`` for the ``set_node_bounds`` child export.
     Returns True iff the reduction proved the node infeasible under the cutoff (a
-    rigorous fathom). Tighten-only: any failure leaves the box unchanged."""
-    try:
-        cur_lb = np.asarray(batch_lb[i], dtype=np.float64)
-        cur_ub = np.asarray(batch_ub[i], dtype=np.float64)
-        # do_fbbt=False: the FREE reduced-cost DBBT only — no per-node Rust
-        # ``fbbt_with_cutoff`` repr rebuild. The rebuild is the expensive, disruptive
-        # part (it re-derives a full box that perturbs the child search); the DBBT
-        # from the node LP's own reduced costs is the ~zero-cost BARON-style move
-        # this lever is about. cutoff-FBBT can be re-added selectively in step 3.
-        res = reduce_node_fn(model, cur_lb, cur_ub, lp_result, cutoff, do_fbbt=False)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("reduce_node failed at node %d: %s", i, exc)
-        return False
+    rigorous fathom). Tighten-only: a reduction that cannot run declines by
+    returning an unchanged box (``n_tightened == 0``)."""
+    cur_lb = np.asarray(batch_lb[i], dtype=np.float64)
+    cur_ub = np.asarray(batch_ub[i], dtype=np.float64)
+    # do_fbbt=False: the FREE reduced-cost DBBT only — no per-node Rust
+    # ``fbbt_with_cutoff`` repr rebuild. The rebuild is the expensive, disruptive
+    # part (it re-derives a full box that perturbs the child search); the DBBT
+    # from the node LP's own reduced costs is the ~zero-cost BARON-style move
+    # this lever is about. cutoff-FBBT can be re-added selectively in step 3.
+    #
+    # #1514: no ``except`` here. ``reduce_node`` declines by return value (missing
+    # marginals / no cutoff / no ``rc_absum`` all skip the move), and with
+    # ``do_fbbt=False`` it is pure numpy with no external call, so an exception is
+    # a defect and must fail the solve rather than read as "nothing to tighten".
+    res = reduce_node_fn(model, cur_lb, cur_ub, lp_result, cutoff, do_fbbt=False)
     if res.infeasible:
         return True
     if res.n_tightened > 0:
@@ -3996,17 +4009,27 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
     # linearization is only sound for linear constraints; applying it to
     # nonlinear constraints (e.g. x^1.5) can over-tighten and exclude
     # feasible regions, causing false infeasibility (issue #6).
+    #
+    # Clip first: unbounded vars give inf-(-inf)=NaN under unclipped subtract.
+    lb_c = np.clip(lb, -_SPC, _SPC)
+    ub_c = np.clip(ub, -_SPC, _SPC)
+    pt_a = lb_c + 0.25 * (ub_c - lb_c)
+    pt_b = lb_c + 0.75 * (ub_c - lb_c)
     try:
-        # Clip first: unbounded vars give inf-(-inf)=NaN under unclipped subtract.
-        lb_c = np.clip(lb, -_SPC, _SPC)
-        ub_c = np.clip(ub, -_SPC, _SPC)
-        pt_a = lb_c + 0.25 * (ub_c - lb_c)
-        pt_b = lb_c + 0.75 * (ub_c - lb_c)
         J_a = evaluator.evaluate_jacobian(pt_a)
         J_b = evaluator.evaluate_jacobian(pt_b)
-        is_linear = np.all(np.abs(J_a - J_b) < 1e-8, axis=1)  # (m,) bool
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - see comment
+        # #1514: kept as a sound fallback, now visible. A model can hold code the
+        # evaluator cannot differentiate -- a user ``dm.custom`` callable written
+        # with plain numpy raises ``TracerArrayConversionError`` under the JAX
+        # fallback evaluator -- and the structural/interval tightening below needs
+        # no Jacobian, so falling back only forgoes the linear-row sweep. The first
+        # failure per solve is a WARNING (it used to be silent).
+        _warn_fallback_once(
+            "linear-row FBBT: constraint Jacobian", exc, "using interval tightening only"
+        )
         return _apply_nonlinear_tightening_with_status(evaluator._model, lb, ub)
+    is_linear = np.all(np.abs(J_a - J_b) < 1e-8, axis=1)  # (m,) bool
 
     # The two-point Jacobian test is fooled by saturating nonlinearities
     # (max/abs/clamped exprs) when both samples fall in one locally-flat piece;
@@ -4039,11 +4062,11 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
         try:
             J = evaluator.evaluate_jacobian(mid)  # (m, n)
             g = evaluator.evaluate_constraints(mid)  # (m,)
-        except Exception as exc:  # noqa: BLE001 - keeps the tightening found so far
-            logger.debug(
-                "linear-row FBBT stopped, Jacobian evaluation failed: %s: %s",
-                type(exc).__name__,
-                exc,
+        except Exception as exc:  # noqa: BLE001 - see the two-point test above
+            # #1514: same sound fallback as the two-point test: keep the tightening
+            # found so far; reported once per solve at WARNING.
+            _warn_fallback_once(
+                "linear-row FBBT: constraint Jacobian", exc, "keeping the tightening so far"
             )
             break
 
@@ -4074,32 +4097,36 @@ def _apply_nonlinear_tightening_with_status(
     lb: np.ndarray,
     ub: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
-    """Apply opportunistic nonlinear bound tightening without aborting node processing."""
-    try:
-        from discopt._relax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+    """Apply opportunistic nonlinear bound tightening without aborting node processing.
 
-        # #875: this was the ONE nonlinear-tightening entry point with no budget. The
-        # other three all pass a deadline — the root declared-box pass, the
-        # periodic/domain pass, and AMP — so this one ran the pass to completion on
-        # every invocation. On watercontamination0202 (107k rows) that is ~23 s per
-        # call and it fired 3x inside a 30 s ``time_limit``, i.e. ~70 s of a 126 s
-        # profile: the single largest remaining overrun after the sparse-linearizer
-        # fix, and the reason a deadline on ``tighten_nonlinear_bounds`` alone did not
-        # bound the solve.
-        #
-        # Bound it by the solve's own ABSOLUTE deadline rather than a fresh per-call
-        # fraction. A per-call fraction is what let the convexity classifier's budget
-        # multiply across model objects (each reformulation restarted it), and this
-        # helper is called per node as well as at the root, so a fraction here would
-        # compound the same way. ``None`` (no time limit) keeps the unbounded pass,
-        # which is the current behavior for an untimed solve.
-        _nbt_deadline = getattr(model, "_solve_deadline", None)
-        tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(
-            model, lb, ub, deadline=_nbt_deadline
-        )
-    except Exception as exc:
-        logger.debug("Skipping nonlinear tightening after error: %s", exc)
-        return lb, ub, False
+    #1514: no ``except`` around the pass. ``tighten_nonlinear_bounds`` declines by
+    return value -- an exhausted deadline, a rule with nothing to tighten or a rule
+    that abstains all return a looser box, and an infeasibility proof comes back in
+    ``stats`` (its rules' ``NonlinearBoundTighteningInfeasible`` is caught inside
+    the pass). An exception reaching this frame is therefore a defect; the old
+    DEBUG-logged catch-all turned it into "no tightening at this node".
+    """
+    from discopt._relax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+
+    # #875: this was the ONE nonlinear-tightening entry point with no budget. The
+    # other three all pass a deadline — the root declared-box pass, the
+    # periodic/domain pass, and AMP — so this one ran the pass to completion on
+    # every invocation. On watercontamination0202 (107k rows) that is ~23 s per
+    # call and it fired 3x inside a 30 s ``time_limit``, i.e. ~70 s of a 126 s
+    # profile: the single largest remaining overrun after the sparse-linearizer
+    # fix, and the reason a deadline on ``tighten_nonlinear_bounds`` alone did not
+    # bound the solve.
+    #
+    # Bound it by the solve's own ABSOLUTE deadline rather than a fresh per-call
+    # fraction. A per-call fraction is what let the convexity classifier's budget
+    # multiply across model objects (each reformulation restarted it), and this
+    # helper is called per node as well as at the root, so a fraction here would
+    # compound the same way. ``None`` (no time limit) keeps the unbounded pass,
+    # which is the current behavior for an untimed solve.
+    _nbt_deadline = getattr(model, "_solve_deadline", None)
+    tightened_lb, tightened_ub, stats = tighten_nonlinear_bounds(
+        model, lb, ub, deadline=_nbt_deadline
+    )
 
     if stats.infeasible:
         logger.debug("Nonlinear tightening proved infeasibility: %s", stats.infeasibility_reason)
@@ -6238,13 +6265,12 @@ def _declared_box_tightening(model: Model, deadline: Optional[float] = None):
     floor, and ``_check_finite_bounds``'s conditional need is a subset of that.
     """
     raw_lb, raw_ub = flat_variable_bounds(model)
-    try:
-        from discopt._relax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+    from discopt._relax.nonlinear_bound_tightening import tighten_nonlinear_bounds
 
-        return tighten_nonlinear_bounds(model, raw_lb, raw_ub, deadline=deadline)
-    except Exception as exc:
-        logger.debug("Nonlinear bound tightening on the declared box failed: %s", exc)
-        return None
+    # #1514: no ``except``. The pass declines by return value (see
+    # ``_apply_nonlinear_tightening_with_status``); an exception is a defect, and
+    # returning ``None`` for it made both consumers silently skip their check.
+    return tighten_nonlinear_bounds(model, raw_lb, raw_ub, deadline=deadline)
 
 
 def _constant_objective_result(model: Model, t_start: float) -> Optional[SolveResult]:
@@ -8239,22 +8265,23 @@ def _apply_auto_cut_policy(model: "Model", relaxer) -> None:
     """
     from discopt._relax.milp_relaxation import _any_linear_constraint_form
 
-    try:
-        n = sum(v.size for v in model._variables)
-        # Sparse-bilinear widening (issue #727, flag-gated default-off): admit the
-        # per-node RLT cut family for a medium pooling / bilinear-network model whose
-        # product structure is sparse, past the raw variable-count gate.
-        if n > _AUTO_CUTS_MAX_VARS and not _rlt_sparse_admit(model, n):
-            return  # size gate: leave cuts off
-        has_linear_constraints = _any_linear_constraint_form(model, n)
-        if has_linear_constraints:
-            relaxer._rlt_cuts = True
-            relaxer._psd_cuts = False
-        else:
-            relaxer._psd_cuts = True
-            relaxer._rlt_cuts = False
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("auto cut policy skipped: %s", exc)
+    # #1514: no ``except``. This is structural inspection with no external call;
+    # ``_any_linear_constraint_form`` declines a nonlinear body by returning False
+    # (its linearizer's ``ValueError`` is caught inside ``_linear_form_terms``), so
+    # an exception here is a defect and used to leave the cut policy silently unset.
+    n = sum(v.size for v in model._variables)
+    # Sparse-bilinear widening (issue #727, flag-gated default-off): admit the
+    # per-node RLT cut family for a medium pooling / bilinear-network model whose
+    # product structure is sparse, past the raw variable-count gate.
+    if n > _AUTO_CUTS_MAX_VARS and not _rlt_sparse_admit(model, n):
+        return  # size gate: leave cuts off
+    has_linear_constraints = _any_linear_constraint_form(model, n)
+    if has_linear_constraints:
+        relaxer._rlt_cuts = True
+        relaxer._psd_cuts = False
+    else:
+        relaxer._psd_cuts = True
+        relaxer._rlt_cuts = False
 
 
 def _admissible_probe_bound(
@@ -8359,8 +8386,10 @@ def _root_relaxation_lower_bound(
     Numerically catastrophic envelopes (e.g. cleared-division equalities over
     wide-ranged defined variables) are sanitized away first so the backend can
     return a bound instead of failing on the conditioning. Only ever called for a
-    MINIMIZE objective; defensively returns ``None`` on any failure so it can
-    never make a previously-bounded solve worse.
+    MINIMIZE objective. Returns ``None`` whenever no candidate bound is available
+    (a producer that declines says so by return value); an exception from a
+    producer is a defect and propagates (#1514) rather than silently costing the
+    solve this bound.
     """
     from discopt._relax.discretization import DiscretizationState
     from discopt._relax.milp_relaxation import (
@@ -8463,258 +8492,261 @@ def _root_relaxation_lower_bound(
     if _base_deadline_on:
         _base_build_deadline = _fb_deadline
 
-    try:
-        terms = classify_nonlinear_terms(model)
-        relax, _relax_info = build_milp_relaxation(
-            model,
-            terms,
-            DiscretizationState(),
-            bound_override=(root_lb, root_ub),
-            build_deadline=_base_build_deadline,
+    # #1514: no outer ``except``. Every producer below declines by return value
+    # (``build_milp_relaxation`` marks an objective it cannot linearize via
+    # ``_objective_bound_valid``; the LP/MILP backends and ``solve_at_node`` report
+    # failure as a status), so an exception is a defect in the relaxation layer --
+    # e.g. an expression type the builder mishandles -- and must fail the solve
+    # rather than quietly cost it its last-ditch dual bound.
+    terms = classify_nonlinear_terms(model)
+    relax, _relax_info = build_milp_relaxation(
+        model,
+        terms,
+        DiscretizationState(),
+        bound_override=(root_lb, root_ub),
+        build_deadline=_base_build_deadline,
+    )
+    if not relax._objective_bound_valid:
+        return None
+    relax = sanitize_relaxation_for_conditioning(relax)
+
+    # Candidates accumulate here in completion order; every entry is an
+    # independently valid lower bound on the internally minimized objective,
+    # so ``max`` at the bottom keeps the tightest and any prefix is sound.
+    _have: list[float] = []
+
+    # #930, flag-gated half (``DISCOPT_ROOT_PROBE_SEEDS_FALLBACK``, default off).
+    # The two rules below that read ``_have`` — rule 1 of ``_fb_stop`` and the
+    # ``_sep_budget`` clamp — both ask "is a valid bound already in hand?". On the
+    # spatial path the honest answer is usually yes before we even start: the root
+    # LP probe proved one inside the budget. Seeding it here is what lets the
+    # fallback stop re-deriving what the solver already knows (hda: a 2.72 s
+    # ``solve_at_node`` returning the probe's value to all 17 digits).
+    #
+    # Default off because it is bound-CHANGING, not merely faster: with ``_have``
+    # non-empty, rule 2 may decline the separated phase, and a starved probe's
+    # bound can be looser than that phase would prove (``solve_at_node`` reports a
+    # weak NS floor under ``status="optimal"``). Sound either way — the seeded
+    # value is a valid lower bound over this exact box and reaches the caller
+    # through the same ``max`` — so this trades bound quality for punctuality
+    # exactly where rule 2 already does, never correctness.
+    if getattr(_tuning(), "root_probe_seeds_fallback", False):
+        _seed = _admissible_probe_bound(probe, root_lb, root_ub)
+        if _seed is not None:
+            _have.append(_seed)
+
+    # PSD (moment) cuts strengthen the McCormick relaxation toward the SDP
+    # bound on nonconvex QCQP. `sanitize_*` only drops rows, so the column
+    # map `_relax_info` still matches `relax`. Each cut is valid for the whole
+    # feasible region, so the strengthened LP value is a *valid* lower bound
+    # (>= the plain bound); it joins the candidates below and `max` keeps the
+    # tightest. Opt-in via `psd_cuts=True`; any failure is a sound no-op.
+    psd_bound: Optional[float] = None
+    if psd_cuts and not _fb_stop(_have):
+        # #1514: no ``except``. ``psd_strengthen_relaxation_bound`` declines by
+        # return value (no exact LP oracle, a non-optimal LP status or no separable cut
+        # all give ``n_cuts == 0``); the exact simplex reports a numerical failure as a
+        # status, not an exception. A raise is a defect.
+        from discopt._relax.model_utils import binary_flat_cols
+        from discopt._relax.psd_cuts import psd_strengthen_relaxation_bound
+
+        # Binary variables have moment diagonal X_ii = x_i, so the moment
+        # separator can form cliques over pure products of distinct binaries
+        # (QAP-class) that carry no lifted square column — otherwise it finds
+        # no clique and emits no cut (a no-op strengthening).
+        _zb, _za, _nc = psd_strengthen_relaxation_bound(
+            relax, _relax_info, binary_vars=binary_flat_cols(model)
         )
-        if not relax._objective_bound_valid:
-            return None
-        relax = sanitize_relaxation_for_conditioning(relax)
+        if _nc and _za is not None and np.isfinite(_za):
+            psd_bound = float(_za)
+            _have.append(psd_bound)
 
-        # Candidates accumulate here in completion order; every entry is an
-        # independently valid lower bound on the internally minimized objective,
-        # so ``max`` at the bottom keeps the tightest and any prefix is sound.
-        _have: list[float] = []
+    # RLT level-1 (constraint-factor products) strengthens the root bound on a
+    # constrained *binary* QP where McCormick alone is trivially loose (qap:
+    # root ~0 vs optimum 388214, issue #661). Each added row is a product of
+    # valid model constraints; the RLT LP is solved with the exact vertex
+    # simplex and the surfaced value is the Neumaier-Shcherbina *safe* dual
+    # bound from that solve (rigorous at any conditioning, `<=` the true LP
+    # min), so it joins the `max` below — it can only raise the bound. Opt-in
+    # (`DISCOPT_RLT1_ROOT_BOUND`, default off); any ineligibility/failure is a
+    # sound no-op.
+    rlt_bound: Optional[float] = None
+    _tun = _tuning()
+    if getattr(_tun, "rlt1_root_bound", False) and not _fb_stop(_have):
+        # #1514: no ``except``. ``rlt1_lower_bound`` returns ``(None, n)`` on every
+        # ineligibility, a non-optimal simplex status or missing duals; a raise is a
+        # defect, not a decline.
+        from discopt._relax.model_utils import binary_flat_cols as _bfc
+        from discopt._relax.rlt import rlt1_lower_bound
 
-        # #930, flag-gated half (``DISCOPT_ROOT_PROBE_SEEDS_FALLBACK``, default off).
-        # The two rules below that read ``_have`` — rule 1 of ``_fb_stop`` and the
-        # ``_sep_budget`` clamp — both ask "is a valid bound already in hand?". On the
-        # spatial path the honest answer is usually yes before we even start: the root
-        # LP probe proved one inside the budget. Seeding it here is what lets the
-        # fallback stop re-deriving what the solver already knows (hda: a 2.72 s
-        # ``solve_at_node`` returning the probe's value to all 17 digits).
-        #
-        # Default off because it is bound-CHANGING, not merely faster: with ``_have``
-        # non-empty, rule 2 may decline the separated phase, and a starved probe's
-        # bound can be looser than that phase would prove (``solve_at_node`` reports a
-        # weak NS floor under ``status="optimal"``). Sound either way — the seeded
-        # value is a valid lower bound over this exact box and reaches the caller
-        # through the same ``max`` — so this trades bound quality for punctuality
-        # exactly where rule 2 already does, never correctness.
-        if getattr(_tuning(), "root_probe_seeds_fallback", False):
-            _seed = _admissible_probe_bound(probe, root_lb, root_ub)
-            if _seed is not None:
-                _have.append(_seed)
+        _rb, _nrows = rlt1_lower_bound(
+            model,
+            relax,
+            _relax_info,
+            binary_vars=_bfc(model),
+            time_limit=min(30.0, max(5.0, time_limit * 0.5)),
+            max_pairs=int(getattr(_tun, "rlt1_max_pairs", 60_000)),
+        )
+        if _nrows and _rb is not None and np.isfinite(_rb):
+            rlt_bound = float(_rb)
+            _have.append(rlt_bound)
 
-        # PSD (moment) cuts strengthen the McCormick relaxation toward the SDP
-        # bound on nonconvex QCQP. `sanitize_*` only drops rows, so the column
-        # map `_relax_info` still matches `relax`. Each cut is valid for the whole
-        # feasible region, so the strengthened LP value is a *valid* lower bound
-        # (>= the plain bound); it joins the candidates below and `max` keeps the
-        # tightest. Opt-in via `psd_cuts=True`; any failure is a sound no-op.
-        psd_bound: Optional[float] = None
-        if psd_cuts and not _fb_stop(_have):
-            try:
-                from discopt._relax.model_utils import binary_flat_cols
-                from discopt._relax.psd_cuts import psd_strengthen_relaxation_bound
+    # RLT-1 via the Lagrangian dual of the coupling rows: the same rigorous
+    # bound reached without forming the degenerate monolithic RLT-1 LP — each
+    # subgradient step is a cheap sparse McCormick solve, made rigorous by the
+    # NS-safe bound, and `g(mu) <= RLT-1 opt` for every `mu` (weak duality). The
+    # route that beats the exact simplex's scaling wall at qap scale. Opt-in
+    # (`DISCOPT_RLT1_LAGRANGIAN`, default off); any failure is a sound no-op.
+    rlt_lag_bound: Optional[float] = None
+    if getattr(_tun, "rlt1_lagrangian", False) and not _fb_stop(_have):
+        # #1514: no ``except``. ``rlt1_lagrangian_lower_bound`` returns
+        # ``(None, n)`` on ineligibility or a failed inner solve; a raise is a defect.
+        from discopt._relax.model_utils import binary_flat_cols as _bfc
+        from discopt._relax.rlt import rlt1_lagrangian_lower_bound
 
-                # Binary variables have moment diagonal X_ii = x_i, so the moment
-                # separator can form cliques over pure products of distinct binaries
-                # (QAP-class) that carry no lifted square column — otherwise it finds
-                # no clique and emits no cut (a no-op strengthening).
-                _zb, _za, _nc = psd_strengthen_relaxation_bound(
-                    relax, _relax_info, binary_vars=binary_flat_cols(model)
-                )
-                if _nc and _za is not None and np.isfinite(_za):
-                    psd_bound = float(_za)
-                    _have.append(psd_bound)
-            except Exception as psd_exc:  # pragma: no cover - defensive
-                logger.debug("root PSD-strengthened bound skipped: %s", psd_exc)
+        _lb, _nc = rlt1_lagrangian_lower_bound(
+            model,
+            relax,
+            _relax_info,
+            binary_vars=_bfc(model),
+            max_iter=int(getattr(_tun, "rlt1_lagrangian_max_iter", 300)),
+            time_limit=min(30.0, max(5.0, time_limit * 0.5)),
+            max_pairs=int(getattr(_tun, "rlt1_max_pairs", 60_000)),
+        )
+        if _nc and _lb is not None and np.isfinite(_lb):
+            rlt_lag_bound = float(_lb)
+            _have.append(rlt_lag_bound)
 
-        # RLT level-1 (constraint-factor products) strengthens the root bound on a
-        # constrained *binary* QP where McCormick alone is trivially loose (qap:
-        # root ~0 vs optimum 388214, issue #661). Each added row is a product of
-        # valid model constraints; the RLT LP is solved with the exact vertex
-        # simplex and the surfaced value is the Neumaier-Shcherbina *safe* dual
-        # bound from that solve (rigorous at any conditioning, `<=` the true LP
-        # min), so it joins the `max` below — it can only raise the bound. Opt-in
-        # (`DISCOPT_RLT1_ROOT_BOUND`, default off); any ineligibility/failure is a
-        # sound no-op.
-        rlt_bound: Optional[float] = None
-        _tun = _tuning()
-        if getattr(_tun, "rlt1_root_bound", False) and not _fb_stop(_have):
-            try:
-                from discopt._relax.model_utils import binary_flat_cols as _bfc
-                from discopt._relax.rlt import rlt1_lower_bound
+    # Strong-Shor SDP root bound (issue #661): the global moment-matrix PSD
+    # constraint + lifted-equality RLT + McCormick box on X + gangster rows,
+    # solved with a first-order conic solver (SCS, optional dep). The surfaced
+    # value is the *safe dual bound* recomputed from the returned multipliers
+    # (rigorous for any multipliers by weak duality + an eigenvalue shift on
+    # the dual slack matrix), never the solver's approximate objective, so it
+    # joins the `max` below — it can only raise the bound. Root-only. Opt-in
+    # (`DISCOPT_SHOR_SDP_ROOT_BOUND`, default off); any ineligibility, missing
+    # solver, or failure is a sound no-op.
+    shor_bound: Optional[float] = None
+    if getattr(_tun, "shor_sdp_root_bound", False) and not _fb_stop(_have):
+        # #1514: no ``except``. ``shor_sdp_lower_bound`` absorbs the two external
+        # failure modes itself (SCS not installed; SCS raising inside its solve) and
+        # returns ``(None, dim)``; anything reaching here is a defect.
+        from discopt._relax.model_utils import binary_flat_cols as _bfc
+        from discopt._relax.shor_sdp import shor_sdp_lower_bound
 
-                _rb, _nrows = rlt1_lower_bound(
-                    model,
-                    relax,
-                    _relax_info,
-                    binary_vars=_bfc(model),
-                    time_limit=min(30.0, max(5.0, time_limit * 0.5)),
-                    max_pairs=int(getattr(_tun, "rlt1_max_pairs", 60_000)),
-                )
-                if _nrows and _rb is not None and np.isfinite(_rb):
-                    rlt_bound = float(_rb)
-                    _have.append(rlt_bound)
-            except Exception as rlt_exc:  # pragma: no cover - defensive
-                logger.debug("root RLT-1 bound skipped: %s", rlt_exc)
+        _sb, _sdim = shor_sdp_lower_bound(
+            model,
+            relax,
+            _relax_info,
+            binary_vars=_bfc(model),
+            time_limit=float(getattr(_tun, "shor_sdp_time_limit", 120.0)),
+            max_dim=int(getattr(_tun, "shor_sdp_max_dim", 400)),
+        )
+        if _sdim and _sb is not None and np.isfinite(_sb):
+            shor_bound = float(_sb)
+            _have.append(shor_bound)
 
-        # RLT-1 via the Lagrangian dual of the coupling rows: the same rigorous
-        # bound reached without forming the degenerate monolithic RLT-1 LP — each
-        # subgradient step is a cheap sparse McCormick solve, made rigorous by the
-        # NS-safe bound, and `g(mu) <= RLT-1 opt` for every `mu` (weak duality). The
-        # route that beats the exact simplex's scaling wall at qap scale. Opt-in
-        # (`DISCOPT_RLT1_LAGRANGIAN`, default off); any failure is a sound no-op.
-        rlt_lag_bound: Optional[float] = None
-        if getattr(_tun, "rlt1_lagrangian", False) and not _fb_stop(_have):
-            try:
-                from discopt._relax.model_utils import binary_flat_cols as _bfc
-                from discopt._relax.rlt import rlt1_lagrangian_lower_bound
+    budget = min(10.0, max(1.0, time_limit * 0.1))
+    # Checkpoint: the static-envelope solve is optional tightening only once a
+    # strengthened candidate (PSD/RLT) already landed; with those default-off
+    # ``_have`` is empty here, so this gate is inert on the default path and
+    # the plain solve always runs (rule 1 — it is then the first candidate).
+    result = None if _fb_stop(_have) else relax.solve(time_limit=budget, gap_tolerance=1e-6)
+    # Only an OPTIMAL relaxation solve yields a valid lower bound. An
+    # "unbounded" verdict means the relaxation (e.g. a McCormick envelope over
+    # a box where a nonlinear-term variable is still unbounded) has no finite
+    # lower bound, yet the backend still reports ``bound = 0.0`` — a finite
+    # value that is NOT a valid bound. On himmel16 the root relaxation is
+    # unbounded and 0.0 > the true optimum -0.866; surfacing it as the
+    # fallback bound would publish an invalid (above-incumbent) dual bound.
+    # Gate on optimality so an unbounded/limit solve returns no bound instead.
+    plain_bound: Optional[float] = None
+    if (
+        result is not None
+        and result.status == "optimal"
+        and result.bound is not None
+        and np.isfinite(result.bound)
+    ):
+        plain_bound = float(result.bound)
+        _have.append(plain_bound)
 
-                _lb, _nc = rlt1_lagrangian_lower_bound(
-                    model,
-                    relax,
-                    _relax_info,
-                    binary_vars=_bfc(model),
-                    max_iter=int(getattr(_tun, "rlt1_lagrangian_max_iter", 300)),
-                    time_limit=min(30.0, max(5.0, time_limit * 0.5)),
-                    max_pairs=int(getattr(_tun, "rlt1_max_pairs", 60_000)),
-                )
-                if _nc and _lb is not None and np.isfinite(_lb):
-                    rlt_lag_bound = float(_lb)
-                    _have.append(rlt_lag_bound)
-            except Exception as lag_exc:  # pragma: no cover - defensive
-                logger.debug("root RLT-1 Lagrangian bound skipped: %s", lag_exc)
+    # The raw ``relax.solve`` above carries only the static envelope cuts; the
+    # per-node spatial relaxation additionally separates the multilinear hull,
+    # edge-concave blocks, and (issue #114) the univariate-square tangents the
+    # static envelope leaves slack deep inside a wide box. Routing the root
+    # box through ``solve_at_node`` applies that same on-demand separation, so
+    # the surfaced fallback bound matches the tree's tight per-node bounds
+    # instead of the loose static value (ex9_2_6: -201.5 -> ~-1.7). Each
+    # separated cut is a supporting hyperplane, so the result is still a
+    # rigorous global lower bound; the relaxer's own guards (himmel16
+    # unbounded cross-check, infeasible/limit re-verify) return no bound on
+    # any unsound solve. ``_objective_bound_valid`` above already certified
+    # the objective is fully linearized, the precondition both paths share.
+    # Checkpoint (#654): this candidate's LP build is NOT bounded by its solve
+    # ``time_limit`` — measured 16.8s on sonet23v4 against a 1.0s solve budget —
+    # so it is the fallback's dominant overrun. It is nonetheless the sole
+    # bound producer on the whole #654 class (``plain`` is None there), hence
+    # rule 1: it is declined only when a valid bound is ALREADY in hand, in
+    # which case it could merely tighten one we can still soundly report.
+    sep_bound: Optional[float] = None
+    if not _fb_stop(_have):
+        # #1514: no ``except``. ``solve_at_node`` declines by status: a relaxation
+        # build failure is caught inside it and returned as ``status="error"`` with no
+        # ``lower_bound``, which this block already treats as "no candidate".
+        from discopt._relax.mccormick_lp import MccormickLPRelaxer
 
-        # Strong-Shor SDP root bound (issue #661): the global moment-matrix PSD
-        # constraint + lifted-equality RLT + McCormick box on X + gangster rows,
-        # solved with a first-order conic solver (SCS, optional dep). The surfaced
-        # value is the *safe dual bound* recomputed from the returned multipliers
-        # (rigorous for any multipliers by weak duality + an eigenvalue shift on
-        # the dual slack matrix), never the solver's approximate objective, so it
-        # joins the `max` below — it can only raise the bound. Root-only. Opt-in
-        # (`DISCOPT_SHOR_SDP_ROOT_BOUND`, default off); any ineligibility, missing
-        # solver, or failure is a sound no-op.
-        shor_bound: Optional[float] = None
-        if getattr(_tun, "shor_sdp_root_bound", False) and not _fb_stop(_have):
-            try:
-                from discopt._relax.model_utils import binary_flat_cols as _bfc
-                from discopt._relax.shor_sdp import shor_sdp_lower_bound
+        # Rule 1 vs rule 2, applied to the SOLVE budget and not just to
+        # whether the phase starts. With no candidate in hand this is the
+        # sole bound producer and keeps the full slice. Once ``plain`` (or a
+        # strengthened candidate) has landed it is optional tightening, and
+        # it must fit in what is genuinely LEFT of the grant — a phase that
+        # merely starts before the checkpoint could otherwise run arbitrarily
+        # past it (measured on hda at a 2.0s grant: this solve started at
+        # 1.62s and ran 2.19s, so the fallback took 4.05s, 2.0x its grant).
+        # A solve stopped on its own deadline still reports the sound
+        # Neumaier-Shcherbina floor via ``_time_limit_result``, so the clamp
+        # weakens the candidate at worst — it never invalidates one.
+        _sep_budget = min(budget, _fb_left()) if _have else budget
+        node_res = MccormickLPRelaxer(model).solve_at_node(
+            root_lb,
+            root_ub,
+            time_limit=_role2_budget(_sep_budget),
+            build_deadline=_build_deadline,
+        )
+        if node_res.lower_bound is not None and np.isfinite(node_res.lower_bound):
+            sep_bound = float(node_res.lower_bound)
 
-                _sb, _sdim = shor_sdp_lower_bound(
-                    model,
-                    relax,
-                    _relax_info,
-                    binary_vars=_bfc(model),
-                    time_limit=float(getattr(_tun, "shor_sdp_time_limit", 120.0)),
-                    max_dim=int(getattr(_tun, "shor_sdp_max_dim", 400)),
-                )
-                if _sdim and _sb is not None and np.isfinite(_sb):
-                    shor_bound = float(_sb)
-                    _have.append(shor_bound)
-            except Exception as sdp_exc:  # pragma: no cover - defensive
-                logger.debug("root strong-Shor SDP bound skipped: %s", sdp_exc)
-
-        budget = min(10.0, max(1.0, time_limit * 0.1))
-        # Checkpoint: the static-envelope solve is optional tightening only once a
-        # strengthened candidate (PSD/RLT) already landed; with those default-off
-        # ``_have`` is empty here, so this gate is inert on the default path and
-        # the plain solve always runs (rule 1 — it is then the first candidate).
-        result = None if _fb_stop(_have) else relax.solve(time_limit=budget, gap_tolerance=1e-6)
-        # Only an OPTIMAL relaxation solve yields a valid lower bound. An
-        # "unbounded" verdict means the relaxation (e.g. a McCormick envelope over
-        # a box where a nonlinear-term variable is still unbounded) has no finite
-        # lower bound, yet the backend still reports ``bound = 0.0`` — a finite
-        # value that is NOT a valid bound. On himmel16 the root relaxation is
-        # unbounded and 0.0 > the true optimum -0.866; surfacing it as the
-        # fallback bound would publish an invalid (above-incumbent) dual bound.
-        # Gate on optimality so an unbounded/limit solve returns no bound instead.
-        plain_bound: Optional[float] = None
-        if (
-            result is not None
-            and result.status == "optimal"
-            and result.bound is not None
-            and np.isfinite(result.bound)
-        ):
-            plain_bound = float(result.bound)
-            _have.append(plain_bound)
-
-        # The raw ``relax.solve`` above carries only the static envelope cuts; the
-        # per-node spatial relaxation additionally separates the multilinear hull,
-        # edge-concave blocks, and (issue #114) the univariate-square tangents the
-        # static envelope leaves slack deep inside a wide box. Routing the root
-        # box through ``solve_at_node`` applies that same on-demand separation, so
-        # the surfaced fallback bound matches the tree's tight per-node bounds
-        # instead of the loose static value (ex9_2_6: -201.5 -> ~-1.7). Each
-        # separated cut is a supporting hyperplane, so the result is still a
-        # rigorous global lower bound; the relaxer's own guards (himmel16
-        # unbounded cross-check, infeasible/limit re-verify) return no bound on
-        # any unsound solve. ``_objective_bound_valid`` above already certified
-        # the objective is fully linearized, the precondition both paths share.
-        # Checkpoint (#654): this candidate's LP build is NOT bounded by its solve
-        # ``time_limit`` — measured 16.8s on sonet23v4 against a 1.0s solve budget —
-        # so it is the fallback's dominant overrun. It is nonetheless the sole
-        # bound producer on the whole #654 class (``plain`` is None there), hence
-        # rule 1: it is declined only when a valid bound is ALREADY in hand, in
-        # which case it could merely tighten one we can still soundly report.
-        sep_bound: Optional[float] = None
-        if not _fb_stop(_have):
-            try:
-                from discopt._relax.mccormick_lp import MccormickLPRelaxer
-
-                # Rule 1 vs rule 2, applied to the SOLVE budget and not just to
-                # whether the phase starts. With no candidate in hand this is the
-                # sole bound producer and keeps the full slice. Once ``plain`` (or a
-                # strengthened candidate) has landed it is optional tightening, and
-                # it must fit in what is genuinely LEFT of the grant — a phase that
-                # merely starts before the checkpoint could otherwise run arbitrarily
-                # past it (measured on hda at a 2.0s grant: this solve started at
-                # 1.62s and ran 2.19s, so the fallback took 4.05s, 2.0x its grant).
-                # A solve stopped on its own deadline still reports the sound
-                # Neumaier-Shcherbina floor via ``_time_limit_result``, so the clamp
-                # weakens the candidate at worst — it never invalidates one.
-                _sep_budget = min(budget, _fb_left()) if _have else budget
-                node_res = MccormickLPRelaxer(model).solve_at_node(
-                    root_lb,
-                    root_ub,
-                    time_limit=_role2_budget(_sep_budget),
-                    build_deadline=_build_deadline,
-                )
-                if node_res.lower_bound is not None and np.isfinite(node_res.lower_bound):
-                    sep_bound = float(node_res.lower_bound)
-            except Exception as sep_exc:  # pragma: no cover - defensive
-                logger.debug("root separated-relaxation bound skipped: %s", sep_exc)
-
-        # Both values are valid lower bounds for a minimization, so the larger
-        # (tighter) one is the better rigorous bound.
-        candidates = [
-            b
-            for b in (plain_bound, sep_bound, psd_bound, rlt_bound, rlt_lag_bound, shor_bound)
-            if b is not None
-        ]
-        # #930: the root LP probe in ``solve_model`` already solved this exact
-        # relaxation and threw the answer away — it consumed the result only as a
-        # keep/discard boolean for the relaxer. Re-admit it as one more candidate
-        # here, where ``max`` makes a weaker one harmless and a stronger one a free
-        # win, so a starved fallback can no longer REPLACE a better bound the solver
-        # already proved (hda at a 10 s limit reported -141697 having proved -64473).
-        #
-        # The gate is exact box equality, and it is checked HERE rather than at the
-        # call sites so no caller can hand in a bound from a different box. That
-        # matters: the probe box is the FBBT/OBBT-tightened one under
-        # ``DISCOPT_ROOT_LP_PROBE_TIGHT`` (default ON), and a bound over a box that
-        # is a strict SUBSET of the root box need not bound the global optimum at
-        # all — reporting one would be a false certificate. Measured over 10 in-repo
-        # instances, 8 produced both boxes: 5 equal (hda, casctanks, contvar,
-        # heatexch_gen1, nvs05) and 3 NOT EVEN COMPARABLE (4stufen, beuster,
-        # bchoco06), which is why "probe ⊆ root" is not the test. On equality the
-        # probe bound is the identical quantity this function computes, over the
-        # identical box, from the identical relaxer — so it is exactly as sound as
-        # the bound already shipped, with no new soundness surface.
-        _probe_ok = _admissible_probe_bound(probe, root_lb, root_ub)
-        if _probe_ok is not None:
-            candidates.append(_probe_ok)
-        if candidates:
-            return max(candidates)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("root MILP-relaxation bound skipped: %s", exc)
+    # Both values are valid lower bounds for a minimization, so the larger
+    # (tighter) one is the better rigorous bound.
+    candidates = [
+        b
+        for b in (plain_bound, sep_bound, psd_bound, rlt_bound, rlt_lag_bound, shor_bound)
+        if b is not None
+    ]
+    # #930: the root LP probe in ``solve_model`` already solved this exact
+    # relaxation and threw the answer away — it consumed the result only as a
+    # keep/discard boolean for the relaxer. Re-admit it as one more candidate
+    # here, where ``max`` makes a weaker one harmless and a stronger one a free
+    # win, so a starved fallback can no longer REPLACE a better bound the solver
+    # already proved (hda at a 10 s limit reported -141697 having proved -64473).
+    #
+    # The gate is exact box equality, and it is checked HERE rather than at the
+    # call sites so no caller can hand in a bound from a different box. That
+    # matters: the probe box is the FBBT/OBBT-tightened one under
+    # ``DISCOPT_ROOT_LP_PROBE_TIGHT`` (default ON), and a bound over a box that
+    # is a strict SUBSET of the root box need not bound the global optimum at
+    # all — reporting one would be a false certificate. Measured over 10 in-repo
+    # instances, 8 produced both boxes: 5 equal (hda, casctanks, contvar,
+    # heatexch_gen1, nvs05) and 3 NOT EVEN COMPARABLE (4stufen, beuster,
+    # bchoco06), which is why "probe ⊆ root" is not the test. On equality the
+    # probe bound is the identical quantity this function computes, over the
+    # identical box, from the identical relaxer — so it is exactly as sound as
+    # the bound already shipped, with no new soundness surface.
+    _probe_ok = _admissible_probe_bound(probe, root_lb, root_ub)
+    if _probe_ok is not None:
+        candidates.append(_probe_ok)
+    if candidates:
+        return max(candidates)
     return None
 
 
@@ -9398,6 +9430,88 @@ def _stamp_layer_timing(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+class _FallbackWarnings(threading.local):
+    """Per-thread record of which sound-fallback sites already warned in this solve.
+
+    #1514: a handful of solve-time sites keep a broad ``except`` because the
+    failure they absorb is a genuine external one (a POUNCE IPM call that raises
+    from native code) and falling back is sound (the node stays open, the bound
+    is not tightened). What made the old handlers a defect was that they logged
+    at DEBUG, so a *broken* backend read as a *declining* one. Each such site now
+    reports through :func:`_warn_fallback_once`: the first failure per site per
+    solve is a WARNING carrying the exception, later ones are DEBUG so a
+    per-node failure cannot flood the log. ``threading.local`` for the same
+    reason as ``_CallbackFailures``: two solves on two threads keep separate
+    records.
+    """
+
+    def __init__(self):
+        self.seen: set[str] = set()
+        self.active = False
+
+
+_FALLBACK_WARNINGS = _FallbackWarnings()
+
+
+def _warn_fallback_once(site: str, exc: BaseException, fallback: str) -> None:
+    """Report a failure absorbed at a documented sound-fallback site (#1514).
+
+    ``site`` names the call that failed, ``fallback`` what the solve does
+    instead. The first occurrence of ``site`` in a solve is logged at WARNING with
+    the exception type and message; repeats are logged at DEBUG.
+    """
+    if site in _FALLBACK_WARNINGS.seen:
+        logger.debug("%s failed again (%s: %s); %s", site, type(exc).__name__, exc, fallback)
+        return
+    _FALLBACK_WARNINGS.seen.add(site)
+    logger.warning(
+        "%s failed (%s: %s); %s. Further failures at this site in this solve are "
+        "logged at DEBUG (#1514).",
+        site,
+        type(exc).__name__,
+        exc,
+        fallback,
+    )
+
+
+def _structure_cut_declined(exc: BaseException) -> bool:
+    """True iff ``exc`` is one of the structure-cut recognizer's documented declines.
+
+    ``CutDerivationError`` lives in a SymPy-importing module, so it is looked up in
+    ``sys.modules`` rather than imported: if that module was never loaded, nothing
+    in it can have raised.
+    """
+    from discopt.symbolic import SymbolicTranslationError
+
+    if isinstance(exc, (SymbolicTranslationError, NotImplementedError)):
+        return True
+    _cc = sys.modules.get("discopt._relax.symbolic.constraint_cuts")
+    return _cc is not None and isinstance(exc, _cc.CutDerivationError)
+
+
+def _scoped_fallback_warnings(fn: _F) -> _F:
+    """Give each top-level solve a fresh :func:`_warn_fallback_once` record (#1514).
+
+    Only the outermost ``solve_model`` on a thread resets the record: a nested
+    sub-solve (RENS, local branching, a probe) is part of the same user-visible
+    solve, so a site that already warned there stays at DEBUG.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _FALLBACK_WARNINGS.active:
+            return fn(*args, **kwargs)
+        _FALLBACK_WARNINGS.active = True
+        _FALLBACK_WARNINGS.seen = set()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _FALLBACK_WARNINGS.active = False
+            _FALLBACK_WARNINGS.seen = set()
+
+    return cast(_F, wrapper)
+
+
 def _refusing_on_callback_failure(fn: _F) -> _F:
     """Outermost wrapper on ``solve_model``: refuse a result whose feasibility
     callbacks failed (#1436).
@@ -9451,6 +9565,7 @@ def _refusing_on_callback_failure(fn: _F) -> _F:
 
 
 @_refusing_on_callback_failure
+@_scoped_fallback_warnings
 @_stamp_layer_timing
 @_scoped_deep_recursion
 @_scoped_tuning
@@ -10062,7 +10177,7 @@ def solve_model(
     # branches on integers/products and runs a feasibility-pump primal, closing
     # nvs17 to proven optimality. Opt-in via ``solve(lp_spatial=True)``; returns
     # ``None`` (falls through to the default path, no behavior change) for any model
-    # out of its scope or on any error.
+    # out of its scope.
     #
     # #860 widened that scope to mixed-integer and MAXIMIZE models behind
     # ``DISCOPT_LP_SPATIAL_MIXED``. That flag was RETIRED in #1357 under CLAUDE.md §5's
@@ -10085,19 +10200,18 @@ def solve_model(
     # see ``lp_spatial_bb._is_in_scope``.
     if kwargs.get("lp_spatial", False):
         _warn_abs_gap_ignored("The lp_spatial engine", abs_gap_tolerance)
-        try:
-            from discopt._relax.lp_spatial_bb import solve_lp_spatial_bb
+        from discopt._relax.lp_spatial_bb import solve_lp_spatial_bb
 
-            _lps = solve_lp_spatial_bb(
-                model,
-                time_limit=time_limit,
-                gap_tolerance=gap_tolerance,
-                max_nodes=max_nodes,
-                root_cut_rounds=int(kwargs.get("lp_spatial_cut_rounds", 0)),
-            )
-        except Exception as _lps_exc:  # pragma: no cover - defensive
-            logger.debug("lp_spatial engine failed, falling back: %s", _lps_exc)
-            _lps = None
+        # #1514: no ``except``. The engine declines an out-of-scope model by
+        # returning ``None`` (which falls through to the default path below); an
+        # exception is a defect in an engine the caller explicitly asked for.
+        _lps = solve_lp_spatial_bb(
+            model,
+            time_limit=time_limit,
+            gap_tolerance=gap_tolerance,
+            max_nodes=max_nodes,
+            root_cut_rounds=int(kwargs.get("lp_spatial_cut_rounds", 0)),
+        )
         if _lps is not None:
             return SolveResult(
                 status=_lps.status,
@@ -10123,7 +10237,7 @@ def solve_model(
     # with budget remaining. Runs *before* the relaxation build so the tightened
     # model flows through the normal pipeline. Only the square-difference detector
     # is auto-engaged here — the broader ``inject_all_patterns`` battery stays
-    # opt-in. Any failure is swallowed so the recognizer can never break a solve.
+    # opt-in. Only the recognizer's documented declines are absorbed (#1514).
     if structure_cuts and model._objective is not None and _remaining_budget() > 1.0:
         _struct_size = sum(v.size for v in model._variables) + len(model._constraints)
         if _struct_size <= _STRUCTURE_CUTS_MAX_SIZE:
@@ -10139,33 +10253,41 @@ def solve_model(
                     )
             except ImportError:
                 pass  # optional [sympy] extra not installed -> skip silently
-            except Exception as _sc_exc:  # pragma: no cover - defensive
-                logger.debug("structure-cut presolve skipped: %s", _sc_exc)
+            except Exception as _sc_exc:
+                # #1514: narrowed. The recognizer's documented declines are a model
+                # outside its translator (``SymbolicTranslationError``), a chain it
+                # cannot solve symbolically (``CutDerivationError``) and SymPy's own
+                # "cannot solve/derive" (``NotImplementedError``, which
+                # ``EnvelopeDerivationError`` subclasses). Anything else is a defect.
+                if not _structure_cut_declined(_sc_exc):
+                    raise
+                logger.debug("structure-cut presolve declined: %s", _sc_exc)
 
     # G-convexity transformation-cut presolve (#181, DISCOPT_G_CONVEX_CUTS,
     # default-OFF). A *bound-changing* capability (CLAUDE.md §5): recognizes
     # constraint bodies that are G-convex (a strictly larger class than
     # DCP-convex) and injects rigorously valid linear cuts exposing the
     # transformed convex shape to the LP relaxation. Gated behind the env flag
-    # and only run when set, so the default solve path is byte-identical. Any
-    # failure is swallowed — the injector can never break a solve.
+    # and only run when set, so the default solve path is byte-identical.
     if model._objective is not None:
-        try:
-            from discopt._relax.convexity.g_convex_inject import (
-                g_convex_cuts_enabled,
-                inject_g_convex_cuts,
-            )
+        from discopt._relax.convexity.g_convex_inject import (
+            g_convex_cuts_enabled,
+            inject_g_convex_cuts,
+        )
 
-            if g_convex_cuts_enabled():
-                _n_gconv = inject_g_convex_cuts(model)
-                if _n_gconv:
-                    logger.info(
-                        "G-convexity cut presolve: injected %d transformation cut(s) "
-                        "(DISCOPT_G_CONVEX_CUTS)",
-                        _n_gconv,
-                    )
-        except Exception as _gc_exc:  # pragma: no cover - defensive
-            logger.debug("g-convex cut presolve skipped: %s", _gc_exc)
+        # #1514: no outer ``except``. ``inject_g_convex_cuts`` already declines per
+        # constraint (an uncertifiable body or an unusable enclosure is skipped
+        # inside it) and returns 0 on an unbounded box, so an exception here is a
+        # defect -- and one that may leave the model half-injected, which the old
+        # catch-all hid.
+        if g_convex_cuts_enabled():
+            _n_gconv = inject_g_convex_cuts(model)
+            if _n_gconv:
+                logger.info(
+                    "G-convexity cut presolve: injected %d transformation cut(s) "
+                    "(DISCOPT_G_CONVEX_CUTS)",
+                    _n_gconv,
+                )
 
     # Snapshot of every option the MIP-NLP family cannot honour, taken before
     # dispatch so both consumers see the caller's values: the auto-route below
@@ -12138,56 +12260,55 @@ def solve_model(
         logger.info("Root presolve skipped: the HiGHS LP/MILP route presolves internally")
         presolve = False
     if _model_repr is not None and presolve and not _deadline_exhausted():
-        try:
-            from discopt._relax.presolve_pipeline import (
-                propagate_bounds_to_model,
-                run_root_presolve,
-            )
+        # #1514: no ``except``. The orchestrator declines by return value (a pass
+        # with nothing to do, a spent ``time_limit_ms``), and ``propagate_bounds_to_model``
+        # RAISES on purpose -- ``ValueError`` for an optimality-derived box that must not
+        # be adopted as declared bounds (CLAUDE.md §3). The old catch-all turned that
+        # refusal, and any defect, into "presolve found nothing".
+        from discopt._relax.presolve_pipeline import (
+            propagate_bounds_to_model,
+            run_root_presolve,
+        )
 
-            # Cap presolve to a fraction of the time limit, further clamped to
-            # the time actually left. The Rust side honours ``time_limit_ms``
-            # between sweeps, so an overrun is bounded by a single sweep.
-            #
-            # This cap used to be load-bearing rather than a safety net: the
-            # orchestrator ran to its 16-sweep iteration cap on most models
-            # because `made_progress()` counted detections and last-bit noise
-            # as progress, so the fixed point was unreachable (#1053). With
-            # that fixed, 23 of the 66 in-repo corpus instances now stop at
-            # `NoProgress` instead of the cap and total root-presolve wall over
-            # the corpus fell 58.5s -> 15.4s. Keep the cap anyway — a model
-            # whose passes genuinely keep finding work must not starve search.
-            _presolve_budget_s = min(
-                min(max(0.25 * float(time_limit), 2.0), 30.0), _remaining_budget()
+        # Cap presolve to a fraction of the time limit, further clamped to
+        # the time actually left. The Rust side honours ``time_limit_ms``
+        # between sweeps, so an overrun is bounded by a single sweep.
+        #
+        # This cap used to be load-bearing rather than a safety net: the
+        # orchestrator ran to its 16-sweep iteration cap on most models
+        # because `made_progress()` counted detections and last-bit noise
+        # as progress, so the fixed point was unreachable (#1053). With
+        # that fixed, 23 of the 66 in-repo corpus instances now stop at
+        # `NoProgress` instead of the cap and total root-presolve wall over
+        # the corpus fell 58.5s -> 15.4s. Keep the cap anyway — a model
+        # whose passes genuinely keep finding work must not starve search.
+        _presolve_budget_s = min(min(max(0.25 * float(time_limit), 2.0), 30.0), _remaining_budget())
+        _model_repr, _presolve_stats = run_root_presolve(
+            _model_repr,
+            eliminate=True,
+            polynomial=presolve_polynomial,
+            fbbt=True,
+            time_limit_ms=int(_presolve_budget_s * 1000),
+        )
+        # #1061: hand the orchestrator's own box over as well. Without the
+        # stats argument this call sees only the repr, which the Rust side
+        # deliberately leaves untightened, so every bound presolve derived
+        # was discarded here.
+        n_tightened = propagate_bounds_to_model(
+            model,
+            _model_repr,
+            _presolve_stats if _presolve_bound_propagation_enabled() else None,
+        )
+        elim = _presolve_stats.get("elimination", {})
+        poly = _presolve_stats.get("polynomial", {})
+        if elim.get("variables_fixed", 0) > 0 or n_tightened > 0:
+            logger.info(
+                "Presolve: fixed %d vars, removed %d eqs, tightened %d bounds (poly aux vars: %d)",
+                elim.get("variables_fixed", 0),
+                elim.get("constraints_removed", 0),
+                n_tightened,
+                poly.get("aux_variables_introduced", 0),
             )
-            _model_repr, _presolve_stats = run_root_presolve(
-                _model_repr,
-                eliminate=True,
-                polynomial=presolve_polynomial,
-                fbbt=True,
-                time_limit_ms=int(_presolve_budget_s * 1000),
-            )
-            # #1061: hand the orchestrator's own box over as well. Without the
-            # stats argument this call sees only the repr, which the Rust side
-            # deliberately leaves untightened, so every bound presolve derived
-            # was discarded here.
-            n_tightened = propagate_bounds_to_model(
-                model,
-                _model_repr,
-                _presolve_stats if _presolve_bound_propagation_enabled() else None,
-            )
-            elim = _presolve_stats.get("elimination", {})
-            poly = _presolve_stats.get("polynomial", {})
-            if elim.get("variables_fixed", 0) > 0 or n_tightened > 0:
-                logger.info(
-                    "Presolve: fixed %d vars, removed %d eqs, tightened %d "
-                    "bounds (poly aux vars: %d)",
-                    elim.get("variables_fixed", 0),
-                    elim.get("constraints_removed", 0),
-                    n_tightened,
-                    poly.get("aux_variables_introduced", 0),
-                )
-        except Exception as e:
-            logger.debug("Root presolve failed: %s", e)
 
     # --- Activity-based big-M coefficient tightening (#282, opt-in) ---
     # Shrinks big-M coefficients on binary-indicator rows toward the FBBT
@@ -12229,14 +12350,13 @@ def solve_model(
     # can be slow on very large models. Skipped once the budget is blown (#654):
     # it only tightens bounds, so declining it leaves a valid looser box.
     if presolve and presolve_reverse_ad and not _deadline_exhausted():
-        try:
-            from discopt._relax.presolve_pipeline import run_reverse_ad_tightening
+        # #1514: no ``except``. ``run_reverse_ad_tightening`` absorbs the
+        # propagation's own decline internally and returns a count; a raise is a defect.
+        from discopt._relax.presolve_pipeline import run_reverse_ad_tightening
 
-            n_rad = run_reverse_ad_tightening(model)
-            if n_rad > 0:
-                logger.info("Reverse-AD presolve tightened %d variable bounds", n_rad)
-        except Exception as e:
-            logger.debug("Reverse-AD tightening failed: %s", e)
+        n_rad = run_reverse_ad_tightening(model)
+        if n_rad > 0:
+            logger.info("Reverse-AD presolve tightened %d variable bounds", n_rad)
 
     # --- Eigenvalue root bound on quadratic objectives (M6 of #51, opt-in) ---
     # For models with a quadratic objective, compute a sound root-node
@@ -12270,7 +12390,10 @@ def solve_model(
                         float(eig_bound.lo),
                         float(eig_bound.hi),
                     )
-        except Exception as e:
+        except np.linalg.LinAlgError as e:
+            # #1514: narrowed. The one expected failure is ``eigh`` not converging
+            # on an ill-conditioned Q; the bound is informational, so declining it
+            # is sound. Anything else is a defect and propagates.
             logger.debug("Eigenvalue root bound failed: %s", e)
 
     # --- Learned relaxation registry (opt-in) ---
@@ -13197,82 +13320,82 @@ def solve_model(
     ):
         # OBBT wall time falls into python_time (computed as the remainder at
         # the end of the solve), so no separate timer is tracked here.
-        try:
-            from discopt._relax.obbt import obbt_tighten_root
+        # #1514: no ``except``. ``obbt_tighten_root`` returns the input box
+        # (``n_tightened == 0``) when it cannot proceed -- no relaxable nonlinearity, a
+        # failed envelope build, a declined LP -- so an exception is a defect.
+        from discopt._relax.obbt import obbt_tighten_root
 
-            # #1152: ``_setup_remaining_budget`` withholds the root-fallback
-            # reserve, so a root OBBT sweep entered near the deadline can no longer
-            # spend the slice the last-ditch bound producer needs.
-            _obbt_budget = min(min(max(time_limit * 0.1, 2.0), 15.0), _setup_remaining_budget())
+        # #1152: ``_setup_remaining_budget`` withholds the root-fallback
+        # reserve, so a root OBBT sweep entered near the deadline can no longer
+        # spend the slice the last-ditch bound producer needs.
+        _obbt_budget = min(min(max(time_limit * 0.1, 2.0), 15.0), _setup_remaining_budget())
 
-            # #282 iterate-to-convergence lever (default OFF). The ``rounds=3`` cap
-            # stops the root OBBT far short of the fixpoint on a wide-box dense
-            # QCQP, where the McCormick envelope is loose and each sweep's box
-            # shrink unlocks the next. When the flag is on AND the model is
-            # quadratically structured (bilinear or square terms) with a wide box,
-            # raise the sweep cap and let the existing fixpoint / min-improvement
-            # break run to convergence. General structural gate — no problem-name
-            # keying; each tightening is still the NS-safe clamp (soundness
-            # unchanged). OFF path is byte-identical (``rounds=3``, no early-stop).
-            _obbt_rounds = 3
-            _obbt_min_impr: Optional[float] = None
-            if _obbt_iterate_root_enabled():
-                try:
-                    from discopt._relax.term_classifier import (
-                        classify_nonlinear_terms as _cnt_it,
-                    )
+        # #282 iterate-to-convergence lever (default OFF). The ``rounds=3`` cap
+        # stops the root OBBT far short of the fixpoint on a wide-box dense
+        # QCQP, where the McCormick envelope is loose and each sweep's box
+        # shrink unlocks the next. When the flag is on AND the model is
+        # quadratically structured (bilinear or square terms) with a wide box,
+        # raise the sweep cap and let the existing fixpoint / min-improvement
+        # break run to convergence. General structural gate — no problem-name
+        # keying; each tightening is still the NS-safe clamp (soundness
+        # unchanged). OFF path is byte-identical (``rounds=3``, no early-stop).
+        _obbt_rounds = 3
+        _obbt_min_impr: Optional[float] = None
+        if _obbt_iterate_root_enabled():
+            try:
+                from discopt._relax.term_classifier import (
+                    classify_nonlinear_terms as _cnt_it,
+                )
 
-                    _ot_it = _cnt_it(model)
-                    _is_quadratic = bool(_ot_it.bilinear) or any(
-                        int(p) == 2 for _, p in _ot_it.monomial
-                    )
-                except Exception:
-                    _is_quadratic = False
-                _fin_w = ub - lb
-                _fin_w = _fin_w[np.isfinite(_fin_w)]
-                _wide_box = bool(_fin_w.size) and float(_fin_w.max()) > _OBBT_ITERATE_MIN_BOX_WIDTH
-                if _is_quadratic and _wide_box:
-                    _obbt_rounds = _OBBT_ITERATE_ROUNDS
-                    _obbt_min_impr = _OBBT_ITERATE_MIN_IMPROVEMENT
+                _ot_it = _cnt_it(model)
+                _is_quadratic = bool(_ot_it.bilinear) or any(
+                    int(p) == 2 for _, p in _ot_it.monomial
+                )
+            except Exception:
+                _is_quadratic = False
+            _fin_w = ub - lb
+            _fin_w = _fin_w[np.isfinite(_fin_w)]
+            _wide_box = bool(_fin_w.size) and float(_fin_w.max()) > _OBBT_ITERATE_MIN_BOX_WIDTH
+            if _is_quadratic and _wide_box:
+                _obbt_rounds = _OBBT_ITERATE_ROUNDS
+                _obbt_min_impr = _OBBT_ITERATE_MIN_IMPROVEMENT
 
-            _obbt_res = obbt_tighten_root(
-                model,
-                lb,
-                ub,
-                rounds=_obbt_rounds,
-                deadline=_role2_deadline(time.perf_counter() + _obbt_budget),
-                # #1152: ``deadline`` above is polled between rounds and between the
-                # sweep's LPs; this one reaches INSIDE the per-round envelope build,
-                # the phase's only uninterruptible op.
-                build_deadline=_root_setup_build_deadline(),
-                prefer_pounce=nlp_solver == "pounce",
-                min_improvement=_obbt_min_impr,
+        _obbt_res = obbt_tighten_root(
+            model,
+            lb,
+            ub,
+            rounds=_obbt_rounds,
+            deadline=_role2_deadline(time.perf_counter() + _obbt_budget),
+            # #1152: ``deadline`` above is polled between rounds and between the
+            # sweep's LPs; this one reaches INSIDE the per-round envelope build,
+            # the phase's only uninterruptible op.
+            build_deadline=_root_setup_build_deadline(),
+            prefer_pounce=nlp_solver == "pounce",
+            min_improvement=_obbt_min_impr,
+        )
+        if _obbt_res.infeasible:
+            wall_time = time.perf_counter() - t_start
+            return SolveResult(
+                status="infeasible",
+                objective=None,
+                bound=None,
+                gap=None,
+                x=None,
+                wall_time=wall_time,
+                node_count=0,
+                rust_time=rust_time,
+                jax_time=jax_time,
+                python_time=wall_time - rust_time - jax_time,
             )
-            if _obbt_res.infeasible:
-                wall_time = time.perf_counter() - t_start
-                return SolveResult(
-                    status="infeasible",
-                    objective=None,
-                    bound=None,
-                    gap=None,
-                    x=None,
-                    wall_time=wall_time,
-                    node_count=0,
-                    rust_time=rust_time,
-                    jax_time=jax_time,
-                    python_time=wall_time - rust_time - jax_time,
-                )
-            if _obbt_res.n_tightened > 0:
-                lb = np.maximum(lb, _obbt_res.lb)
-                ub = np.minimum(ub, _obbt_res.ub)
-                logger.info(
-                    "Root OBBT tightened %d bounds over %d sweep(s) (%.2fs)",
-                    _obbt_res.n_tightened,
-                    _obbt_res.n_rounds,
-                    _obbt_res.total_lp_time,
-                )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug("Root OBBT failed: %s", e)
+        if _obbt_res.n_tightened > 0:
+            lb = np.maximum(lb, _obbt_res.lb)
+            ub = np.minimum(ub, _obbt_res.ub)
+            logger.info(
+                "Root OBBT tightened %d bounds over %d sweep(s) (%.2fs)",
+                _obbt_res.n_tightened,
+                _obbt_res.n_rounds,
+                _obbt_res.total_lp_time,
+            )
 
     # Snapshot the root-global box (root FBBT + non-cutoff root OBBT only) so a
     # rigorous root MILP-relaxation fallback bound can be computed at the end if
@@ -13379,19 +13502,16 @@ def solve_model(
             _rr_budget = _remaining_budget()
             _rr_val = None
             if _rr_budget > 0.0:
-                try:
-                    _rr_val = _root_relaxation_lower_bound(
-                        model,
-                        _root_lb_snapshot,
-                        _root_ub_snapshot,
-                        _rr_budget,
-                        psd_cuts=psd_cuts,
-                    )
-                except Exception as _rr_exc:  # pragma: no cover - defensive
-                    logger.debug(
-                        "root-relaxation fallback (deadline short-circuit) failed: %s", _rr_exc
-                    )
-                    _rr_val = None
+                # #1514: no ``except``. ``_root_relaxation_lower_bound`` returns ``None`` when
+                # no candidate bound is available; an exception from it is a defect in the
+                # relaxation layer, which the main post-search call already lets propagate.
+                _rr_val = _root_relaxation_lower_bound(
+                    model,
+                    _root_lb_snapshot,
+                    _root_ub_snapshot,
+                    _rr_budget,
+                    psd_cuts=psd_cuts,
+                )
             if _rr_val is not None and np.isfinite(_rr_val):
                 # A lower bound on the internally minimized objective: for a MINIMIZE
                 # it is the dual lower bound directly; for a MAXIMIZE the builder
@@ -13911,28 +14031,27 @@ def solve_model(
                 # point, freezing the dual bound at 0; the partition over the
                 # exactly-enumerable achievable rational set is the measured
                 # unlock — see docs/dev/integer-ratio-partition-2026-07-16.md).
-                try:
-                    from discopt._relax.integer_ratio import (
-                        IntegerRatioPartitioner,
-                        detect_integer_ratio_specs,
-                    )
-                    from discopt._relax.integer_ratio import (
-                        enabled as _integer_ratio_enabled,
-                    )
+                # #1514: no ``except``. Detection declines by returning no specs; this is
+                # structural wiring with no external call, so a raise is a defect.
+                from discopt._relax.integer_ratio import (
+                    IntegerRatioPartitioner,
+                    detect_integer_ratio_specs,
+                )
+                from discopt._relax.integer_ratio import (
+                    enabled as _integer_ratio_enabled,
+                )
 
-                    if _integer_ratio_enabled():
-                        _ir_model = _prereform_model if _prereform_model is not None else model
-                        _ir_specs = detect_integer_ratio_specs(_ir_model)
-                        if _ir_specs:
-                            _mc_lp_relaxer.set_integer_ratio_partitioner(
-                                IntegerRatioPartitioner(_ir_model, _ir_specs)
-                            )
-                            logger.info(
-                                "integer-ratio partition bound active: %d spec(s)",
-                                len(_ir_specs),
-                            )
-                except Exception as _ir_exc:  # pragma: no cover - defensive
-                    logger.debug("integer-ratio partition wiring skipped: %s", _ir_exc)
+                if _integer_ratio_enabled():
+                    _ir_model = _prereform_model if _prereform_model is not None else model
+                    _ir_specs = detect_integer_ratio_specs(_ir_model)
+                    if _ir_specs:
+                        _mc_lp_relaxer.set_integer_ratio_partitioner(
+                            IntegerRatioPartitioner(_ir_model, _ir_specs)
+                        )
+                        logger.info(
+                            "integer-ratio partition bound active: %d spec(s)",
+                            len(_ir_specs),
+                        )
                 # Structure-gated cut policy (cuts="auto", the default): the A/B
                 # sweep showed RLT dominates on QCQP *with* linear constraints, PSD
                 # on box-QP (no constraints), and stacking the two is
@@ -13991,52 +14110,49 @@ def solve_model(
                     # and the relaxation is tight. The Rust selector's last-resort
                     # fallback still branches a deprioritized column if no
                     # independent one remains, preserving completeness.
-                    try:
-                        _dep_cols_set: set = set()
-                        if _prereform_model is not None and n_vars > _prereform_nvars:
-                            _dep_cols_set.update(range(_prereform_nvars, n_vars))
-                        # R4 (DISCOPT_LIFT_ZERO_SPANNING_FACTORS): a lifted aux
-                        # ``w = f(x)`` for a *product factor* whose interval spans 0
-                        # is branch-responsive — splitting w at 0 flips the factor's
-                        # sign and tightens the product's McCormick envelope, the one
-                        # move that un-pins the bound (st_e36). Keep those columns
-                        # branchable by removing them from the deprioritized set. The
-                        # flag gates the reform's tagging, so this set is empty (no
-                        # behaviour change) unless the flag is on.
-                        _zsf_names = getattr(model, "_zero_spanning_factor_auxes", None)
-                        if _zsf_names:
-                            _name_to_col = {}
-                            _col = 0
-                            for _v in model._variables:
-                                _name_to_col[_v.name] = _col
-                                _col += _v.size
-                            _zsf_cols = {
-                                _name_to_col[_nm] for _nm in _zsf_names if _nm in _name_to_col
-                            }
-                            _dep_cols_set.difference_update(_zsf_cols)
-                        if _dependent_var_names:
-                            from discopt._relax.dependent_vars import (
-                                dependent_columns_for_model,
-                            )
+                    # #1514: no ``except``. Pure column bookkeeping over the model and the
+                    # tree; nothing here has a documented failure mode, so a raise is a defect.
+                    _dep_cols_set: set = set()
+                    if _prereform_model is not None and n_vars > _prereform_nvars:
+                        _dep_cols_set.update(range(_prereform_nvars, n_vars))
+                    # R4 (DISCOPT_LIFT_ZERO_SPANNING_FACTORS): a lifted aux
+                    # ``w = f(x)`` for a *product factor* whose interval spans 0
+                    # is branch-responsive — splitting w at 0 flips the factor's
+                    # sign and tightens the product's McCormick envelope, the one
+                    # move that un-pins the bound (st_e36). Keep those columns
+                    # branchable by removing them from the deprioritized set. The
+                    # flag gates the reform's tagging, so this set is empty (no
+                    # behaviour change) unless the flag is on.
+                    _zsf_names = getattr(model, "_zero_spanning_factor_auxes", None)
+                    if _zsf_names:
+                        _name_to_col = {}
+                        _col = 0
+                        for _v in model._variables:
+                            _name_to_col[_v.name] = _col
+                            _col += _v.size
+                        _zsf_cols = {_name_to_col[_nm] for _nm in _zsf_names if _nm in _name_to_col}
+                        _dep_cols_set.difference_update(_zsf_cols)
+                    if _dependent_var_names:
+                        from discopt._relax.dependent_vars import (
+                            dependent_columns_for_model,
+                        )
 
-                            _dep_cols_set.update(
-                                dependent_columns_for_model(model, _dependent_var_names)
-                            )
-                        _dep_cols = sorted(_dep_cols_set)
-                        if _dep_cols:
-                            tree.set_branch_deprioritized(np.asarray(_dep_cols, dtype=np.int64))
-                            logger.debug(
-                                "spatial branching deprioritizes %d "
-                                "functionally-dependent continuous columns "
-                                "(%d lifted aux + %d original outputs)",
-                                len(_dep_cols),
-                                max(0, n_vars - _prereform_nvars)
-                                if _prereform_model is not None
-                                else 0,
-                                len(_dependent_var_names),
-                            )
-                    except Exception as _dep_exc:  # pragma: no cover - defensive
-                        logger.debug("branch-deprioritization wiring skipped: %s", _dep_exc)
+                        _dep_cols_set.update(
+                            dependent_columns_for_model(model, _dependent_var_names)
+                        )
+                    _dep_cols = sorted(_dep_cols_set)
+                    if _dep_cols:
+                        tree.set_branch_deprioritized(np.asarray(_dep_cols, dtype=np.int64))
+                        logger.debug(
+                            "spatial branching deprioritizes %d "
+                            "functionally-dependent continuous columns "
+                            "(%d lifted aux + %d original outputs)",
+                            len(_dep_cols),
+                            max(0, n_vars - _prereform_nvars)
+                            if _prereform_model is not None
+                            else 0,
+                            len(_dependent_var_names),
+                        )
                     # SOS1 selector spatial branch (issue #196,
                     # ``DISCOPT_SOS1_SELECTOR_BRANCH``, default off). Register the
                     # continuous one-of-N selectors so the Rust tree branches one
@@ -14045,17 +14161,15 @@ def solve_model(
                     # unaffected); empty list when the flag is off or the structure
                     # is absent, leaving the branch path byte-identical.
                     if _tuning().sos1_selector_branch:
-                        try:
-                            _sos1_cols = sorted(_sos1_selector_vars(model))
-                            if _sos1_cols:
-                                tree.set_sos1_selector_cols(np.asarray(_sos1_cols, dtype=np.int64))
-                                logger.info(
-                                    "SOS1 selector spatial branching: %d selector(s) %s",
-                                    len(_sos1_cols),
-                                    _sos1_cols,
-                                )
-                        except Exception as _sos1_exc:  # pragma: no cover - defensive
-                            logger.debug("SOS1 selector wiring skipped: %s", _sos1_exc)
+                        # #1514: no ``except``. Structural detection with no external call.
+                        _sos1_cols = sorted(_sos1_selector_vars(model))
+                        if _sos1_cols:
+                            tree.set_sos1_selector_cols(np.asarray(_sos1_cols, dtype=np.int64))
+                            logger.info(
+                                "SOS1 selector spatial branching: %d selector(s) %s",
+                                len(_sos1_cols),
+                                _sos1_cols,
+                            )
                     # Root probe: keep the LP relaxer only if it actually yields
                     # a valid objective bound (or a rigorous infeasibility proof)
                     # at the root box. When the objective is not LP-linearizable
@@ -14066,124 +14180,127 @@ def solve_model(
                     # "none" here preserves the rigorous alphaBB underestimator
                     # for those models while keeping the LP bound for the ones it
                     # can actually relax.
-                    try:
-                        _probe_lb, _probe_ub = flat_variable_bounds(model)
-                        # #282/#764 (default ON, ``DISCOPT_ROOT_LP_PROBE_TIGHT=0``
-                        # opts out): probe the relaxer over the FBBT/OBBT-TIGHTENED
-                        # root box rather than the raw declared model bounds. The
-                        # keep/discard decision above solves the McCormick LP once at
-                        # ``(_probe_lb, _probe_ub)``; on a model with unbounded
-                        # declared bounds (e.g. syn30hfsg's x0..x4 = [0, inf], or
-                        # tanksize's bilinear tank-sizing vars) that LP is
-                        # unbounded/None over the raw box — a box NO node ever solves
-                        # — so the relaxer was wrongly discarded (``_mc_mode =
-                        # "none"``) and the whole spatial search fell back to a far
-                        # looser alphaBB/interval/NLP root bound, even though the SAME
-                        # relaxer yields a valid, much tighter bound on the
-                        # already-computed tightened box (syn05hfsg feasible->optimal,
-                        # tanksize root 0.8529->0.9063). Every node the tree then
-                        # solves uses its own box (subset of this one), so keeping the
-                        # relaxer here is sound; the probe only decides whether to keep
-                        # it, never a bound. Graduated through the CLAUDE.md Regime-2
-                        # panel gate (#764).
-                        if _root_lp_probe_tight_enabled():
-                            _probe_lb = np.asarray(lb, dtype=np.float64)
-                            _probe_ub = np.asarray(ub, dtype=np.float64)
-                        # Bound the probe's MILP relaxation solve to a SMALL slice
-                        # of the budget. Without any limit it inherited
-                        # solve_at_node's default time_limit=None -> the Rust MILP
-                        # B&B ran unbounded (up to max_nodes=1e6), solving the root
-                        # relaxation to optimality; on a hard MINLP root (e.g.
-                        # du-opt) that single *discarded* probe consumed the whole
-                        # wall-clock (~77s vs a 25s limit) before the spatial search
-                        # even began. The probe only needs to learn whether the
-                        # relaxer yields a usable bound / infeasibility proof — the
-                        # Rust solver returns a valid dual bound even on an early
-                        # timeout — so a brief cap suffices and leaves the bulk of
-                        # the budget for the actual B&B. Mirror the OBBT root-budget
-                        # heuristic above, never exceeding the live remaining time.
-                        if _deadline_exhausted():
-                            # #654: the probe's FIRST ``solve_at_node`` builds the
-                            # full McCormick LP (seconds on the large sparse
-                            # sonet/qap/eg_all_s class) — that build is NOT bounded by
-                            # the solve ``time_limit`` below, only the Rust MILP solve
-                            # is — solely to decide whether to keep the relaxer for a
-                            # search that, past the deadline, finalizes after <=1 node.
-                            # Once the budget is already spent, skip the probe: leaving
-                            # ``_probe=None`` drops the relaxer to the sound ``"none"``
-                            # bound source, the node loop exits immediately, and the
-                            # rigorous post-search root-relaxation fallback still
-                            # supplies the dual bound. Sound: the relaxer only ever
-                            # *tightens* a per-node bound the fallback also computes —
-                            # skipping it never changes the reported bound's validity.
-                            _probe = None
-                        else:
-                            # #1152: the remainder MINUS the root-fallback reserve
-                            # (``_setup_remaining_budget``); unchanged when the flag
-                            # is off.
-                            _probe_remaining = _setup_remaining_budget()
-                            _probe_budget = min(
-                                # #1153: the comment above says this mirrors the
-                                # root OBBT heuristic — and it did, except for that
-                                # site's 15 s ceiling, so this grant alone tracked
-                                # the caller's budget upward forever.
-                                _role2_saturate(max(time_limit * 0.1, 2.0), 0.1),
-                                max(_probe_remaining, _DEADLINE_NODE_FLOOR_S),
-                            )
-                            _probe = _mc_lp_relaxer.solve_at_node(
-                                _probe_lb,
-                                _probe_ub,
-                                time_limit=_role2_budget(_probe_budget),
-                                # #1152: the probe's cold build is NOT bounded by the
-                                # solve ``time_limit`` above (only the Rust MILP solve
-                                # is) — the very overrun this comment block documents.
-                                # A truncated build only drops rows, so the keep/discard
-                                # verdict and the banked bound stay sound (weaker at
-                                # worst), and #928's cut-short objective floor keeps the
-                                # bound finite.
-                                build_deadline=_root_setup_build_deadline(),
-                            )
-                            # #930: bank the probe's proved bound WITH the box it was
-                            # proved over. This solve costs real time (3.4 s on hda)
-                            # and its result was previously consumed only as the
-                            # keep/discard boolean below. The box travels with the
-                            # value because it is the soundness gate — see
-                            # ``_root_relaxation_lower_bound``, which is where the
-                            # comparison happens and where a mismatched box is
-                            # refused. Recording it here is inert on its own: nothing
-                            # reports this value unless that gate passes.
-                            if (
-                                _probe is not None
-                                and _probe.lower_bound is not None
-                                and np.isfinite(_probe.lower_bound)
-                            ):
-                                _root_probe_bound = (
-                                    float(_probe.lower_bound),
-                                    np.asarray(_probe_lb, dtype=np.float64).copy(),
-                                    np.asarray(_probe_ub, dtype=np.float64).copy(),
-                                )
-                                # #933 part (a): install the probe's proved bound
-                                # into the tree root, so ``global_lower_bound`` is
-                                # finite — anytime and monotone by construction —
-                                # from this first root LP onward instead of from
-                                # the first fully-processed batch. The tree was
-                                # created with exactly the snapshot box, so the
-                                # #930 box-equality gate is precisely "the bound
-                                # was proved over the tree's root box"; the same
-                                # trusted relaxer produces every node bound on
-                                # this path, so the seed adds no new arithmetic
-                                # trust surface.
-                                if _root_bound_seed_enabled():
-                                    _seed = _admissible_probe_bound(
-                                        _root_probe_bound,
-                                        _root_lb_snapshot,
-                                        _root_ub_snapshot,
-                                    )
-                                    if _seed is not None:
-                                        tree.seed_root_bound(float(_seed))
-                    except Exception as e:  # pragma: no cover - defensive
-                        logger.debug("McCormick LP root probe failed: %s", e)
+                    # #1514: no ``except``. The probe's own decline is by status: a probe that
+                    # yields neither a bound nor an infeasibility proof (``status="error"`` from a
+                    # failed build, a non-optimal LP) drops the relaxer below via
+                    # ``_probe_useful``. An exception is a defect in the node engine -- and the old
+                    # catch-all turned it into a silent switch of the WHOLE search to the weaker
+                    # ``"none"`` bound source, which also hid every per-node ``solve_at_node``
+                    # failure behind this one.
+                    _probe_lb, _probe_ub = flat_variable_bounds(model)
+                    # #282/#764 (default ON, ``DISCOPT_ROOT_LP_PROBE_TIGHT=0``
+                    # opts out): probe the relaxer over the FBBT/OBBT-TIGHTENED
+                    # root box rather than the raw declared model bounds. The
+                    # keep/discard decision above solves the McCormick LP once at
+                    # ``(_probe_lb, _probe_ub)``; on a model with unbounded
+                    # declared bounds (e.g. syn30hfsg's x0..x4 = [0, inf], or
+                    # tanksize's bilinear tank-sizing vars) that LP is
+                    # unbounded/None over the raw box — a box NO node ever solves
+                    # — so the relaxer was wrongly discarded (``_mc_mode =
+                    # "none"``) and the whole spatial search fell back to a far
+                    # looser alphaBB/interval/NLP root bound, even though the SAME
+                    # relaxer yields a valid, much tighter bound on the
+                    # already-computed tightened box (syn05hfsg feasible->optimal,
+                    # tanksize root 0.8529->0.9063). Every node the tree then
+                    # solves uses its own box (subset of this one), so keeping the
+                    # relaxer here is sound; the probe only decides whether to keep
+                    # it, never a bound. Graduated through the CLAUDE.md Regime-2
+                    # panel gate (#764).
+                    if _root_lp_probe_tight_enabled():
+                        _probe_lb = np.asarray(lb, dtype=np.float64)
+                        _probe_ub = np.asarray(ub, dtype=np.float64)
+                    # Bound the probe's MILP relaxation solve to a SMALL slice
+                    # of the budget. Without any limit it inherited
+                    # solve_at_node's default time_limit=None -> the Rust MILP
+                    # B&B ran unbounded (up to max_nodes=1e6), solving the root
+                    # relaxation to optimality; on a hard MINLP root (e.g.
+                    # du-opt) that single *discarded* probe consumed the whole
+                    # wall-clock (~77s vs a 25s limit) before the spatial search
+                    # even began. The probe only needs to learn whether the
+                    # relaxer yields a usable bound / infeasibility proof — the
+                    # Rust solver returns a valid dual bound even on an early
+                    # timeout — so a brief cap suffices and leaves the bulk of
+                    # the budget for the actual B&B. Mirror the OBBT root-budget
+                    # heuristic above, never exceeding the live remaining time.
+                    if _deadline_exhausted():
+                        # #654: the probe's FIRST ``solve_at_node`` builds the
+                        # full McCormick LP (seconds on the large sparse
+                        # sonet/qap/eg_all_s class) — that build is NOT bounded by
+                        # the solve ``time_limit`` below, only the Rust MILP solve
+                        # is — solely to decide whether to keep the relaxer for a
+                        # search that, past the deadline, finalizes after <=1 node.
+                        # Once the budget is already spent, skip the probe: leaving
+                        # ``_probe=None`` drops the relaxer to the sound ``"none"``
+                        # bound source, the node loop exits immediately, and the
+                        # rigorous post-search root-relaxation fallback still
+                        # supplies the dual bound. Sound: the relaxer only ever
+                        # *tightens* a per-node bound the fallback also computes —
+                        # skipping it never changes the reported bound's validity.
                         _probe = None
+                    else:
+                        # #1152: the remainder MINUS the root-fallback reserve
+                        # (``_setup_remaining_budget``); unchanged when the flag
+                        # is off.
+                        _probe_remaining = _setup_remaining_budget()
+                        _probe_budget = min(
+                            # #1153: the comment above says this mirrors the
+                            # root OBBT heuristic — and it did, except for that
+                            # site's 15 s ceiling, so this grant alone tracked
+                            # the caller's budget upward forever.
+                            _role2_saturate(max(time_limit * 0.1, 2.0), 0.1),
+                            max(_probe_remaining, _DEADLINE_NODE_FLOOR_S),
+                        )
+                        _probe = _mc_lp_relaxer.solve_at_node(
+                            _probe_lb,
+                            _probe_ub,
+                            time_limit=_role2_budget(_probe_budget),
+                            # #1152: the probe's cold build is NOT bounded by the
+                            # solve ``time_limit`` above (only the Rust MILP solve
+                            # is) — the very overrun this comment block documents.
+                            # A truncated build only drops rows, so the keep/discard
+                            # verdict and the banked bound stay sound (weaker at
+                            # worst), and #928's cut-short objective floor keeps the
+                            # bound finite.
+                            build_deadline=_root_setup_build_deadline(),
+                        )
+                        # #930: bank the probe's proved bound WITH the box it was
+                        # proved over. This solve costs real time (3.4 s on hda)
+                        # and its result was previously consumed only as the
+                        # keep/discard boolean below. The box travels with the
+                        # value because it is the soundness gate — see
+                        # ``_root_relaxation_lower_bound``, which is where the
+                        # comparison happens and where a mismatched box is
+                        # refused. Recording it here is inert on its own: nothing
+                        # reports this value unless that gate passes.
+                        if (
+                            _probe is not None
+                            and _probe.lower_bound is not None
+                            and np.isfinite(_probe.lower_bound)
+                        ):
+                            _root_probe_bound = (
+                                float(_probe.lower_bound),
+                                np.asarray(_probe_lb, dtype=np.float64).copy(),
+                                np.asarray(_probe_ub, dtype=np.float64).copy(),
+                            )
+                            # #933 part (a): install the probe's proved bound
+                            # into the tree root, so ``global_lower_bound`` is
+                            # finite — anytime and monotone by construction —
+                            # from this first root LP onward instead of from
+                            # the first fully-processed batch. The tree was
+                            # created with exactly the snapshot box, so the
+                            # #930 box-equality gate is precisely "the bound
+                            # was proved over the tree's root box"; the same
+                            # trusted relaxer produces every node bound on
+                            # this path, so the seed adds no new arithmetic
+                            # trust surface.
+                            if _root_bound_seed_enabled():
+                                _seed = _admissible_probe_bound(
+                                    _root_probe_bound,
+                                    _root_lb_snapshot,
+                                    _root_ub_snapshot,
+                                )
+                                if _seed is not None:
+                                    tree.seed_root_bound(float(_seed))
                     _probe_useful = _probe is not None and (
                         _probe.status == "infeasible" or _probe.lower_bound is not None
                     )
@@ -14210,71 +14327,72 @@ def solve_model(
                         # (0.5s -> 16ms) while reproducing the strong root bound.
                         # Sound: each PSD cut is valid for the whole feasible set,
                         # so an inherited row never cuts off a feasible point.
-                        try:
-                            _pool_chunks: list = []
-                            # #1152: see ``_setup_remaining_budget`` — the pool is
-                            # root setup and must leave the fallback its reserve.
-                            _root_remaining = _setup_remaining_budget()
-                            _pool_budget = min(
-                                # #1153: the pool this separates is inherited by
-                                # EVERY node LP, so an uncapped grant here raises
-                                # the per-node cost in step with the caller's
-                                # budget and shrinks the tree the rest of it can
-                                # cover. Saturate the carve.
-                                _role2_saturate(max(time_limit * 0.25, 5.0), 0.25),
-                                max(_root_remaining, _DEADLINE_NODE_FLOOR_S),
+                        # #1514: no ``except``. ``solve_at_node`` declines by status: a
+                        # relaxation build failure is caught inside it and returned as
+                        # ``status="error"``, and LP trouble comes back as a non-optimal
+                        # status with no ``lower_bound`` -- both handled below. An exception
+                        # is a defect in the node engine.
+                        _pool_chunks: list = []
+                        # #1152: see ``_setup_remaining_budget`` — the pool is
+                        # root setup and must leave the fallback its reserve.
+                        _root_remaining = _setup_remaining_budget()
+                        _pool_budget = min(
+                            # #1153: the pool this separates is inherited by
+                            # EVERY node LP, so an uncapped grant here raises
+                            # the per-node cost in step with the caller's
+                            # budget and shrinks the tree the rest of it can
+                            # cover. Saturate the carve.
+                            _role2_saturate(max(time_limit * 0.25, 5.0), 0.25),
+                            max(_root_remaining, _DEADLINE_NODE_FLOOR_S),
+                        )
+                        _pool_res = _mc_lp_relaxer.solve_at_node(
+                            _probe_lb,
+                            _probe_ub,
+                            time_limit=_role2_budget(_pool_budget),
+                            out_cuts=_pool_chunks,
+                            psd_max_rounds=_root_cut_rounds,
+                            # #1152: bound the pool's cold build too. Fewer
+                            # separated cuts only loosens per-node bounds.
+                            build_deadline=_root_setup_build_deadline(),
+                        )
+                        if _pool_chunks and _pool_chunks[0] is not None:
+                            # solve_at_node captures each separated chunk as a
+                            # (A, b, col_idents) triple of upper-bound rows
+                            # ``A x <= b`` over the root's lifted column space
+                            # plus the per-column identity vector (C-44); a
+                            # node remaps the rows onto its own layout by those
+                            # identities. inherited_cuts takes the same form.
+                            _A_pool, _b_pool, _idents_pool = _pool_chunks[0]
+                            _n_pool = _A_pool.shape[0]
+                            if _n_pool > _root_cut_max:
+                                # Keep the last (most-recently separated, i.e.
+                                # deepest-round) rows; they target the tightest
+                                # residual violation. Capping bounds per-node LP
+                                # size so inheritance stays cheap.
+                                _A_pool = _A_pool[-_root_cut_max:]
+                                _b_pool = _b_pool[-_root_cut_max:]
+                            _root_cut_pool = (_A_pool, _b_pool, _idents_pool)
+                            # Keep the strengthened root bound: it is a valid
+                            # global lower bound (the pool relaxation holds over
+                            # the whole feasible region) and is far tighter than
+                            # the cut-less tree path — so the final certificate
+                            # should use it rather than recomputing from scratch.
+                            if (
+                                _pool_res is not None
+                                and _pool_res.lower_bound is not None
+                                and np.isfinite(_pool_res.lower_bound)
+                            ):
+                                _root_pool_bound = float(_pool_res.lower_bound)
+                            logger.info(
+                                "Root PSD cut pool: %d cuts (of %d separated, "
+                                "%d rounds), root bound %s — inherited at every node",
+                                _A_pool.shape[0],
+                                _n_pool,
+                                _root_cut_rounds,
+                                f"{_pool_res.lower_bound:.4g}"
+                                if _pool_res is not None and _pool_res.lower_bound is not None
+                                else "n/a",
                             )
-                            _pool_res = _mc_lp_relaxer.solve_at_node(
-                                _probe_lb,
-                                _probe_ub,
-                                time_limit=_role2_budget(_pool_budget),
-                                out_cuts=_pool_chunks,
-                                psd_max_rounds=_root_cut_rounds,
-                                # #1152: bound the pool's cold build too. Fewer
-                                # separated cuts only loosens per-node bounds.
-                                build_deadline=_root_setup_build_deadline(),
-                            )
-                            if _pool_chunks and _pool_chunks[0] is not None:
-                                # solve_at_node captures each separated chunk as a
-                                # (A, b, col_idents) triple of upper-bound rows
-                                # ``A x <= b`` over the root's lifted column space
-                                # plus the per-column identity vector (C-44); a
-                                # node remaps the rows onto its own layout by those
-                                # identities. inherited_cuts takes the same form.
-                                _A_pool, _b_pool, _idents_pool = _pool_chunks[0]
-                                _n_pool = _A_pool.shape[0]
-                                if _n_pool > _root_cut_max:
-                                    # Keep the last (most-recently separated, i.e.
-                                    # deepest-round) rows; they target the tightest
-                                    # residual violation. Capping bounds per-node LP
-                                    # size so inheritance stays cheap.
-                                    _A_pool = _A_pool[-_root_cut_max:]
-                                    _b_pool = _b_pool[-_root_cut_max:]
-                                _root_cut_pool = (_A_pool, _b_pool, _idents_pool)
-                                # Keep the strengthened root bound: it is a valid
-                                # global lower bound (the pool relaxation holds over
-                                # the whole feasible region) and is far tighter than
-                                # the cut-less tree path — so the final certificate
-                                # should use it rather than recomputing from scratch.
-                                if (
-                                    _pool_res is not None
-                                    and _pool_res.lower_bound is not None
-                                    and np.isfinite(_pool_res.lower_bound)
-                                ):
-                                    _root_pool_bound = float(_pool_res.lower_bound)
-                                logger.info(
-                                    "Root PSD cut pool: %d cuts (of %d separated, "
-                                    "%d rounds), root bound %s — inherited at every node",
-                                    _A_pool.shape[0],
-                                    _n_pool,
-                                    _root_cut_rounds,
-                                    f"{_pool_res.lower_bound:.4g}"
-                                    if _pool_res is not None and _pool_res.lower_bound is not None
-                                    else "n/a",
-                                )
-                        except Exception as _pool_exc:  # pragma: no cover - defensive
-                            logger.debug("root cut pool separation skipped: %s", _pool_exc)
-                            _root_cut_pool = None
                     elif getattr(_mc_lp_relaxer, "_inc", None) is not None or _cut_inherit_enabled:
                         # Root cut pool for the GENERAL spatial path (cert:T1.3).
                         # When the incremental engine is active but PSD cuts are
@@ -14296,79 +14414,80 @@ def solve_model(
                         # separators dominate (nvs24: 73%+12% of the solve wall) —
                         # so the node call sites below can skip those loops in
                         # favour of the inherited pool (``skip_pool_separators``).
-                        try:
-                            _pool_chunks = []
-                            # #1152: see ``_setup_remaining_budget`` — the pool is
-                            # root setup and must leave the fallback its reserve.
-                            _root_remaining = _setup_remaining_budget()
-                            _pool_budget = min(
-                                # #1153: the pool this separates is inherited by
-                                # EVERY node LP, so an uncapped grant here raises
-                                # the per-node cost in step with the caller's
-                                # budget and shrinks the tree the rest of it can
-                                # cover. Saturate the carve.
-                                _role2_saturate(max(time_limit * 0.25, 5.0), 0.25),
-                                max(_root_remaining, _DEADLINE_NODE_FLOOR_S),
+                        # #1514: no ``except``. ``solve_at_node`` declines by status: a
+                        # relaxation build failure is caught inside it and returned as
+                        # ``status="error"``, and LP trouble comes back as a non-optimal
+                        # status with no ``lower_bound`` -- both handled below. An exception
+                        # is a defect in the node engine.
+                        _pool_chunks = []
+                        # #1152: see ``_setup_remaining_budget`` — the pool is
+                        # root setup and must leave the fallback its reserve.
+                        _root_remaining = _setup_remaining_budget()
+                        _pool_budget = min(
+                            # #1153: the pool this separates is inherited by
+                            # EVERY node LP, so an uncapped grant here raises
+                            # the per-node cost in step with the caller's
+                            # budget and shrinks the tree the rest of it can
+                            # cover. Saturate the carve.
+                            _role2_saturate(max(time_limit * 0.25, 5.0), 0.25),
+                            max(_root_remaining, _DEADLINE_NODE_FLOOR_S),
+                        )
+                        # CUT-INHERIT-GRAD structure predicate: snapshot the
+                        # per-family separation timers BEFORE the root pool solve
+                        # so the square+PSD wall this ONE root separation spends is
+                        # isolable (no node solves have run yet, so the delta is
+                        # root-only). The fraction of the root pool solve's wall
+                        # consumed by the two point-separation loops is the
+                        # cheap, general, root-time feature that discriminates the
+                        # dense-integer-QP win class (loops dominate the node wall,
+                        # THRU-3: nvs24 73%+12%, nvs19 42%+20%) from the neutral
+                        # quadratic slice (loops fire but are not the bottleneck,
+                        # THRU-4-graduate wall ratio 1.004x). Keys on measured cost
+                        # only — never on instance name/shape (CLAUDE.md §2).
+                        _sep_before = dict(getattr(_mc_lp_relaxer, "_sep_timers", {}))
+                        _sqpsd_before = _sep_before.get("univariate_square", 0.0) + (
+                            _sep_before.get("psd", 0.0)
+                        )
+                        _pool_solve_t0 = time.perf_counter()
+                        _pool_res = _mc_lp_relaxer.solve_at_node(
+                            _probe_lb,
+                            _probe_ub,
+                            time_limit=_role2_budget(_pool_budget),
+                            out_cuts=_pool_chunks,
+                            # #1152: bound the pool's cold build too (see the PSD
+                            # pool above) — fewer cuts only loosens, never falsifies.
+                            build_deadline=_root_setup_build_deadline(),
+                        )
+                        _pool_solve_wall = time.perf_counter() - _pool_solve_t0
+                        _sep_after = getattr(_mc_lp_relaxer, "_sep_timers", {})
+                        _sqpsd_root_wall = (
+                            _sep_after.get("univariate_square", 0.0)
+                            + _sep_after.get("psd", 0.0)
+                            - _sqpsd_before
+                        )
+                        if _pool_solve_wall > 1e-9:
+                            _root_sqpsd_frac = max(0.0, _sqpsd_root_wall / _pool_solve_wall)
+                        else:
+                            _root_sqpsd_frac = 0.0
+                        if _pool_chunks and _pool_chunks[0] is not None:
+                            _A_pool, _b_pool, _idents_pool = _pool_chunks[0]
+                            _n_pool = _A_pool.shape[0]
+                            if _n_pool > _root_cut_max:
+                                _A_pool = _A_pool[-_root_cut_max:]
+                                _b_pool = _b_pool[-_root_cut_max:]
+                            _root_cut_pool = (_A_pool, _b_pool, _idents_pool)
+                            if (
+                                _pool_res is not None
+                                and _pool_res.lower_bound is not None
+                                and np.isfinite(_pool_res.lower_bound)
+                            ):
+                                _root_pool_bound = float(_pool_res.lower_bound)
+                            logger.info(
+                                "Root cut pool (general spatial): %d cuts (of %d "
+                                "separated), inherited at every fast-path node",
+                                _A_pool.shape[0],
+                                _n_pool,
                             )
-                            # CUT-INHERIT-GRAD structure predicate: snapshot the
-                            # per-family separation timers BEFORE the root pool solve
-                            # so the square+PSD wall this ONE root separation spends is
-                            # isolable (no node solves have run yet, so the delta is
-                            # root-only). The fraction of the root pool solve's wall
-                            # consumed by the two point-separation loops is the
-                            # cheap, general, root-time feature that discriminates the
-                            # dense-integer-QP win class (loops dominate the node wall,
-                            # THRU-3: nvs24 73%+12%, nvs19 42%+20%) from the neutral
-                            # quadratic slice (loops fire but are not the bottleneck,
-                            # THRU-4-graduate wall ratio 1.004x). Keys on measured cost
-                            # only — never on instance name/shape (CLAUDE.md §2).
-                            _sep_before = dict(getattr(_mc_lp_relaxer, "_sep_timers", {}))
-                            _sqpsd_before = _sep_before.get("univariate_square", 0.0) + (
-                                _sep_before.get("psd", 0.0)
-                            )
-                            _pool_solve_t0 = time.perf_counter()
-                            _pool_res = _mc_lp_relaxer.solve_at_node(
-                                _probe_lb,
-                                _probe_ub,
-                                time_limit=_role2_budget(_pool_budget),
-                                out_cuts=_pool_chunks,
-                                # #1152: bound the pool's cold build too (see the PSD
-                                # pool above) — fewer cuts only loosens, never falsifies.
-                                build_deadline=_root_setup_build_deadline(),
-                            )
-                            _pool_solve_wall = time.perf_counter() - _pool_solve_t0
-                            _sep_after = getattr(_mc_lp_relaxer, "_sep_timers", {})
-                            _sqpsd_root_wall = (
-                                _sep_after.get("univariate_square", 0.0)
-                                + _sep_after.get("psd", 0.0)
-                                - _sqpsd_before
-                            )
-                            if _pool_solve_wall > 1e-9:
-                                _root_sqpsd_frac = max(0.0, _sqpsd_root_wall / _pool_solve_wall)
-                            else:
-                                _root_sqpsd_frac = 0.0
-                            if _pool_chunks and _pool_chunks[0] is not None:
-                                _A_pool, _b_pool, _idents_pool = _pool_chunks[0]
-                                _n_pool = _A_pool.shape[0]
-                                if _n_pool > _root_cut_max:
-                                    _A_pool = _A_pool[-_root_cut_max:]
-                                    _b_pool = _b_pool[-_root_cut_max:]
-                                _root_cut_pool = (_A_pool, _b_pool, _idents_pool)
-                                if (
-                                    _pool_res is not None
-                                    and _pool_res.lower_bound is not None
-                                    and np.isfinite(_pool_res.lower_bound)
-                                ):
-                                    _root_pool_bound = float(_pool_res.lower_bound)
-                                logger.info(
-                                    "Root cut pool (general spatial): %d cuts (of %d "
-                                    "separated), inherited at every fast-path node",
-                                    _A_pool.shape[0],
-                                    _n_pool,
-                                )
-                        except Exception as _pool_exc:  # pragma: no cover - defensive
-                            logger.debug("general root cut pool skipped: %s", _pool_exc)
-                            _root_cut_pool = None
 
     # AlphaBB alpha estimate (lever 3, issue #194), deferred from above: compute
     # it only when the LP relaxer is NOT the bound source. When the LP relaxer is
@@ -14593,30 +14712,30 @@ def solve_model(
     if _ir_partitioner is not None and not _tuning().ns_sharp_margin:
         _ir_partitioner = None
     if _ir_partitioner is not None:
-        try:
-            from discopt._relax.primal_heuristics import subnlp as _ir_subnlp
+        # #1514: no ``except``. ``root_witnesses`` is an enumeration and ``subnlp``
+        # already absorbs every NLP-backend failure (it returns ``None``), so a raise
+        # here is a defect rather than a heuristic that found nothing.
+        from discopt._relax.primal_heuristics import subnlp as _ir_subnlp
 
-            _ir_budget = max(1.0, min(5.0, 0.05 * time_limit))
-            _ir_lb_c = np.maximum(lb, -1e3)
-            _ir_ub_c = np.minimum(ub, 1e3)
-            _ir_best: Optional[tuple[np.ndarray, float]] = None
-            for _ir_cand in _ir_partitioner.root_witnesses(lb, ub)[:8]:
-                _ir_seed = 0.5 * (_ir_lb_c + _ir_ub_c)
-                for _ir_col, _ir_val in _ir_cand.items():
-                    _ir_seed[_ir_col] = float(_ir_val)
-                _ir_sn = _ir_subnlp(
-                    model,
-                    np.clip(_ir_seed, lb, ub),
-                    evaluator=evaluator,
-                    time_budget=_role2_horizon(_ir_budget),
-                )
-                if _ir_sn is not None and (_ir_best is None or _ir_sn[1] < _ir_best[1]):
-                    _ir_best = _ir_sn
-            if _ir_best is not None:
-                _inject_incumbent(_ir_best[0], float(_ir_best[1]))
-                logger.info("integer-ratio witness incumbent injected: obj=%.6g", _ir_best[1])
-        except Exception:  # pragma: no cover - defensive (never blocks the solve)
-            logger.debug("integer-ratio witness injection skipped", exc_info=True)
+        _ir_budget = max(1.0, min(5.0, 0.05 * time_limit))
+        _ir_lb_c = np.maximum(lb, -1e3)
+        _ir_ub_c = np.minimum(ub, 1e3)
+        _ir_best: Optional[tuple[np.ndarray, float]] = None
+        for _ir_cand in _ir_partitioner.root_witnesses(lb, ub)[:8]:
+            _ir_seed = 0.5 * (_ir_lb_c + _ir_ub_c)
+            for _ir_col, _ir_val in _ir_cand.items():
+                _ir_seed[_ir_col] = float(_ir_val)
+            _ir_sn = _ir_subnlp(
+                model,
+                np.clip(_ir_seed, lb, ub),
+                evaluator=evaluator,
+                time_budget=_role2_horizon(_ir_budget),
+            )
+            if _ir_sn is not None and (_ir_best is None or _ir_sn[1] < _ir_best[1]):
+                _ir_best = _ir_sn
+        if _ir_best is not None:
+            _inject_incumbent(_ir_best[0], float(_ir_best[1]))
+            logger.info("integer-ratio witness incumbent injected: obj=%.6g", _ir_best[1])
 
     # --- Feasibility pump at root ---
     # Try to find an integer-feasible incumbent before B&B starts.
@@ -15000,10 +15119,8 @@ def solve_model(
     # when the model has no such gating integers, leaving branching unchanged.
     _branch_priority_vars: frozenset[int] = frozenset()
     if _tuning().obj_branch_priority:
-        try:
-            _branch_priority_vars = _branch_priority_integer_vars(model)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug("objective-gating priority detection failed: %s", e)
+        # #1514: no ``except``. Structural detection with no external call.
+        _branch_priority_vars = _branch_priority_integer_vars(model)
         if _branch_priority_vars:
             logger.info(
                 "Objective-gating priority branching: %d integer var(s) %s",
@@ -15203,15 +15320,14 @@ def solve_model(
         (``[:_reduced_n_orig]``) — the reduced evaluator is defined over the
         original variables only (see the setup block's rationale).
         """
-        try:
-            rb = _reduced_bound_fn(
-                _reduced_model,
-                np.asarray(_node_lb, dtype=np.float64)[:_reduced_n_orig],
-                np.asarray(_node_ub, dtype=np.float64)[:_reduced_n_orig],
-            )
-        except Exception as _rb_exc:  # pragma: no cover - defensive
-            logger.debug("reduced-space bound failed at node %d: %s", _i, _rb_exc)
-            return None, None
+        # #1514: no ``except``. ``reduced_mccormick_lp_bound`` converts its
+        # documented refusal (``UnsupportedRelaxation``) and every LP failure into a
+        # status (``unsupported`` / ``error``), handled below; a raise is a defect.
+        rb = _reduced_bound_fn(
+            _reduced_model,
+            np.asarray(_node_lb, dtype=np.float64)[:_reduced_n_orig],
+            np.asarray(_node_ub, dtype=np.float64)[:_reduced_n_orig],
+        )
         if rb.status == "infeasible":
             return "infeasible", None
         if rb.status == "optimal" and rb.bound is not None and np.isfinite(rb.bound):
@@ -15499,62 +15615,63 @@ def solve_model(
         # counted and warned about (``_note_in_tree_presolve_skip``), not skipped
         # silently as it was before #1513 for every model with an array variable.
         if in_tree_presolve_stride and _model_repr is not None:
-            try:
-                _itp_probing = _node_probing_enabled()
-                _itp_probe_max = _node_probe_max_vars()
-                _itp_inc = tree.incumbent()
-                # #1373: the kernel applies the cutoff against the REPR's own
-                # objective under the repr's declared sense, so it needs the
-                # incumbent in the MODEL's space -- ``tree.incumbent()[1]`` is the
-                # internal minimization-space value (``-f`` for a maximize). Feeding
-                # the internal value built the row ``f >= -f(x_inc)``, which on a
-                # maximize model with a negative optimum is stricter than valid: it
-                # emptied every child box and certified a false ``optimal``.
-                # ``repr_space_cutoff`` converts and then VERIFIES against the
-                # incumbent point, returning None (cutoff-free FBBT -- a looser box,
-                # which is sound) when the spaces cannot be shown to agree.
-                _itp_cutoff = (
-                    _repr_space_cutoff(
-                        _model_repr,
-                        float(_itp_inc[1]),
-                        incumbent_point=_itp_inc[0],
-                    )
-                    if _itp_inc is not None
-                    and np.isfinite(_itp_inc[1])
-                    and _itp_inc[1] < _SENTINEL_THRESHOLD
-                    else None
+            # #1514: no ``except``. The Rust in-tree presolve reports "did not run"
+            # through ``delta["ran"]`` and an empty box through
+            # ``delta["infeasible"]``; it has no documented exception, so one is a
+            # defect.
+            _itp_probing = _node_probing_enabled()
+            _itp_probe_max = _node_probe_max_vars()
+            _itp_inc = tree.incumbent()
+            # #1373: the kernel applies the cutoff against the REPR's own
+            # objective under the repr's declared sense, so it needs the
+            # incumbent in the MODEL's space -- ``tree.incumbent()[1]`` is the
+            # internal minimization-space value (``-f`` for a maximize). Feeding
+            # the internal value built the row ``f >= -f(x_inc)``, which on a
+            # maximize model with a negative optimum is stricter than valid: it
+            # emptied every child box and certified a false ``optimal``.
+            # ``repr_space_cutoff`` converts and then VERIFIES against the
+            # incumbent point, returning None (cutoff-free FBBT -- a looser box,
+            # which is sound) when the spaces cannot be shown to agree.
+            _itp_cutoff = (
+                _repr_space_cutoff(
+                    _model_repr,
+                    float(_itp_inc[1]),
+                    incumbent_point=_itp_inc[0],
                 )
-                _itp_depths = tree.node_depths(np.asarray(batch_ids, dtype=np.int64))
-                _t_itp = time.perf_counter()
-                for i in range(n_batch):
-                    if node_infeasible_mask[i]:
-                        continue
-                    _itp_refusal = _in_tree_presolve_refusal(_model_repr, len(batch_lb[i]))
-                    if _itp_refusal is not None:
-                        _note_in_tree_presolve_skip(_itp_refusal, 1, "global spatial")
-                        continue
-                    _itp_delta = _model_repr.in_tree_presolve(
-                        np.asarray(batch_lb[i], dtype=np.float64),
-                        np.asarray(batch_ub[i], dtype=np.float64),
-                        node_depth=int(_itp_depths[i]),
-                        depth_stride=in_tree_presolve_stride,
-                        incumbent=_itp_cutoff,
-                        probing=_itp_probing,
-                        probe_max_vars=_itp_probe_max,
-                    )
-                    if not _itp_delta["ran"]:
-                        continue
-                    _IN_TREE_PRESOLVE_GLOBAL_CALLS += 1
-                    if _itp_delta["infeasible"]:
-                        # Rigorous fathom: the node box is empty (FBBT/probing
-                        # proof), so its subtree holds no feasible point.
-                        node_infeasible_mask[i] = True
-                    else:
-                        batch_lb[i] = list(_itp_delta["lb"])
-                        batch_ub[i] = list(_itp_delta["ub"])
-                _reduce_timers["fbbt"] += time.perf_counter() - _t_itp
-            except Exception as _itp_exc:  # pragma: no cover - defensive
-                logger.debug("global in-tree presolve skipped: %s", _itp_exc)
+                if _itp_inc is not None
+                and np.isfinite(_itp_inc[1])
+                and _itp_inc[1] < _SENTINEL_THRESHOLD
+                else None
+            )
+            _itp_depths = tree.node_depths(np.asarray(batch_ids, dtype=np.int64))
+            _t_itp = time.perf_counter()
+            for i in range(n_batch):
+                if node_infeasible_mask[i]:
+                    continue
+                _itp_refusal = _in_tree_presolve_refusal(_model_repr, len(batch_lb[i]))
+                if _itp_refusal is not None:
+                    _note_in_tree_presolve_skip(_itp_refusal, 1, "global spatial")
+                    continue
+                _itp_delta = _model_repr.in_tree_presolve(
+                    np.asarray(batch_lb[i], dtype=np.float64),
+                    np.asarray(batch_ub[i], dtype=np.float64),
+                    node_depth=int(_itp_depths[i]),
+                    depth_stride=in_tree_presolve_stride,
+                    incumbent=_itp_cutoff,
+                    probing=_itp_probing,
+                    probe_max_vars=_itp_probe_max,
+                )
+                if not _itp_delta["ran"]:
+                    continue
+                _IN_TREE_PRESOLVE_GLOBAL_CALLS += 1
+                if _itp_delta["infeasible"]:
+                    # Rigorous fathom: the node box is empty (FBBT/probing
+                    # proof), so its subtree holds no feasible point.
+                    node_infeasible_mask[i] = True
+                else:
+                    batch_lb[i] = list(_itp_delta["lb"])
+                    batch_ub[i] = list(_itp_delta["ub"])
+            _reduce_timers["fbbt"] += time.perf_counter() - _t_itp
 
         # --- Per-node OBBT (Lever A) ---
         # Tighten each surviving node's box against its own McCormick relaxation
@@ -15595,25 +15712,20 @@ def solve_model(
                 _t_pn = time.perf_counter()
                 if time_limit - (_t_pn - t_start) < _DEADLINE_NODE_FLOOR_S:
                     break
-                try:
-                    _pn_res = obbt_tighten_root(
-                        model,
-                        np.asarray(batch_lb[i], dtype=np.float64),
-                        ub=np.asarray(batch_ub[i], dtype=np.float64),
-                        rounds=_PER_NODE_OBBT_ROUNDS,
-                        incumbent_cutoff=_pn_cutoff,
-                        deadline=_role2_deadline(_t_pn + _PER_NODE_OBBT_PER_NODE_S),
-                        time_limit_per_lp=_PER_NODE_OBBT_PER_LP_S,
-                        prefer_pounce=nlp_solver == "pounce",
-                        top_k=_pn_obbt_topk,
-                    )
-                except Exception as _pn_exc:  # pragma: no cover - defensive
-                    logger.debug("per-node OBBT failed: %s", _pn_exc)
-                    _pn_res = None
-                finally:
-                    _pn_obbt_spent += time.perf_counter() - _t_pn
-                if _pn_res is None:
-                    continue
+                # #1514: no ``except``. ``obbt_tighten_root`` returns the input box
+                # when it cannot proceed, so a raise is a defect.
+                _pn_res = obbt_tighten_root(
+                    model,
+                    np.asarray(batch_lb[i], dtype=np.float64),
+                    ub=np.asarray(batch_ub[i], dtype=np.float64),
+                    rounds=_PER_NODE_OBBT_ROUNDS,
+                    incumbent_cutoff=_pn_cutoff,
+                    deadline=_role2_deadline(_t_pn + _PER_NODE_OBBT_PER_NODE_S),
+                    time_limit_per_lp=_PER_NODE_OBBT_PER_LP_S,
+                    prefer_pounce=nlp_solver == "pounce",
+                    top_k=_pn_obbt_topk,
+                )
+                _pn_obbt_spent += time.perf_counter() - _t_pn
                 if _pn_res.infeasible:
                     node_infeasible_mask[i] = True
                     continue
@@ -15874,30 +15986,30 @@ def solve_model(
                         _exp_build = _mc_lp_relaxer.expected_build_cost()
                         _yield_round = _exp_build is not None and _node_remaining < _exp_build
                     nlp_failed = result_lbs[i] >= _SENTINEL_THRESHOLD
-                    try:
-                        mc_res = _mc_lp_relaxer.solve_at_node(
-                            np.asarray(batch_lb[i]),
-                            np.asarray(batch_ub[i]),
-                            time_limit=max(_node_remaining, _DEADLINE_NODE_FLOOR_S),
-                            round_deadline=(_deadline if _round_budget_enabled else None),
-                            yield_round=_yield_round,
-                            inherited_cuts=_root_cut_pool,
-                            separate=True,
-                            want_marginals=_phase2_dbbt_enabled,
-                            # THRU-4: with the root pool inherited, skip the per-node
-                            # square/PSD point-separation loops (sound: their cut
-                            # families are box-independent and already in the pool)
-                            # — unless the global-stall governor is probing (C-42).
-                            skip_pool_separators=(
-                                _cut_inherit_enabled
-                                and _root_cut_pool is not None
-                                and not _lazy_probing
-                            ),
-                        )
-                    except Exception as e:
-                        logger.debug("McCormick LP failed at node %d: %s", i, e)
-                        _yield_keeps_node_open(_yield_round, nlp_failed, result_lbs, i)
-                        continue
+                    # #1514: no ``except``. ``solve_at_node`` declines by status: a
+                    # relaxation build failure is caught inside it and returned as
+                    # ``status="error"``, and LP trouble comes back as a non-optimal
+                    # status with no ``lower_bound`` -- both handled below. An exception
+                    # is a defect in the node engine.
+                    mc_res = _mc_lp_relaxer.solve_at_node(
+                        np.asarray(batch_lb[i]),
+                        np.asarray(batch_ub[i]),
+                        time_limit=max(_node_remaining, _DEADLINE_NODE_FLOOR_S),
+                        round_deadline=(_deadline if _round_budget_enabled else None),
+                        yield_round=_yield_round,
+                        inherited_cuts=_root_cut_pool,
+                        separate=True,
+                        want_marginals=_phase2_dbbt_enabled,
+                        # THRU-4: with the root pool inherited, skip the per-node
+                        # square/PSD point-separation loops (sound: their cut
+                        # families are box-independent and already in the pool)
+                        # — unless the global-stall governor is probing (C-42).
+                        skip_pool_separators=(
+                            _cut_inherit_enabled
+                            and _root_cut_pool is not None
+                            and not _lazy_probing
+                        ),
+                    )
                     if mc_res.status == "infeasible":
                         # Rigorous fathom: the McCormick LP is a valid outer
                         # relaxation, so an empty relaxed feasible set proves the
@@ -16273,29 +16385,30 @@ def solve_model(
                 else:
                     _round_blocked = True
                 if _mc_lp_relaxer is not None and not _reduced_done_serial and not _round_blocked:
-                    try:
-                        mc_lp_res = _mc_lp_relaxer.solve_at_node(
-                            node_lb,
-                            node_ub,
-                            time_limit=max(_deadline - time.perf_counter(), _DEADLINE_NODE_FLOOR_S),
-                            round_deadline=(_deadline if _round_budget_enabled else None),
-                            yield_round=_serial_yield_round,
-                            inherited_cuts=_root_cut_pool,
-                            separate=True,
-                            want_marginals=_phase2_dbbt_enabled,
-                            # THRU-4: with the root pool inherited, skip the per-node
-                            # square/PSD point-separation loops (sound: their cut
-                            # families are box-independent and already in the pool)
-                            # — unless the global-stall governor is probing (C-42).
-                            skip_pool_separators=(
-                                _cut_inherit_enabled
-                                and _root_cut_pool is not None
-                                and not _lazy_probing
-                            ),
-                        )
-                    except Exception as e:
-                        logger.debug("McCormick LP failed at node %d: %s", int(batch_ids[i]), e)
-                        mc_lp_res = None
+                    # #1514: no ``except``. ``solve_at_node`` declines by status: a
+                    # relaxation build failure is caught inside it and returned as
+                    # ``status="error"``, and LP trouble comes back as a non-optimal
+                    # status with no ``lower_bound`` -- both handled below. An exception
+                    # is a defect in the node engine.
+                    mc_lp_res = _mc_lp_relaxer.solve_at_node(
+                        node_lb,
+                        node_ub,
+                        time_limit=max(_deadline - time.perf_counter(), _DEADLINE_NODE_FLOOR_S),
+                        round_deadline=(_deadline if _round_budget_enabled else None),
+                        yield_round=_serial_yield_round,
+                        inherited_cuts=_root_cut_pool,
+                        separate=True,
+                        want_marginals=_phase2_dbbt_enabled,
+                        # THRU-4: with the root pool inherited, skip the per-node
+                        # square/PSD point-separation loops (sound: their cut
+                        # families are box-independent and already in the pool)
+                        # — unless the global-stall governor is probing (C-42).
+                        skip_pool_separators=(
+                            _cut_inherit_enabled
+                            and _root_cut_pool is not None
+                            and not _lazy_probing
+                        ),
+                    )
                     if mc_lp_res is not None and mc_lp_res.status == "infeasible":
                         # The McCormick LP is a valid OUTER relaxation of this
                         # node's subtree: if the (larger) relaxed feasible set is
@@ -16627,13 +16740,12 @@ def solve_model(
                         and _convex_constraint_mask is not None
                         and not all(_convex_constraint_mask)
                     ):
-                        try:
-                            node_mask = _refresh_mask(
-                                model, _convex_constraint_mask, node_lb_i, node_ub_i
-                            )
-                        except Exception as exc:
-                            logger.debug("Per-node convexity refresh failed: %s", exc)
-                            node_mask = _convex_constraint_mask
+                        # #1514: no ``except``. ``refresh_convex_mask`` falls back to the root mask
+                        # itself on a shape mismatch or a crossed box, and absorbs a per-constraint
+                        # certificate failure; a raise is a defect.
+                        node_mask = _refresh_mask(
+                            model, _convex_constraint_mask, node_lb_i, node_ub_i
+                        )
                         if (
                             node_mask is not _convex_constraint_mask
                             and node_mask is not None
@@ -17870,36 +17982,35 @@ def solve_model(
             if incumbent_info is not None:
                 inc_sol, inc_obj = incumbent_info
                 if inc_obj < _SENTINEL_THRESHOLD:
-                    try:
-                        from discopt._relax.obbt import obbt_tighten_root
+                    # #1514: no ``except``. ``obbt_tighten_root`` returns the input box when it
+                    # cannot proceed, so a raise is a defect.
+                    from discopt._relax.obbt import obbt_tighten_root
 
-                        # Tighten against the McCormick *relaxation* (not just the
-                        # model's linear rows) with the incumbent as a cutoff. This
-                        # runs duality-based bound tightening (one objective LP whose
-                        # reduced costs bound every variable) followed by
-                        # optimality-based OBBT, so a new incumbent shrinks the box
-                        # via the nonlinear envelopes too — both are rigorous
-                        # tightenings of an outer approximation.
-                        obbt_result = obbt_tighten_root(
-                            model,
-                            np.array(lb),
-                            ub=np.array(ub),
-                            rounds=2,
-                            incumbent_cutoff=float(inc_obj),
-                            deadline=_role2_deadline(time.perf_counter() + 5.0),
-                            time_limit_per_lp=0.1,
-                            prefer_pounce=nlp_solver == "pounce",
+                    # Tighten against the McCormick *relaxation* (not just the
+                    # model's linear rows) with the incumbent as a cutoff. This
+                    # runs duality-based bound tightening (one objective LP whose
+                    # reduced costs bound every variable) followed by
+                    # optimality-based OBBT, so a new incumbent shrinks the box
+                    # via the nonlinear envelopes too — both are rigorous
+                    # tightenings of an outer approximation.
+                    obbt_result = obbt_tighten_root(
+                        model,
+                        np.array(lb),
+                        ub=np.array(ub),
+                        rounds=2,
+                        incumbent_cutoff=float(inc_obj),
+                        deadline=_role2_deadline(time.perf_counter() + 5.0),
+                        time_limit_per_lp=0.1,
+                        prefer_pounce=nlp_solver == "pounce",
+                    )
+                    if not obbt_result.infeasible and obbt_result.n_tightened > 0:
+                        lb = obbt_result.lb
+                        ub = obbt_result.ub
+                        logger.info(
+                            "Relaxation OBBT/DBBT tightened %d bounds (incumbent=%.6g)",
+                            obbt_result.n_tightened,
+                            inc_obj,
                         )
-                        if not obbt_result.infeasible and obbt_result.n_tightened > 0:
-                            lb = obbt_result.lb
-                            ub = obbt_result.ub
-                            logger.info(
-                                "Relaxation OBBT/DBBT tightened %d bounds (incumbent=%.6g)",
-                                obbt_result.n_tightened,
-                                inc_obj,
-                            )
-                    except Exception as e:
-                        logger.debug("Periodic OBBT failed: %s", e)
 
         # --- FBBT with incumbent cutoff (Phase C3) ---
         # Cheap bound tightening via Rust FBBT (no LP solves).
@@ -17919,65 +18030,63 @@ def solve_model(
                     else None
                 )
                 if _c3_cutoff is not None:
-                    try:
-                        fbbt_lbs, fbbt_ubs = _model_repr.fbbt_with_cutoff(
-                            max_iter=10, tol=1e-8, incumbent_bound=_c3_cutoff
-                        )
-                        fbbt_lbs = np.asarray(fbbt_lbs, dtype=np.float64)
-                        fbbt_ubs = np.asarray(fbbt_ubs, dtype=np.float64)
-                        # C-40: apply cutoff-FBBT bounds only when the Rust repr's
-                        # variable layout provably aligns 1:1 with the flat B&B
-                        # columns — i.e. it returns exactly ``n_vars`` intervals and
-                        # every model block is scalar (block index == flat column).
-                        # ``_model_repr`` can carry a reformulated/eliminated variable
-                        # set whose length differs from ``model._variables`` (measured
-                        # 144 vs 145 on ``util``); the old ``fbbt_lbs[bi]`` → ``lb[flat]``
-                        # map then reads a *misaligned* variable's bound, writes a
-                        # crossed ``lb>ub`` box, and — with the write done in place and
-                        # the OOB swallowed — leaves the GLOBAL box corrupted. That
-                        # corrupted box empties the intersection at the child-node
-                        # cutoff clamp below, fathoming the optimum-containing node and
-                        # certifying a false optimal (C-40). Forgoing this *optional*
-                        # tightening on a misaligned repr keeps a valid, looser box —
-                        # sound by construction (CLAUDE.md §3), never a lost bound.
-                        _all_scalar = all(v.size == 1 for v in model._variables)
-                        _aligned = (
-                            fbbt_lbs.shape == (n_vars,)
-                            and fbbt_ubs.shape == (n_vars,)
-                            and _all_scalar
-                        )
-                        if _aligned:
-                            # Intersect into a candidate box; commit only if it stays
-                            # consistent (no crossed bound). FBBT lower bounds and
-                            # upper bounds are each valid, so ``max``/``min`` against
-                            # the current box only tightens — a crossing would mean the
-                            # region is empty under the cutoff, which the tree proves
-                            # via node relaxations, not via an in-place box write.
-                            cand_lb = np.maximum(lb, fbbt_lbs)
-                            cand_ub = np.minimum(ub, fbbt_ubs)
-                            if not np.any(cand_lb > cand_ub + 1e-9):
-                                n_tightened = int(
-                                    np.count_nonzero(cand_lb > lb + 1e-10)
-                                    + np.count_nonzero(cand_ub < ub - 1e-10)
-                                )
-                                lb = cand_lb
-                                ub = cand_ub
-                                if n_tightened > 0:
-                                    logger.info(
-                                        "FBBT tightened %d bounds (incumbent=%.6g)",
-                                        n_tightened,
-                                        inc_obj,
-                                    )
-                        else:
-                            logger.debug(
-                                "Cutoff-FBBT skipped: repr layout misaligned "
-                                "(returned %d intervals, flat n_vars=%d, all_scalar=%s)",
-                                fbbt_lbs.shape[0] if fbbt_lbs.ndim == 1 else -1,
-                                n_vars,
-                                _all_scalar,
+                    # #1514: no ``except``. ``fbbt_with_cutoff`` is infallible on the Rust side
+                    # (it returns intervals, never an error), and the alignment gate below handles
+                    # the one documented mismatch; a raise is a defect.
+                    fbbt_lbs, fbbt_ubs = _model_repr.fbbt_with_cutoff(
+                        max_iter=10, tol=1e-8, incumbent_bound=_c3_cutoff
+                    )
+                    fbbt_lbs = np.asarray(fbbt_lbs, dtype=np.float64)
+                    fbbt_ubs = np.asarray(fbbt_ubs, dtype=np.float64)
+                    # C-40: apply cutoff-FBBT bounds only when the Rust repr's
+                    # variable layout provably aligns 1:1 with the flat B&B
+                    # columns — i.e. it returns exactly ``n_vars`` intervals and
+                    # every model block is scalar (block index == flat column).
+                    # ``_model_repr`` can carry a reformulated/eliminated variable
+                    # set whose length differs from ``model._variables`` (measured
+                    # 144 vs 145 on ``util``); the old ``fbbt_lbs[bi]`` → ``lb[flat]``
+                    # map then reads a *misaligned* variable's bound, writes a
+                    # crossed ``lb>ub`` box, and — with the write done in place and
+                    # the OOB swallowed — leaves the GLOBAL box corrupted. That
+                    # corrupted box empties the intersection at the child-node
+                    # cutoff clamp below, fathoming the optimum-containing node and
+                    # certifying a false optimal (C-40). Forgoing this *optional*
+                    # tightening on a misaligned repr keeps a valid, looser box —
+                    # sound by construction (CLAUDE.md §3), never a lost bound.
+                    _all_scalar = all(v.size == 1 for v in model._variables)
+                    _aligned = (
+                        fbbt_lbs.shape == (n_vars,) and fbbt_ubs.shape == (n_vars,) and _all_scalar
+                    )
+                    if _aligned:
+                        # Intersect into a candidate box; commit only if it stays
+                        # consistent (no crossed bound). FBBT lower bounds and
+                        # upper bounds are each valid, so ``max``/``min`` against
+                        # the current box only tightens — a crossing would mean the
+                        # region is empty under the cutoff, which the tree proves
+                        # via node relaxations, not via an in-place box write.
+                        cand_lb = np.maximum(lb, fbbt_lbs)
+                        cand_ub = np.minimum(ub, fbbt_ubs)
+                        if not np.any(cand_lb > cand_ub + 1e-9):
+                            n_tightened = int(
+                                np.count_nonzero(cand_lb > lb + 1e-10)
+                                + np.count_nonzero(cand_ub < ub - 1e-10)
                             )
-                    except Exception as e:
-                        logger.debug("FBBT with cutoff failed: %s", e)
+                            lb = cand_lb
+                            ub = cand_ub
+                            if n_tightened > 0:
+                                logger.info(
+                                    "FBBT tightened %d bounds (incumbent=%.6g)",
+                                    n_tightened,
+                                    inc_obj,
+                                )
+                    else:
+                        logger.debug(
+                            "Cutoff-FBBT skipped: repr layout misaligned "
+                            "(returned %d intervals, flat n_vars=%d, all_scalar=%s)",
+                            fbbt_lbs.shape[0] if fbbt_lbs.ndim == 1 else -1,
+                            n_vars,
+                            _all_scalar,
+                        )
 
         # --- Node callback: notify user after each batch ---
         if node_callback is not None:
@@ -18042,106 +18151,105 @@ def solve_model(
             and _mc_lp_relaxer is not None
             and model._objective is not None
         ):
-            try:
-                from discopt._relax.root_reduce import run_root_fixpoint
+            # #1514: no ``except``. ``run_root_fixpoint`` returns an unchanged box when
+            # a stage cannot run (its OBBT/FBBT stages decline internally); a raise is a
+            # defect.
+            from discopt._relax.root_reduce import run_root_fixpoint
 
-                _rf_inc = tree.incumbent()
-                _rf_cutoff = (
-                    float(_rf_inc[1])
-                    if _rf_inc is not None
-                    and np.isfinite(_rf_inc[1])
-                    and _rf_inc[1] < _SENTINEL_THRESHOLD
-                    else None
+            _rf_inc = tree.incumbent()
+            _rf_cutoff = (
+                float(_rf_inc[1])
+                if _rf_inc is not None
+                and np.isfinite(_rf_inc[1])
+                and _rf_inc[1] < _SENTINEL_THRESHOLD
+                else None
+            )
+            # No-offtarget gate (§14 T2.4 ≤1.05 wall guard): skip the fixpoint
+            # when the root is already tight — the relative gap between the root
+            # dual bound and the incumbent cutoff is below a small threshold, so
+            # reduction has nothing to close and the loop would only add wall
+            # cost on the already-fast class (e.g. instances that close at ≤10
+            # nodes). When there is no incumbent yet OR no root bound, run it
+            # (the structural/finitizing value can still help).
+            _rf_gap_ok = True
+            if _rf_cutoff is not None and _root_glb_internal is not None:
+                _rf_lo = float(_root_glb_internal)
+                if np.isfinite(_rf_lo):
+                    _rf_rel_gap = abs(_rf_cutoff - _rf_lo) / (1.0 + abs(_rf_cutoff))
+                    _rf_gap_ok = _rf_rel_gap > _ROOT_FIXPOINT_MIN_GAP
+            # R1 budget: ~10% of the time limit (loop converges in <=2 iters,
+            # S3 OBBT gets ~85% of it inside the loop). Hard deadline-bounded.
+            # #1153: saturate the carve — the fixpoint's own round cap
+            # (<=2 iterations) is what should end it, not the caller's budget.
+            _rf_budget = min(
+                _role2_saturate(max(time_limit * 0.10, 1.0), 0.10),
+                max(_remaining_budget(), 0.0),
+            )
+            if _rf_gap_ok and _rf_budget > _DEADLINE_NODE_FLOOR_S:
+                _rf_res = run_root_fixpoint(
+                    model,
+                    np.asarray(lb, dtype=np.float64),
+                    np.asarray(ub, dtype=np.float64),
+                    incumbent_cutoff=_rf_cutoff,
+                    deadline=_role2_deadline(time.perf_counter() + _rf_budget),
+                    tol=1e-6,
+                    prefer_pounce=nlp_solver == "pounce",
+                    measure_bound=False,
                 )
-                # No-offtarget gate (§14 T2.4 ≤1.05 wall guard): skip the fixpoint
-                # when the root is already tight — the relative gap between the root
-                # dual bound and the incumbent cutoff is below a small threshold, so
-                # reduction has nothing to close and the loop would only add wall
-                # cost on the already-fast class (e.g. instances that close at ≤10
-                # nodes). When there is no incumbent yet OR no root bound, run it
-                # (the structural/finitizing value can still help).
-                _rf_gap_ok = True
-                if _rf_cutoff is not None and _root_glb_internal is not None:
-                    _rf_lo = float(_root_glb_internal)
-                    if np.isfinite(_rf_lo):
-                        _rf_rel_gap = abs(_rf_cutoff - _rf_lo) / (1.0 + abs(_rf_cutoff))
-                        _rf_gap_ok = _rf_rel_gap > _ROOT_FIXPOINT_MIN_GAP
-                # R1 budget: ~10% of the time limit (loop converges in <=2 iters,
-                # S3 OBBT gets ~85% of it inside the loop). Hard deadline-bounded.
-                # #1153: saturate the carve — the fixpoint's own round cap
-                # (<=2 iterations) is what should end it, not the caller's budget.
-                _rf_budget = min(
-                    _role2_saturate(max(time_limit * 0.10, 1.0), 0.10),
-                    max(_remaining_budget(), 0.0),
-                )
-                if _rf_gap_ok and _rf_budget > _DEADLINE_NODE_FLOOR_S:
-                    _rf_res = run_root_fixpoint(
-                        model,
-                        np.asarray(lb, dtype=np.float64),
-                        np.asarray(ub, dtype=np.float64),
-                        incumbent_cutoff=_rf_cutoff,
-                        deadline=_role2_deadline(time.perf_counter() + _rf_budget),
-                        tol=1e-6,
-                        prefer_pounce=nlp_solver == "pounce",
-                        measure_bound=False,
+                if _rf_res.infeasible:
+                    # The relaxation excludes every point better than the
+                    # incumbent cutoff -> the incumbent is optimal. Nothing to
+                    # tighten; the tree certifies on the next termination check.
+                    logger.info(
+                        "Root fixpoint proved no improving point below the "
+                        "incumbent cutoff (root reduce)"
                     )
-                    if _rf_res.infeasible:
-                        # The relaxation excludes every point better than the
-                        # incumbent cutoff -> the incumbent is optimal. Nothing to
-                        # tighten; the tree certifies on the next termination check.
-                        logger.info(
-                            "Root fixpoint proved no improving point below the "
-                            "incumbent cutoff (root reduce)"
+                elif _rf_res.n_tightened > 0:
+                    # Intersect tighten-only into the global box.
+                    lb = np.maximum(np.asarray(lb, dtype=np.float64), _rf_res.lb)
+                    ub = np.minimum(np.asarray(ub, dtype=np.float64), _rf_res.ub)
+                    logger.info(
+                        "Root fixpoint tightened %d bounds over %d round(s) (cutoff=%s)",
+                        _rf_res.n_tightened,
+                        _rf_res.n_rounds,
+                        "none" if _rf_cutoff is None else f"{_rf_cutoff:.6g}",
+                    )
+                    # The existing root cut pool (captured on the WIDER root box)
+                    # stays valid after tightening — a cut valid over a box is
+                    # valid over any sub-box — so every in-tree node keeps
+                    # inheriting sound cuts with NO refresh needed for soundness.
+                    # A refresh on the tightened box can only *strengthen* the
+                    # pool, but it costs a full separating solve (irreducible ~1s
+                    # floor on a large lifted relaxation, not bounded by the LP
+                    # time_limit — measured +3.7s on pooling_adhya1stp), which is
+                    # a no-offtarget-guard violation (§14 T2.4 ≤1.05 wall). So the
+                    # refresh is opt-in only (DISCOPT_ROOT_FIXPOINT_REPOOL=1) for a
+                    # future strength A/B; the default flagged path skips it and
+                    # keeps the still-valid pool.
+                    if (
+                        getattr(_mc_lp_relaxer, "_inc", None) is not None
+                        and os.environ.get("DISCOPT_ROOT_FIXPOINT_REPOOL") == "1"
+                        and _remaining_budget() > _DEADLINE_NODE_FLOOR_S
+                    ):
+                        # #1514: no ``except``. ``solve_at_node`` declines by status: a
+                        # relaxation build failure is caught inside it and returned as
+                        # ``status="error"``, and LP trouble comes back as a non-optimal
+                        # status with no ``lower_bound`` -- both handled below. An exception
+                        # is a defect in the node engine.
+                        _rf_chunks: list = []
+                        _mc_lp_relaxer.solve_at_node(
+                            np.asarray(lb, dtype=np.float64),
+                            np.asarray(ub, dtype=np.float64),
+                            time_limit=max(_remaining_budget(), _DEADLINE_NODE_FLOOR_S),
+                            out_cuts=_rf_chunks,
                         )
-                    elif _rf_res.n_tightened > 0:
-                        # Intersect tighten-only into the global box.
-                        lb = np.maximum(np.asarray(lb, dtype=np.float64), _rf_res.lb)
-                        ub = np.minimum(np.asarray(ub, dtype=np.float64), _rf_res.ub)
-                        logger.info(
-                            "Root fixpoint tightened %d bounds over %d round(s) (cutoff=%s)",
-                            _rf_res.n_tightened,
-                            _rf_res.n_rounds,
-                            "none" if _rf_cutoff is None else f"{_rf_cutoff:.6g}",
-                        )
-                        # The existing root cut pool (captured on the WIDER root box)
-                        # stays valid after tightening — a cut valid over a box is
-                        # valid over any sub-box — so every in-tree node keeps
-                        # inheriting sound cuts with NO refresh needed for soundness.
-                        # A refresh on the tightened box can only *strengthen* the
-                        # pool, but it costs a full separating solve (irreducible ~1s
-                        # floor on a large lifted relaxation, not bounded by the LP
-                        # time_limit — measured +3.7s on pooling_adhya1stp), which is
-                        # a no-offtarget-guard violation (§14 T2.4 ≤1.05 wall). So the
-                        # refresh is opt-in only (DISCOPT_ROOT_FIXPOINT_REPOOL=1) for a
-                        # future strength A/B; the default flagged path skips it and
-                        # keeps the still-valid pool.
-                        if (
-                            getattr(_mc_lp_relaxer, "_inc", None) is not None
-                            and os.environ.get("DISCOPT_ROOT_FIXPOINT_REPOOL") == "1"
-                            and _remaining_budget() > _DEADLINE_NODE_FLOOR_S
-                        ):
-                            try:
-                                _rf_chunks: list = []
-                                _mc_lp_relaxer.solve_at_node(
-                                    np.asarray(lb, dtype=np.float64),
-                                    np.asarray(ub, dtype=np.float64),
-                                    time_limit=max(_remaining_budget(), _DEADLINE_NODE_FLOOR_S),
-                                    out_cuts=_rf_chunks,
-                                )
-                                if _rf_chunks and _rf_chunks[0] is not None:
-                                    _A_rf, _b_rf, _idents_rf = _rf_chunks[0]
-                                    if _A_rf is not None and _A_rf.shape[0] > 0:
-                                        if _A_rf.shape[0] > _root_cut_max:
-                                            _A_rf = _A_rf[-_root_cut_max:]
-                                            _b_rf = _b_rf[-_root_cut_max:]
-                                        _root_cut_pool = (_A_rf, _b_rf, _idents_rf)
-                            except Exception as _rf_pool_exc:  # pragma: no cover
-                                logger.debug(
-                                    "root-fixpoint cut-pool refresh skipped: %s",
-                                    _rf_pool_exc,
-                                )
-            except Exception as _rf_exc:  # pragma: no cover - defensive
-                logger.debug("root fixpoint reduce skipped: %s", _rf_exc)
+                        if _rf_chunks and _rf_chunks[0] is not None:
+                            _A_rf, _b_rf, _idents_rf = _rf_chunks[0]
+                            if _A_rf is not None and _A_rf.shape[0] > 0:
+                                if _A_rf.shape[0] > _root_cut_max:
+                                    _A_rf = _A_rf[-_root_cut_max:]
+                                    _b_rf = _b_rf[-_root_cut_max:]
+                                _root_cut_pool = (_A_rf, _b_rf, _idents_rf)
 
         iteration += 1
 
@@ -20259,13 +20367,15 @@ def _solve_nlp_bb(
     # Write-back honors the #772 lessons: each cut is a NEW Constraint with the
     # full row folded into the body and ``rhs=0.0``. The applied cuts remain in
     # the model after the solve (valid rows; keeps result.constraint_duals
-    # aligned). Failure-safe: any error degrades to the flag-off path.
+    # aligned). A documented decline degrades to the flag-off path (#1514).
     _root_cut_bound: Optional[float] = None
     _root_cut_count = 0
     # Top-level solves only: RENS/local-branching sub-solves recurse into this
     # function (with rens_enabled/_lns_enabled False) and must not pay for —
     # or mutate their restricted models with — a second root-cut stage.
     if _model_is_convex and rens_enabled and _lns_enabled:
+        from discopt.solvers._root_cuts import RootCutsNotApplicable
+
         try:
             from discopt.solvers._root_cuts import (
                 flat_column_terms,
@@ -20320,7 +20430,12 @@ def _solve_nlp_bb(
                         _rc.productive_rounds,
                         _root_cut_bound if _root_cut_bound is not None else float("nan"),
                     )
-        except Exception as e:
+        except (RootCutsNotApplicable, ImportError) as e:
+            # #1514: narrowed. ``generate_root_cuts`` documents exactly two
+            # declines -- an objective the LP cannot represent
+            # (``RootCutsNotApplicable``) and a missing ``highspy`` -- both raised
+            # before any cut is appended. Everything else (its own invariant
+            # refusals included) is a defect and fails the solve.
             logger.debug("NLP-BB root cuts skipped: %s", e)
             _root_cut_bound = None
 
@@ -20622,61 +20737,58 @@ def _solve_nlp_bb(
         # SCALAR (#1513), so array-variable models run it too; a box it cannot
         # take is counted and warned about, never skipped silently.
         if in_tree_presolve_stride and in_tree_presolve_repr is not None:
-            try:
-                # P3 branch-and-reduce: enable per-node probing (default OFF) and
-                # feed the current incumbent as a cutoff so both the in-tree FBBT
-                # and the probing pass are optimality-aware. The incumbent value
-                # is a valid upper bound on the optimum, so cutoff-driven
-                # contraction never removes an improving feasible point.
-                _itp_probing = _node_probing_enabled()
-                _itp_probe_max = _node_probe_max_vars()
-                _itp_inc = tree.incumbent()
-                # #1373: model-space, verified -- see the spatial loop's copy of
-                # this conversion for why the internal value is a false certificate.
-                _itp_cutoff = (
-                    _repr_space_cutoff(
-                        in_tree_presolve_repr,
-                        float(_itp_inc[1]),
-                        incumbent_point=_itp_inc[0],
-                    )
-                    if _itp_inc is not None
-                    and np.isfinite(_itp_inc[1])
-                    and _itp_inc[1] < _SENTINEL_THRESHOLD
-                    else None
+            # #1514: no ``except``. As in the spatial loop: ``in_tree_presolve``
+            # reports through ``delta``, never by raising.
+            # P3 branch-and-reduce: enable per-node probing (default OFF) and
+            # feed the current incumbent as a cutoff so both the in-tree FBBT
+            # and the probing pass are optimality-aware. The incumbent value
+            # is a valid upper bound on the optimum, so cutoff-driven
+            # contraction never removes an improving feasible point.
+            _itp_probing = _node_probing_enabled()
+            _itp_probe_max = _node_probe_max_vars()
+            _itp_inc = tree.incumbent()
+            # #1373: model-space, verified -- see the spatial loop's copy of
+            # this conversion for why the internal value is a false certificate.
+            _itp_cutoff = (
+                _repr_space_cutoff(
+                    in_tree_presolve_repr,
+                    float(_itp_inc[1]),
+                    incumbent_point=_itp_inc[0],
                 )
-                # Real per-node tree depth so the depth-stride gate is honest
-                # (issue #632 / PF1): the old hardcode of 0 made every stride
-                # fire at every node (0 % s == 0). At stride 1 this is a no-op
-                # (fires everywhere either way); it only matters for stride > 1.
-                _itp_depths = tree.node_depths(np.asarray(batch_ids, dtype=np.int64))
-                for i in range(n_batch):
-                    _itp_refusal = _in_tree_presolve_refusal(
-                        in_tree_presolve_repr, len(batch_lb[i])
-                    )
-                    if _itp_refusal is not None:
-                        _note_in_tree_presolve_skip(_itp_refusal, 1, "NLP-BB")
-                        continue
-                    delta = in_tree_presolve_repr.in_tree_presolve(
-                        np.asarray(batch_lb[i], dtype=np.float64),
-                        np.asarray(batch_ub[i], dtype=np.float64),
-                        node_depth=int(_itp_depths[i]),
-                        depth_stride=in_tree_presolve_stride,
-                        incumbent=_itp_cutoff,
-                        probing=_itp_probing,
-                        probe_max_vars=_itp_probe_max,
-                    )
-                    if delta["ran"]:
-                        global _IN_TREE_PRESOLVE_NLPBB_CALLS
-                        _IN_TREE_PRESOLVE_NLPBB_CALLS += 1
-                    if delta["ran"] and delta["infeasible"]:
-                        # Rigorous fathom: the node box is empty (FBBT/probing
-                        # proof). Mark infeasible so the node is pruned soundly.
-                        node_infeasible_mask[i] = True
-                    elif delta["ran"]:
-                        batch_lb[i] = list(delta["lb"])
-                        batch_ub[i] = list(delta["ub"])
-            except Exception as _e:
-                logger.debug("in-tree presolve skipped: %s", _e)
+                if _itp_inc is not None
+                and np.isfinite(_itp_inc[1])
+                and _itp_inc[1] < _SENTINEL_THRESHOLD
+                else None
+            )
+            # Real per-node tree depth so the depth-stride gate is honest
+            # (issue #632 / PF1): the old hardcode of 0 made every stride
+            # fire at every node (0 % s == 0). At stride 1 this is a no-op
+            # (fires everywhere either way); it only matters for stride > 1.
+            _itp_depths = tree.node_depths(np.asarray(batch_ids, dtype=np.int64))
+            for i in range(n_batch):
+                _itp_refusal = _in_tree_presolve_refusal(in_tree_presolve_repr, len(batch_lb[i]))
+                if _itp_refusal is not None:
+                    _note_in_tree_presolve_skip(_itp_refusal, 1, "NLP-BB")
+                    continue
+                delta = in_tree_presolve_repr.in_tree_presolve(
+                    np.asarray(batch_lb[i], dtype=np.float64),
+                    np.asarray(batch_ub[i], dtype=np.float64),
+                    node_depth=int(_itp_depths[i]),
+                    depth_stride=in_tree_presolve_stride,
+                    incumbent=_itp_cutoff,
+                    probing=_itp_probing,
+                    probe_max_vars=_itp_probe_max,
+                )
+                if delta["ran"]:
+                    global _IN_TREE_PRESOLVE_NLPBB_CALLS
+                    _IN_TREE_PRESOLVE_NLPBB_CALLS += 1
+                if delta["ran"] and delta["infeasible"]:
+                    # Rigorous fathom: the node box is empty (FBBT/probing
+                    # proof). Mark infeasible so the node is pruned soundly.
+                    node_infeasible_mask[i] = True
+                elif delta["ran"]:
+                    batch_lb[i] = list(delta["lb"])
+                    batch_ub[i] = list(delta["ub"])
 
         # Solve NLP at each node (no relaxation, no multistart for convex)
         t_jax_start = time.perf_counter()
@@ -24930,8 +25042,14 @@ def _structured_node_recovery(
             lb=lb_n,
             ub=ub_n,
         )
-    except Exception as e:
-        logger.debug("POUNCE structured node recovery failed: %s", e)
+    except Exception as e:  # noqa: BLE001 - external backend; see comment
+        # #1514: kept as a sound fallback. POUNCE is an external IPM whose native
+        # layer can raise (a PyO3 error from a failed factorization or a malformed
+        # internal state) rather than return a status; the node is then left
+        # unsettled (``None``), which every caller treats as "keep it open on its
+        # parent bound". The first failure per solve is a WARNING so a broken
+        # backend cannot pass for a declining one.
+        _warn_fallback_once("POUNCE structured node recovery", e, "leaving the node open")
         return None
 
     if res.status == "primal_infeasible":
@@ -25024,8 +25142,14 @@ def _pounce_recover_node_bound(
         kwargs["Q"] = Q
     try:
         res = _pounce_solve(**kwargs)
-    except Exception as e:
-        logger.debug("POUNCE node-bound recovery failed: %s", e)
+    except Exception as e:  # noqa: BLE001 - external backend; see comment
+        # #1514: kept as a sound fallback. POUNCE is an external IPM whose native
+        # layer can raise (a PyO3 error from a failed factorization or a malformed
+        # internal state) rather than return a status; the node is then left
+        # unsettled (``None``), which every caller treats as "keep it open on its
+        # parent bound". The first failure per solve is a WARNING so a broken
+        # backend cannot pass for a declining one.
+        _warn_fallback_once("POUNCE node-bound recovery", e, "leaving the node open")
         return None
     if (
         res.status == SolveStatus.OPTIMAL
@@ -25096,55 +25220,75 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
         solve_qp_batch = None
 
     if solve_qp_batch is not None:
+        from discopt.solvers.lp_pounce import _snap_inverted_bounds
+
+        # The structural inequality/equality blocks are shared across the
+        # wave; only the variable box (lb/ub) varies per node. The
+        # decomposition returns ``None`` for an absent block (no pure
+        # equalities or no inequalities), which POUNCE's ``solve_qp``
+        # accepts directly.
+        A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
+            A_eq,
+            b_eq,
+            n_orig,
+            n_slack,
+            np.asarray(qp_data.x_u, dtype=np.float64),
+            row_sense=_declared_row_senses(qp_data, A_eq),
+        )
+        P_s = Q[:n_orig, :n_orig]
+        c_s = c[:n_orig]
+        A_struct = A_eq[:, :n_orig]
+        # Exact slack reconstruction: the slack columns ``S`` are shared, so
+        # given a structural ``x_s`` the original equality-slack iterate has
+        # slacks ``z = S^+ (b_eq - A_struct x_s)``. Then
+        # ``A_eq_full [x_s, z] = b_eq`` exactly (rhs lies in range(S) for a
+        # feasible slack form), so the caller's n_total feasibility check
+        # and snapping see a byte-faithful full iterate.
+        #
+        # #1514: the wave's only expected failures are external/numerical -- the
+        # slack pseudo-inverse not converging (``LinAlgError``) and POUNCE raising
+        # from native code inside ``solve_qp_batch`` -- and the serial path below
+        # answers the same nodes without either, so falling back is sound. The
+        # marshalling around them is ours: a failure there is a defect and
+        # propagates (the old handler wrapped this whole block).
+        _wave_ok = True
         try:
-            from discopt.solvers.lp_pounce import _snap_inverted_bounds
-
-            # The structural inequality/equality blocks are shared across the
-            # wave; only the variable box (lb/ub) varies per node. The
-            # decomposition returns ``None`` for an absent block (no pure
-            # equalities or no inequalities), which POUNCE's ``solve_qp``
-            # accepts directly.
-            A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-                A_eq,
-                b_eq,
-                n_orig,
-                n_slack,
-                np.asarray(qp_data.x_u, dtype=np.float64),
-                row_sense=_declared_row_senses(qp_data, A_eq),
-            )
-            P_s = Q[:n_orig, :n_orig]
-            c_s = c[:n_orig]
-            A_struct = A_eq[:, :n_orig]
-            # Exact slack reconstruction: the slack columns ``S`` are shared, so
-            # given a structural ``x_s`` the original equality-slack iterate has
-            # slacks ``z = S^+ (b_eq - A_struct x_s)``. Then
-            # ``A_eq_full [x_s, z] = b_eq`` exactly (rhs lies in range(S) for a
-            # feasible slack form), so the caller's n_total feasibility check
-            # and snapping see a byte-faithful full iterate.
             S_pinv = np.linalg.pinv(A_eq[:, n_orig:]) if n_slack > 0 else None
+        except np.linalg.LinAlgError as e:
+            _warn_fallback_once(
+                "batched POUNCE QP wave: slack pseudo-inverse",
+                e,
+                "solving the wave serially",
+            )
+            _wave_ok = False
 
-            problems = []
-            for i in range(n_batch):
-                lb_n = np.asarray(batch_lb[i], dtype=np.float64)
-                ub_n = np.asarray(batch_ub[i], dtype=np.float64)
-                lb_n, ub_n = _snap_inverted_bounds(lb_n, ub_n)
-                problems.append(
-                    {
-                        "P": P_s,
-                        "c": c_s,
-                        "A": A_eq_m,
-                        "b": b_eq_m,
-                        "G": A_ub_m,
-                        "h": b_ub_m,
-                        "lb": lb_n,
-                        "ub": ub_n,
-                    }
-                )
+        problems = []
+        for i in range(n_batch):
+            lb_n = np.asarray(batch_lb[i], dtype=np.float64)
+            ub_n = np.asarray(batch_ub[i], dtype=np.float64)
+            lb_n, ub_n = _snap_inverted_bounds(lb_n, ub_n)
+            problems.append(
+                {
+                    "P": P_s,
+                    "c": c_s,
+                    "A": A_eq_m,
+                    "b": b_eq_m,
+                    "G": A_ub_m,
+                    "h": b_ub_m,
+                    "lb": lb_n,
+                    "ub": ub_n,
+                }
+            )
 
-            # Q is shared and convex by assumption (same as the JAX QP IPM);
-            # skip the per-problem O(n^3) PSD check.
-            results = solve_qp_batch(problems, check_psd=False)
-
+        # Q is shared and convex by assumption (same as the JAX QP IPM);
+        # skip the per-problem O(n^3) PSD check.
+        results = None
+        if _wave_ok:
+            try:
+                results = solve_qp_batch(problems, check_psd=False)
+            except Exception as e:  # noqa: BLE001 - POUNCE native failure; see above
+                _warn_fallback_once("batched POUNCE QP wave", e, "solving the wave serially")
+        if results is not None:
             for i in range(n_batch):
                 res = results[i]
                 if res.status == "optimal" and res.x is not None and np.isfinite(res.obj):
@@ -25161,12 +25305,6 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
                 elif res.status == "primal_infeasible":
                     infeasible[i] = True
             return clean, infeasible, obj_vals, x_vals
-        except Exception as e:  # noqa: BLE001 - any wave failure -> serial fallback
-            logger.debug("Batched POUNCE QP wave failed (%s); serial fallback", e)
-            clean[:] = False
-            infeasible[:] = False
-            obj_vals[:] = np.nan
-            x_vals[:] = np.nan
 
     # --- Serial callback fallback (older wheels / batch failure) ---
     from discopt.solvers.qp_pounce import solve_qp as _pounce_qp
@@ -25188,8 +25326,13 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
                 bounds=bounds,
                 time_limit=min(30.0, time_left),
             )
-        except Exception as e:  # noqa: BLE001 - a crashed node solve is "untrusted"
-            logger.debug("POUNCE node QP solve failed: %s", e)
+        except Exception as e:  # noqa: BLE001 - external backend; see comment
+            # #1514: kept as a sound fallback. POUNCE's native layer can raise
+            # rather than return a status; this node is then skipped (left
+            # untrusted, so it stays open on its parent bound). The first failure
+            # per solve is a WARNING so a broken backend cannot pass for a
+            # declining one.
+            _warn_fallback_once("POUNCE node QP solve", e, "leaving the node open")
             continue
         if (
             res.status == SolveStatus.OPTIMAL
@@ -25242,18 +25385,20 @@ def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, ti
     # A_ub/A_eq over the structural columns.
     _A_eq_dense = _dense_A(lp_data.A_eq)
     n_slack = int(_A_eq_dense.shape[1]) - n_orig
+    # #1514: only the POUNCE call is guarded. The decomposition is ours and
+    # declines by returning ``None`` blocks, so a raise there is a defect.
+    A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
+        _A_eq_dense,
+        np.asarray(lp_data.b_eq, dtype=np.float64),
+        n_orig,
+        n_slack,
+        np.asarray(lp_data.x_u, dtype=np.float64),
+        row_sense=_declared_row_senses(lp_data, _A_eq_dense),
+    )
+    lb_n = np.asarray(node_lb, dtype=np.float64)
+    ub_n = np.asarray(node_ub, dtype=np.float64)
+    lb_n, ub_n = _snap_inverted_bounds(lb_n, ub_n)
     try:
-        A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            _A_eq_dense,
-            np.asarray(lp_data.b_eq, dtype=np.float64),
-            n_orig,
-            n_slack,
-            np.asarray(lp_data.x_u, dtype=np.float64),
-            row_sense=_declared_row_senses(lp_data, _A_eq_dense),
-        )
-        lb_n = np.asarray(node_lb, dtype=np.float64)
-        ub_n = np.asarray(node_ub, dtype=np.float64)
-        lb_n, ub_n = _snap_inverted_bounds(lb_n, ub_n)
         res = pounce.solve_qp(
             P=None,  # P=0 -> LP
             c=np.asarray(lp_data.c[:n_orig], dtype=np.float64),
@@ -25264,8 +25409,11 @@ def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, ti
             lb=lb_n,
             ub=ub_n,
         )
-    except Exception as e:
-        logger.debug("POUNCE convex node solve failed: %s", e)
+    except Exception as e:  # noqa: BLE001 - external backend; see comment
+        # #1514: kept as a sound fallback. POUNCE's native layer can raise rather
+        # than return a status; the node is then unsettled (``None``: the caller
+        # falls back or keeps it open). The first failure per solve is a WARNING.
+        _warn_fallback_once("POUNCE convex node solve", e, "leaving the node unsettled")
         return None
     if res.status == "optimal" and res.x is not None and np.isfinite(res.obj):
         x_sol = np.asarray(res.x, dtype=np.float64)
@@ -25326,29 +25474,28 @@ def _solve_node_lp_simplex(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, t
     # _solve_node_lp_pounce so node bounds apply to the structural columns.
     _A_eq_dense = _dense_A(lp_data.A_eq)
     n_slack = int(_A_eq_dense.shape[1]) - n_orig
-    try:
-        A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
-            _A_eq_dense,
-            np.asarray(lp_data.b_eq, dtype=np.float64),
-            n_orig,
-            n_slack,
-            np.asarray(lp_data.x_u, dtype=np.float64),
-            row_sense=_declared_row_senses(lp_data, _A_eq_dense),
-        )
-        lb_n = np.asarray(node_lb, dtype=np.float64)
-        ub_n = np.asarray(node_ub, dtype=np.float64)
-        bounds = list(zip(lb_n.tolist(), ub_n.tolist()))
-        res = solve_lp(
-            np.asarray(lp_data.c[:n_orig], dtype=np.float64),
-            A_ub=A_ub_m,
-            b_ub=b_ub_m,
-            A_eq=A_eq_m,
-            b_eq=b_eq_m,
-            bounds=bounds,
-        )
-    except Exception as e:
-        logger.debug("simplex node solve failed: %s", e)
-        return None
+    # #1514: no ``except``. The in-house simplex reports every numerical or
+    # iteration failure as a status (handled below), and the decomposition declines
+    # by returning ``None`` blocks, so an exception is a defect in the node engine.
+    A_ub_m, b_ub_m, A_eq_m, b_eq_m = _decompose_eq_slack_form(
+        _A_eq_dense,
+        np.asarray(lp_data.b_eq, dtype=np.float64),
+        n_orig,
+        n_slack,
+        np.asarray(lp_data.x_u, dtype=np.float64),
+        row_sense=_declared_row_senses(lp_data, _A_eq_dense),
+    )
+    lb_n = np.asarray(node_lb, dtype=np.float64)
+    ub_n = np.asarray(node_ub, dtype=np.float64)
+    bounds = list(zip(lb_n.tolist(), ub_n.tolist()))
+    res = solve_lp(
+        np.asarray(lp_data.c[:n_orig], dtype=np.float64),
+        A_ub=A_ub_m,
+        b_ub=b_ub_m,
+        A_eq=A_eq_m,
+        b_eq=b_eq_m,
+        bounds=bounds,
+    )
     if res.status == SolveStatus.OPTIMAL and res.x is not None and np.isfinite(res.objective):
         x_sol = np.asarray(res.x, dtype=np.float64)
         # Soundness gate (mirror _solve_node_lp_pounce): reject a point that
@@ -25922,8 +26069,12 @@ def _root_reduced_cost_fixing(lp_data, n_orig, lb, ub, int_offsets, int_sizes, t
             bounds=list(zip(np.asarray(lb).tolist(), np.asarray(ub).tolist())),
             time_limit=min(30.0, max(0.5, time_limit - (time.perf_counter() - t_start))),
         )
-    except Exception as e:
-        logger.debug("root RCF: POUNCE LP failed: %s", e)
+    except Exception as e:  # noqa: BLE001 - external backend; see comment
+        # #1514: kept as a sound fallback. POUNCE's native layer can raise rather
+        # than return a status; reduced-cost fixing is then skipped (bounds
+        # untouched, no incumbent), which only forgoes a tightening. The first
+        # failure per solve is a WARNING.
+        _warn_fallback_once("root reduced-cost fixing: POUNCE LP", e, "skipping the fixing")
         return lb, ub, None
     if res.status != SolveStatus.OPTIMAL or res.reduced_costs is None or res.x is None:
         return lb, ub, None
@@ -26233,28 +26384,32 @@ def _extract_clique_edges(model: Model) -> list[tuple[int, int]]:
     Each edge ``(i, j)`` (flat variable indices) is a pair of binaries that
     cannot both be 1. Best-effort: returns ``[]`` if the bridge/pass is
     unavailable."""
-    try:
-        from discopt._relax.presolve_pipeline import run_root_presolve
-        from discopt._rust import model_to_repr
+    from discopt._relax.presolve_pipeline import run_root_presolve
+    from discopt._rust import model_to_repr
 
+    # #1514: narrowed to the one documented decline. ``model_to_repr`` raises
+    # ``ValueError`` for a model the Rust IR cannot represent -- the same
+    # "repr unavailable" the root presolve setup treats as a skip. The clique pass
+    # itself reports through ``stats``; any other exception is a defect.
+    try:
         repr_ = model_to_repr(model, getattr(model, "_builder", None))
-        _, stats = run_root_presolve(
-            repr_,
-            cliques=True,
-            eliminate=False,
-            aggregate=False,
-            redundancy=False,
-            implied_bounds=False,
-            coefficient_strengthening=False,
-            factorable_elim=False,
-            fbbt=False,
-            simplify=False,
-            probing=False,
-        )
-        return list(stats.get("cliques", {}).get("edges", []) or [])
-    except Exception as e:
-        logger.debug("clique edge extraction skipped: %s", e)
+    except ValueError as e:
+        logger.debug("clique edge extraction skipped, no Rust repr: %s", e)
         return []
+    _, stats = run_root_presolve(
+        repr_,
+        cliques=True,
+        eliminate=False,
+        aggregate=False,
+        redundancy=False,
+        implied_bounds=False,
+        coefficient_strengthening=False,
+        factorable_elim=False,
+        fbbt=False,
+        simplify=False,
+        probing=False,
+    )
+    return list(stats.get("cliques", {}).get("edges", []) or [])
 
 
 def _cut_loop_relaxation_x(lp_data, prefer_pounce: bool):
@@ -26287,8 +26442,11 @@ def _cut_loop_relaxation_x(lp_data, prefer_pounce: bool):
                 )
             ),
         )
-    except Exception as exc:
-        logger.debug("cut-loop POUNCE solve failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - external backend; see comment
+        # #1514: kept as a sound fallback. POUNCE's native layer can raise rather
+        # than return a status; the cut loop then stops (no separation seed),
+        # which only forgoes cuts. The first failure per solve is a WARNING.
+        _warn_fallback_once("root cut loop: POUNCE LP", exc, "stopping the cut loop")
         return None
     if res.status == SolveStatus.OPTIMAL and res.x is not None:
         return np.asarray(res.x, dtype=np.float64)
@@ -26363,7 +26521,11 @@ def _root_cover_cut_loop(
                 np.asarray(lp_data.x_l),
                 np.asarray(lp_data.x_u),
             )
-        except Exception as _xo_exc:
+        except np.linalg.LinAlgError as _xo_exc:
+            # #1514: narrowed. The crossover's null-space step is a dense
+            # factorization whose one expected failure is non-convergence; the
+            # interior point is still a valid separation seed, so falling back to
+            # it only costs cut strength. Anything else is a defect.
             logger.debug("crossover skipped: %s", _xo_exc)
             x_vertex = x_relax
         x_star = x_vertex[:n_orig]
@@ -26401,11 +26563,9 @@ def _root_cover_cut_loop(
             )
         )
         if _int_fractional:
-            try:
-                gom = _separate_gomory_cuts(lp_data, x_vertex, n_orig, int_idx)
-            except Exception as _gom_exc:
-                logger.debug("gomory separation skipped: %s", _gom_exc)
-                gom = None
+            # #1514: no ``except``. The separator declines by returning ``None``
+            # (no Rust kernel, no basis, nothing fractional); a raise is a defect.
+            gom = _separate_gomory_cuts(lp_data, x_vertex, n_orig, int_idx)
             if gom is not None:
                 gc, gr = gom
                 lp_data = _augment_lpdata_with_gomory_cuts(lp_data, gc, gr)
@@ -26414,11 +26574,9 @@ def _root_cover_cut_loop(
         # MIR cuts from the original <= rows (basis-free; complements GMI). Same
         # POUNCE-mode gate (has_gomory) and round-0-only policy.
         if has_gomory and _round == 0:
-            try:
-                mir = _separate_mir_cuts(lp_data, x_vertex, n_orig, int_idx, A_ub_orig, b_ub_orig)
-            except Exception as _mir_exc:
-                logger.debug("mir separation skipped: %s", _mir_exc)
-                mir = None
+            # #1514: no ``except``. The separator declines by returning ``None``
+            # (no Rust kernel, an infinite lower bound, no violated cut).
+            mir = _separate_mir_cuts(lp_data, x_vertex, n_orig, int_idx, A_ub_orig, b_ub_orig)
             if mir is not None:
                 mc, mr = mir
                 lp_data = _augment_lpdata_with_mir_cuts(lp_data, mc, mr)
@@ -27751,12 +27909,13 @@ def _solve_milp_bb(
     # graceful -- only ever tightens, skipped entirely if POUNCE is absent or
     # no incumbent is recoverable.
     _root_incumbent = None
-    try:
-        lb, ub, _root_incumbent = _root_reduced_cost_fixing(
-            lp_data, n_orig, lb, ub, int_offsets, int_sizes, t_start, time_limit
-        )
-    except Exception as _rcf_exc:
-        logger.debug("root RCF skipped: %s", _rcf_exc)
+    # #1514: no ``except``. ``_root_reduced_cost_fixing`` returns the box
+    # unchanged whenever it cannot proceed (no POUNCE, a dense A_eq over budget, a
+    # non-optimal LP, no recoverable incumbent), and its one external call reports
+    # through ``_warn_fallback_once``; any exception reaching here is a defect.
+    lb, ub, _root_incumbent = _root_reduced_cost_fixing(
+        lp_data, n_orig, lb, ub, int_offsets, int_sizes, t_start, time_limit
+    )
 
     # --- Root knapsack cover cuts (Phase 3) ---
     # Separate valid cover inequalities from the *original* knapsack rows and
@@ -27779,42 +27938,44 @@ def _solve_milp_bb(
         row_sense=_declared_row_senses(lp_data, _A_eq_dense),
     )
     _cut_by_source = {"cover_clique": 0, "gomory": 0, "mir": 0}
-    try:
-        _is_bin = _binary_mask(model, n_orig)
-        # Conflict-graph clique edges (only worth extracting if binaries exist).
-        _clique_edges = _extract_clique_edges(model) if bool(_is_bin.any()) else []
-        # Gomory cuts gated on the relaxation engine (see _gomory_enabled):
-        # passing no integer indices disables the GMI branch, so under the JAX
-        # IPM the loop runs exactly as before GMI (cover/clique only, no
-        # recompile). In POUNCE mode the node solves (Path B) take cut-augmented
-        # shapes for free, so GMI is enabled.
-        _cut_int_idx = (
-            [j for off, sz in zip(int_offsets, int_sizes) for j in range(off, off + int(sz))]
-            if _gomory_enabled(prefer_pounce)
-            else []
+    # #1514: no ``except``. The cut loop declines by returning ``lp_data``
+    # unchanged: its POUNCE seed solve and crossover handle their own external
+    # failure modes, and the separators return ``None`` when they find nothing. A
+    # raise is a defect -- and one that previously could leave a half-augmented
+    # ``lp_data`` behind the handler.
+    _is_bin = _binary_mask(model, n_orig)
+    # Conflict-graph clique edges (only worth extracting if binaries exist).
+    _clique_edges = _extract_clique_edges(model) if bool(_is_bin.any()) else []
+    # Gomory cuts gated on the relaxation engine (see _gomory_enabled):
+    # passing no integer indices disables the GMI branch, so under the JAX
+    # IPM the loop runs exactly as before GMI (cover/clique only, no
+    # recompile). In POUNCE mode the node solves (Path B) take cut-augmented
+    # shapes for free, so GMI is enabled.
+    _cut_int_idx = (
+        [j for off, sz in zip(int_offsets, int_sizes) for j in range(off, off + int(sz))]
+        if _gomory_enabled(prefer_pounce)
+        else []
+    )
+    lp_data, _n_cuts, _cut_by_source = _root_cover_cut_loop(
+        lp_data,
+        n_orig,
+        _is_bin,
+        _A_ub_m,
+        _b_ub_m,
+        t_start,
+        time_limit,
+        clique_edges=_clique_edges,
+        int_idx=_cut_int_idx,
+        prefer_pounce=prefer_pounce,
+    )
+    if _n_cuts:
+        logger.info(
+            "root cuts added %d valid inequalities (cover/clique=%d gomory=%d mir=%d)",
+            _n_cuts,
+            _cut_by_source.get("cover_clique", 0),
+            _cut_by_source.get("gomory", 0),
+            _cut_by_source.get("mir", 0),
         )
-        lp_data, _n_cuts, _cut_by_source = _root_cover_cut_loop(
-            lp_data,
-            n_orig,
-            _is_bin,
-            _A_ub_m,
-            _b_ub_m,
-            t_start,
-            time_limit,
-            clique_edges=_clique_edges,
-            int_idx=_cut_int_idx,
-            prefer_pounce=prefer_pounce,
-        )
-        if _n_cuts:
-            logger.info(
-                "root cuts added %d valid inequalities (cover/clique=%d gomory=%d mir=%d)",
-                _n_cuts,
-                _cut_by_source.get("cover_clique", 0),
-                _cut_by_source.get("gomory", 0),
-                _cut_by_source.get("mir", 0),
-            )
-    except Exception as _cc_exc:
-        logger.debug("root cuts skipped: %s", _cc_exc)
 
     # Seed a rigorous root lower bound from the (cut-augmented) LP relaxation,
     # solved once via the fast convex engine (~0.03 s). This is always a valid
@@ -27826,12 +27987,11 @@ def _solve_milp_bb(
     # left at -inf otherwise so behavior is unchanged on the JAX-IPM path.
     _root_lp_bound = -np.inf
     if _use_structured_nodes:
-        try:
-            _root_out = _node_solve(lp_data, lb, ub, n_vars, n_orig, t_start, time_limit)
-            if _root_out is not None and _root_out[2] == "optimal" and np.isfinite(_root_out[0]):
-                _root_lp_bound = float(_root_out[0])
-        except Exception as _rlb_exc:
-            logger.debug("root LP bound seeding skipped: %s", _rlb_exc)
+        # #1514: no ``except``. ``_node_solve`` returns ``None`` when it cannot
+        # settle the root; a raise is a defect.
+        _root_out = _node_solve(lp_data, lb, ub, n_vars, n_orig, t_start, time_limit)
+        if _root_out is not None and _root_out[2] == "optimal" and np.isfinite(_root_out[0]):
+            _root_lp_bound = float(_root_out[0])
 
     t_rust_start = time.perf_counter()
     tree = PyTreeManager(n_vars, lb.tolist(), ub.tolist(), int_offsets, int_sizes, strategy)
@@ -27896,20 +28056,19 @@ def _solve_milp_bb(
     _lag_bounder = None
     _lag_freq = max(1, int(lagrangian_frequency))
     if lagrangian_bound:
-        try:
-            from discopt.decomposition.lagrangian.node_bounder import LagrangianNodeBounder
+        # #1514: no ``except``. ``LagrangianNodeBounder.try_build`` returns ``None``
+        # for a model outside its scope and ``solve_root_dual`` stops on a failed
+        # subproblem; a raise is a defect in a hook the caller explicitly enabled.
+        from discopt.decomposition.lagrangian.node_bounder import LagrangianNodeBounder
 
-            _lag_bounder = LagrangianNodeBounder.try_build(model)
-            if _lag_bounder is not None:
-                _lag_bounder.solve_root_dual(lb, ub)
-            else:
-                logger.info(
-                    "lagrangian_bound: model is not a linear minimization with coupling "
-                    "structure; node-bound hook disabled."
-                )
-        except Exception as _lag_exc:
-            logger.debug("lagrangian_bound setup failed: %s", _lag_exc)
-            _lag_bounder = None
+        _lag_bounder = LagrangianNodeBounder.try_build(model)
+        if _lag_bounder is not None:
+            _lag_bounder.solve_root_dual(lb, ub)
+        else:
+            logger.info(
+                "lagrangian_bound: model is not a linear minimization with coupling "
+                "structure; node-bound hook disabled."
+            )
     # Root fractional diving (Phase 3): an early incumbent front-loads pruning
     # and reduced-cost fixing. The tree keeps the best of any injected points.
     try:

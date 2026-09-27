@@ -109,31 +109,34 @@ class _Leaf:
 def _box_fbbt(model: Model, lb: np.ndarray, ub: np.ndarray):
     """Interval FBBT restricted to ``[lb, ub]`` via a fresh Rust repr.
 
-    Returns ``(tight_lb, tight_ub, crossed)``; on any failure returns the input
-    box with ``crossed=False`` (abstaining is sound — FBBT is a tightener).
+    Returns ``(tight_lb, tight_ub, crossed)``. Abstains -- the input box with
+    ``crossed=False``, sound because FBBT is a tightener -- when the model has no
+    Rust repr (``model_to_repr``'s documented ``ValueError``) or the repr's block
+    layout does not match the flat box. Any other exception is a defect and
+    propagates (#1514).
     """
-    try:
-        from discopt._rust import model_to_repr
+    from discopt._rust import model_to_repr
 
+    try:
         rep = model_to_repr(model, getattr(model, "_builder", None))
-        off = 0
-        for bi, v in enumerate(model._variables):
-            rep.tighten_var_bounds(bi, list(lb[off : off + v.size]), list(ub[off : off + v.size]))
-            off += v.size
-        fl, fu = rep.fbbt(max_iter=_FBBT_MAX_ITER, tol=_FBBT_TOL)
-        tl = np.concatenate([np.atleast_1d(np.asarray(b, dtype=np.float64)) for b in fl])
-        tu = np.concatenate([np.atleast_1d(np.asarray(b, dtype=np.float64)) for b in fu])
-        if tl.shape != lb.shape:
-            return lb, ub, False
-        # Intersect defensively (FBBT starts from the written box, so this is a
-        # no-op unless the binding returned something unexpected).
-        tl = np.maximum(tl, lb)
-        tu = np.minimum(tu, ub)
-        crossed = bool(np.any(tl > tu + 1e-9))
-        return tl, tu, crossed
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("disjunctive pass: per-box FBBT abstained: %s", exc)
+    except ValueError as exc:
+        logger.debug("disjunctive pass: per-box FBBT abstained, no Rust repr: %s", exc)
         return lb, ub, False
+    off = 0
+    for bi, v in enumerate(model._variables):
+        rep.tighten_var_bounds(bi, list(lb[off : off + v.size]), list(ub[off : off + v.size]))
+        off += v.size
+    fl, fu = rep.fbbt(max_iter=_FBBT_MAX_ITER, tol=_FBBT_TOL)
+    tl = np.concatenate([np.atleast_1d(np.asarray(b, dtype=np.float64)) for b in fl])
+    tu = np.concatenate([np.atleast_1d(np.asarray(b, dtype=np.float64)) for b in fu])
+    if tl.shape != lb.shape:
+        return lb, ub, False
+    # Intersect defensively (FBBT starts from the written box, so this is a
+    # no-op unless the binding returned something unexpected).
+    tl = np.maximum(tl, lb)
+    tu = np.minimum(tu, ub)
+    crossed = bool(np.any(tl > tu + 1e-9))
+    return tl, tu, crossed
 
 
 def _split_var(
@@ -214,20 +217,18 @@ def compute_disjunctive_config_bound(
     # #732 Stage 4: continuous bisection candidates — nonlinear-term participants
     # that are neither configuration counts nor indicators (the cubic block's
     # x6-class variables on ex1252). Structural, never name-keyed.
-    cont_flats: list[int] = []
-    try:
-        from discopt._relax.term_classifier import classify_nonlinear_terms
+    # #1514: no ``except``. Term classification is structural, with no documented
+    # failure mode; a raise is a defect, not "no continuous candidates".
+    from discopt._relax.term_classifier import classify_nonlinear_terms
 
-        _terms = classify_nonlinear_terms(model)
-        _part: set[int] = set()
-        for _grp in (_terms.bilinear, _terms.trilinear, _terms.multilinear):
-            for _t in _grp or []:
-                _part.update(int(_x) for _x in _t)
-        for _t in _terms.monomial or []:
-            _part.add(int(_t[0]))
-        cont_flats = sorted(_part - set(count_flats) - set(indicators))
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("disjunctive pass: continuous candidates skipped: %s", exc)
+    _terms = classify_nonlinear_terms(model)
+    _part: set[int] = set()
+    for _grp in (_terms.bilinear, _terms.trilinear, _terms.multilinear):
+        for _t in _grp or []:
+            _part.update(int(_x) for _x in _t)
+    for _t in _terms.monomial or []:
+        _part.add(int(_t[0]))
+    cont_flats: list[int] = sorted(_part - set(count_flats) - set(indicators))
     root_width = np.where(
         np.isfinite(ub - lb), ub - lb, np.inf
     )  # spatial ranking is relative to the root width
@@ -264,22 +265,21 @@ def compute_disjunctive_config_bound(
             res.n_pruned_infeasible += 1
             return None
         leaf.lb, leaf.ub = tl, tu
-        try:
-            ob = obbt_tighten_root(
-                model,
-                leaf.lb.copy(),
-                leaf.ub.copy(),
-                rounds=obbt_rounds,
-                time_limit_per_lp=obbt_lp_time,
-                incumbent_cutoff=incumbent,
-                deadline=deadline,
-            )
-            if ob.infeasible:
-                res.n_pruned_infeasible += 1
-                return None
-            leaf.lb, leaf.ub = ob.lb.copy(), ob.ub.copy()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("disjunctive pass: OBBT abstained: %s", exc)
+        # #1514: no ``except``. ``obbt_tighten_root`` returns the input box when it
+        # cannot proceed, so a raise is a defect.
+        ob = obbt_tighten_root(
+            model,
+            leaf.lb.copy(),
+            leaf.ub.copy(),
+            rounds=obbt_rounds,
+            time_limit_per_lp=obbt_lp_time,
+            incumbent_cutoff=incumbent,
+            deadline=deadline,
+        )
+        if ob.infeasible:
+            res.n_pruned_infeasible += 1
+            return None
+        leaf.lb, leaf.ub = ob.lb.copy(), ob.ub.copy()
         _tl = None
         if deadline is not None:
             _tl = max(deadline - time.perf_counter(), 1.0)
