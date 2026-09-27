@@ -358,3 +358,72 @@ def test_a_module_monkeypatch_still_reaches_the_call_site(monkeypatch):
     monkeypatch.setattr(gdp_reformulate, "reformulate_gdp", spy)
     _gdp_model().solve(time_limit=30)
     assert seen
+
+
+# ── #1497: the fingerprint and the diff see every coefficient ────────────
+
+
+def _coef_model(rhs, a):
+    m = dm.Model("m")
+    x = m.continuous("x", shape=(3,), lb=0, ub=10)
+    m.minimize(np.array(a) @ x)
+    m.subject_to(x[0] + x[1] + x[2] >= rhs)
+    return m
+
+
+def test_fingerprint_sees_a_seventh_digit_coefficient_change():
+    """A scalar ``Constant`` displays with ``.6g``; the fingerprint must not."""
+    m1, m2 = _coef_model(1.0000001, [1.0, 2.0, 3.0]), _coef_model(1.0000004, [1.0, 2.0, 3.0])
+    assert dt.model_fingerprint(m1) != dt.model_fingerprint(m2)
+    d = dt.diff_models(m1, m2)
+    assert not d.unchanged
+    assert len(d.added_constraints) == 1 and "1.0000004" in d.added_constraints[0]
+    assert len(d.removed_constraints) == 1 and "1.0000001" in d.removed_constraints[0]
+    assert not d.objective_changed
+
+
+def test_fingerprint_sees_one_element_of_an_array_constant():
+    """An array ``Constant`` displays as its shape; the fingerprint must see its data."""
+    m1, m2 = _coef_model(1.0, [1.0, 2.0, 3.0]), _coef_model(1.0, [1.0, 2.0, 3.5])
+    assert dt.model_fingerprint(m1) != dt.model_fingerprint(m2)
+    d = dt.diff_models(m1, m2)
+    assert d.objective_changed and not d.added_constraints and not d.removed_constraints
+
+
+def test_fingerprint_sees_a_change_inside_a_large_array_and_a_sum_over():
+    def build(k, bump):
+        m = dm.Model("big")
+        x = m.continuous("x", shape=(100,), lb=0, ub=1)
+        c = np.linspace(0.0, 1.0, 100)
+        c[k] += bump
+        m.minimize(c @ x)
+        m.subject_to(dm.sum(lambda i: (1.0 + bump * (i == k)) * x[i], over=range(3)) <= 2)
+        return m
+
+    base = dt.model_fingerprint(build(57, 0.0))
+    assert dt.model_fingerprint(build(57, 0.0)) == base
+    assert dt.model_fingerprint(build(57, 1e-12)) != base
+
+
+def test_fingerprint_equal_for_a_deep_copy_with_array_constants():
+    m = _coef_model(1.0000001, [1.0, 2.0, 3.0])
+    assert dt.model_fingerprint(copy.deepcopy(m)) == dt.model_fingerprint(m)
+    assert dt.diff_models(m, copy.deepcopy(m)).unchanged
+
+
+def test_apply_to_detects_a_pass_that_only_changes_coefficients(monkeypatch):
+    """``apply_to`` clears the source records exactly when the fingerprint moves;
+    a coefficient-only mutation must count as a change."""
+
+    def rescale(model):
+        model._objective.expression.left.value = np.array([9.0, 9.0, 9.0])
+        return model
+
+    t = dt.Transformation("test.rescale", rescale, "functional", "mutates coefficients")
+    monkeypatch.setitem(dt._REGISTRY, "test.rescale", t)
+    m = _coef_model(1.0, [1.0, 2.0, 3.0])
+    m._source_nl_path = "/nonexistent/source.nl"
+    before = dt.model_fingerprint(m)
+    dt.apply_to("test.rescale", m)
+    assert dt.model_fingerprint(m) != before
+    assert "_source_nl_path" not in m.__dict__
