@@ -3447,6 +3447,29 @@ def stack(arrays: Sequence, axis: int = 0) -> np.ndarray:
     return np.stack(parts, axis=axis)
 
 
+def _objective_poles_or_none(model: "Model") -> list:
+    """Objective poles for the no-bound diagnostic (#1493); ``[]`` when none.
+
+    Detection only -- see :mod:`discopt._relax.poles`. A failure to analyse is
+    reported, not swallowed: it downgrades the diagnostic to the generic one and
+    says so, but never breaks a returned solve.
+    """
+    try:
+        from discopt._relax.poles import objective_poles
+
+        return objective_poles(model)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, reported below
+        import logging
+
+        logging.getLogger("discopt.solver").warning(
+            "objective pole analysis failed (%s: %s); the no-bound diagnostic below "
+            "is the generic one",
+            type(exc).__name__,
+            exc,
+        )
+        return []
+
+
 def norm(x: Expression, ord: Union[int, float, str] = 2) -> Expression:
     """
     Vector norm.
@@ -8783,6 +8806,34 @@ class Model:
                 "(status=error: %s). The result cannot be certified globally optimal.",
                 self.name,
                 result.error,
+            )
+        elif (
+            isinstance(result, SolveResult)
+            and result.bound is None
+            and result.status not in ("infeasible", "unbounded")
+            and (_poles := _objective_poles_or_none(self))
+        ):
+            # #1493: a POLE, not a missing envelope. ``min 1/x`` on ``[-5, 5]``
+            # has no dual bound on any box holding ``x = 0`` -- the objective is
+            # unbounded there -- and the epigraph advice below cannot change that.
+            # The status stays what the solve proved (a feasible point, no bound):
+            # ``unbounded`` means CERTIFIED unboundedness (``discopt.status``),
+            # which no relaxation proves at a pole, and the constraints may
+            # exclude the pole anyway (``x**2 >= 1``).
+            from discopt._relax.poles import describe_poles
+
+            _logging.getLogger("discopt.solver").warning(
+                "No valid dual bound was produced for model %r (status=%s): its "
+                "objective has a pole inside the variable box -- %s. The objective "
+                "diverges near the pole, so no relaxation can bound it on a box "
+                "that contains the pole and the result carries no optimality claim "
+                "(the problem itself is unbounded if it diverges in the optimizing "
+                "direction at feasible points near the pole). If the pole is not "
+                "meant to be reachable, bound the denominator away from zero (e.g. "
+                "a strictly positive lower bound) or split the model by its sign.",
+                self.name,
+                result.status,
+                describe_poles(_poles),
             )
         elif (
             isinstance(result, SolveResult)
