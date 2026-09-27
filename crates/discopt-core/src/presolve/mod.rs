@@ -27,6 +27,7 @@ pub mod aggregate;
 pub mod cliques;
 pub mod coefficient_strengthening;
 pub mod delta;
+pub mod directed;
 pub mod duality;
 pub mod eliminate;
 pub mod factorable_elim;

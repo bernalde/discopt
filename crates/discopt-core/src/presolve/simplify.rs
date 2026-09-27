@@ -3,7 +3,9 @@
 
 use std::time::Instant;
 
-use super::fbbt::{forward_propagate, forward_propagate_into, FwdScratch, Interval};
+use super::fbbt::{
+    forward_propagate, forward_propagate_into, snap_integral_interval, FwdScratch, Interval,
+};
 use crate::expr::{BinOp, ConstraintSense, ExprArena, ExprId, ExprNode, ModelRepr, UnOp, VarType};
 
 /// Result of simplification.
@@ -73,11 +75,19 @@ pub fn simplify_until(
             VarType::Integer => {
                 let old_lo = var_bounds[i].lo;
                 let old_hi = var_bounds[i].hi;
-                let new_lo = old_lo.ceil();
-                let new_hi = old_hi.floor();
-                if new_lo > old_lo || new_hi < old_hi {
+                // #1504: round with the FBBT integrality tolerance (ceil(lo - tol)),
+                // not a bare ceil. A bound one ulp past an integer (2.0000000000000004)
+                // is round-off, and a bare ceil turned it into 3, excluding 2. The
+                // snapped value replaces such a bound even though it is an ulp looser:
+                // leaving 2.0000000000000004 in place would let the next consumer's
+                // bare ceil make the same mistake.
+                let snapped = snap_integral_interval(Interval::new(old_lo, old_hi));
+                let (new_lo, new_hi) = (snapped.lo, snapped.hi);
+                if new_lo != old_lo || new_hi != old_hi {
                     var_bounds[i] = Interval::new(new_lo, new_hi);
-                    result.integer_bounds_tightened += 1;
+                    if new_lo > old_lo || new_hi < old_hi {
+                        result.integer_bounds_tightened += 1;
+                    }
                 }
             }
             VarType::Binary => {
@@ -323,6 +333,49 @@ mod tests {
         assert_eq!(result.integer_bounds_tightened, 1);
         assert!((var_bounds[0].lo - 2.0).abs() < 1e-15);
         assert!((var_bounds[0].hi - 4.0).abs() < 1e-15);
+    }
+
+    /// #1504: a bound an ulp past an integer is round-off; rounding it with a bare
+    /// `ceil`/`floor` excluded the integer (`ceil(2.0000000000000004) = 3`).
+    #[test]
+    fn integer_rounding_absorbs_ulp_residuals() {
+        let mut arena = ExprArena::new();
+        let _x = arena.add(ExprNode::Variable {
+            name: "x".into(),
+            index: 0,
+            size: 1,
+            shape: vec![],
+        });
+        let model = ModelRepr {
+            arena,
+            objective: ExprId(0),
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![],
+            variables: vec![VarInfo {
+                name: "x".into(),
+                var_type: VarType::Integer,
+                offset: 0,
+                size: 1,
+                shape: vec![],
+                lb: vec![0.0],
+                ub: vec![10.0],
+            }],
+            n_vars: 1,
+        };
+        let lo = 2.0f64 + f64::EPSILON * 2.0; // 2.0000000000000004
+        let hi = 5.0f64 - f64::EPSILON * 4.0;
+        let mut var_bounds = vec![Interval::new(lo, hi)];
+        simplify(&model, &mut var_bounds);
+        assert_eq!(
+            var_bounds[0].lo, 2.0,
+            "integer 2 excluded: {:?}",
+            var_bounds[0]
+        );
+        assert_eq!(
+            var_bounds[0].hi, 5.0,
+            "integer 5 excluded: {:?}",
+            var_bounds[0]
+        );
     }
 
     #[test]

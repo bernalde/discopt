@@ -7,6 +7,10 @@ use crate::expr::{
     xlogx, BinOp, ConstraintSense, ExprArena, ExprId, ExprNode, MathFunc, ModelRepr,
     ObjectiveSense, UnOp, VarType,
 };
+use crate::presolve::directed::{
+    abs_down, abs_up, add_down, add_up, div_down, div_up, lib_down, lib_up, mul_down, mul_up,
+    powi_down, powi_up, root_down, root_up, sqrt_down, sqrt_up, sub_down, sub_up,
+};
 use std::f64::consts::PI;
 use std::time::Instant;
 
@@ -156,14 +160,21 @@ impl Interval {
 // Interval arithmetic
 // ─────────────────────────────────────────────────────────────
 
-/// `[a,b] + [c,d] = [a+c, b+d]`
+// Every endpoint below is rounded OUTWARD (#1504): lower endpoints toward
+// -inf, upper toward +inf, via `presolve::directed`. Round-to-nearest endpoints
+// are not enclosures, and the backward pass inverts non-Lipschitz functions
+// (roots) that amplify an ulp-level inward error into a bound shift of 1e-5 and
+// more -- enough to cut the optimum of `b**3 - 2*x0**3 == 5`. Exact results are
+// returned unchanged, so integer-valued data does not move.
+
+/// `[a,b] + [c,d] = [a+c, b+d]` (outward-rounded)
 pub fn interval_add(a: &Interval, b: &Interval) -> Interval {
-    Interval::new(a.lo + b.lo, a.hi + b.hi)
+    Interval::new(add_down(a.lo, b.lo), add_up(a.hi, b.hi))
 }
 
-/// `[a,b] - [c,d] = [a-d, b-c]`
+/// `[a,b] - [c,d] = [a-d, b-c]` (outward-rounded)
 pub fn interval_sub(a: &Interval, b: &Interval) -> Interval {
-    Interval::new(a.lo - b.hi, a.hi - b.lo)
+    Interval::new(sub_down(a.lo, b.hi), sub_up(a.hi, b.lo))
 }
 
 /// `[a,b] * [c,d]` using all four endpoint products.
@@ -177,19 +188,18 @@ pub fn interval_sub(a: &Interval, b: &Interval) -> Interval {
 /// here *only* from `0 * ±∞`; every other operand pair is finite×finite (never
 /// NaN) or a genuine ±∞ product, so the substitution never masks a real value.
 pub fn interval_mul(a: &Interval, b: &Interval) -> Interval {
-    let prod = |x: f64, y: f64| {
-        let p = x * y;
-        if p.is_nan() {
-            0.0
-        } else {
-            p
-        }
-    };
-    let p1 = prod(a.lo, b.lo);
-    let p2 = prod(a.lo, b.hi);
-    let p3 = prod(a.hi, b.lo);
-    let p4 = prod(a.hi, b.hi);
-    Interval::new(p1.min(p2).min(p3).min(p4), p1.max(p2).max(p3).max(p4))
+    // Each corner product is rounded down for the lower endpoint and up for the
+    // upper one (#1504); `0 * inf = NaN` maps to 0 as before (C-22).
+    let nan0 = |p: f64| if p.is_nan() { 0.0 } else { p };
+    let lo = nan0(mul_down(a.lo, b.lo))
+        .min(nan0(mul_down(a.lo, b.hi)))
+        .min(nan0(mul_down(a.hi, b.lo)))
+        .min(nan0(mul_down(a.hi, b.hi)));
+    let hi = nan0(mul_up(a.lo, b.lo))
+        .max(nan0(mul_up(a.lo, b.hi)))
+        .max(nan0(mul_up(a.hi, b.lo)))
+        .max(nan0(mul_up(a.hi, b.hi)));
+    Interval::new(lo, hi)
 }
 
 /// Whether any interval in `bounds` is empty by more than `tol`.
@@ -220,7 +230,8 @@ pub fn interval_div(a: &Interval, b: &Interval) -> Interval {
         // Denominator contains zero — result is the entire real line.
         Interval::entire()
     } else {
-        let inv_b = Interval::new(1.0 / b.hi, 1.0 / b.lo);
+        // Outward reciprocal, then an outward product (#1504).
+        let inv_b = Interval::new(div_down(1.0, b.hi), div_up(1.0, b.lo));
         interval_mul(a, &inv_b)
     }
 }
@@ -237,20 +248,22 @@ pub fn interval_pow_int(base: &Interval, n: i64) -> Interval {
         let pos = interval_pow_int(base, -n);
         return interval_div(&Interval::point(1.0), &pos);
     }
+    // Directed powers (#1504): `powi` is neither correctly rounded nor directed.
+    let n = n as u64;
     if n % 2 == 0 {
         // Even power: result is non-negative.
         if base.lo >= 0.0 {
-            Interval::new(base.lo.powi(n as i32), base.hi.powi(n as i32))
+            Interval::new(powi_down(base.lo, n), powi_up(base.hi, n))
         } else if base.hi <= 0.0 {
-            Interval::new(base.hi.powi(n as i32), base.lo.powi(n as i32))
+            Interval::new(powi_down(base.hi, n), powi_up(base.lo, n))
         } else {
             // Interval straddles zero.
-            let max_val = base.lo.abs().max(base.hi.abs()).powi(n as i32);
+            let max_val = powi_up(base.lo.abs().max(base.hi.abs()), n);
             Interval::new(0.0, max_val)
         }
     } else {
         // Odd power: monotone increasing.
-        Interval::new(base.lo.powi(n as i32), base.hi.powi(n as i32))
+        Interval::new(powi_down(base.lo, n), powi_up(base.hi, n))
     }
 }
 
@@ -281,7 +294,8 @@ pub fn interval_pow(base: &Interval, exp: &Interval) -> Interval {
     ];
     let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
     let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    Interval::new(lo, hi)
+    // `powf` is a libm call: widen outward, but never below the true range floor 0.
+    Interval::new(lib_down(lo).max(0.0), lib_up(hi))
 }
 
 /// `neg([a,b]) = [-b, -a]`
@@ -302,7 +316,43 @@ pub fn interval_abs(a: &Interval) -> Interval {
 
 /// `exp([a,b]) = [exp(a), exp(b)]`
 pub fn interval_exp(a: &Interval) -> Interval {
-    Interval::new(a.lo.exp(), a.hi.exp())
+    Interval::new(exp_down(a.lo), exp_up(a.hi))
+}
+
+/// `exp(x)` rounded outward-down; exact at `x == 0` (#1504).
+fn exp_down(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        lib_down(x.exp()).max(0.0)
+    }
+}
+
+/// `exp(x)` rounded outward-up; exact at `x == 0` (#1504).
+fn exp_up(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        lib_up(x.exp())
+    }
+}
+
+/// `ln(x)` rounded outward-down; exact at `x == 1` (#1504).
+fn ln_down(x: f64) -> f64 {
+    if x == 1.0 {
+        0.0
+    } else {
+        lib_down(x.ln())
+    }
+}
+
+/// `ln(x)` rounded outward-up; exact at `x == 1` (#1504).
+fn ln_up(x: f64) -> f64 {
+    if x == 1.0 {
+        0.0
+    } else {
+        lib_up(x.ln())
+    }
 }
 
 /// `log([a,b]) = [log(max(a, eps)), log(b)]`
@@ -311,7 +361,7 @@ pub fn interval_log(a: &Interval) -> Interval {
     if a.hi <= 0.0 {
         return Interval::empty();
     }
-    Interval::new(lo.ln(), a.hi.ln())
+    Interval::new(ln_down(lo), ln_up(a.hi))
 }
 
 /// `log2([a,b])`
@@ -320,7 +370,7 @@ pub fn interval_log2(a: &Interval) -> Interval {
     if a.hi <= 0.0 {
         return Interval::empty();
     }
-    Interval::new(lo.log2(), a.hi.log2())
+    Interval::new(lib_down(lo.log2()), lib_up(a.hi.log2()))
 }
 
 /// `log10([a,b])`
@@ -329,7 +379,7 @@ pub fn interval_log10(a: &Interval) -> Interval {
     if a.hi <= 0.0 {
         return Interval::empty();
     }
-    Interval::new(lo.log10(), a.hi.log10())
+    Interval::new(lib_down(lo.log10()), lib_up(a.hi.log10()))
 }
 
 /// `sqrt([a,b]) = [sqrt(max(a,0)), sqrt(b)]`
@@ -337,7 +387,7 @@ pub fn interval_sqrt(a: &Interval) -> Interval {
     if a.hi < 0.0 {
         return Interval::empty();
     }
-    Interval::new(a.lo.max(0.0).sqrt(), a.hi.sqrt())
+    Interval::new(sqrt_down(a.lo.max(0.0)), sqrt_up(a.hi))
 }
 
 /// `sin([a,b])` with periodicity handling.
@@ -365,13 +415,25 @@ pub fn interval_sin(a: &Interval) -> Interval {
         min_val = -1.0;
     }
 
-    Interval::new(min_val, max_val)
+    // Outward (#1504): the extremum test reduces by a rounded `2*pi`, whose error
+    // is absolute at the argument's magnitude, so widen by that and clamp to the
+    // true range [-1, 1] (clamping is sound: sin never leaves it).
+    let scale = 1.0 + a.lo.abs().max(a.hi.abs());
+    Interval::new(
+        abs_down(min_val, scale).max(-1.0),
+        abs_up(max_val, scale).min(1.0),
+    )
 }
 
 /// `cos([a,b])` with periodicity handling.
 pub fn interval_cos(a: &Interval) -> Interval {
-    // cos(x) = sin(x + pi/2)
-    interval_sin(&Interval::new(a.lo + PI / 2.0, a.hi + PI / 2.0))
+    // cos(x) = sin(x + pi/2). The shift is rounded outward so the shifted interval
+    // still contains every true `x + pi/2`; `interval_sin` then widens by the
+    // absolute error of the shifted argument's magnitude.
+    interval_sin(&Interval::new(
+        abs_down(a.lo + PI / 2.0, a.lo),
+        abs_up(a.hi + PI / 2.0, a.hi),
+    ))
 }
 
 /// `tan([a,b])` with branch handling.
@@ -387,7 +449,7 @@ pub fn interval_tan(a: &Interval) -> Interval {
     let branch_hi = (a.hi / PI).round();
     if branch_lo == branch_hi {
         // Same branch: tan is increasing and finite here.
-        Interval::new(a.lo.tan(), a.hi.tan())
+        Interval::new(lib_down(a.lo.tan()), lib_up(a.hi.tan()))
     } else {
         // Spans at least one asymptote: unbounded.
         Interval::entire()
@@ -648,8 +710,9 @@ fn sum_backward_preimage(
         return Some(sum_bound);
     }
     let km1 = (k - 1) as f64;
-    let lo = sum_bound.lo - km1 * hull.hi;
-    let hi = sum_bound.hi - km1 * hull.lo;
+    // Outward (#1504): the subtraction is where cancellation happens.
+    let lo = sub_down(sum_bound.lo, mul_up(km1, hull.hi));
+    let hi = sub_up(sum_bound.hi, mul_down(km1, hull.lo));
     if lo.is_nan() || hi.is_nan() || lo > hi {
         return None;
     }
@@ -675,8 +738,8 @@ fn interval_sum_of(a: Interval, n: Option<usize>) -> Interval {
         None => Interval::entire(),
         Some(k) => {
             let k = k as f64;
-            let lo = a.lo * k;
-            let hi = a.hi * k;
+            let lo = mul_down(a.lo, k);
+            let hi = mul_up(a.hi, k);
             if lo.is_nan() || hi.is_nan() {
                 Interval::entire()
             } else {
@@ -758,47 +821,51 @@ fn eval_node_interval(
                 MathFunc::Tan => interval_tan(&a0),
                 MathFunc::Atan => {
                     // atan is monotonically increasing, range (-pi/2, pi/2)
-                    Interval::new(a0.lo.atan(), a0.hi.atan())
+                    Interval::new(lib_down(a0.lo.atan()), lib_up(a0.hi.atan()))
                 }
                 MathFunc::Sinh => {
                     // sinh is monotonically increasing
-                    Interval::new(a0.lo.sinh(), a0.hi.sinh())
+                    Interval::new(lib_down(a0.lo.sinh()), lib_up(a0.hi.sinh()))
                 }
                 MathFunc::Cosh => {
                     // cosh is convex, minimum at 0
+                    // (cosh >= 1 always, so the lower endpoint clamps at 1.)
                     if a0.lo >= 0.0 {
-                        Interval::new(a0.lo.cosh(), a0.hi.cosh())
+                        Interval::new(lib_down(a0.lo.cosh()).max(1.0), lib_up(a0.hi.cosh()))
                     } else if a0.hi <= 0.0 {
-                        Interval::new(a0.hi.cosh(), a0.lo.cosh())
+                        Interval::new(lib_down(a0.hi.cosh()).max(1.0), lib_up(a0.lo.cosh()))
                     } else {
-                        Interval::new(1.0, a0.lo.cosh().max(a0.hi.cosh()))
+                        Interval::new(1.0, lib_up(a0.lo.cosh().max(a0.hi.cosh())))
                     }
                 }
                 MathFunc::Asin => {
                     // asin defined on [-1, 1], monotonically increasing
                     let lo = a0.lo.max(-1.0).asin();
                     let hi = a0.hi.min(1.0).asin();
-                    Interval::new(lo, hi)
+                    Interval::new(lib_down(lo), lib_up(hi))
                 }
                 MathFunc::Acos => {
                     // acos defined on [-1, 1], monotonically decreasing
                     let lo = a0.hi.min(1.0).acos();
                     let hi = a0.lo.max(-1.0).acos();
-                    Interval::new(lo, hi)
+                    Interval::new(lib_down(lo).max(0.0), lib_up(hi))
                 }
                 MathFunc::Tanh => {
                     // tanh is monotonically increasing, range (-1, 1)
-                    Interval::new(a0.lo.tanh(), a0.hi.tanh())
+                    Interval::new(
+                        lib_down(a0.lo.tanh()).max(-1.0),
+                        lib_up(a0.hi.tanh()).min(1.0),
+                    )
                 }
                 MathFunc::Asinh => {
                     // asinh is monotonically increasing on all of R
-                    Interval::new(a0.lo.asinh(), a0.hi.asinh())
+                    Interval::new(lib_down(a0.lo.asinh()), lib_up(a0.hi.asinh()))
                 }
                 MathFunc::Acosh => {
                     // acosh defined on [1, inf), monotonically increasing
                     let lo = a0.lo.max(1.0).acosh();
                     let hi = a0.hi.max(1.0).acosh();
-                    Interval::new(lo, hi)
+                    Interval::new(lib_down(lo).max(0.0), lib_up(hi))
                 }
                 MathFunc::Atanh => {
                     // atanh defined on (-1, 1), monotonically increasing.
@@ -806,27 +873,35 @@ fn eval_node_interval(
                     const EPS: f64 = 1e-12;
                     let lo = a0.lo.clamp(-1.0 + EPS, 1.0 - EPS).atanh();
                     let hi = a0.hi.clamp(-1.0 + EPS, 1.0 - EPS).atanh();
-                    Interval::new(lo, hi)
+                    Interval::new(lib_down(lo), lib_up(hi))
                 }
                 MathFunc::Erf => {
                     // erf is monotonically increasing, range (-1, 1)
-                    Interval::new(libm::erf(a0.lo), libm::erf(a0.hi))
+                    Interval::new(
+                        lib_down(libm::erf(a0.lo)).max(-1.0),
+                        lib_up(libm::erf(a0.hi)).min(1.0),
+                    )
                 }
                 MathFunc::Log1p => {
                     // log1p(x) = ln(1 + x), defined on (-1, inf), increasing.
                     let lo = (a0.lo.max(-1.0)).ln_1p();
                     let hi = (a0.hi.max(-1.0)).ln_1p();
-                    Interval::new(lo, hi)
+                    Interval::new(lib_down(lo), lib_up(hi))
                 }
                 MathFunc::Sigmoid => {
                     // sigmoid is monotonically increasing, range (0, 1)
+                    // `0.5 + 0.5*tanh` cancels for very negative x, so its error
+                    // is absolute (scale 1), not relative.
                     let sig = |x: f64| 0.5 + 0.5 * (0.5 * x).tanh();
-                    Interval::new(sig(a0.lo), sig(a0.hi))
+                    Interval::new(
+                        abs_down(sig(a0.lo), 1.0).max(0.0),
+                        abs_up(sig(a0.hi), 1.0).min(1.0),
+                    )
                 }
                 MathFunc::Softplus => {
                     // softplus is monotonically increasing, range (0, inf)
                     let sp = |x: f64| x.max(0.0) + (-x.abs()).exp().ln_1p();
-                    Interval::new(sp(a0.lo), sp(a0.hi))
+                    Interval::new(lib_down(sp(a0.lo)).max(0.0), lib_up(sp(a0.hi)))
                 }
                 MathFunc::Entropy => entropy_interval(&a0),
                 MathFunc::Abs => interval_abs(&a0),
@@ -983,8 +1058,13 @@ fn backward_propagate_with(
                     // a + b in [lo, hi]
                     // a in [lo - b_hi, hi - b_lo]
                     // b in [lo - a_hi, hi - a_lo]
-                    let new_l = Interval::new(tightened.lo - r.hi, tightened.hi - r.lo);
-                    let new_r = Interval::new(tightened.lo - l.hi, tightened.hi - l.lo);
+                    // Outward-rounded (#1504): this subtraction is where the
+                    // terms of a residual cancel, so its rounding error is at
+                    // the terms' magnitude, not the result's.
+                    let new_l =
+                        Interval::new(sub_down(tightened.lo, r.hi), sub_up(tightened.hi, r.lo));
+                    let new_r =
+                        Interval::new(sub_down(tightened.lo, l.hi), sub_up(tightened.hi, l.lo));
                     backward_propagate_with(
                         arena,
                         *left,
@@ -1006,8 +1086,11 @@ fn backward_propagate_with(
                     // a - b in [lo, hi]
                     // a in [lo + b_lo, hi + b_hi]
                     // b in [a_lo - hi, a_hi - lo]
-                    let new_l = Interval::new(tightened.lo + r.lo, tightened.hi + r.hi);
-                    let new_r = Interval::new(l.lo - tightened.hi, l.hi - tightened.lo);
+                    // Outward-rounded (#1504), see `Add`.
+                    let new_l =
+                        Interval::new(add_down(tightened.lo, r.lo), add_up(tightened.hi, r.hi));
+                    let new_r =
+                        Interval::new(sub_down(l.lo, tightened.hi), sub_up(l.hi, tightened.lo));
                     backward_propagate_with(
                         arena,
                         *left,
@@ -1081,20 +1164,19 @@ fn backward_propagate_with(
                     if let Some(exp_val) = arena.try_constant_value_pub(*right) {
                         let exp_int = exp_val.round() as i64;
                         if (exp_val - exp_int as f64).abs() < 1e-12 && exp_int > 0 {
-                            let inv = 1.0 / exp_int as f64;
+                            // Roots are VERIFIED outward (#1504): `powf(1/n)`
+                            // rounds to nearest, so the lower root could land
+                            // above the true root and cut it. `root_down` /
+                            // `root_up` check the candidate against a directed
+                            // power and step outward until it is on the right
+                            // side. This is the inversion that amplified an
+                            // ulp into `b >= 1.2e-5` in #1504.
+                            let n = exp_int as u64;
                             if exp_int % 2 == 1 {
                                 // Odd power is monotone: base^n in [lo, hi]
                                 // => base in [lo^(1/n), hi^(1/n)], preserving sign.
-                                let new_lo = if tightened.lo >= 0.0 {
-                                    tightened.lo.powf(inv)
-                                } else {
-                                    -((-tightened.lo).powf(inv))
-                                };
-                                let new_hi = if tightened.hi >= 0.0 {
-                                    tightened.hi.powf(inv)
-                                } else {
-                                    -((-tightened.hi).powf(inv))
-                                };
+                                let new_lo = root_down(tightened.lo, n);
+                                let new_hi = root_up(tightened.hi, n);
                                 let new_base = Interval::new(new_lo, new_hi);
                                 backward_propagate_with(
                                     arena,
@@ -1119,8 +1201,8 @@ fn backward_propagate_with(
                                     );
                                     return;
                                 }
-                                let root_hi = tightened.hi.powf(inv);
-                                let root_lo = tightened.lo.max(0.0).powf(inv);
+                                let root_hi = root_up(tightened.hi, n);
+                                let root_lo = root_down(tightened.lo.max(0.0), n);
                                 // Use the forward base bounds to resolve the sign of u.
                                 let new_base = if l.lo >= 0.0 {
                                     // Base known nonnegative: u in [root_lo, root_hi].
@@ -1184,13 +1266,14 @@ fn backward_propagate_with(
             match func {
                 MathFunc::Exp => {
                     // exp(a) in [lo, hi] => a in [log(lo), log(hi)]
+                    // Outward-widened libm results (#1504).
                     let new_lo = if tightened.lo > 0.0 {
-                        tightened.lo.ln()
+                        ln_down(tightened.lo)
                     } else {
                         f64::NEG_INFINITY
                     };
                     let new_hi = if tightened.hi > 0.0 {
-                        tightened.hi.ln()
+                        ln_up(tightened.hi)
                     } else {
                         f64::NEG_INFINITY
                     };
@@ -1206,7 +1289,7 @@ fn backward_propagate_with(
                 }
                 MathFunc::Log => {
                     // log(a) in [lo, hi] => a in [exp(lo), exp(hi)]
-                    let new = Interval::new(tightened.lo.exp(), tightened.hi.exp());
+                    let new = Interval::new(exp_down(tightened.lo), exp_up(tightened.hi));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1219,7 +1302,7 @@ fn backward_propagate_with(
                 MathFunc::Sqrt => {
                     // sqrt(a) in [lo, hi] => a in [lo^2, hi^2] (lo >= 0)
                     let lo = tightened.lo.max(0.0);
-                    let new = Interval::new(lo * lo, tightened.hi * tightened.hi);
+                    let new = Interval::new(mul_down(lo, lo), mul_up(tightened.hi, tightened.hi));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1231,7 +1314,8 @@ fn backward_propagate_with(
                 }
                 MathFunc::Log2 => {
                     // log2(a) in [lo, hi] => a in [2^lo, 2^hi]
-                    let new = Interval::new(tightened.lo.exp2(), tightened.hi.exp2());
+                    let new =
+                        Interval::new(lib_down(tightened.lo.exp2()), lib_up(tightened.hi.exp2()));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1243,7 +1327,10 @@ fn backward_propagate_with(
                 }
                 MathFunc::Log10 => {
                     // log10(a) in [lo, hi] => a in [10^lo, 10^hi]
-                    let new = Interval::new(10f64.powf(tightened.lo), 10f64.powf(tightened.hi));
+                    let new = Interval::new(
+                        lib_down(10f64.powf(tightened.lo)),
+                        lib_up(10f64.powf(tightened.hi)),
+                    );
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1255,7 +1342,10 @@ fn backward_propagate_with(
                 }
                 MathFunc::Log1p => {
                     // log1p(a)=ln(1+a) in [lo, hi] => a in [e^lo - 1, e^hi - 1]
-                    let new = Interval::new(tightened.lo.exp_m1(), tightened.hi.exp_m1());
+                    let new = Interval::new(
+                        lib_down(tightened.lo.exp_m1()),
+                        lib_up(tightened.hi.exp_m1()),
+                    );
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1267,7 +1357,8 @@ fn backward_propagate_with(
                 }
                 MathFunc::Sinh => {
                     // sinh increasing, inverse asinh.
-                    let new = Interval::new(tightened.lo.asinh(), tightened.hi.asinh());
+                    let new =
+                        Interval::new(lib_down(tightened.lo.asinh()), lib_up(tightened.hi.asinh()));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1279,7 +1370,8 @@ fn backward_propagate_with(
                 }
                 MathFunc::Asinh => {
                     // asinh increasing, inverse sinh.
-                    let new = Interval::new(tightened.lo.sinh(), tightened.hi.sinh());
+                    let new =
+                        Interval::new(lib_down(tightened.lo.sinh()), lib_up(tightened.hi.sinh()));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1292,8 +1384,8 @@ fn backward_propagate_with(
                 MathFunc::Tanh => {
                     // tanh increasing onto (-1, 1), inverse atanh. Clamp inside domain.
                     const EPS: f64 = 1e-12;
-                    let lo = tightened.lo.clamp(-1.0 + EPS, 1.0 - EPS).atanh();
-                    let hi = tightened.hi.clamp(-1.0 + EPS, 1.0 - EPS).atanh();
+                    let lo = lib_down(tightened.lo.clamp(-1.0 + EPS, 1.0 - EPS).atanh());
+                    let hi = lib_up(tightened.hi.clamp(-1.0 + EPS, 1.0 - EPS).atanh());
                     backward_propagate(
                         arena,
                         args[0],
@@ -1304,7 +1396,8 @@ fn backward_propagate_with(
                 }
                 MathFunc::Atanh => {
                     // atanh increasing on (-1, 1), inverse tanh.
-                    let new = Interval::new(tightened.lo.tanh(), tightened.hi.tanh());
+                    let new =
+                        Interval::new(lib_down(tightened.lo.tanh()), lib_up(tightened.hi.tanh()));
                     backward_propagate_with(
                         arena,
                         args[0],
@@ -1324,8 +1417,9 @@ fn backward_propagate_with(
                     let branch_hi = (inp.hi / PI).round();
                     if branch_lo == branch_hi {
                         let k_pi = branch_lo * PI;
-                        let new_lo = tightened.lo.atan() + k_pi;
-                        let new_hi = tightened.hi.atan() + k_pi;
+                        // `k_pi` is a rounded multiple of pi: absolute error.
+                        let new_lo = abs_down(tightened.lo.atan() + k_pi, k_pi.abs() + PI);
+                        let new_hi = abs_up(tightened.hi.atan() + k_pi, k_pi.abs() + PI);
                         backward_propagate(
                             arena,
                             args[0],
@@ -1339,8 +1433,8 @@ fn backward_propagate_with(
                     // atan increasing onto (-pi/2, pi/2), inverse tan. Clamp range.
                     use std::f64::consts::FRAC_PI_2;
                     const EPS: f64 = 1e-12;
-                    let lo = tightened.lo.clamp(-FRAC_PI_2 + EPS, FRAC_PI_2 - EPS).tan();
-                    let hi = tightened.hi.clamp(-FRAC_PI_2 + EPS, FRAC_PI_2 - EPS).tan();
+                    let lo = lib_down(tightened.lo.clamp(-FRAC_PI_2 + EPS, FRAC_PI_2 - EPS).tan());
+                    let hi = lib_up(tightened.hi.clamp(-FRAC_PI_2 + EPS, FRAC_PI_2 - EPS).tan());
                     backward_propagate(
                         arena,
                         args[0],
@@ -1352,8 +1446,8 @@ fn backward_propagate_with(
                 MathFunc::Asin => {
                     // asin increasing onto [-pi/2, pi/2], inverse sin; preimage in [-1, 1].
                     use std::f64::consts::FRAC_PI_2;
-                    let lo = tightened.lo.clamp(-FRAC_PI_2, FRAC_PI_2).sin();
-                    let hi = tightened.hi.clamp(-FRAC_PI_2, FRAC_PI_2).sin();
+                    let lo = lib_down(tightened.lo.clamp(-FRAC_PI_2, FRAC_PI_2).sin());
+                    let hi = lib_up(tightened.hi.clamp(-FRAC_PI_2, FRAC_PI_2).sin());
                     backward_propagate(
                         arena,
                         args[0],
@@ -1371,15 +1465,15 @@ fn backward_propagate_with(
                     backward_propagate(
                         arena,
                         args[0],
-                        Interval::new(hi_in.cos(), lo_in.cos()),
+                        Interval::new(abs_down(hi_in.cos(), 1.0), abs_up(lo_in.cos(), 1.0)),
                         node_bounds,
                         var_bounds,
                     );
                 }
                 MathFunc::Acosh => {
                     // acosh increasing onto [0, inf), inverse cosh; preimage in [1, inf).
-                    let lo = tightened.lo.max(0.0).cosh();
-                    let hi = tightened.hi.max(0.0).cosh();
+                    let lo = lib_down(tightened.lo.max(0.0).cosh());
+                    let hi = lib_up(tightened.hi.max(0.0).cosh());
                     backward_propagate(
                         arena,
                         args[0],
@@ -1391,7 +1485,7 @@ fn backward_propagate_with(
                 MathFunc::Cosh => {
                     // cosh(a) in [lo, hi] (hi >= 1) is even; conservative symmetric preimage
                     // a in [-acosh(hi), acosh(hi)].
-                    let r = tightened.hi.max(1.0).acosh();
+                    let r = lib_up(tightened.hi.max(1.0).acosh());
                     backward_propagate(
                         arena,
                         args[0],
@@ -1410,7 +1504,11 @@ fn backward_propagate_with(
                     backward_propagate(
                         arena,
                         args[0],
-                        Interval::new(logit(tightened.lo), logit(tightened.hi)),
+                        // `1 - p` loses digits: absolute error at scale 1.
+                        Interval::new(
+                            abs_down(logit(tightened.lo), 1.0),
+                            abs_up(logit(tightened.hi), 1.0),
+                        ),
                         node_bounds,
                         var_bounds,
                     );
@@ -1418,14 +1516,20 @@ fn backward_propagate_with(
                 MathFunc::Softplus => {
                     // softplus increasing onto (0, inf), inverse a = s + ln(1 - e^{-s}), s > 0.
                     const EPS: f64 = 1e-12;
+                    // a = s + ln(1 - e^{-s}). `ln_1p(-exp(-s))` cancels
+                    // catastrophically for small s (relative error ~eps/s in the
+                    // argument); `-expm1(-s)` computes `1 - e^{-s}` accurately.
                     let inv = |s: f64| {
                         let s = s.max(EPS);
-                        s + (-(-s).exp()).ln_1p()
+                        s + (-(-s).exp_m1()).ln()
                     };
                     backward_propagate(
                         arena,
                         args[0],
-                        Interval::new(inv(tightened.lo), inv(tightened.hi)),
+                        Interval::new(
+                            abs_down(inv(tightened.lo), tightened.lo),
+                            abs_up(inv(tightened.hi), tightened.hi),
+                        ),
                         node_bounds,
                         var_bounds,
                     );
@@ -1483,13 +1587,16 @@ fn backward_propagate_with(
                         let (new_lo, new_hi) = if mid.cos() >= 0.0 {
                             // increasing piece centered at 2*m*pi
                             let m = (mid / (2.0 * PI)).round();
-                            (ylo.asin() + 2.0 * m * PI, yhi.asin() + 2.0 * m * PI)
+                            (
+                                abs_down(ylo.asin() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
+                                abs_up(yhi.asin() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
+                            )
                         } else {
                             // decreasing piece centered at pi + 2*m*pi
                             let m = ((mid - PI) / (2.0 * PI)).round();
                             (
-                                PI - yhi.asin() + 2.0 * m * PI,
-                                PI - ylo.asin() + 2.0 * m * PI,
+                                abs_down(PI - yhi.asin() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
+                                abs_up(PI - ylo.asin() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
                             )
                         };
                         backward_propagate(
@@ -1517,11 +1624,17 @@ fn backward_propagate_with(
                         let (new_lo, new_hi) = if mid.sin() > 0.0 {
                             // decreasing piece [2m*pi, pi+2m*pi]: x = acos(y) + 2m*pi,
                             // larger y -> smaller x.
-                            (yhi.acos() + 2.0 * m * PI, ylo.acos() + 2.0 * m * PI)
+                            (
+                                abs_down(yhi.acos() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
+                                abs_up(ylo.acos() + 2.0 * m * PI, (2.0 * m * PI).abs() + PI),
+                            )
                         } else {
                             // increasing piece [pi+2m'*pi, 2pi+2m'*pi]:
                             // x = 2*pi*m - acos(y) (m rounds to the piece's right end).
-                            (2.0 * PI * m - ylo.acos(), 2.0 * PI * m - yhi.acos())
+                            (
+                                abs_down(2.0 * PI * m - ylo.acos(), (2.0 * PI * m).abs() + PI),
+                                abs_up(2.0 * PI * m - yhi.acos(), (2.0 * PI * m).abs() + PI),
+                            )
                         };
                         backward_propagate(
                             arena,
@@ -1542,15 +1655,20 @@ fn backward_propagate_with(
             // For a sum t1 + t2 + ... + tn in [lo, hi],
             // each ti in [lo - sum_others_hi, hi - sum_others_lo].
             for (i, t) in terms.iter().enumerate() {
+                // Outward-rounded sums (#1504): the final subtraction is where a
+                // residual's terms cancel.
                 let mut others_lo = 0.0;
                 let mut others_hi = 0.0;
                 for (j, s) in terms.iter().enumerate() {
                     if i != j {
-                        others_lo += node_bounds[s.0].lo;
-                        others_hi += node_bounds[s.0].hi;
+                        others_lo = add_down(others_lo, node_bounds[s.0].lo);
+                        others_hi = add_up(others_hi, node_bounds[s.0].hi);
                     }
                 }
-                let new = Interval::new(tightened.lo - others_hi, tightened.hi - others_lo);
+                let new = Interval::new(
+                    sub_down(tightened.lo, others_hi),
+                    sub_up(tightened.hi, others_lo),
+                );
                 backward_propagate_with(arena, *t, new, node_bounds, var_bounds, reduce_counts);
             }
         }
@@ -2009,7 +2127,9 @@ fn entropy_interval(a: &Interval) -> Interval {
     } else {
         f_lo.min(f_hi)
     };
-    Interval::new(lo, f_lo.max(f_hi))
+    // Outward (#1504): `xlogx` is a libm composite, and `ENTROPY_MIN` is -1/e
+    // rounded to nearest.
+    Interval::new(lib_down(lo), lib_up(f_lo.max(f_hi)))
 }
 
 /// Preimage of `out` under `entropy`, restricted to the forward box `inp`.
@@ -2837,6 +2957,151 @@ mod tests {
         assert!((bounds[0].hi - 5.0).abs() < 1e-10);
         assert!((bounds[1].lo - 0.0).abs() < 1e-10);
         assert!((bounds[1].hi - 5.0).abs() < 1e-10);
+    }
+
+    /// `c_b * b**p - c_x * x0**q == rhs` with `b` of type `b_type` in `[0, b_ub]`
+    /// and `x0` continuous in `[x_lo, x_hi]` (issue #1504).
+    #[allow(clippy::too_many_arguments)]
+    fn make_1504_model(
+        b_type: VarType,
+        b_ub: f64,
+        p: f64,
+        q: f64,
+        c_b: f64,
+        c_x: f64,
+        rhs: f64,
+        x_lo: f64,
+        x_hi: f64,
+    ) -> ModelRepr {
+        let mut arena = ExprArena::new();
+        let x0 = arena.add(ExprNode::Variable {
+            name: "x0".into(),
+            index: 0,
+            size: 1,
+            shape: vec![],
+        });
+        let b = arena.add(ExprNode::Variable {
+            name: "b".into(),
+            index: 1,
+            size: 1,
+            shape: vec![],
+        });
+        let cp = arena.add(ExprNode::Constant(p));
+        let cq = arena.add(ExprNode::Constant(q));
+        let bp = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Pow,
+            left: b,
+            right: cp,
+        });
+        let xq = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Pow,
+            left: x0,
+            right: cq,
+        });
+        let kb = arena.add(ExprNode::Constant(c_b));
+        let kx = arena.add(ExprNode::Constant(c_x));
+        let tb = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Mul,
+            left: kb,
+            right: bp,
+        });
+        let tx = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Mul,
+            left: kx,
+            right: xq,
+        });
+        let body = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Sub,
+            left: tb,
+            right: tx,
+        });
+        ModelRepr {
+            arena,
+            objective: b,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body,
+                sense: ConstraintSense::Eq,
+                rhs,
+                name: Some("c1504".into()),
+            }],
+            variables: vec![
+                VarInfo {
+                    name: "x0".into(),
+                    var_type: VarType::Continuous,
+                    offset: 0,
+                    size: 1,
+                    shape: vec![],
+                    lb: vec![x_lo],
+                    ub: vec![x_hi],
+                },
+                VarInfo {
+                    name: "b".into(),
+                    var_type: b_type,
+                    offset: 1,
+                    size: 1,
+                    shape: vec![],
+                    lb: vec![0.0],
+                    ub: vec![b_ub],
+                },
+            ],
+            n_vars: 2,
+        }
+    }
+
+    /// #1504: `b**3 - 2*x0**3 == 5`, `x0 in [-2, 0]`. The feasible point `b = 0`,
+    /// `x0 = -cbrt(2.5)` must survive FBBT. Before the fix the backward cube root
+    /// through `x0**3` rounded inward, the forward pass then saw a residual of
+    /// `+1.776e-15` on `b**3`, and the cube-root inverse lifted `b` to
+    /// `1.2110908904786693e-05` -- which the integrality snap turned into `b = 1`.
+    #[test]
+    fn fbbt_1504_root_roundoff_never_cuts_a_feasible_integer() {
+        let mut checked = 0usize;
+        // Binary b: must keep b = 0.
+        let m = make_1504_model(VarType::Binary, 1.0, 3.0, 3.0, 1.0, 2.0, 5.0, -2.0, 0.0);
+        let bounds = fbbt(&m, 20, 1e-9);
+        assert_eq!(bounds[1].lo, 0.0, "binary b lifted off 0: {:?}", bounds[1]);
+        // The true root must stay inside x0's box.
+        let root = -(2.5f64.cbrt());
+        assert!(
+            bounds[0].lo <= root && root <= bounds[0].hi,
+            "{:?}",
+            bounds[0]
+        );
+        checked += 2;
+        // Continuous b: the derived lower bound must be <= 0 (the true infimum).
+        let m = make_1504_model(VarType::Continuous, 1.0, 3.0, 3.0, 1.0, 2.0, 5.0, -2.0, 0.0);
+        let bounds = fbbt(&m, 20, 1e-9);
+        assert!(bounds[1].lo <= 0.0, "continuous b lb = {:e}", bounds[1].lo);
+        checked += 1;
+        // A small sweep: c_b*y**p - c_x*x0**q == R with the integer y = 0 feasible
+        // whenever -R/c_x has a real q-th root in the x0 box.
+        for &r in &[2.0f64, 3.0, 5.0, 6.0, 7.0, 9.0] {
+            for &p in &[2.0, 3.0] {
+                for &q in &[2.0, 3.0] {
+                    // y = 0 feasible iff c_x * x0^q == -R for some x0 in [-2, 2].
+                    let c_x = -1.0;
+                    let root_mag = if q == 2.0 { r.sqrt() } else { r.cbrt() };
+                    if root_mag > 2.0 {
+                        continue;
+                    }
+                    let m = make_1504_model(VarType::Integer, 3.0, p, q, 0.5, c_x, r, -2.0, 2.0);
+                    let bounds = fbbt(&m, 20, 1e-9);
+                    assert!(
+                        bounds[1].lo <= 0.0,
+                        "R={r} p={p} q={q}: y lb {:?} excludes the feasible y = 0",
+                        bounds[1]
+                    );
+                    assert!(
+                        bounds[0].lo <= root_mag && root_mag <= bounds[0].hi,
+                        "R={r} p={p} q={q}: x0 box {:?} excludes root {root_mag:e}",
+                        bounds[0]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "comparisons executed: {checked}");
     }
 
     #[test]
