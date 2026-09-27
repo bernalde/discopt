@@ -18862,7 +18862,12 @@ _FW_LINE_SEARCH_ITERS = 50
 #: Relative size below which an exhibited "better" point is floating-point noise
 #: rather than evidence (#1499). It only decides whether the rigorous first-order
 #: bound below is REQUIRED; it can never loosen a certificate, since a point this
-#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see.
+#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see. The
+#: Lagrangian arm scales it by the cancellation magnitude of its linearized gap as
+#: well (#1508): a gain a 1e-12 relative error in ``(x, lam)`` could produce is not
+#: evidence that ``x`` is suboptimal. Measured on nlp_cvx_001_010 (box +-1.3e12):
+#: the fake gain is ~ rho * cancel_mag for a relative perturbation ``rho``, so
+#: perturbations up to 1e-13 no longer withhold, and 1e-11 still does.
 _WITNESS_NOISE_REL = 1e-12
 
 
@@ -19129,7 +19134,22 @@ def _convex_nlp_certificate(
                     e_ = a + gr * (b - a)
                     fe = _lag(e_)
                 best = min(best, fc, fe)
-            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0)):
+            # Noise floor (#1508). By convexity the gain ``L0 - best`` is at most the
+            # linearized gap ``-reduced . d``, and ``reduced = grad + J^T lam`` is a
+            # CANCELLATION: at a stationary point its entries are the rounding residue
+            # of terms of size ``|grad_j| + sum_i |lam_i J_ij|``. A relative error
+            # ``rho`` in (x, lam) therefore moves ``-reduced . d`` by up to
+            # ``rho * cancel_mag`` with ``cancel_mag = sum_j |d_j| (|grad_j| +
+            # (|J|^T |lam|)_j)``. On a huge presolve box (+-1.3e12 on nlp_cvx_001_010)
+            # ``|d|`` makes that 1e-5..1e-2 at ``rho = 1e-15`` -- a "gain" that is
+            # multiplier noise, not a better point -- so the floor scales with it. A
+            # real descent (#1499: 8.8e-5 at cancel_mag 7.9e-3) stays far above it.
+            cancel_mag = float(np.abs(d) @ np.abs(grad))
+            if m > 0:
+                cancel_mag += float(np.abs(d) @ (np.abs(jac).T @ np.abs(lam)))
+            if not np.isfinite(cancel_mag):
+                cancel_mag = 0.0  # overflow: no noise credit, keep the #1499 floor
+            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0) + cancel_mag):
                 # An in-box point beats the incumbent Lagrangian: the dual bound these
                 # multipliers support is below f(x), so f(x) is not a bound (#1499;
                 # before, only a beat by more than ``margin`` withheld). Certify only
