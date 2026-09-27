@@ -27,11 +27,12 @@ def test_to_latex_structure():
     assert s.startswith("\\begin{aligned}") and s.endswith("\\end{aligned}")
     assert r"\text{minimize}" in s
     assert r"\text{subject to}" in s
-    # power -> superscript, product -> \cdot
+    # power -> superscript; a coefficient product is implicit, as in print
     assert "^{2}" in s
-    assert r"\cdot" in s
-    # un-normalised natural constraint form (not "4 - (...) <= 0")
-    assert r"4 \le x + 5 \cdot y" in s
+    assert r"2 y" in s and r"\cdot" not in s
+    # un-normalised natural constraint form (not "4 - (...) <= 0"), variables
+    # on the left (not "4 <= x + 5y")
+    assert r"x + 5 y \ge 4" in s
     # variable domains
     assert r"0 \le x \le 10" in s
     assert r"y \in \{0, 1\}" in s
