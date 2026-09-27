@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -78,7 +79,8 @@ def _dispersion(n: int):
 def _load(name: str):
     import discopt.modeling as dm
 
-    if name.startswith("disp"):
+    # Exact match: the corpus has ``dispatch``, which a prefix test would take.
+    if re.fullmatch(r"disp\d+", name):
         return _dispersion(int(name[4:]))
     return dm.from_nl(str(_NL_DIR / f"{name}.nl"))
 
