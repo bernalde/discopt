@@ -4903,6 +4903,55 @@ def _is_fast_linear_quadratic_family(model) -> bool:
 # these to ``None`` on the copy and omits every other ``*_cache`` attribute (#1479).
 _MODEL_INIT_CACHES = frozenset({"_flat_var_offsets_cache"})
 
+#: Model-level *validation guards*: lists of assumptions a construction-time
+#: rewrite relied on, re-checked by :meth:`Model.validate` before every solve
+#: because variable bounds are mutable afterwards. ``_atan2_preconditions`` holds
+#: the sign an ``atan2`` rewrite assumed; ``_piecewise_domains`` the breakpoint
+#: span a ``piecewise`` lowering clamps its input to. Each record references the
+#: model's own ``Variable`` objects. A pass that rebuilds a model into a fresh
+#: ``Model`` must forward them with :func:`carry_validation_guards` -- the rows the
+#: guard protects are forwarded with it, so dropping the guard turns a later bound
+#: widening from a refusal into a silent clamp (#1498).
+VALIDATION_GUARD_ATTRS: tuple[str, ...] = ("_atan2_preconditions", "_piecewise_domains")
+
+
+def carry_validation_guards(src: "Model", dst: "Model") -> None:
+    """Forward ``src``'s validation guards onto ``dst``, a model rebuilt from it.
+
+    The same record objects are appended (identity-deduplicated), so carrying
+    twice, or through any number of passes, is idempotent and
+    :func:`missing_validation_guards` can check by identity.
+    """
+    for attr in VALIDATION_GUARD_ATTRS:
+        records = getattr(src, attr, None) or []
+        if not records:
+            continue
+        held = getattr(dst, attr, None)
+        if held is None:
+            held = []
+            setattr(dst, attr, held)
+        seen = {id(r) for r in held}
+        for r in records:
+            if id(r) not in seen:
+                held.append(r)
+                seen.add(id(r))
+
+
+def missing_validation_guards(src: "Model", dst: "Model") -> list[str]:
+    """``attr: label`` of every guard of ``src`` that ``dst`` does not hold.
+
+    Compared by record identity, which is what :func:`carry_validation_guards`
+    preserves (and what a guard's expression -- whose ``==`` builds a constraint
+    -- forces).
+    """
+    missing = []
+    for attr in VALIDATION_GUARD_ATTRS:
+        held = {id(r) for r in (getattr(dst, attr, None) or [])}
+        for r in getattr(src, attr, None) or []:
+            if id(r) not in held:
+                missing.append(f"{attr}: {r[-1]}")
+    return missing
+
 
 class Model:
     """
@@ -8636,6 +8685,10 @@ class Model:
                     # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was
                     # shown to be invalid, and the dual bound remains rigorous.
                     result.status = "error"
+                    result.error = (
+                        "the incumbent the solver returned is infeasible in the original "
+                        "model (false-primal guard, #772); it was withheld"
+                    )
             except Exception as _ver_exc:
                 # A swallowed exception here does not "skip verification" -- it
                 # DELETES the soundness guard while leaving every caller believing
@@ -8693,6 +8746,20 @@ class Model:
             except Exception:
                 result.validation_report = None
 
+        # --- #1493: an ``error`` status always says what failed ---------------- #
+        # ``error`` is documented as "why this solve failed", yet only
+        # ``solve_batch`` ever set it, so every in-process ``status="error"``
+        # arrived with ``error=None`` and the caller could not tell a backend
+        # failure from a withheld incumbent from a crashed relaxation. Routes that
+        # know their cause now record it at the source (the single-NLP route, the
+        # false-primal guard above); this is the backstop for every other route, so
+        # the invariant holds for all of them rather than for the ones audited.
+        if isinstance(result, SolveResult) and result.status == "error" and not result.error:
+            result.error = (
+                "the solve route ended with status='error' without recording a cause; "
+                "the discopt.solver log for this solve has the details"
+            )
+
         # --- No dual bound at all: say so (#1256) ---------------------------- #
         # A solve that produces no valid relaxation bound returns ``bound=None``
         # and, absent this, says nothing else: the only trace was a
@@ -8704,7 +8771,18 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
-        if (
+        if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
+            # #1507: the envelope/epigraph advice below describes a relaxation that
+            # could not bound the objective. On a failed solve that diagnosis is a
+            # guess, and it was wrong on the linear-objective convex QCP #1507
+            # reported; say what is actually known instead.
+            _logging.getLogger("discopt.solver").warning(
+                "No valid dual bound was produced for model %r: the solve failed "
+                "(status=error: %s). The result cannot be certified globally optimal.",
+                self.name,
+                result.error,
+            )
+        elif (
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")

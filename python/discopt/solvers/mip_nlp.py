@@ -299,10 +299,12 @@ def _try_direct_lp(
     elif backend == "simplex":
         result = None
     else:
-        # ``_solve_lp`` no longer takes ``prefer_pounce`` (its engine order is
-        # fixed: simplex, then POUNCE); passing it raised TypeError on every LP
-        # under the SHOT profile (found while fixing #1501).
-        result = solver_module._solve_lp(model, t_start, time_limit)
+        # #1501: "auto" is the engine the default route uses for a pure LP, so an
+        # LP under the SHOT profile gets exactly the default route's certificate
+        # (and its reading of the documented default box). ``_solve_lp`` alone
+        # returned ``error`` on ``max x + y, x - y <= 1, x, y >= 0`` where the
+        # default route certifies the default-box corner.
+        result = _solve_lp_like_default_route(model, t_start, time_limit, solver_module)
     if isinstance(result, solver_module._DeferredUnbounded):
         # An UNBOUNDED the #850 guard would rather see confirmed by an engine that
         # honors the declared box. On this path the caller pinned the backend, so
@@ -328,6 +330,149 @@ def _try_direct_lp(
         ),
         None,
     )
+
+
+def _solve_lp_like_default_route(
+    model: Model, t_start: float, time_limit: float | None, solver_module: Any
+) -> SolveResult:
+    """Solve a pure LP with the engine ``Model.solve()``'s default route uses.
+
+    The same dispatch as the LP branch of ``solver._solve_impl``: the verified
+    HiGHS route by default, the Rust simplex (then POUNCE) under
+    ``DISCOPT_LP_MILP_BACKEND=rust``.
+    """
+    if solver_module._lp_milp_backend() == "highs":
+        return cast(SolveResult, solver_module._solve_lp_highs(model, t_start, time_limit))
+    return cast(SolveResult, solver_module._solve_lp(model, t_start, time_limit))
+
+
+def _try_integer_free_lp(
+    model: Model,
+    *,
+    method: str,
+    profile: str,
+    shot_config: MIPNLPShotConfig | None,
+    options: dict[str, Any],
+    time_limit: float,
+) -> SolveResult | None:
+    """Answer a pure LP with the default route's LP engine (#1501).
+
+    Every MIP-NLP method reduces an integer-free model to ONE local NLP solve
+    (there is no master problem to alternate with). On an LP that solve is an
+    interior-point run whose failure modes are not certificates: on ``min x``
+    over the documented default box it diverged and was reported
+    ``no_feasible_point`` (before #1501, ``infeasible`` with a certificate),
+    while the default route certifies ``optimal`` at the box corner (#850), and
+    on a genuinely unbounded LP it could not produce the ``unbounded`` verdict at
+    all. An LP is its own outer approximation, so the exact LP engine *is* the
+    method here, not a substitute for it.
+    """
+    if any(options.get(key) is not None for key in _EVENT_HOOK_OPTION_KEYS):
+        # A caller hook expects the method's own loop to call it.
+        return None
+    import discopt.solver as solver_module
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
+
+    if classify_problem(model) != ProblemClass.LP:
+        return None
+    result = _solve_lp_like_default_route(model, time.perf_counter(), time_limit, solver_module)
+    ensure_mip_nlp_trace(result, method=method, profile=profile, shot_config=shot_config)
+    return _annotate_strategy_trace(
+        result,
+        method=method,
+        profile=profile,
+        shot_config=shot_config,
+        selected_strategy="direct_lp",
+        problem_class=ProblemClass.LP.value,
+        backend=solver_module._lp_milp_backend(),
+    )
+
+
+def _unlift_result(result: SolveResult, source: Model, lifted: Model) -> SolveResult:
+    """Map a result on the nonsmooth-lifted model back to *source* (#1501).
+
+    The lifting is exact (:mod:`discopt._relax.nonsmooth_lift`), so the lifted
+    model's status and bound are statements about *source*. The incumbent is
+    projected onto *source*'s columns, re-verified on *source* independently, and
+    its objective re-evaluated there: with only ``t >= |u|`` required, the lifted
+    objective at a point is an upper estimate (min) of the source objective at the
+    same point. Multipliers and KKT data describe the lifted rows and are dropped
+    rather than misattributed.
+    """
+    import logging
+    import warnings
+
+    import numpy as np
+
+    from discopt.validation.feasibility import verify_point
+
+    n_aux = len(getattr(lifted, "_nsl_aux", ()))
+    result.constraint_duals = None
+    result.bound_duals_lower = None
+    result.bound_duals_upper = None
+    result.kkt = None
+    result.infeasibility_certificate = None
+    result._model = source
+    trace = result.mip_nlp_trace
+    if isinstance(trace, dict):
+        trace["nonsmooth_lift"] = {"aux_columns": n_aux}
+    if not result.x:
+        return result
+    x_src = {v.name: np.asarray(result.x[v.name]) for v in source._variables}
+    flat = np.concatenate(
+        [np.asarray(x_src[v.name], dtype=np.float64).ravel() for v in source._variables]
+    )
+    check = verify_point(source, flat, with_objective=True)
+    maximize = source._objective is not None and source._objective.sense == ObjectiveSense.MAXIMIZE
+    if not check.ok or check.objective is None:
+        msg = (
+            "MIP-NLP (nonsmooth lifting, #1501): the lifted model's incumbent does not "
+            f"verify on the declared model ({check.reason}); it is dropped and the "
+            "result is not certified"
+        )
+        logging.getLogger(__name__).warning(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        result.x = None
+        result.objective = None
+        result.gap = None
+        result.gap_certified = False
+        result.incumbent_verification_failed = True
+        if result.status in ("optimal", "feasible"):
+            result.status = "no_feasible_point"
+        return result
+    obj = float(check.objective)
+    result.x = x_src
+    result.objective = obj
+    if result.bound is not None:
+        bound = float(result.bound)
+        slack = 1e-6 + 1e-7 * max(1.0, abs(obj))
+        passes = bound < obj - slack if maximize else bound > obj + slack
+        if passes:
+            # A valid bound never passes a verified point. The two come from
+            # different evaluations (lifted model vs. source model), so refuse the
+            # certificate -- and the bound -- rather than publish an incumbent
+            # past its own bound.
+            msg = (
+                f"MIP-NLP (nonsmooth lifting, #1501): bound {bound!r} passes the verified "
+                f"objective {obj!r}; neither the bound nor a certificate is reported"
+            )
+            logging.getLogger(__name__).warning(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+            result.gap_certified = False
+            result.bound = None
+            result.bound_valid = False
+            result.gap = None
+            if result.status == "optimal":
+                result.status = "feasible"
+            return result
+        # Within evaluation noise the source objective at the lifted point can sit
+        # just past the lifted bound (``t`` is only required to be >= the atom, so
+        # the lifted objective over-states the source one by the NLP's own
+        # tolerance). Weakening a bound to the verified objective is always valid.
+        bound = max(bound, obj) if maximize else min(bound, obj)
+        result.bound = bound
+        result.gap = abs(obj - bound) / max(1.0, abs(obj))
+    return result
 
 
 def _try_direct_milp(
@@ -687,7 +832,13 @@ def solve_mip_nlp(
     initial_point=None,
     **kwargs: Any,
 ) -> SolveResult:
-    """Solve a MINLP with a MIP-NLP decomposition method."""
+    """Solve a MINLP with a MIP-NLP decomposition method.
+
+    Two model classes are handled before the method's own driver (#1501): a model
+    with ``abs``/``max``/``min`` atoms in monotone positions is solved through its
+    exact smooth epigraph lifting (``nonsmooth.epigraph``) and the result mapped
+    back and re-verified; a pure LP is answered by the default route's LP engine.
+    """
     method = _normalize_method(method)
     from discopt._relax.factorable_reform import canonicalize_entropy
 
@@ -726,6 +877,34 @@ def solve_mip_nlp(
                 + ". Supported options are: "
                 + ", ".join(sorted(supported_keys))
             )
+
+        # #1501: an abs/max/min kink carries one subgradient, so neither the
+        # integer-free NLP solve nor an OA tangent there is a certificate. Lift
+        # every monotone-position atom to its exact smooth epigraph first; the
+        # method then runs on a smooth model and its certificates apply. A model
+        # already lifted is never lifted again.
+        if getattr(model, "_nsl_source_model", None) is None:
+            from discopt.transformations import get as _get_transformation
+
+            lifted = _get_transformation("nonsmooth.epigraph").apply(model)
+            if lifted is not model:
+                from discopt._relax.nonsmooth_lift import complete_lifted_point
+
+                lifted_x0 = (
+                    None if initial_point is None else complete_lifted_point(lifted, initial_point)
+                )
+                inner = solve_mip_nlp(
+                    lifted,
+                    method=method,
+                    mip_nlp_options=mip_nlp_options,
+                    time_limit=time_limit,
+                    gap_tolerance=gap_tolerance,
+                    max_iterations=max_iterations,
+                    nlp_solver=nlp_solver,
+                    initial_point=lifted_x0,
+                    **kwargs,
+                )
+                return _unlift_result(inner, model, lifted)
 
         if (
             profile == "shot"
@@ -799,6 +978,17 @@ def solve_mip_nlp(
         )
         if direct_result is not None:
             return direct_result
+
+        lp_result = _try_integer_free_lp(
+            model,
+            method=method,
+            profile=profile,
+            shot_config=shot_config,
+            options=options,
+            time_limit=time_limit,
+        )
+        if lp_result is not None:
+            return lp_result
 
         if method == "fp":
             from discopt.solvers.oa import _normalize_init_strategy, solve_feasibility_pump

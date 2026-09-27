@@ -5630,6 +5630,63 @@ def _gap_values_converged(
     return abs_gap / denom <= gap_tolerance
 
 
+#: The Rust spatial brancher's ``SPATIAL_MIN_WIDTH`` (``branching.rs``) doubled, so
+#: :func:`_may_be_tight_fathomed` errs toward "may be fathomed" (#1492).
+_TIGHT_FATHOM_REL_WIDTH = 2e-6
+#: ``INTEGRALITY_TOL`` of the Rust ``is_integer_feasible`` (``branching.rs``).
+_TREE_INTEGRALITY_TOL = 1e-5
+
+
+def _may_be_tight_fathomed(
+    node_lb: np.ndarray,
+    node_ub: np.ndarray,
+    sol: np.ndarray,
+    is_feasible: bool,
+    global_lb: np.ndarray,
+    global_ub: np.ndarray,
+    int_mask: np.ndarray,
+    spatial_int_cols: np.ndarray,
+) -> bool:
+    """Whether the Rust tree may fathom this node as a TIGHT box (#1492).
+
+    In nonconvex mode ``process_evaluated`` fathoms an integer-feasible node when no
+    dimension is branchable any more -- every continuous column narrower than
+    ``SPATIAL_MIN_WIDTH`` (1e-6) of its root width, every spatial-integer column
+    narrower than 1 -- and, when its bound is finite and its box finite, it drops
+    the node WITHOUT flooring the global bound at the node's lower bound. That is
+    sound only if a relative width of 1e-6 makes the node's relaxation gap
+    negligible, which fails wherever the objective is not Lipschitz: ``asin`` at
+    ``-1`` changes by ``sqrt(2*1e-6) = 1.4e-3`` over such a box, and the region's
+    optimum was certified away (bound 1.4e-3 above ``min asin(x) - x/2``).
+
+    A conservative mirror of that test: every condition the Rust arm needs is
+    checked with the same or a looser threshold, so any node the tree can fathom
+    this way reads True here (a spurious True only costs a floor that is a valid
+    bound anyway). Unbounded dimensions are treated as tight -- the tree marks
+    those unresolved itself.
+    """
+    if not is_feasible:
+        x = np.asarray(sol, dtype=np.float64)
+        xi = x[int_mask]
+        frac = xi - np.floor(xi)
+        # NaN compares False here, as it does in the Rust test (reads integral).
+        if np.any((frac > _TREE_INTEGRALITY_TOL) & (frac < 1.0 - _TREE_INTEGRALITY_TOL)):
+            return False  # the tree integer-branches instead
+    w = np.asarray(node_ub, dtype=np.float64) - np.asarray(node_lb, dtype=np.float64)
+    gw = np.asarray(global_ub, dtype=np.float64) - np.asarray(global_lb, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = w / gw
+    cont = (~int_mask) & (gw >= 1e-15) & np.isfinite(rel)
+    if np.any(rel[cont] >= _TIGHT_FATHOM_REL_WIDTH):
+        return False  # a continuous column is still bisected
+    if spatial_int_cols.size:
+        s = spatial_int_cols
+        s_branch = (w[s] >= 1.0 - 1e-9) & (gw[s] >= 1e-15) & np.isfinite(rel[s])
+        if np.any(s_branch):
+            return False  # a spatial-integer column is still partitioned
+    return True
+
+
 def _objective_at_reported_point(
     x: np.ndarray,
     c: np.ndarray,
@@ -12728,7 +12785,9 @@ def solve_model(
             _root_is_convex = False
             _pure_continuous_force_spatial = True
             # Fall through to the spatial B&B below.
-        elif has_clearable_denominator(model):
+        elif has_clearable_denominator(model) and (
+            (cleared := factorable_reformulate(model, clear_only=True)) is not model
+        ):
             # (2) An ill-conditioned division whose denominator reaches toward
             # zero (like st_e17's 0.2458*x0**2/x1 with x1 down to 1e-5). If the
             # model has a sign-definite non-constant denominator — which the
@@ -12736,29 +12795,47 @@ def solve_model(
             # value-preserving) and fall back to the sound spatial B&B, which can
             # certify it. Only clearing is applied (no convexity-destroying
             # mixed-product lift).
-            cleared = factorable_reformulate(model, clear_only=True)
-            if cleared is not model:
-                logger.info(
-                    "Convex NLP did not certify (status=%s); clearing sign-definite "
-                    "denominator and retrying via spatial B&B",
-                    result.status,
-                )
-                model = cleared
-                _pure_continuous_is_convex = False
-                _root_is_convex = False
-                _root_constraint_mask = None  # stale: cleared constraint is nonconvex
-                try:
-                    from discopt._rust import model_to_repr
+            logger.info(
+                "Convex NLP did not certify (status=%s); clearing sign-definite "
+                "denominator and retrying via spatial B&B",
+                result.status,
+            )
+            model = cleared
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _root_constraint_mask = None  # stale: cleared constraint is nonconvex
+            try:
+                from discopt._rust import model_to_repr
 
-                    _model_repr = model_to_repr(model, getattr(model, "_builder", None))
-                except Exception:
-                    _model_repr = None
-                # Fall through to the spatial B&B below (rebuilt from `model`).
-            else:
-                return result
+                _model_repr = model_to_repr(model, getattr(model, "_builder", None))
+            except Exception:
+                _model_repr = None
+            # Fall through to the spatial B&B below (rebuilt from `model`).
+        elif result.status == "error" and result.x is None:
+            # (3) #1507: the single NLP failed outright and left no verified
+            # point. The typical cause on a convex model is Ipopt's code 2
+            # (``Infeasible_Problem_Detected``), which ``_IPOPT_STATUS_MAP`` maps
+            # to ``error`` because a local-infeasibility verdict is not itself a
+            # proof. Returning that bare ``error`` abandons the question; the
+            # spatial B&B's relaxation is a sound outer approximation that can
+            # prove infeasibility (an empty relaxation) or find and certify a
+            # point, so hand the model to it -- the same fall-through the
+            # convexity-unknown route takes on an NLP error (#266). The convex
+            # shortcut is dropped (``_root_is_convex = False``) so NLP-BB does
+            # not re-run the same failing NLP; only an extra sound search is
+            # added, never a verdict.
+            logger.info(
+                "Convex NLP failed (status=error) with no verified point; "
+                "retrying via spatial B&B for a sound verdict (issue #1507)"
+            )
+            _pure_continuous_is_convex = False
+            _root_is_convex = False
+            _pure_continuous_force_spatial = True
+            # Fall through to the spatial B&B below.
         else:
-            # Nothing clearable and the model is smooth: return the NLP result
-            # unchanged (no regression).
+            # Nothing clearable, the model is smooth, and the NLP left a verified
+            # point or stopped on a limit: return the NLP result unchanged (no
+            # regression).
             return result
 
     # --- Pure continuous: solve directly only when spatial search was not requested ---
@@ -13251,6 +13328,12 @@ def solve_model(
     )
     tree.initialize()
     rust_time += time.perf_counter() - t_rust_start
+    # #1492: the box the Rust brancher measures relative widths against (its
+    # ``global_lb``/``global_ub`` never change after construction), and the columns
+    # it partitions as spatial integers -- read by ``_may_be_tight_fathomed``.
+    _tree_global_lb = np.asarray(lb, dtype=np.float64).copy()
+    _tree_global_ub = np.asarray(ub, dtype=np.float64).copy()
+    _tree_spatial_int_cols = np.zeros(0, dtype=np.int64)
 
     # --- Compile NLP evaluator ---
     t_jax_start = time.perf_counter()
@@ -13360,7 +13443,8 @@ def solve_model(
             & _dag_nonlinear_columns(model)
         )
         if _nl_int_cols_all:
-            tree.set_spatial_integer_cols(np.asarray(_nl_int_cols_all, dtype=np.int64))
+            _tree_spatial_int_cols = np.asarray(_nl_int_cols_all, dtype=np.int64)
+            tree.set_spatial_integer_cols(_tree_spatial_int_cols)
     _gap_certified = True
     # #1500: from here on every incumbent is screened -- the batch import gate and
     # the funnel below -- so this solve's result honours the feasibility callbacks.
@@ -13758,7 +13842,8 @@ def solve_model(
                     _mc_mode = "none" if _pure_discrete else "nlp"
                 else:
                     if _nl_int_cols:
-                        tree.set_spatial_integer_cols(np.asarray(_nl_int_cols, dtype=np.int64))
+                        _tree_spatial_int_cols = np.asarray(_nl_int_cols, dtype=np.int64)
+                        tree.set_spatial_integer_cols(_tree_spatial_int_cols)
                     # Deprioritize functionally-dependent continuous columns in
                     # spatial branching. Two disjoint sources, both of which are
                     # *outputs* pinned by the independent variables, so bisecting
@@ -17447,11 +17532,34 @@ def solve_model(
         # accepts only a strictly-improving feasible point and never touches the
         # dual bound, so this only ever tightens the incumbent — it cannot make
         # the search unsound, only complete.
-        if not _model_is_convex and int_offsets:
+        #
+        # #1492: the same holds for a node the tree will fathom as a TIGHT box
+        # (``_may_be_tight_fathomed``), integer or not -- it is removed with its
+        # bound dropped, so its relaxation point is the last chance to record the
+        # region's value. A pure-continuous model used to skip this guard entirely.
+        _tight_fathom = np.zeros(n_batch, dtype=bool)
+        if not _model_is_convex:
+            for i in range(n_batch):
+                if node_infeasible_mask[i] or not (result_lbs[i] < _SENTINEL_THRESHOLD):
+                    continue
+                _tb = _nr_pending.get(i) if _nr_pending else None
+                _tight_fathom[i] = _may_be_tight_fathomed(
+                    _tb[0] if _tb is not None else batch_lb[i],
+                    _tb[1] if _tb is not None else batch_ub[i],
+                    result_sols[i],
+                    bool(result_feas[i]),
+                    _tree_global_lb,
+                    _tree_global_ub,
+                    _nbb_int_mask,
+                    _tree_spatial_int_cols,
+                )
+        if not _model_is_convex and (int_offsets or np.any(_tight_fathom)):
             _cl = [c[0] for c in constraint_bounds] if constraint_bounds else None
             _cu = [c[1] for c in constraint_bounds] if constraint_bounds else None
             for i in range(n_batch):
                 if node_infeasible_mask[i] or result_lbs[i] >= _SENTINEL_THRESHOLD:
+                    continue
+                if not int_offsets and not _tight_fathom[i]:
                     continue
                 xi = np.asarray(result_sols[i], dtype=np.float64)
                 if not _is_integer_feasible_solution(xi, int_offsets, int_sizes):
@@ -17459,11 +17567,84 @@ def solve_model(
                 xr = xi.copy()
                 for _off, _sz in zip(int_offsets, int_sizes):
                     xr[_off : _off + _sz] = np.round(xr[_off : _off + _sz])
-                if _cl is not None and not _check_constraint_feasibility(evaluator, xr, _cl, _cu):
+                _cands = [xr]
+                if _tight_fathom[i]:
+                    # #1492: the relaxation point need not be the region's best
+                    # point (``min asin(x) - x/2`` on the tight box ``[-1, -1+1e-6]``
+                    # puts it at the upper end, the optimum sits at -1). Also try
+                    # the node-box vertex the objective gradient descends to,
+                    # moving continuous columns only.
+                    _tb = _nr_pending.get(i) if _nr_pending else None
+                    _vlo = np.asarray(_tb[0] if _tb is not None else batch_lb[i], np.float64)
+                    _vhi = np.asarray(_tb[1] if _tb is not None else batch_ub[i], np.float64)
+                    _xc = np.clip(xr, _vlo, _vhi)
+                    _g = np.asarray(evaluator.evaluate_gradient(_xc), dtype=np.float64)
+                    if _g.shape == _xc.shape and np.all(np.isfinite(_g)):
+                        _xv = np.where(_g > 0.0, _vlo, np.where(_g < 0.0, _vhi, _xc))
+                        _xv = np.where(_nbb_int_mask | ~np.isfinite(_xv), _xc, _xv)
+                        _cands.append(_xv)
+                for _xk in _cands:
+                    if _cl is not None and not _check_constraint_feasibility(
+                        evaluator, _xk, _cl, _cu
+                    ):
+                        continue
+                    _obj_i = float(evaluator.evaluate_objective(_xk))
+                    if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
+                        _inject_incumbent(_xk, _obj_i)
+
+        # #1492: a tight-box fathom drops the node's lower bound from the tree's
+        # dual bound (``_may_be_tight_fathomed``). When that bound is NOT within
+        # the certification gap of the incumbent, the removed region is unproven:
+        # keep it in the reported bound through the taint floor (the node's own
+        # bound and its pop-time bound are both valid for its box; the larger is
+        # kept) and decertify, exactly like a non-rigorous sentinel fathom -- the
+        # SPATIAL-CERT block re-earns the label if the floor-inclusive gap closes
+        # against a later incumbent. A tight node inside the gap needs nothing,
+        # which keeps every Lipschitz model on its existing path.
+        if np.any(_tight_fathom):
+            _tf_inc = tree.incumbent()
+            _tf_inc_val = float(_tf_inc[1]) if _tf_inc is not None else np.inf
+            _tf_pop = None
+            for i in (int(_q) for _q in np.flatnonzero(_tight_fathom)):
+                _tf_lb = float(result_lbs[i])
+                # The node's own bound can be far looser than the box warrants: a
+                # fixed-integer leaf of ``min -1.3x + sin(3y)`` on
+                # x = 2, y in [0, 9.3e-16] carries -3.6 (sin relaxed to [-1, 1])
+                # while the box holds only values near -2.6, and flooring at -3.6
+                # decertified a correct optimum. An outward-rounded interval
+                # enclosure of the objective over the same box is equally valid;
+                # keep the larger. ``_compute_interval_bound`` returns -inf when it
+                # cannot enclose, which leaves the node bound in charge.
+                _tb_iv = _nr_pending.get(i) if _nr_pending else None
+                _tf_lb = max(
+                    _tf_lb,
+                    _compute_interval_bound(
+                        model,
+                        _tb_iv[0] if _tb_iv is not None else batch_lb[i],
+                        _tb_iv[1] if _tb_iv is not None else batch_ub[i],
+                        _obj_negate,
+                    ),
+                )
+                if _gap_values_converged(_tf_inc_val, _tf_lb, gap_tolerance, abs_gap_tol):
                     continue
-                _obj_i = float(evaluator.evaluate_objective(xr))
-                if np.isfinite(_obj_i) and _obj_i < _SENTINEL_THRESHOLD:
-                    _inject_incumbent(xr, _obj_i)
+                if _tf_lb >= _tf_inc_val:
+                    continue  # pruned against the incumbent by the tree
+                if _tf_pop is None:
+                    _tf_pop = np.asarray(
+                        tree.node_lower_bounds(np.asarray(result_ids, dtype=np.int64)),
+                        dtype=np.float64,
+                    )
+                _tf_floor = max(_tf_lb, float(_tf_pop[i]))
+                _nonrigorous_fathom = True
+                _gap_certified = False
+                _taint_floor_internal = min(_taint_floor_internal, _tf_floor)
+                logger.debug(
+                    "Tight-box fathom at node %d with bound %.10g outside the gap of "
+                    "incumbent %.10g: kept as a floor of the reported bound (#1492)",
+                    int(result_ids[i]),
+                    _tf_floor,
+                    _tf_inc_val,
+                )
 
         # Interactive debugger: steer point — relaxations solved, results not
         # yet imported. Safe-steer (inject incumbent / branch hint) applies here;
@@ -18842,7 +19023,12 @@ _FW_LINE_SEARCH_ITERS = 50
 #: Relative size below which an exhibited "better" point is floating-point noise
 #: rather than evidence (#1499). It only decides whether the rigorous first-order
 #: bound below is REQUIRED; it can never loosen a certificate, since a point this
-#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see.
+#: close to ``L(x)`` changes nothing a tolerance of ``>= 1e-6`` could see. The
+#: Lagrangian arm scales it by the cancellation magnitude of its linearized gap as
+#: well (#1508): a gain a 1e-12 relative error in ``(x, lam)`` could produce is not
+#: evidence that ``x`` is suboptimal. Measured on nlp_cvx_001_010 (box +-1.3e12):
+#: the fake gain is ~ rho * cancel_mag for a relative perturbation ``rho``, so
+#: perturbations up to 1e-13 no longer withhold, and 1e-11 still does.
 _WITNESS_NOISE_REL = 1e-12
 
 
@@ -19109,7 +19295,22 @@ def _convex_nlp_certificate(
                     e_ = a + gr * (b - a)
                     fe = _lag(e_)
                 best = min(best, fc, fe)
-            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0)):
+            # Noise floor (#1508). By convexity the gain ``L0 - best`` is at most the
+            # linearized gap ``-reduced . d``, and ``reduced = grad + J^T lam`` is a
+            # CANCELLATION: at a stationary point its entries are the rounding residue
+            # of terms of size ``|grad_j| + sum_i |lam_i J_ij|``. A relative error
+            # ``rho`` in (x, lam) therefore moves ``-reduced . d`` by up to
+            # ``rho * cancel_mag`` with ``cancel_mag = sum_j |d_j| (|grad_j| +
+            # (|J|^T |lam|)_j)``. On a huge presolve box (+-1.3e12 on nlp_cvx_001_010)
+            # ``|d|`` makes that 1e-5..1e-2 at ``rho = 1e-15`` -- a "gain" that is
+            # multiplier noise, not a better point -- so the floor scales with it. A
+            # real descent (#1499: 8.8e-5 at cancel_mag 7.9e-3) stays far above it.
+            cancel_mag = float(np.abs(d) @ np.abs(grad))
+            if m > 0:
+                cancel_mag += float(np.abs(d) @ (np.abs(jac).T @ np.abs(lam)))
+            if not np.isfinite(cancel_mag):
+                cancel_mag = 0.0  # overflow: no noise credit, keep the #1499 floor
+            if L0 - best > _WITNESS_NOISE_REL * (1.0 + abs(L0) + cancel_mag):
                 # An in-box point beats the incumbent Lagrangian: the dual bound these
                 # multipliers support is below f(x), so f(x) is not a bound (#1499;
                 # before, only a beat by more than ``margin`` withheld). Certify only
@@ -19584,6 +19785,20 @@ def _solve_continuous(
     else:
         status = nlp_result.status.value
 
+    # #1493: ``SolveStatus.ERROR`` is where several distinct backend failures
+    # collapse (Ipopt's local-infeasibility code 2, restoration failure, diverging
+    # iterates, ...). A ``status="error"`` result with ``error=None`` gave the caller
+    # no way to tell which, so name the backend's own return code here, at the one
+    # place it is known.
+    _error_reason: Optional[str] = None
+    if status == "error":
+        from discopt.solvers.nlp_ipopt import describe_ipopt_return_code
+
+        _error_reason = (
+            f"single NLP solve ({nlp_solver}) terminated without a solution: "
+            f"{describe_ipopt_return_code(nlp_result.raw_status)}"
+        )
+
     x_dict = _unpack_solution(model, nlp_result.x) if nlp_result.x is not None else None
 
     # Negate objective back for maximization (NLPEvaluator solves minimization of -f)
@@ -19752,6 +19967,30 @@ def _solve_continuous(
             # An unverified point can never be reported as a proven optimum.
             if status == "optimal":
                 status = "unknown"
+            if _error_reason is not None:
+                _error_reason += "; its final iterate failed the feasibility screen"
+
+    # #1493: an NLP failure that nevertheless left a point which PASSED the
+    # false-primal screen above is not an error in the caller's terms -- it is a
+    # feasible incumbent without an optimality proof, which is exactly
+    # ``status="feasible"`` with no bound (``discopt.status`` state 3). Reporting it
+    # as ``"error"`` beside a feasible ``x`` (and ``error=None``) contradicted the
+    # point it returned: ``min norm(v, inf)`` s.t. ``v0 + v1 >= 1`` came back
+    # ``error`` at the feasible (0.545, 0.545). Only on the convexity-certified
+    # route: the convexity-unknown caller (#266) reads ``"error"`` as its cue to fall
+    # back to the spatial B&B, and that caller never surfaces this result.
+    # Downgrade-only in what it claims: no bound, no certificate.
+    if certify_convex and status == "error" and x_dict is not None:
+        logger.info(
+            "Convex single NLP failed (%s) but left a feasible point; reporting it "
+            "as an uncertified feasible incumbent (issue #1493).",
+            _error_reason,
+        )
+        status = "feasible"
+        _gap_certified = False
+        _c_bound = None
+        _c_gap = None
+        _error_reason = None
 
     # #1315: name the provenance of the bound this path reports. Under
     # ``certify_convex`` a local minimum of a PROVED-convex model is the global
@@ -19792,6 +20031,7 @@ def _solve_continuous(
         root_time=wall_time,
         gap_certified=_gap_certified,
         kkt=nlp_result.kkt,
+        error=_error_reason if status == "error" else None,
     )
 
 

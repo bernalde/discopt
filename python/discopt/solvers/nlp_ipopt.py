@@ -81,6 +81,40 @@ _IPOPT_STATUS_MAP: dict[int, SolveStatus] = {
     -5: SolveStatus.TIME_LIMIT,  # Maximum_WallTime_Exceeded
 }
 
+#: Ipopt ``ApplicationReturnStatus`` names, for the human-readable reason a
+#: ``status="error"`` result carries in :attr:`SolveResult.error` (#1493). Several
+#: codes collapse onto ``SolveStatus.ERROR`` above, so the mapped status alone
+#: cannot tell a caller which failure it was.
+IPOPT_RETURN_CODE_NAMES: dict[int, str] = {
+    0: "Solve_Succeeded",
+    1: "Solved_To_Acceptable_Level",
+    2: "Infeasible_Problem_Detected",
+    3: "Search_Direction_Becomes_Too_Small",
+    4: "Diverging_Iterates",
+    5: "User_Requested_Stop",
+    6: "Feasible_Point_Found",
+    -1: "Maximum_Iterations_Exceeded",
+    -2: "Restoration_Failed",
+    -3: "Error_In_Step_Computation",
+    -4: "Maximum_CpuTime_Exceeded",
+    -5: "Maximum_WallTime_Exceeded",
+    -10: "Not_Enough_Degrees_Of_Freedom",
+    -11: "Invalid_Problem_Definition",
+    -12: "Invalid_Option",
+    -13: "Invalid_Number_Detected",
+    -100: "Unrecoverable_Exception",
+    -101: "NonIpopt_Exception_Thrown",
+    -102: "Insufficient_Memory",
+    -199: "Internal_Error",
+}
+
+
+def describe_ipopt_return_code(code: Optional[int]) -> str:
+    """``"code 2 (Infeasible_Problem_Detected)"``, or ``"no return code"``."""
+    if code is None:
+        return "no return code"
+    return f"code {int(code)} ({IPOPT_RETURN_CODE_NAMES.get(int(code), 'unrecognized')})"
+
 
 def _charge_evaluator(method):
     """Charge a derivative callback's time to the evaluator's own layer.

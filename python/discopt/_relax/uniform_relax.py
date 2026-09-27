@@ -2200,8 +2200,19 @@ def _emit_secant_only(ctx, w, lt, lo, hi, f, sign) -> bool:
 def _pow_curv(p: float, lo: float, hi: float) -> Optional[str]:
     """Sound curvature of ``t**p`` on ``[lo,hi]`` (``f'' = p(p-1) t^(p-2)``)."""
     is_int = float(p).is_integer()
-    if is_int and int(p) % 2 == 0:
-        return "convex"  # even integer power: convex on all of R
+    if is_int and int(p) % 2 == 0 and p > 0.0:
+        return "convex"  # even POSITIVE integer power: convex on all of R
+    # #1493: a NEGATIVE even power (``t**-2``, ``t**-4``) is convex on each open
+    # half-line but has a pole at ``t = 0``, so it is convex on no interval that
+    # contains 0 -- it is not even finite there. Reading it as "convex on all of R"
+    # (the branch above, which used to admit every even integer) emitted the secant
+    # ``w <= f(hi)`` between the two finite endpoint values and the endpoint
+    # tangents as global underestimators; on ``[-3, 3]`` that is ``w <= 1/9``, which
+    # cuts off every point of ``x**-2 == 4`` and made the root LP report the
+    # feasible model infeasible. A box touching or straddling the pole has no
+    # curvature verdict; the aux keeps only its (sound) interval enclosure.
+    if p < 0.0 and lo <= 0.0 <= hi:
+        return None
     # Sign-definite box required otherwise (the only curvature change is at t=0,
     # and non-integer p needs t>=0 anyway).
     if lo < 0.0 < hi:
@@ -3622,9 +3633,44 @@ def _single_orig_affine(ctx: "_Builder", lt: "LinForm") -> Optional[tuple[int, f
     return None
 
 
-def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[float]:
+#: Most inflection points one univariate atom may inject into its partition
+#: (#1506). Each injected point splits a partition interval and costs one binary
+#: selector plus two continuous columns and ~10 rows, so the count must be bounded
+#: by something other than the box width: ``sin`` on ``[-1e9, 1e9]`` has ~6.4e8
+#: inflections, which the unbounded enumeration walked in pure Python inside the
+#: relaxation build, where no deadline is checked. 64 inflections is an argument
+#: span of ~64*pi ~ 201. This is a COST cap, not a tightness claim: below it the
+#: injected set is exactly the pre-#1506 enumeration, above it the extra pieces are
+#: simply not added (sound: see ``_univariate_inflection_args``).
+_MAX_INFLECTION_POINTS = 64
+
+
+def _periodic_inflection_range(fname: str, alo: float, ahi: float) -> Optional[tuple[int, int]]:
+    """``(k_min, k_max)`` such that the ``sin``/``cos`` inflections in ``[alo, ahi]``
+    are ``start + k*pi`` for ``k_min <= k <= k_max``, or ``None`` when an endpoint
+    is not finite (there are infinitely many; nothing can be enumerated).
+
+    O(1) whatever the width, so callers can COUNT before they enumerate.
+    """
+    if not (math.isfinite(alo) and math.isfinite(ahi)):
+        return None
+    start = 0.0 if fname == "sin" else 0.5 * math.pi
+    return math.ceil((alo - start) / math.pi), math.floor((ahi - start) / math.pi)
+
+
+def _univariate_inflection_args(
+    fname: str, alo: float, ahi: float, max_points: int = _MAX_INFLECTION_POINTS
+) -> Optional[list[float]]:
     """Curvature-change (inflection) points of ``fname`` inside ``(alo, ahi)`` in
-    ARGUMENT space, so each sub-interval is single-curvature."""
+    ARGUMENT space, so each sub-interval is single-curvature.
+
+    Returns ``None`` -- "too many to enumerate" -- when the interval is unbounded
+    or holds more than ``max_points`` inflections (#1506). ``None`` is not "no
+    inflections": the caller must not treat the interval as single-curvature. It
+    is safe to inject nothing for such an interval, because a piece that straddles
+    an inflection gets no curvature verdict and keeps only its sound interval
+    floor (``_emit_piecewise_1d`` emits no rows for ``curv is None``).
+    """
     out: list[float] = []
     # f'' has the sign of the argument -> inflection at 0.
     if fname in ("tan", "tanh", "atan", "asin", "asinh", "atanh", "erf", "sinh"):
@@ -3633,9 +3679,13 @@ def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[floa
         return out
     if fname in ("sin", "cos"):
         # sin'' = -sin (inflections at k*pi); cos'' = -cos (inflections at pi/2+k*pi).
+        rng = _periodic_inflection_range(fname, alo, ahi)
+        if rng is None:
+            return None
+        k_min, k_max = rng
+        if k_max - k_min + 1 > max_points:
+            return None
         start = 0.0 if fname == "sin" else 0.5 * math.pi
-        k_min = math.ceil((alo - start) / math.pi)
-        k_max = math.floor((ahi - start) / math.pi)
         for k in range(k_min, k_max + 1):
             p = start + k * math.pi
             if alo < p < ahi:
@@ -3643,12 +3693,57 @@ def _univariate_inflection_args(fname: str, alo: float, ahi: float) -> list[floa
     return out
 
 
+def _partition_inflection_args(
+    fname: str, coeff: float, const: float, pts: list[float]
+) -> list[float]:
+    """Inflection points (ARGUMENT space) to inject into the partition ``pts`` of
+    ``x`` for the atom ``fname(coeff*x + const)``, at most
+    ``_MAX_INFLECTION_POINTS`` of them (#1506).
+
+    When the whole box holds no more than the cap, every inflection is injected --
+    the pre-#1506 behaviour, unchanged. Otherwise (a wide box) each partition
+    interval gets its own inflections when it holds at most the cap still unspent,
+    so the narrow intervals AMP refines around the incumbent become
+    single-curvature while a wide interval stays one mixed-curvature piece with
+    its sound interval floor. The work is O(len(pts) + cap), independent of the
+    box width.
+    """
+    whole = _univariate_inflection_args(
+        fname,
+        min(coeff * pts[0] + const, coeff * pts[-1] + const),
+        max(coeff * pts[0] + const, coeff * pts[-1] + const),
+    )
+    if whole is not None:
+        return whole
+    out: list[float] = []
+    budget = _MAX_INFLECTION_POINTS
+    for k in range(len(pts) - 1):
+        a0 = coeff * pts[k] + const
+        a1 = coeff * pts[k + 1] + const
+        local = _univariate_inflection_args(fname, min(a0, a1), max(a0, a1), budget)
+        if local is None:
+            continue
+        out.extend(local)
+        budget -= len(local)
+        if budget <= 0:
+            break
+    return out
+
+
 def _tan_branch_safe(alo: float, ahi: float) -> bool:
-    """True iff ``[alo, ahi]`` contains no ``tan`` asymptote (pi/2 + k*pi)."""
+    """True iff ``[alo, ahi]`` contains no ``tan`` asymptote (pi/2 + k*pi).
+
+    O(1) in the width (#1506): an unbounded interval, or one at least ``pi`` wide,
+    always contains an asymptote; a narrower one can only contain the asymptotes
+    next to ``alo``, which are tested exactly as before.
+    """
     margin = 1e-6
-    k_min = math.floor((alo - 0.5 * math.pi) / math.pi) - 1
-    k_max = math.ceil((ahi - 0.5 * math.pi) / math.pi) + 1
-    for k in range(k_min, k_max + 1):
+    if not (math.isfinite(alo) and math.isfinite(ahi)):
+        return False
+    if (ahi + margin) - (alo - margin) >= math.pi:
+        return False
+    k0 = math.floor((alo - 0.5 * math.pi) / math.pi)
+    for k in range(k0 - 1, k0 + 3):
         asymptote = 0.5 * math.pi + k * math.pi
         if alo - margin <= asymptote <= ahi + margin:
             return False
@@ -3841,11 +3936,25 @@ def _apply_partition_refinement(ctx: "_Builder", disc_state: object) -> None:
         # Inject the function's inflection points (mapped from arg space to x space)
         # so no sub-interval straddles a curvature change; without this a partition
         # refined only near the incumbent leaves the inflection interval loose.
-        infl_x: list[float] = []
-        _e0 = coeff * float(ctx.col_lb[v]) + const
-        _e1 = coeff * float(ctx.col_ub[v]) + const
-        for a_infl in _univariate_inflection_args(fname, min(_e0, _e1), max(_e0, _e1)):
-            infl_x.append((a_infl - const) / coeff)
+        # The partition is resolved first -- ``_clamped_breakpoints`` refuses a
+        # non-finite box, which ``_clamped`` below would refuse anyway -- and the
+        # injection is bounded by the partition, not by the box width (#1506: an
+        # unbounded argument crashed ``math.ceil(-inf)`` here and a 1e9-wide one
+        # hung the build in an O(width) loop). ``min_intervals=1`` so a partition
+        # that only the inflections split into >= 2 pieces is still refined, as
+        # before.
+        base_pts = _clamped_breakpoints(
+            np.asarray(parts[v], dtype=np.float64),
+            float(ctx.col_lb[v]),
+            float(ctx.col_ub[v]),
+            min_intervals=1,
+        )
+        if base_pts is None:
+            continue
+        infl_x = [
+            (a_infl - const) / coeff
+            for a_infl in _partition_inflection_args(fname, coeff, const, base_pts)
+        ]
         pts = _clamped(v, infl_x)
         if pts is None:
             continue

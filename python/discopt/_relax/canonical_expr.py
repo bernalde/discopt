@@ -45,13 +45,18 @@ from typing import Any, Optional
 
 import numpy as np
 
-from discopt._relax.scalarize import scalar_elements, sum_is_full_reduction
+from discopt._relax.scalarize import (
+    scalar_elements,
+    scalar_matmul_contraction,
+    sum_is_full_reduction,
+)
 from discopt.modeling.core import (
     BinaryOp,
     Constant,
     Expression,
     FunctionCall,
     IndexExpression,
+    MatMulExpression,
     Model,
     Parameter,
     SumExpression,
@@ -485,6 +490,17 @@ class _Canonicalizer:
             if elems is None:
                 raise UnsupportedCanonicalization("sum reduction")
             return self._sum([(1.0, self.canon(e)) for e in elems], 0.0)
+
+        if isinstance(expr, MatMulExpression):
+            # A scalar-valued ``c @ x`` is the affine contraction ``sum_k c_k x_k``.
+            # Left opaque, it had no envelope and an unbounded aux column, so a
+            # trivial integer MILP written ``minimize(c @ x)`` got no dual bound
+            # from AMP (#1502) while the same model with scalar terms certified.
+            # ``None`` (array-valued, unknown shape, over the cap) keeps it opaque.
+            contraction = scalar_matmul_contraction(expr)
+            if contraction is None:
+                raise UnsupportedCanonicalization("matmul")
+            return self.canon(contraction)
 
         raise UnsupportedCanonicalization(type(expr).__name__)
 

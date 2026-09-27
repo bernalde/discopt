@@ -75,6 +75,7 @@ _MISS = object()
 
 __all__ = [
     "scalar_elements",
+    "scalar_matmul_contraction",
     "static_shape",
     "sum_result_shape",
     "sum_is_full_reduction",
@@ -248,6 +249,51 @@ def _broadcast(
         return tuple(int(d) for d in np.broadcast_shapes(ls, rs))
     except ValueError:
         return None
+
+
+def scalar_matmul_contraction(expr: MatMulExpression) -> Optional[Expression]:
+    """Explicit contraction ``sum_k left[k] * right[k]`` of a *scalar-valued* ``@``.
+
+    :func:`scalar_elements` returns a scalar expression unchanged (identity), so
+    a scalar-shaped matmul such as ``c @ x`` (1-D @ 1-D) comes back as the same
+    opaque :class:`MatMulExpression` node. A structural walker that understands
+    only scalar operators needs the contraction spelled out; this is it, built by
+    the same value-preserving :func:`_elem_matmul` the array case uses (#1502:
+    the objective ``c @ x`` of a trivial integer MILP reached the relaxation as
+    one opaque atom with an unbounded aux column, so AMP never produced a dual
+    bound).
+
+    ``None`` when the node is not provably scalar-valued or cannot be expanded —
+    the caller keeps its conservative path, never "assume scalar".
+    """
+    if static_shape(expr) != ():
+        return None
+    left_shape = static_shape(expr.left)
+    inner = int(left_shape[-1]) if left_shape else 0
+    if inner > MAX_SCALAR_ELEMENTS:
+        logger.warning(
+            "scalarize: refusing to expand a %d-term contraction (cap %d); "
+            "caller keeps its unexpanded path",
+            inner,
+            MAX_SCALAR_ELEMENTS,
+        )
+        return None
+    # A scalar result means both operands are 1-D (``_matmul_shape``). Emitted as
+    # one flat ``SumOverExpression`` rather than ``_elem_matmul``'s left-nested
+    # ``+`` chain, so a long contraction does not become a recursion-depth hazard
+    # for the recursive walkers that consume it.
+    try:
+        terms: list[Expression] = [
+            BinaryOp("*", _elem(expr.left, (k,)), _elem(expr.right, (k,))) for k in range(inner)
+        ]
+    except _Unscalarizable as exc:
+        logger.debug("scalarize: %s", exc)
+        return None
+    if not terms:  # an empty contraction is exactly zero
+        return Constant(0.0)
+    if len(terms) == 1:
+        return terms[0]
+    return SumOverExpression(terms)
 
 
 def scalar_elements(expr: Expression) -> Optional[list[Expression]]:
