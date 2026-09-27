@@ -3445,14 +3445,17 @@ class TestCurrentCodeWeaknesses:
         monkeypatch.setattr(disc_mod, "initialize_partitions", spy_initialize)
         monkeypatch.setattr(amp_mod, "_solve_milp_with_oa_recovery", stop_after_init)
 
-        result = amp_mod.solve_amp(
-            _make_obbt_demo(),
-            presolve_bt=True,
-            max_iter=1,
-            time_limit=1.0,
-        )
+        # #1502: an exception out of AMP's MILP build propagates (it used to be
+        # caught and turned into ``status="error"``), so the injected stop surfaces
+        # here -- after partition initialization, which is what this test checks.
+        with pytest.raises(RuntimeError, match="stop after initialization"):
+            amp_mod.solve_amp(
+                _make_obbt_demo(),
+                presolve_bt=True,
+                max_iter=1,
+                time_limit=1.0,
+            )
 
-        assert result.status == "error"
         assert captured["lb"] == [0.0, 0.0]
         assert captured["ub"] == [1.0, 1.0]
 
