@@ -385,7 +385,7 @@ _EXTRACTION_DECLINES = (_NotLinearError, _NotQuadraticError)
 #: converter has no arm for (``CustomCall``, an unsupported index component) and
 #: ``IndexError`` for a subscript it refuses (a boolean index, an out-of-range
 #: component). Every narrowed ``model_to_repr`` call site absorbs exactly these.
-MODEL_TO_REPR_DECLINES: tuple[type[Exception], ...] = (ValueError, TypeError, IndexError)
+MODEL_TO_REPR_DECLINES = (ValueError, TypeError, IndexError)
 _MODEL_TO_REPR_DECLINES = MODEL_TO_REPR_DECLINES
 
 
