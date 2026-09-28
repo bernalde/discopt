@@ -17,7 +17,9 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use discopt_core::bnb::spatial_kernel::{BlfTerm, EnvTerm, FixedRow, SpatialKernelSpec};
-use discopt_core::bnb::spatial_tree::{solve_spatial_tree, SpatialTreeConfig, TreeStatus};
+use discopt_core::bnb::spatial_tree::{
+    solve_spatial_tree_with_hook, PrimalHook, SpatialTreeConfig, TreeStatus,
+};
 use discopt_core::lp::simplex::SimplexOptions;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -44,7 +46,7 @@ use std::time::{Duration, Instant};
     min_box_width=1e-9, run_obbt=false, run_propagation=true,
     propagation_rounds=15, initial_incumbent=None, time_limit_s=None,
     incumbent_time_extension_s=None, bound_time_extension_s=None,
-    cold_dual_start=false,
+    cold_dual_start=false, primal_hook=None,
 ))]
 pub fn solve_spatial_tree_py<'py>(
     py: Python<'py>,
@@ -90,6 +92,7 @@ pub fn solve_spatial_tree_py<'py>(
     incumbent_time_extension_s: Option<f64>,
     bound_time_extension_s: Option<f64>,
     cold_dual_start: bool,
+    primal_hook: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let c = c.as_slice()?;
     let integrality = integrality.as_slice()?;
@@ -334,8 +337,43 @@ pub fn solve_spatial_tree_py<'py>(
         ..SimplexOptions::default()
     };
 
+    // #1522: the optional primal hook, `primal_hook(x, incumbent) -> None |
+    // (value, point_list)`. `x` is the node's LP point (all `n_cols` columns),
+    // `incumbent` the current value or None; a returned `value` must be the
+    // internal-units objective of a point the caller has VERIFIED feasible. The
+    // tree runs with the GIL released, so each call re-acquires it. A Python
+    // exception is not a "no improvement": the first one is kept, the hook is not
+    // called again, and the error is raised once the tree returns (CLAUDE.md §7).
+    let mut hook_err: Option<PyErr> = None;
     // Release the GIL for the (potentially long) solve.
-    let res = py.allow_threads(|| solve_spatial_tree(&spec, &cfg, &opts));
+    let res = py.allow_threads(|| match primal_hook.as_ref() {
+        None => solve_spatial_tree_with_hook(&spec, &cfg, &opts, None),
+        Some(cb) => {
+            let mut call = |x: &[f64], inc: Option<f64>| -> Option<(f64, Vec<f64>)> {
+                if hook_err.is_some() {
+                    return None;
+                }
+                Python::with_gil(|py| {
+                    let arr = PyArray1::from_slice(py, x);
+                    match cb
+                        .call1(py, (arr, inc))
+                        .and_then(|r| r.extract::<Option<(f64, Vec<f64>)>>(py))
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            hook_err = Some(e);
+                            None
+                        }
+                    }
+                })
+            };
+            let hook: &mut PrimalHook<'_> = &mut call;
+            solve_spatial_tree_with_hook(&spec, &cfg, &opts, Some(hook))
+        }
+    });
+    if let Some(e) = hook_err {
+        return Err(e);
+    }
 
     let status = match res.status {
         TreeStatus::Optimal => "optimal",
@@ -366,5 +404,8 @@ pub fn solve_spatial_tree_py<'py>(
     // non-finite bound -- root region certified empty, root LP undecided, and the
     // search never reaching node 1 -- and all three map to `root_bound=None`.
     out.set_item("root_status", res.root_status)?;
+    // #1522: whether the primal hook fired and how often it replaced the incumbent.
+    out.set_item("n_primal_hook_calls", res.n_primal_hook_calls)?;
+    out.set_item("n_primal_hook_improvements", res.n_primal_hook_improvements)?;
     Ok(out)
 }

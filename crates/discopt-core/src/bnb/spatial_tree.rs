@@ -304,7 +304,38 @@ pub struct SpatialTreeResult {
     /// this they are the same observation from Python, which is the §6 conflation
     /// this instrumentation exists to remove, reproduced inside it.
     pub root_status: &'static str,
+    /// #1522: how many times the caller's primal hook was consulted, and how many
+    /// of those calls replaced the incumbent. Reported so a panel can tell "the
+    /// hook never fired" from "it fired and found nothing" (CLAUDE.md §6). Both
+    /// are 0 when no hook was supplied.
+    pub n_primal_hook_calls: usize,
+    /// #1522: primal-hook calls that replaced the incumbent (see above).
+    pub n_primal_hook_improvements: usize,
 }
+
+/// A caller-supplied primal heuristic for [`solve_spatial_tree_with_hook`] (#1522).
+///
+/// Called with a node's LP point (all `n_cols` columns) and the current incumbent
+/// value; returns `Some((value, point))` ONLY for a point the caller has
+/// independently VERIFIED feasible for the problem being solved, `value` being that
+/// point's objective in the kernel's internal minimize units. The kernel adopts it
+/// as the incumbent when it strictly improves, and records `point` as
+/// `incumbent_x` (so `incumbent_x` may then be shorter than `n_cols`: it holds
+/// whatever columns the caller's point carries).
+///
+/// Why the kernel needs one. Its only internal source of incumbents is an LP vertex
+/// at which every lifted term is McCormick-tight to `mccormick_tol`. When the
+/// optimum lies on a curved manifold (an equality whose lifted terms are tight only
+/// on tiny boxes) that condition is met rarely and far from the optimum: on MINLPLib
+/// `prob09` with no external seed, 100k nodes produced incumbents 2e-3 above an
+/// optimum the root bound had already proven, so the gap could never close. One
+/// local NLP from the first such vertex lands on the optimum.
+///
+/// Soundness. The value only prunes: the reported bound is still the min of the
+/// closed regions' rigorous bounds, so a hook can never make the bound invalid —
+/// but a value that no feasible point attains would prune regions that hold the
+/// optimum, which is why the contract demands a verified point.
+pub type PrimalHook<'a> = dyn FnMut(&[f64], Option<f64>) -> Option<(f64, Vec<f64>)> + 'a;
 
 /// True value of a lifted term at the point `x` (structural columns), for the
 /// McCormick-exactness feasibility test. `None` for a sqrt of a negative argument
@@ -395,6 +426,21 @@ pub fn solve_spatial_tree(
     config: &SpatialTreeConfig,
     opts: &SimplexOptions,
 ) -> SpatialTreeResult {
+    solve_spatial_tree_with_hook(spec, config, opts, None)
+}
+
+/// [`solve_spatial_tree`] with an optional caller primal heuristic (#1522); see
+/// [`PrimalHook`]. It is consulted when the tree accepts a new McCormick-tight
+/// incumbent and at nodes 1, 2, 4, 8, ... (a geometric schedule, so the calls grow
+/// with the logarithm of the node count). `None` is exactly [`solve_spatial_tree`].
+pub fn solve_spatial_tree_with_hook(
+    spec: &SpatialKernelSpec,
+    config: &SpatialTreeConfig,
+    opts: &SimplexOptions,
+    mut hook: Option<&mut PrimalHook<'_>>,
+) -> SpatialTreeResult {
+    let mut n_primal_hook_calls = 0usize;
+    let mut n_primal_hook_improvements = 0usize;
     // Best-bound frontier: a min-heap on the inherited lower bound. Exploring the
     // lowest-bound region first lifts the global frontier minimum (the reported dual
     // bound) as fast as possible — the key to certifying instances like tanksize
@@ -514,6 +560,8 @@ pub fn solve_spatial_tree(
                 root_bound,
                 root_time_s,
                 root_status,
+                n_primal_hook_calls,
+                n_primal_hook_improvements,
             };
         }
         // Fathom by the parent bound if the incumbent already dominates it. The
@@ -544,6 +592,8 @@ pub fn solve_spatial_tree(
                 root_bound,
                 root_time_s,
                 root_status,
+                n_primal_hook_calls,
+                n_primal_hook_improvements,
             };
         }
         node_count += 1;
@@ -723,6 +773,7 @@ pub fn solve_spatial_tree(
         }
         let terms_tight = worst_gap <= config.mccormick_tol;
 
+        let mut accepted_lp_point = false;
         if int_ok && terms_tight {
             // Feasible point: accept if it improves the incumbent. The objective is
             // linear over the (now-tight) lifted columns, so `cᵀx` is the true
@@ -731,20 +782,39 @@ pub fn solve_spatial_tree(
             if incumbent.map(|inc| obj < inc - 1e-12).unwrap_or(true) {
                 incumbent = Some(obj);
                 incumbent_x = x[..spec.n_cols].to_vec();
+                accepted_lp_point = true;
             }
-            // CLOSE the region ONLY when its rigorous bound certifies that no
-            // point in it beats the incumbent by more than the gap. A feasible
-            // point does NOT prove the region optimal — with a loose bound the
-            // region may hold BETTER points, so it must be branched further
-            // (closing here would be a premature fathom → a false certificate).
-            let inc_now = incumbent.unwrap();
+        }
+        // #1522: the caller's local primal step, from this node's LP point. Adopted
+        // only on strict improvement; the caller has verified the point.
+        if let Some(h) = hook.as_mut() {
+            if accepted_lp_point || node_count.is_power_of_two() {
+                n_primal_hook_calls += 1;
+                if let Some((v, xp)) = h(x, incumbent) {
+                    if v.is_finite() && incumbent.map(|inc| v < inc - 1e-12).unwrap_or(true) {
+                        incumbent = Some(v);
+                        incumbent_x = xp;
+                        n_primal_hook_improvements += 1;
+                    }
+                }
+            }
+        }
+        // CLOSE the region ONLY when its rigorous bound certifies that no point in
+        // it beats the incumbent by more than the gap. A feasible point does NOT
+        // prove the region optimal — with a loose bound the region may hold BETTER
+        // points, so it must be branched further (closing here would be a premature
+        // fathom → a false certificate). The incumbent can only have changed since
+        // the bound-vs-incumbent fathom above through the two updates just made, so
+        // with no hook this fires exactly where it did when it sat inside the
+        // feasible branch.
+        if let Some(inc_now) = incumbent {
             if gap_closed(bound, inc_now, config) {
                 global_lb_closed = global_lb_closed.min(bound);
                 continue;
             }
-            // fall through to branching (branch_col may be None: all terms tight —
-            // the widest-column fallback below picks the split).
         }
+        // fall through to branching (branch_col may be None: all terms tight — the
+        // widest-column fallback below picks the split).
 
         // --- Branch --- //
         // Prefer closing an integer infeasibility; else spatial-branch the worst
@@ -811,6 +881,8 @@ pub fn solve_spatial_tree(
                 root_bound,
                 root_time_s,
                 root_status,
+                n_primal_hook_calls,
+                n_primal_hook_improvements,
             }
         }
         None => SpatialTreeResult {
@@ -827,6 +899,8 @@ pub fn solve_spatial_tree(
             root_bound,
             root_time_s,
             root_status,
+            n_primal_hook_calls,
+            n_primal_hook_improvements,
         },
     }
 }
@@ -939,7 +1013,7 @@ mod tests {
     // True feasible region on [0,2]^2 with x+y>=3: the min of x*y is 2 (corners
     // (2,1),(1,2)); the interior x=y=1.5 gives 2.25 > 2. McCormick underestimates
     // at the root, so B&B must branch to certify 2.0.
-    fn xy_min_spec() -> SpatialKernelSpec {
+    pub(super) fn xy_min_spec() -> SpatialKernelSpec {
         SpatialKernelSpec {
             n_cols: 3,
             n_orig: 2,
@@ -1610,5 +1684,109 @@ mod gap_criterion_tests {
             }
         }
         assert_eq!(checked, 35, "probe ran {checked} comparisons");
+    }
+
+    /// #1522: with no hook, `solve_spatial_tree_with_hook` is `solve_spatial_tree`
+    /// node-for-node — the incumbent re-check was moved out of the feasible branch,
+    /// and this pins that the move changed nothing.
+    #[test]
+    fn no_hook_is_node_for_node_identical() {
+        let spec = super::tests::xy_min_spec();
+        let cfg = SpatialTreeConfig {
+            max_nodes: 5000,
+            gap_tol: 1e-5,
+            ..SpatialTreeConfig::default()
+        };
+        let a = solve_spatial_tree(&spec, &cfg, &SimplexOptions::default());
+        let b = solve_spatial_tree_with_hook(&spec, &cfg, &SimplexOptions::default(), None);
+        assert_eq!(a.status, b.status);
+        assert_eq!(a.node_count, b.node_count);
+        assert_eq!(a.incumbent, b.incumbent);
+        assert_eq!(a.bound, b.bound);
+        assert_eq!(
+            (b.n_primal_hook_calls, b.n_primal_hook_improvements),
+            (0, 0)
+        );
+    }
+
+    /// `max x*y s.t. x + y <= 3` over `[0,2]^2` as `min -w`, optimum -2.25 at
+    /// (1.5, 1.5). The root McCormick LP sits at `w = 3`, not tight, so the kernel
+    /// has to branch before it can accept a point of its own.
+    fn xy_max_spec() -> SpatialKernelSpec {
+        SpatialKernelSpec {
+            n_cols: 3,
+            n_orig: 2,
+            c: vec![0.0, 0.0, -1.0],
+            integrality: vec![false, false, false],
+            global_lo: vec![0.0, 0.0, -1e20],
+            global_hi: vec![2.0, 2.0, 1e20],
+            fixed_rows: vec![crate::bnb::spatial_kernel::FixedRow {
+                cols: vec![0, 1],
+                coeffs: vec![1.0, 1.0],
+                rhs: 3.0,
+            }],
+            terms: vec![EnvTerm::Bilinear { i: 0, j: 1, w: 2 }],
+            blf_terms: vec![],
+            obbt_candidates: vec![0, 1],
+        }
+    }
+
+    /// #1522: a hook handing back the optimum at the root is adopted, recorded as
+    /// the incumbent point, never moves the bound above the optimum, and costs no
+    /// nodes; a hook that finds nothing is consulted but leaves the search
+    /// node-for-node unchanged.
+    #[test]
+    fn primal_hook_is_adopted_only_on_improvement() {
+        let spec = xy_max_spec();
+        let cfg = SpatialTreeConfig {
+            max_nodes: 5000,
+            gap_tol: 1e-5,
+            ..SpatialTreeConfig::default()
+        };
+        let base = solve_spatial_tree(&spec, &cfg, &SimplexOptions::default());
+        assert!(
+            base.node_count > 1,
+            "the control must need to branch: {base:?}"
+        );
+
+        let mut calls = 0usize;
+        let mut good = |_x: &[f64], _inc: Option<f64>| -> Option<(f64, Vec<f64>)> {
+            calls += 1;
+            Some((-2.25, vec![1.5, 1.5, 2.25])) // feasible and optimal
+        };
+        let res =
+            solve_spatial_tree_with_hook(&spec, &cfg, &SimplexOptions::default(), Some(&mut good));
+        assert_eq!(res.status, TreeStatus::Optimal);
+        let inc = res.incumbent.expect("incumbent");
+        assert!((inc + 2.25).abs() < 1e-9, "incumbent {inc} != -2.25");
+        assert!(
+            res.bound <= -2.25 + 1e-6,
+            "bound {} above the optimum",
+            res.bound
+        );
+        assert!(res.n_primal_hook_improvements >= 1);
+        assert_eq!(res.n_primal_hook_calls, calls);
+        assert!(
+            res.node_count <= base.node_count,
+            "an optimal cutoff from node 1 cost nodes: {} > {}",
+            res.node_count,
+            base.node_count
+        );
+
+        let mut nothing = |_x: &[f64], _inc: Option<f64>| -> Option<(f64, Vec<f64>)> { None };
+        let res_w = solve_spatial_tree_with_hook(
+            &spec,
+            &cfg,
+            &SimplexOptions::default(),
+            Some(&mut nothing),
+        );
+        assert!(
+            res_w.n_primal_hook_calls >= 1,
+            "the hook was never consulted"
+        );
+        assert_eq!(res_w.n_primal_hook_improvements, 0);
+        assert_eq!(res_w.node_count, base.node_count);
+        assert_eq!(res_w.incumbent, base.incumbent);
+        assert_eq!(res_w.bound, base.bound);
     }
 }

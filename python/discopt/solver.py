@@ -1190,6 +1190,10 @@ def _native_kernel_verify_point(model, x_flat, source=None):
 
 #: Wall-clock cap on the one local re-solve :func:`_native_kernel_repair_point` makes.
 _NATIVE_REPAIR_MAX_S = 5.0
+#: Per-call cap for the in-tree primal hook (:func:`_native_kernel_primal_hook`). The
+#: hook fires O(log nodes) times plus once per kernel incumbent, so this bounds the
+#: total it can take from the tree's budget.
+_NATIVE_HOOK_MAX_S = 1.0
 
 
 def _native_kernel_source_only_failure(model, x_flat, source) -> bool:
@@ -1211,7 +1215,7 @@ def _native_kernel_source_only_failure(model, x_flat, source) -> bool:
     return not verify_point(src_model, x[: int(src_nvars)]).ok
 
 
-def _native_kernel_repair_point(model, x_flat, source, outer_deadline):
+def _native_kernel_repair_point(model, x_flat, source, outer_deadline, max_s=None):
     """One KKT-accurate local re-solve of the lift from ``x_flat`` (#1522).
 
     Returns ``(x_new, model_objective)`` for a point that verifies on the lift AND on
@@ -1222,14 +1226,24 @@ def _native_kernel_repair_point(model, x_flat, source, outer_deadline):
     rather than to widen any tolerance. Integer columns are fixed at their rounded
     values and the box is the lift's declared box, exactly as the Python engine's
     terminal polish does. A point that does not verify is never adopted.
+
+    The same step is the kernel's in-tree primal heuristic
+    (:func:`_native_kernel_primal_hook`), started from a node's LP point rather than
+    from a reported incumbent; ``max_s`` then caps each call below
+    ``_NATIVE_REPAIR_MAX_S``.
     """
     from discopt._tape_nlp_evaluator import make_evaluator
     from discopt.validation.feasibility import model_integer_mask
 
-    budget = _NATIVE_REPAIR_MAX_S
-    if outer_deadline is not None:
-        budget = min(budget, float(outer_deadline) - time.perf_counter())
-    if budget <= 0.0:
+    cap = _NATIVE_REPAIR_MAX_S if max_s is None else float(max_s)
+    # The cap decides how much local-NLP work runs, so it is a role-2 budget
+    # (#912/#1187): under ``deterministic`` it gives way to the role-1 remainder and
+    # the NLP stops on its own iteration/convergence criteria instead of on machine
+    # speed. ``None`` = no clock at all (no role-1 deadline either).
+    budget = _role2_budget(
+        cap if outer_deadline is None else min(cap, float(outer_deadline) - time.perf_counter())
+    )
+    if budget is not None and budget <= 0.0:
         return None
     evaluator = make_evaluator(model)
     lb, ub = flat_variable_bounds(model)
@@ -1248,7 +1262,8 @@ def _native_kernel_repair_point(model, x_flat, source, outer_deadline):
     constraint_bounds = list(zip(cl, cu)) if cl else None
     opts = pounce_option_defaults()
     opts.update(pounce_incumbent_options())
-    opts["max_wall_time"] = float(budget)
+    if budget is not None:
+        opts["max_wall_time"] = float(budget)
     opts["print_level"] = 0
     res = _solve_node_nlp_kkt(evaluator, x0, fix_lb, fix_ub, constraint_bounds, opts)
     if res.status != SolveStatus.OPTIMAL or res.x is None:
@@ -1260,6 +1275,54 @@ def _native_kernel_repair_point(model, x_flat, source, outer_deadline):
     if not ok or obj is None:
         return None
     return x_new, float(obj)
+
+
+def _native_kernel_primal_hook(model, source, sign, off, n_orig, outer_deadline):
+    """The kernel's in-tree primal step (#1522, ``SolverTuning.native_nlp_primal``).
+
+    Returns ``hook(x, incumbent)`` for ``solve_spatial_tree_py(primal_hook=...)``.
+    From the node's LP point ``x`` (the first ``n_orig`` columns are the lift's
+    variables) it runs :func:`_native_kernel_repair_point`, which returns only a point
+    verified on the lift AND on the pre-reform ``source``; its model-units objective
+    is mapped to the kernel's internal minimize units with the seed's
+    ``internal = sign * model_obj - off``. ``None`` means nothing better was found.
+
+    Every call is counted in ``counts`` (attached as ``hook.counts``) so the caller
+    can report the hook's firings next to the kernel's own counters.
+    """
+    counts = {"calls": 0, "verified": 0}
+
+    def hook(x, incumbent):
+        try:
+            return _step(x, incumbent)
+        except Exception as exc:
+            # Re-raised by the kernel binding once the tree returns; recorded so
+            # ``_try_native_spatial_kernel`` propagates it instead of treating it
+            # as a declined model.
+            counts["error"] = exc
+            raise
+
+    def _step(x, incumbent):
+        counts["calls"] += 1
+        if outer_deadline is not None and time.perf_counter() >= outer_deadline:
+            return None
+        x0 = np.asarray(x, dtype=np.float64)[:n_orig]
+        out = _native_kernel_repair_point(
+            model, x0, source, outer_deadline, max_s=_NATIVE_HOOK_MAX_S
+        )
+        if out is None:
+            return None
+        x_new, model_obj = out
+        internal = sign * float(model_obj) - off
+        if not math.isfinite(internal):
+            return None
+        if incumbent is not None and not internal < float(incumbent) - 1e-12:
+            return None
+        counts["verified"] += 1
+        return internal, [float(v) for v in x_new]
+
+    hook.counts = counts  # type: ignore[attr-defined]
+    return hook
 
 
 # Cap on the number of FREE integers (span > 0.5 in the presolved box) the seed
@@ -1710,6 +1773,7 @@ def _try_native_spatial_kernel(
     # producer build and the NLP seed phase are JAX, the tree is Rust.
     _native_jax_s = 0.0
     _native_rust_s = 0.0
+    _primal_hook = None
     try:
         from discopt import _rust
         from discopt._relax.spatial_producer import build_spatial_kernel_spec
@@ -1831,12 +1895,22 @@ def _try_native_spatial_kernel(
             solve_kwargs["incumbent_time_extension_s"] = float(incumbent_time_extension)
         if initial_incumbent is not None:
             solve_kwargs["initial_incumbent"] = float(initial_incumbent)
+        if _tuning().native_nlp_primal:
+            _primal_hook = _native_kernel_primal_hook(
+                model, source, sign, off, n_orig, outer_deadline
+            )
+            solve_kwargs["primal_hook"] = _primal_hook
         _t_phase = time.perf_counter()
         with _timing.charge("rust"):
             res = _rust.solve_spatial_tree_py(**spec, **solve_kwargs)
         _native_rust_s += time.perf_counter() - _t_phase
         res.update(meta)
     except Exception as exc:  # pragma: no cover - defensive
+        # #1522: an exception out of the primal hook is a defect in OUR code, not
+        # an out-of-scope model; it must not be downgraded to a DEBUG "skipped"
+        # (CLAUDE.md §7). The hook records what it raised so it can be told apart.
+        if _primal_hook is not None and _primal_hook.counts.get("error") is exc:
+            raise
         logger.debug("native spatial kernel skipped: %s", exc)
         return None
     if res is None:
@@ -2116,6 +2190,13 @@ def _try_native_spatial_kernel(
     _native_stats["tree/lp_solves"] = float(int(res.get("n_lp_solves") or 0))
     _native_stats["tree/uncertified_nodes"] = float(int(res.get("n_uncertified") or 0))
     _native_stats["tree/undecided_nodes"] = float(int(res.get("n_undecided") or 0))
+    # #1522: the in-tree primal hook's firings, and how often the kernel adopted what
+    # it returned. Both 0 with ``native_nlp_primal`` off; a panel reads these to tell
+    # "never fired" from "fired and found nothing" (CLAUDE.md §6).
+    _native_stats["tree/primal_hook_calls"] = float(int(res.get("n_primal_hook_calls") or 0))
+    _native_stats["tree/primal_hook_improvements"] = float(
+        int(res.get("n_primal_hook_improvements") or 0)
+    )
 
     # #1236: root-node certification metrics, mapped out of the kernel's internal
     # minimize convention with the same ``sign * (value + offset)`` the incumbent

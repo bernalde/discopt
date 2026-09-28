@@ -123,3 +123,74 @@ def test_time_limited_exit_never_reports_a_source_infeasible_point():
         assert ok, viols
     else:
         assert r.objective is None
+
+
+# --------------------------------------------------------------------------- #
+# Item 4: why 100k nodes did not close, and the in-tree primal step
+# --------------------------------------------------------------------------- #
+# The dual side was never the problem: FBBT on the sum of squares gives ``t >= 0``,
+# so the kernel's root bound is already the optimum. The kernel's only internal
+# incumbents are LP vertices whose lifted terms are McCormick-tight, and on the
+# curved valley ``y = x**2`` those appear only on tiny boxes, far from (1, 1): with
+# no NLP seed, 100k nodes ended 2.3e-3 above the optimum. ``native_nlp_primal``
+# lets the kernel run one verified local NLP from a node's LP point.
+
+FLAG = "DISCOPT_NATIVE_NLP_PRIMAL"
+
+
+def _unseeded_solve(monkeypatch, flag: str, max_nodes: int):
+    monkeypatch.setattr(S, "_native_kernel_seed", lambda *a, **k: (None, None))
+    monkeypatch.setenv(FLAG, flag)
+    return _prob09().solve(deterministic=True, max_nodes=max_nodes)
+
+
+def test_unseeded_kernel_cannot_close_without_the_primal_step(monkeypatch):
+    r = _unseeded_solve(monkeypatch, "0", 2000)
+    st = r.solver_stats or {}
+    assert st.get("tree/nodes") == 2000.0, "must be the kernel's own node-limited exit"
+    assert r.status == "node_limit"
+    assert st.get("tree/primal_hook_calls") == 0.0
+
+
+def test_primal_step_certifies_the_unseeded_kernel(monkeypatch):
+    r = _unseeded_solve(monkeypatch, "1", 2000)
+    st = r.solver_stats or {}
+    assert st.get("tree/nodes") is not None, "must be the kernel's result, not a fallback"
+    assert st["tree/primal_hook_calls"] >= 1 and st["tree/primal_hook_improvements"] >= 1
+    assert r.status == "optimal" and r.gap_certified
+    assert st["tree/nodes"] < 2000
+    assert r.bound <= 1e-9 and r.objective == pytest.approx(0.0, abs=1e-6)
+    ok, viols = warm_start.check_feasibility(_prob09(), _flat(r))
+    assert ok, viols
+
+
+def test_primal_hook_returns_only_verified_improvements(monkeypatch):
+    lifted = factorable_reformulate(_prob09())
+    src, lift = _issue_point()
+    hook = S._native_kernel_primal_hook(lifted, (_prob09(), 3), 1.0, 0.0, 4, None)
+
+    got = hook(np.append(lift, [7.0, 7.0]), None)  # trailing McCormick columns ignored
+    assert got is not None
+    value, point = got
+    assert len(point) == 4
+    assert S._native_kernel_verify_point(lifted, np.array(point), source=(_prob09(), 3))[0]
+    assert value == pytest.approx(point[2])
+    # Not an improvement on an incumbent it cannot beat.
+    assert hook(lift, value - 1.0) is None
+    # Nothing is returned when the local NLP's point does not verify.
+    monkeypatch.setattr(S, "_native_kernel_verify_point", lambda *a, **k: (False, None))
+    assert hook(lift, None) is None
+    assert hook.counts["calls"] == 3 and hook.counts["verified"] == 1
+
+
+def test_a_primal_hook_defect_is_raised_not_skipped(monkeypatch):
+    """The kernel call sits under a defensive ``except`` that logs "skipped" at
+    DEBUG; an exception from OUR hook must not be downgraded to that (CLAUDE.md §7).
+    """
+
+    def boom(*a, **k):
+        raise RuntimeError("hook defect #1522")
+
+    monkeypatch.setattr(S, "_native_kernel_repair_point", boom)
+    with pytest.raises(RuntimeError, match="hook defect #1522"):
+        _unseeded_solve(monkeypatch, "1", 50)
