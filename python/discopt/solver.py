@@ -40,6 +40,7 @@ import numpy as np
 # nonlinear bound tightening) are imported lazily at their nonlinear-path call
 # sites, so a pure LP/MILP/MIQP solve never pays JAX/XLA cold-start.
 from discopt import _timing
+from discopt._relax import _fallback
 from discopt._relax._numeric import roundoff_slack
 from discopt._relax.model_utils import flat_variable_bounds
 from discopt._relax.problem_classifier import _DENSE_A_MAX_BYTES, _sp_issparse
@@ -1133,10 +1134,28 @@ def _root_lp_probe_tight_enabled() -> bool:
 _NATIVE_SEED_HEURISTIC_S = 12.0
 
 
-def _native_kernel_verify_point(model, x_flat):
+def _native_kernel_verify_point(model, x_flat, source=None):
     """Rigorously verify that ``x_flat`` (length ``n_orig``, original-variable order)
     is feasible for the ORIGINAL model, and return ``(True, model_objective)`` with the
     point's TRUE objective in model units, or ``(False, None)``.
+
+    ``source`` is ``(pre_reform_model, pre_reform_nvars)`` when ``model`` is the
+    factorable lift of the problem the caller actually posed, else ``None``. The lift
+    appends aux columns after the originals, so ``x_flat[:pre_reform_nvars]`` is the
+    point in the pre-reform model, and it must verify THERE too (#1522). Verifying the
+    lift alone is not verification of the source: the lift distributes products
+    (``100*(y - x**2)**2`` becomes ``100*y*y - 200*_fr_aux*y + 100*x**4`` with
+    ``_fr_aux = x**2``), so the lifted row's term magnitudes are ~450 where the source
+    row's are ~2, and ``verify_point``'s scale-keyed allowance
+    ``ABS_TOL * max(1, term scale)`` grows with them. Measured on MINLPLib ``prob09``
+    at ``x = 1.03088, y = 1.05765``: the lifted row was allowed 4.5e-4, the source
+    row's residual was 1.6e-4, and the source row itself is allowed ~2e-6 — so the
+    kernel reported an incumbent that ``warm_start.check_feasibility`` rejects at its
+    default ``tol=1e-4``. Each lifted row's residual also composes through the aux
+    definitions into the source row, so a point can sit inside tolerance on every
+    lifted row and outside it on the source. The returned objective stays the lift's
+    (the kernel's own objective, in the same units), so callers that compare it with
+    the kernel's value are unchanged.
 
     Soundness (#764 Task 1): this gates whether a value may seed the native kernel's
     incumbent cutoff. An unverified seed would poison every downstream certificate.
@@ -1156,7 +1175,148 @@ def _native_kernel_verify_point(model, x_flat):
     if not res.ok:
         logger.debug("native seed verification declined: %s", res.reason)
         return False, None
+    if source is not None:
+        src_model, src_nvars = source
+        x_src = np.asarray(x_flat, dtype=np.float64)[: int(src_nvars)]
+        src_res = verify_point(src_model, x_src)
+        if not src_res.ok:
+            logger.debug(
+                "native verification declined: point verifies on the factorable lift "
+                "but not on the pre-reform model (#1522): %s",
+                src_res.reason,
+            )
+            return False, None
     return True, res.objective
+
+
+#: Wall-clock cap on the one local re-solve :func:`_native_kernel_repair_point` makes.
+_NATIVE_REPAIR_MAX_S = 5.0
+#: Per-call cap for the in-tree primal hook (:func:`_native_kernel_primal_hook`). The
+#: hook fires O(log nodes) times plus once per kernel incumbent, so this bounds the
+#: total it can take from the tree's budget.
+_NATIVE_HOOK_MAX_S = 1.0
+
+
+def _native_kernel_source_only_failure(model, x_flat, source) -> bool:
+    """``True`` when ``x_flat`` verifies on the factorable lift but not on its source.
+
+    This is the #1522 mechanism specifically: the lift's rows each sit inside their
+    own tolerance and the pre-reform row does not. A point that fails the lift itself
+    is the #789 class, which keeps its established response (decline to the Python
+    engine), so the two are told apart here rather than by the reason string.
+    """
+    if source is None:
+        return False
+    from discopt.validation.feasibility import verify_point
+
+    x = np.asarray(x_flat, dtype=np.float64)
+    if not verify_point(model, x).ok:
+        return False
+    src_model, src_nvars = source
+    return not verify_point(src_model, x[: int(src_nvars)]).ok
+
+
+def _native_kernel_repair_point(model, x_flat, source, outer_deadline, max_s=None):
+    """One KKT-accurate local re-solve of the lift from ``x_flat`` (#1522).
+
+    Returns ``(x_new, model_objective)`` for a point that verifies on the lift AND on
+    the pre-reform source (``_native_kernel_verify_point`` with ``source``), or
+    ``None``. The kernel's incumbent satisfies each lifted row to ``mccormick_tol``;
+    those residuals compose through the aux definitions into the source row, so the
+    repair is to drive the LIFTED residuals down to the NLP solver's own ``1e-8``
+    rather than to widen any tolerance. Integer columns are fixed at their rounded
+    values and the box is the lift's declared box, exactly as the Python engine's
+    terminal polish does. A point that does not verify is never adopted.
+
+    The same step is the kernel's in-tree primal heuristic
+    (:func:`_native_kernel_primal_hook`), started from a node's LP point rather than
+    from a reported incumbent; ``max_s`` then caps each call below
+    ``_NATIVE_REPAIR_MAX_S``.
+    """
+    from discopt._tape_nlp_evaluator import make_evaluator
+    from discopt.validation.feasibility import model_integer_mask
+
+    cap = _NATIVE_REPAIR_MAX_S if max_s is None else float(max_s)
+    # The cap decides how much local-NLP work runs, so it is a role-2 budget
+    # (#912/#1187): under ``deterministic`` it gives way to the role-1 remainder and
+    # the NLP stops on its own iteration/convergence criteria instead of on machine
+    # speed. ``None`` = no clock at all (no role-1 deadline either).
+    budget = _role2_budget(
+        cap if outer_deadline is None else min(cap, float(outer_deadline) - time.perf_counter())
+    )
+    if budget is not None and budget <= 0.0:
+        return None
+    evaluator = make_evaluator(model)
+    lb, ub = flat_variable_bounds(model)
+    x0 = np.asarray(x_flat, dtype=np.float64)
+    if x0.shape[0] != lb.shape[0]:
+        return None
+    x0 = np.clip(x0, lb, ub)
+    int_mask = model_integer_mask(model)
+    fix_lb = lb.copy()
+    fix_ub = ub.copy()
+    if int_mask is not None and int_mask.shape[0] == x0.shape[0]:
+        x0 = np.where(int_mask, np.round(x0), x0)
+        fix_lb = np.where(int_mask, x0, fix_lb)
+        fix_ub = np.where(int_mask, x0, fix_ub)
+    cl, cu = _infer_constraint_bounds(model, evaluator)
+    constraint_bounds = list(zip(cl, cu)) if cl else None
+    opts = pounce_option_defaults()
+    opts.update(pounce_incumbent_options())
+    if budget is not None:
+        opts["max_wall_time"] = float(budget)
+    opts["print_level"] = 0
+    res = _solve_node_nlp_kkt(evaluator, x0, fix_lb, fix_ub, constraint_bounds, opts)
+    if res.status != SolveStatus.OPTIMAL or res.x is None:
+        return None
+    x_new = np.asarray(res.x, dtype=np.float64)
+    if x_new.shape != x0.shape or not np.all(np.isfinite(x_new)):
+        return None
+    ok, obj = _native_kernel_verify_point(model, x_new, source=source)
+    if not ok or obj is None:
+        return None
+    return x_new, float(obj)
+
+
+def _native_kernel_primal_hook(model, source, sign, off, n_orig, outer_deadline):
+    """The kernel's in-tree primal step (#1522, ``SolverTuning.native_nlp_primal``).
+
+    Returns ``hook(x, incumbent)`` for ``solve_spatial_tree_py(primal_hook=...)``.
+    From the node's LP point ``x`` (the first ``n_orig`` columns are the lift's
+    variables) it runs :func:`_native_kernel_repair_point`, which returns only a point
+    verified on the lift AND on the pre-reform ``source``; its model-units objective
+    is mapped to the kernel's internal minimize units with the seed's
+    ``internal = sign * model_obj - off``. ``None`` means nothing better was found.
+
+    Every call is counted in ``counts`` (attached as ``hook.counts``) so the caller
+    can report the hook's firings next to the kernel's own counters.
+    """
+    counts = {"calls": 0, "verified": 0}
+
+    def hook(x, incumbent):
+        # No ``except``: the kernel binding re-raises whatever this raises once the
+        # tree returns, and the kernel call is not wrapped (#1520), so a defect here
+        # surfaces as an error rather than as "no improvement" (CLAUDE.md §7).
+        counts["calls"] += 1
+        if outer_deadline is not None and time.perf_counter() >= outer_deadline:
+            return None
+        x0 = np.asarray(x, dtype=np.float64)[:n_orig]
+        out = _native_kernel_repair_point(
+            model, x0, source, outer_deadline, max_s=_NATIVE_HOOK_MAX_S
+        )
+        if out is None:
+            return None
+        x_new, model_obj = out
+        internal = sign * float(model_obj) - off
+        if not math.isfinite(internal):
+            return None
+        if incumbent is not None and not internal < float(incumbent) - 1e-12:
+            return None
+        counts["verified"] += 1
+        return internal, [float(v) for v in x_new]
+
+    hook.counts = counts  # type: ignore[attr-defined]
+    return hook
 
 
 # Cap on the number of FREE integers (span > 0.5 in the presolved box) the seed
@@ -1392,7 +1552,7 @@ def _native_kernel_seed_candidates(model, lb, ub, n_orig, deadline):
             logger.debug("native seed multistart raised: %s", exc)
 
 
-def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None):
+def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None, source=None):
     """Return ``(internal_value, point)`` — a genuinely-attained incumbent to seed the
     native solve (``internal_value`` in kernel-internal minimize units, ``point`` the
     verified original-variable vector) — or ``(None, None)`` if no verified feasible
@@ -1421,7 +1581,7 @@ def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None):
         if x_cand.shape[0] < n_orig:
             continue
         point = x_cand[:n_orig].copy()
-        ok, model_obj = _native_kernel_verify_point(model, point)
+        ok, model_obj = _native_kernel_verify_point(model, point, source=source)
         if not ok:
             continue
         internal = sign * float(model_obj) - off
@@ -1451,7 +1611,9 @@ def _native_exit_polish_enabled() -> bool:
     return integer_box_polish_enabled()
 
 
-def _native_exit_primal_polish(model, x_flat, obj_val, bound_val, n_orig, outer_deadline):
+def _native_exit_primal_polish(
+    model, x_flat, obj_val, bound_val, n_orig, outer_deadline, source=None
+):
     """Improve an UNCERTIFIED native-kernel incumbent before reporting it (#1193).
 
     Returns ``(x_new, obj_new)`` — a strictly better, independently re-verified point
@@ -1506,7 +1668,7 @@ def _native_exit_primal_polish(model, x_flat, obj_val, bound_val, n_orig, outer_
     x_new = np.asarray(found[0], dtype=np.float64)
     if x_new.shape[0] < n_orig:
         return None
-    ok, obj_new = _native_kernel_verify_point(model, x_new[:n_orig])
+    ok, obj_new = _native_kernel_verify_point(model, x_new[:n_orig], source=source)
     if not ok or obj_new is None:
         # The box search's arbiter accepted a point the original-model verifier
         # rejects. Keep the reported incumbent; never widen an acceptance to make a
@@ -1562,6 +1724,10 @@ def _try_native_spatial_kernel(
     # (its ``gap_tol`` is applied absolutely), so "unset" has to stay
     # distinguishable from "set to the Python tree's 1e-6 default".
     abs_gap_tolerance: Optional[float] = None,
+    # #1522: ``(pre_reform_model, pre_reform_nvars)`` when ``model`` is the
+    # factorable lift, so every point the kernel reports or seeds is verified
+    # against the problem the caller posed and not only against the lift.
+    source=None,
 ):
     """Issue #764: if the native Rust spatial kernel is enabled and the model is in
     its covered subset — scalar variables; bilinear / monomial / affine-square / sqrt
@@ -1601,134 +1767,138 @@ def _try_native_spatial_kernel(
     # producer build and the NLP seed phase are JAX, the tree is Rust.
     _native_jax_s = 0.0
     _native_rust_s = 0.0
-    try:
-        from discopt import _rust
-        from discopt._relax.spatial_producer import build_spatial_kernel_spec
+    # #1520: no ``except``. ``build_spatial_kernel_spec`` declines by returning
+    # ``None`` (model outside the covered subset), and every ``ValueError``
+    # ``solve_spatial_tree_py`` raises is a malformed-spec check -- a producer
+    # defect. The seed phases inside report their own failures. Swallowing a raise
+    # here silently rerouted a default-path solve to the Python tree.
+    from discopt import _rust
+    from discopt._relax.spatial_producer import build_spatial_kernel_spec
 
-        _t_phase = time.perf_counter()
-        spec = build_spatial_kernel_spec(
-            model,
-            bounds=(
-                np.asarray(lb, dtype=np.float64)[:n_vars],
-                np.asarray(ub, dtype=np.float64)[:n_vars],
-            ),
-        )
-        _native_jax_s += time.perf_counter() - _t_phase
-        if spec is None:
-            return None  # model outside the covered subset -> Python path
-        meta = {k: spec.pop(k) for k in list(spec) if k.startswith("meta_")}
-        sign = float(meta["meta_obj_sense_sign"])
-        off = float(meta["meta_obj_offset"])
-        n_orig = int(spec["n_orig"])
-
-        # Task 1: obtain a cheap, rigorously-verified feasible seed for the cutoff.
-        # A non-finite budget means "no wall-clock cap": carry it as ``None`` rather
-        # than an infinite deadline, so the kernel is asked for an uncapped search
-        # instead of rejecting a non-finite ``time_limit_s`` (which the defensive
-        # ``except`` below would swallow, silently disabling the kernel outright).
-        _outer_budget = float(time_limit)
-        outer_deadline = t_start + _outer_budget if math.isfinite(_outer_budget) else None
-        _t_phase = time.perf_counter()
-        initial_incumbent, seed_point = _native_kernel_seed(
-            model,
+    _t_phase = time.perf_counter()
+    spec = build_spatial_kernel_spec(
+        model,
+        bounds=(
             np.asarray(lb, dtype=np.float64)[:n_vars],
             np.asarray(ub, dtype=np.float64)[:n_vars],
-            sign,
-            off,
-            n_orig,
-            outer_deadline,
-        )
-        # The seed is an NLP relaxation solve plus one sub-NLP per enumerated integer
-        # assignment plus a verification of each candidate — all through the JAX
-        # evaluator, and on nvs19 it was the single largest cost in the solve.
-        _native_jax_s += time.perf_counter() - _t_phase
+        ),
+    )
+    _native_jax_s += time.perf_counter() - _t_phase
+    if spec is None:
+        return None  # model outside the covered subset -> Python path
+    meta = {k: spec.pop(k) for k in list(spec) if k.startswith("meta_")}
+    sign = float(meta["meta_obj_sense_sign"])
+    off = float(meta["meta_obj_offset"])
+    n_orig = int(spec["n_orig"])
 
-        remaining = (
-            None if outer_deadline is None else max(0.0, outer_deadline - time.perf_counter())
+    # Task 1: obtain a cheap, rigorously-verified feasible seed for the cutoff.
+    # A non-finite budget means "no wall-clock cap": carry it as ``None`` rather
+    # than an infinite deadline, so the kernel is asked for an uncapped search
+    # instead of rejecting a non-finite ``time_limit_s`` (which the defensive
+    # ``except`` below would swallow, silently disabling the kernel outright).
+    _outer_budget = float(time_limit)
+    outer_deadline = t_start + _outer_budget if math.isfinite(_outer_budget) else None
+    _t_phase = time.perf_counter()
+    initial_incumbent, seed_point = _native_kernel_seed(
+        model,
+        np.asarray(lb, dtype=np.float64)[:n_vars],
+        np.asarray(ub, dtype=np.float64)[:n_vars],
+        sign,
+        off,
+        n_orig,
+        outer_deadline,
+        source=source,
+    )
+    # The seed is an NLP relaxation solve plus one sub-NLP per enumerated integer
+    # assignment plus a verification of each candidate — all through the JAX
+    # evaluator, and on nvs19 it was the single largest cost in the solve.
+    _native_jax_s += time.perf_counter() - _t_phase
+
+    remaining = None if outer_deadline is None else max(0.0, outer_deadline - time.perf_counter())
+    # #933: withhold the caller's root-fallback reserve from the kernel's
+    # deadline, exactly as the Python node loop withholds it while bound-less
+    # (#844). The kernel reclaims the slice the moment its own dual bound is
+    # finite (`bound_time_extension_s` — the fallback then has nothing to
+    # contribute), so only a still-bound-less kernel forfeits it; the exit
+    # handling below spends the unspent reserve on the rigorous
+    # root-relaxation fallback instead of reporting no bound at all.
+    _bound_reserve = 0.0
+    if rr_reserve_s > 0.0 and remaining is not None and remaining > 0.0:
+        _bound_reserve = min(float(rr_reserve_s), 0.5 * remaining)
+        remaining = remaining - _bound_reserve
+    # #1243. The kernel's ``gap_tol`` has always been applied ABSOLUTELY
+    # (``bound >= inc - gap_tol``), so this route's established absolute
+    # tolerance *is* the caller's ``gap_tolerance``: the default below is
+    # ``gap_tolerance``, not ``_DEFAULT_ABS_GAP_TOL``, because anything else
+    # would silently change every solve that routes here.
+    #
+    # ``min``, NOT the disjunction the Python tree applies. An earlier
+    # version handed the kernel a relative arm as well, so that the two
+    # routes would agree; that is unsound in the surprising direction,
+    # because the relative arm never existed HERE and adding one can only
+    # LOOSEN. Measured: ``abs_gap_tolerance=1e-9`` with ``gap_tolerance`` at
+    # its 1e-4 default and |incumbent| ~ 1e5 moved the effective fathoming
+    # tolerance from 1e-4 to ``max(1e-9, 1e-4 * 1e5) = 10.0`` -- a caller who
+    # asked to tighten by five orders of magnitude got a certificate five
+    # orders looser, and `TreeStatus::Optimal` at an absolute gap of 10.
+    #
+    # So this route honours a TIGHTENING and declines a LOOSENING. Naming an
+    # absolute tolerance is not consent to a relative one, and refusing to
+    # loosen is the safe direction for a certificate. The cost is stated in
+    # ``abs_gap_tolerance``'s docstring: an absolute tolerance LOOSER than
+    # ``gap_tolerance`` does not take effect on this route, which only ever
+    # means the kernel does more work than asked.
+    _kernel_abs_tol = (
+        float(gap_tolerance)
+        if abs_gap_tolerance is None
+        else min(float(gap_tolerance), float(abs_gap_tolerance))
+    )
+    # ...and SAY so when the ``min`` discarded it. Declining to loosen is the
+    # safe direction, but a caller who asked for 1e6 and got 1e-4 explored
+    # the same 45 nodes as with no tolerance at all and was told nothing
+    # (#1330). #1323's rule is honoured-or-declared; this is the declaration.
+    _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
+    solve_kwargs = dict(
+        max_nodes=int(max_nodes),
+        gap_tol=_kernel_abs_tol,
+        # #1263: the kernel's absolute test alone is the 1.0-floored relative
+        # test below unit magnitude (st_z: `Optimal` at 2.7e-5 over a true 0).
+        # The kernel CONJOINS this with `_gap_values_converged`'s own
+        # abs-OR-rel criterion, so it can only tighten the test above.
+        rel_gap_tol=float(gap_tolerance),
+        abs_gap_tol=(
+            _DEFAULT_ABS_GAP_TOL if abs_gap_tolerance is None else float(abs_gap_tolerance)
+        ),
+        time_limit_s=remaining,
+        # Node-LP start basis (default OFF). The kernel's cold two-phase primal
+        # grinds to `max_iter` on equality-rich, hence primal-degenerate,
+        # relaxations — the constraint-factor-RLT class above all. See
+        # ``SolverTuning.lp_cold_dual_start``.
+        cold_dual_start=bool(_tuning().lp_cold_dual_start),
+    )
+    if _bound_reserve > 0.0:
+        solve_kwargs["bound_time_extension_s"] = float(_bound_reserve)
+    # #917: hand the kernel the caller's withheld #844 reserve so it can reclaim
+    # the slice at its own deadline — but only while it already holds an incumbent,
+    # the one state in which that fallback has nothing to contribute. The kernel is
+    # a single uninterruptible call that never enters the Python node loops where
+    # ``_extend_budget_for_incumbent`` lives, so without this a kernel-routed solve
+    # forfeits the reserve outright: nvs17 at a 60 s budget stopped at 39.4 s with
+    # its bound 4.4% short of its own incumbent, and giving the slice back closes
+    # it (-1149.20 -> -1100.40).
+    if incumbent_time_extension > 0.0:
+        solve_kwargs["incumbent_time_extension_s"] = float(incumbent_time_extension)
+    if initial_incumbent is not None:
+        solve_kwargs["initial_incumbent"] = float(initial_incumbent)
+    if _tuning().native_nlp_primal:
+        solve_kwargs["primal_hook"] = _native_kernel_primal_hook(
+            model, source, sign, off, n_orig, outer_deadline
         )
-        # #933: withhold the caller's root-fallback reserve from the kernel's
-        # deadline, exactly as the Python node loop withholds it while bound-less
-        # (#844). The kernel reclaims the slice the moment its own dual bound is
-        # finite (`bound_time_extension_s` — the fallback then has nothing to
-        # contribute), so only a still-bound-less kernel forfeits it; the exit
-        # handling below spends the unspent reserve on the rigorous
-        # root-relaxation fallback instead of reporting no bound at all.
-        _bound_reserve = 0.0
-        if rr_reserve_s > 0.0 and remaining is not None and remaining > 0.0:
-            _bound_reserve = min(float(rr_reserve_s), 0.5 * remaining)
-            remaining = remaining - _bound_reserve
-        # #1243. The kernel's ``gap_tol`` has always been applied ABSOLUTELY
-        # (``bound >= inc - gap_tol``), so this route's established absolute
-        # tolerance *is* the caller's ``gap_tolerance``: the default below is
-        # ``gap_tolerance``, not ``_DEFAULT_ABS_GAP_TOL``, because anything else
-        # would silently change every solve that routes here.
-        #
-        # ``min``, NOT the disjunction the Python tree applies. An earlier
-        # version handed the kernel a relative arm as well, so that the two
-        # routes would agree; that is unsound in the surprising direction,
-        # because the relative arm never existed HERE and adding one can only
-        # LOOSEN. Measured: ``abs_gap_tolerance=1e-9`` with ``gap_tolerance`` at
-        # its 1e-4 default and |incumbent| ~ 1e5 moved the effective fathoming
-        # tolerance from 1e-4 to ``max(1e-9, 1e-4 * 1e5) = 10.0`` -- a caller who
-        # asked to tighten by five orders of magnitude got a certificate five
-        # orders looser, and `TreeStatus::Optimal` at an absolute gap of 10.
-        #
-        # So this route honours a TIGHTENING and declines a LOOSENING. Naming an
-        # absolute tolerance is not consent to a relative one, and refusing to
-        # loosen is the safe direction for a certificate. The cost is stated in
-        # ``abs_gap_tolerance``'s docstring: an absolute tolerance LOOSER than
-        # ``gap_tolerance`` does not take effect on this route, which only ever
-        # means the kernel does more work than asked.
-        _kernel_abs_tol = (
-            float(gap_tolerance)
-            if abs_gap_tolerance is None
-            else min(float(gap_tolerance), float(abs_gap_tolerance))
-        )
-        # ...and SAY so when the ``min`` discarded it. Declining to loosen is the
-        # safe direction, but a caller who asked for 1e6 and got 1e-4 explored
-        # the same 45 nodes as with no tolerance at all and was told nothing
-        # (#1330). #1323's rule is honoured-or-declared; this is the declaration.
-        _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
-        solve_kwargs = dict(
-            max_nodes=int(max_nodes),
-            gap_tol=_kernel_abs_tol,
-            # #1263: the kernel's absolute test alone is the 1.0-floored relative
-            # test below unit magnitude (st_z: `Optimal` at 2.7e-5 over a true 0).
-            # The kernel CONJOINS this with `_gap_values_converged`'s own
-            # abs-OR-rel criterion, so it can only tighten the test above.
-            rel_gap_tol=float(gap_tolerance),
-            abs_gap_tol=(
-                _DEFAULT_ABS_GAP_TOL if abs_gap_tolerance is None else float(abs_gap_tolerance)
-            ),
-            time_limit_s=remaining,
-            # Node-LP start basis (default OFF). The kernel's cold two-phase primal
-            # grinds to `max_iter` on equality-rich, hence primal-degenerate,
-            # relaxations — the constraint-factor-RLT class above all. See
-            # ``SolverTuning.lp_cold_dual_start``.
-            cold_dual_start=bool(_tuning().lp_cold_dual_start),
-        )
-        if _bound_reserve > 0.0:
-            solve_kwargs["bound_time_extension_s"] = float(_bound_reserve)
-        # #917: hand the kernel the caller's withheld #844 reserve so it can reclaim
-        # the slice at its own deadline — but only while it already holds an incumbent,
-        # the one state in which that fallback has nothing to contribute. The kernel is
-        # a single uninterruptible call that never enters the Python node loops where
-        # ``_extend_budget_for_incumbent`` lives, so without this a kernel-routed solve
-        # forfeits the reserve outright: nvs17 at a 60 s budget stopped at 39.4 s with
-        # its bound 4.4% short of its own incumbent, and giving the slice back closes
-        # it (-1149.20 -> -1100.40).
-        if incumbent_time_extension > 0.0:
-            solve_kwargs["incumbent_time_extension_s"] = float(incumbent_time_extension)
-        if initial_incumbent is not None:
-            solve_kwargs["initial_incumbent"] = float(initial_incumbent)
-        _t_phase = time.perf_counter()
-        with _timing.charge("rust"):
-            res = _rust.solve_spatial_tree_py(**spec, **solve_kwargs)
-        _native_rust_s += time.perf_counter() - _t_phase
-        res.update(meta)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("native spatial kernel skipped: %s", exc)
-        return None
+    _t_phase = time.perf_counter()
+    with _timing.charge("rust"):
+        res = _rust.solve_spatial_tree_py(**spec, **solve_kwargs)
+    _native_rust_s += time.perf_counter() - _t_phase
+    res.update(meta)
     if res is None:
         return None  # model outside the covered subset -> Python path
     native_status = res.get("status")
@@ -1804,8 +1974,68 @@ def _try_native_spatial_kernel(
         # ``abs(obj_val)`` below would raise if it were ever violated.
         assert obj_val is not None
         _t_phase = time.perf_counter()
-        _ok, _model_obj = _native_kernel_verify_point(model, x_flat[:n_orig])
+        _ok, _model_obj = _native_kernel_verify_point(model, x_flat[:n_orig], source=source)
         _native_jax_s += time.perf_counter() - _t_phase
+        if (
+            not _ok
+            and native_status != "optimal"
+            and _native_kernel_source_only_failure(model, x_flat[:n_orig], source)
+        ):
+            # #1522: the point is inside tolerance on every lifted row and outside it
+            # on the problem the caller posed. On an UNCERTIFIED exit, declining
+            # here would restart the Python engine with the budget already spent and
+            # discard the kernel's rigorous bound (the #1153 lesson), so repair the
+            # point instead, and if that fails report the bound with no primal
+            # rather than a point ``warm_start.check_feasibility`` rejects. The
+            # bound does not depend on the incumbent being feasible: every node
+            # pruned against it had a bound at or above its value, and the
+            # reported bound is never above it. A certified exit is NOT repaired
+            # here -- its gap was closed against the rejected value -- and keeps
+            # the decline below.
+            _t_phase = time.perf_counter()
+            _repaired = _native_kernel_repair_point(model, x_flat[:n_orig], source, outer_deadline)
+            _native_jax_s += time.perf_counter() - _t_phase
+            _crosses = False
+            if _repaired is not None:
+                # A VERIFIED feasible point beyond the dual bound means the bound is
+                # wrong; surface it and fall back to the trusted engine rather than
+                # report either number (the same rule as #1193's polish).
+                _bound_model = sign * (float(res["bound"]) + off)
+                _rep_obj = _repaired[1]
+                _crosses = math.isfinite(_bound_model) and (
+                    _rep_obj < _bound_model - 1e-6 * (1.0 + abs(_bound_model))
+                    if sign > 0
+                    else _rep_obj > _bound_model + 1e-6 * (1.0 + abs(_bound_model))
+                )
+                if _crosses:
+                    logger.error(
+                        "native spatial kernel: repaired incumbent %.12g is beyond the "
+                        "dual bound %.12g -- the bound is invalid; routing to the Python "
+                        "engine (#1522)",
+                        _rep_obj,
+                        _bound_model,
+                    )
+                    return None
+                logger.info(
+                    "native spatial kernel: incumbent obj=%.6g violated the pre-reform "
+                    "model; repaired to obj=%.6g (#1522)",
+                    obj_val,
+                    _rep_obj,
+                )
+                x_flat, obj_val = _repaired[0], _rep_obj
+                _model_obj = _rep_obj
+            else:
+                logger.info(
+                    "native spatial kernel: incumbent obj=%.6g violates the pre-reform "
+                    "model and could not be repaired; reporting the %s bound with no "
+                    "incumbent (#1522)",
+                    obj_val,
+                    native_status,
+                )
+                x_flat = None
+                obj_val = None
+                _model_obj = None
+            _ok = True
         if not _ok:
             logger.debug(
                 "native spatial kernel: final incumbent failed original-model "
@@ -1816,7 +2046,11 @@ def _try_native_spatial_kernel(
         # Prefer the independently-recomputed true objective (exact model units) over
         # the kernel's mapped relaxation reading when they agree within tolerance; a
         # gross disagreement is itself a decline signal.
-        if _model_obj is not None and abs(_model_obj - obj_val) > 1e-4 * (1.0 + abs(obj_val)):
+        if (
+            _model_obj is not None
+            and obj_val is not None
+            and abs(_model_obj - obj_val) > 1e-4 * (1.0 + abs(obj_val))
+        ):
             logger.debug(
                 "native spatial kernel: reported obj %.6g disagrees with verified "
                 "obj %.6g — routing to the Python engine (#789)",
@@ -1879,7 +2113,7 @@ def _try_native_spatial_kernel(
     if native_status != "optimal" and x_flat is not None and obj_val is not None:
         _t_phase = time.perf_counter()
         _polished = _native_exit_primal_polish(
-            model, x_flat, obj_val, bound_val, n_orig, outer_deadline
+            model, x_flat, obj_val, bound_val, n_orig, outer_deadline, source=source
         )
         _native_jax_s += time.perf_counter() - _t_phase
         if _polished is not None:
@@ -1942,6 +2176,13 @@ def _try_native_spatial_kernel(
     _native_stats["tree/lp_solves"] = float(int(res.get("n_lp_solves") or 0))
     _native_stats["tree/uncertified_nodes"] = float(int(res.get("n_uncertified") or 0))
     _native_stats["tree/undecided_nodes"] = float(int(res.get("n_undecided") or 0))
+    # #1522: the in-tree primal hook's firings, and how often the kernel adopted what
+    # it returned. Both 0 with ``native_nlp_primal`` off; a panel reads these to tell
+    # "never fired" from "fired and found nothing" (CLAUDE.md §6).
+    _native_stats["tree/primal_hook_calls"] = float(int(res.get("n_primal_hook_calls") or 0))
+    _native_stats["tree/primal_hook_improvements"] = float(
+        int(res.get("n_primal_hook_improvements") or 0)
+    )
 
     # #1236: root-node certification metrics, mapped out of the kernel's internal
     # minimize convention with the same ``sign * (value + offset)`` the incumbent
@@ -2223,7 +2464,11 @@ def _rlt_root_gain(model: "Model") -> Optional[float]:
         if b0 is None or b1 is None:
             return None
         return abs(b1 - b0) / (abs(b0) + 1.0)
-    except Exception:  # pragma: no cover - defensive; decline widening on any failure
+    except Exception as exc:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback. The probe builds and solves the full
+        # McCormick relaxer, whose own setup failure the main solve also absorbs
+        # (with a WARNING); declining the RLT widening only forgoes a tightening.
+        _warn_fallback_once("RLT root-gain probe", exc, "declining the RLT widening")
         return None
 
 
@@ -2277,17 +2522,16 @@ def _rlt_sparse_admit(model: "Model", n_vars: int) -> bool:
         return False
     if n_vars > int(tun.rlt_sparse_max_vars):
         return False
-    try:
-        from discopt._relax.term_classifier import classify_nonlinear_terms
+    # #1520: no ``except``. ``classify_nonlinear_terms`` falls back internally
+    # through named routes (#1343); a raise is a defect, not "no widening".
+    from discopt._relax.term_classifier import classify_nonlinear_terms
 
-        terms = classify_nonlinear_terms(model)
-        n_terms = (
-            len(terms.bilinear)
-            + len(getattr(terms, "trilinear", []))
-            + len(getattr(terms, "multilinear", []))
-        )
-    except Exception:  # pragma: no cover - defensive; abstain (no widening) on failure
-        return False
+    terms = classify_nonlinear_terms(model)
+    n_terms = (
+        len(terms.bilinear)
+        + len(getattr(terms, "trilinear", []))
+        + len(getattr(terms, "multilinear", []))
+    )
     if n_terms > int(tun.rlt_sparse_max_terms):
         return False
     # Structure passed. Apply the productivity gate unless explicitly disabled.
@@ -2993,7 +3237,13 @@ def _objective_is_convex_quadratic(
         # curvature. The margin is scale-aware (#1397): see
         # ``_hessian_is_psd_with_margin``.
         return _hessian_is_psd_with_margin(0.5 * (H1 + H1.T))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback. The Hessian evaluation runs user code
+        # (a ``dm.custom`` objective); abstaining keeps the McCormick bound, and
+        # the convex bound is a tightening only.
+        _warn_fallback_once(
+            "convex-quadratic objective test", exc, "keeping the McCormick objective bound"
+        )
         return False
 
 
@@ -3263,9 +3513,12 @@ def _check_constraint_feasibility(evaluator, x, cl_list, cu_list, tol=1e-4):
         grad = _feas_improving_row_norms(evaluator, jac, x, cons, cl, cu, n_check)
         scale = np.asarray(_scale_from_jacobian(jac, x), dtype=np.float64)[:n_check]
     except Exception as exc:  # noqa: BLE001 - reported, never silently accepted
-        # No gradient means no distance estimate, hence no cap; the absolute test
-        # above already passed.
-        logger.debug("feasibility cap: row gradients unavailable (%s); absolute test only", exc)
+        # #1520: kept as a sound fallback, now visible. No gradient (a user
+        # callable the evaluator cannot differentiate) means no distance
+        # estimate, hence no cap; the absolute test above already passed.
+        _warn_fallback_once(
+            "feasibility distance cap: row gradients", exc, "applying the absolute test only"
+        )
         return True
     if grad.size != n_check or scale.size != n_check:
         return True
@@ -3520,7 +3773,10 @@ def _nonlinear_point_excess(
         except Exception as exc:
             # An unevaluable Jacobian is not a licence to forgive: fall back to
             # the raw (stricter) violation rather than silently passing a point.
-            logger.debug("#954 gate: Jacobian unavailable, using raw residuals: %s", exc)
+            # #1520: kept as a sound (stricter) fallback, now visible.
+            _warn_fallback_once(
+                "#954 feasibility gate: constraint Jacobian", exc, "using raw residuals"
+            )
             scale = np.zeros(n, dtype=np.float64)
         net = viol - rtol * scale
         excess = float(net.max())
@@ -3790,24 +4046,24 @@ def _cached_structural_linear_mask(evaluator, m):
     operator) depends only on the constraint bodies, which are invariant across
     B&B nodes. Recomputing it every node re-walks every constraint DAG, so it is
     memoized on the evaluator and keyed by the row count ``m`` to stay robust if
-    the row layout ever differs. Returns ``None`` when the mask is unavailable or
-    cannot be aligned to ``m`` rows, so callers fall back to the numeric
-    two-point Jacobian classification.
+    the row layout ever differs. Returns ``None`` when the mask cannot be aligned
+    to ``m`` rows; the caller then treats *no* row as linear (#1520).
     """
     cached = getattr(evaluator, "_structural_linear_mask_cache", None)
     if cached is not None and cached[0] == m:
         return cached[1]
-    mask = None
-    try:
-        sizes = getattr(evaluator, "_constraint_flat_sizes", None)
-        mask = _structural_linear_row_mask(evaluator._model, sizes, m)
-    except Exception as exc:  # noqa: BLE001 - callers fall back to numeric classification
-        logger.debug("structural linear-row mask unavailable: %s: %s", type(exc).__name__, exc)
-        mask = None
+    # #1520: no ``except``. ``_structural_linear_row_mask`` declines by returning
+    # ``None``; a raise is a defect. Swallowing it used to hand the caller ``None``,
+    # which then fell back to the numeric two-point classification alone -- the
+    # path #27a showed can linearize a saturating body and over-tighten.
+    sizes = getattr(evaluator, "_constraint_flat_sizes", None)
+    mask = _structural_linear_row_mask(evaluator._model, sizes, m)
     try:
         evaluator._structural_linear_mask_cache = (m, mask)
-    except Exception as exc:  # noqa: BLE001 - memoization is optional, the mask is recomputed
-        logger.debug("structural linear-row mask not memoized: %s: %s", type(exc).__name__, exc)
+    except AttributeError as exc:
+        # #1520: narrowed. An evaluator defined with ``__slots__`` cannot carry the
+        # memo; the mask is then recomputed per node, which costs time only.
+        logger.debug("structural linear-row mask not memoized: %s", exc)
     return mask
 
 
@@ -4036,7 +4292,12 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
     # require structural affineness as well so FBBT never linearizes a nonlinear
     # body and over-tightens it (issue #27a).
     _structural = _cached_structural_linear_mask(evaluator, len(is_linear))
-    if _structural is not None:
+    if _structural is None:
+        # #1520: the rows cannot be aligned with the constraint bodies, so no row
+        # is *known* affine. The numeric test alone is the unsound #27a path;
+        # forgo linear FBBT instead (a tightener, so skipping it is sound).
+        is_linear = np.zeros_like(is_linear)
+    else:
         is_linear = is_linear & _structural
 
     if not np.any(is_linear):
@@ -5481,9 +5742,13 @@ def _strong_branch_lp(
         candidate_var_indices = candidate_var_indices[top_k]
 
     # LP objective: gradient of the objective at the current solution.
+    # #1520: the handlers in this function are kept as sound fallbacks: strong
+    # branching only picks a branching variable, so a failure can cost nodes but
+    # never a bound. Each is reported once per solve.
     try:
         c = np.asarray(evaluator.evaluate_gradient(solution), dtype=np.float64).ravel()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - see above
+        _warn_fallback_once("strong branching: objective gradient", exc, "no strong-branch hint")
         return None
 
     # LP constraints from the evaluator's Jacobian (linearized).
@@ -5500,10 +5765,8 @@ def _strong_branch_lp(
             A_ub = J
             b_ub = J @ solution - g_vals
     except Exception as exc:  # noqa: BLE001 - proceed with variable bounds only
-        logger.debug(
-            "linearized constraints unavailable for the pseudocost LP: %s: %s",
-            type(exc).__name__,
-            exc,
+        _warn_fallback_once(
+            "strong branching: constraint linearization", exc, "using variable bounds only"
         )
 
     bounds_list = [(float(node_lb[j]), float(node_ub[j])) for j in range(n_vars)]
@@ -5534,7 +5797,8 @@ def _strong_branch_lp(
                 if down_result.status == SolveStatus.OPTIMAL and down_obj is not None
                 else np.inf
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - see the note at the top
+            _warn_fallback_once("strong branching: child LP", exc, "scoring the child as pruned")
             down_lb = np.inf
 
         # Up branch: x_i >= ceil(val)
@@ -5550,7 +5814,8 @@ def _strong_branch_lp(
                 if up_result.status == SolveStatus.OPTIMAL and up_obj is not None
                 else np.inf
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - see the note at the top
+            _warn_fallback_once("strong branching: child LP", exc, "scoring the child as pruned")
             up_lb = np.inf
 
         # Product score: improvement in each direction
@@ -6735,7 +7000,13 @@ def _custom_call_reduced_admissible(reduced_model: Model, n_orig: int) -> bool:
             return False
         res = _probe(reduced_model, lb[:n_orig], ub[:n_orig], max_rounds=1)
         return res.status != "unsupported"
-    except Exception:  # pragma: no cover - defensive: any probe failure => stay local
+    except Exception as exc:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback. The probe traces the user's
+        # ``CustomCall`` bodies through MCBox, so it can raise from user code;
+        # refusing admission keeps the local-NLP path and claims no certificate.
+        _warn_fallback_once(
+            "reduced-space admission probe", exc, "keeping the local-NLP path (no certificate)"
+        )
         return False
 
 
@@ -6876,13 +7147,16 @@ def _classify_model_convexity(
     except ConvexityBudgetExceeded as exc:
         logger.info("Convexity classification skipped (time budget): %s", exc)
         result = (False, False, None)
-    except Exception as exc:
-        logger.debug("%s: %s", failure_label, exc)
+    except Exception as exc:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback. The certificate path evaluates interval
+        # Hessians of user expressions; convexity-unknown routes to spatial B&B.
+        _warn_fallback_once(failure_label, exc, "treating convexity as unknown")
         result = (False, False, None)
     try:
         model._convexity_classification_cache = result
-    except Exception as exc:  # noqa: BLE001 - caching is optional, classification is redone
-        logger.debug("convexity classification not cached: %s: %s", type(exc).__name__, exc)
+    except AttributeError as exc:
+        # #1520: narrowed. A model that cannot carry the memo is reclassified.
+        logger.debug("convexity classification not cached: %s", exc)
     return result
 
 
@@ -7051,7 +7325,10 @@ def _objective_syntactically_convex(model: Model) -> bool:
 
         return bool(classify_oa_cut_convexity(model, use_certificate=False).objective_is_convex)
     except Exception as exc:  # noqa: BLE001 - classification failure => stay put
-        logger.debug("convex-MINLP route: syntactic objective classification failed: %s", exc)
+        # #1520: kept as a sound fallback (refusing the route keeps the default).
+        _warn_fallback_once(
+            "convex-MINLP route: objective convexity", exc, "not routing to convex MINLP"
+        )
         return False
 
 
@@ -7169,13 +7446,11 @@ def _convex_minlp_auto_route(model: Model) -> tuple[Optional[str], str, dict[str
         # exactly and certifies the same models in ~1.5 s.
         return None, "not routed: model contains a nonsmooth abs/min/max node", {}
 
-    try:
-        from discopt._relax.problem_classifier import ProblemClass, classify_problem
+    # #1520: no ``except``. ``classify_problem`` already falls back to the
+    # always-valid NLP/MINLP class internally; a raise is a defect.
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
 
-        problem_class = classify_problem(model)
-    except Exception as exc:  # noqa: BLE001 - classification failure => stay put
-        logger.debug("convex-MINLP route: problem classification failed: %s", exc)
-        return None, "not routed: problem classification failed", {}
+    problem_class = classify_problem(model)
 
     if not isinstance(problem_class, ProblemClass):  # pragma: no cover - defensive
         return None, "not routed: problem classification returned an unknown value", {}
@@ -9012,10 +9287,9 @@ def _scoped_deep_recursion(fn: _F) -> _F:
         from discopt._relax.convexity.rules import _run_with_deep_recursion
         from discopt._relax.factorable_reform import _max_expr_node_count
 
-        try:
-            depth = _max_expr_node_count(model)
-        except Exception:
-            depth = 0
+        # #1520: no ``except``. The count is iterative with no failure mode; the old
+        # ``depth = 0`` fallback ran a deep model on the small default stack.
+        depth = _max_expr_node_count(model)
         if depth <= _DEEP_SOLVE_DEPTH_GATE:
             return fn(model, *args, **kwargs)
         # A handful of Python frames are entered per node along the deepest path
@@ -9443,48 +9717,11 @@ def _stamp_layer_timing(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
-class _FallbackWarnings(threading.local):
-    """Per-thread record of which sound-fallback sites already warned in this solve.
-
-    #1514: a handful of solve-time sites keep a broad ``except`` because the
-    failure they absorb is a genuine external one (a POUNCE IPM call that raises
-    from native code) and falling back is sound (the node stays open, the bound
-    is not tightened). What made the old handlers a defect was that they logged
-    at DEBUG, so a *broken* backend read as a *declining* one. Each such site now
-    reports through :func:`_warn_fallback_once`: the first failure per site per
-    solve is a WARNING carrying the exception, later ones are DEBUG so a
-    per-node failure cannot flood the log. ``threading.local`` for the same
-    reason as ``_CallbackFailures``: two solves on two threads keep separate
-    records.
-    """
-
-    def __init__(self):
-        self.seen: set[str] = set()
-        self.active = False
-
-
-_FALLBACK_WARNINGS = _FallbackWarnings()
-
-
-def _warn_fallback_once(site: str, exc: BaseException, fallback: str) -> None:
-    """Report a failure absorbed at a documented sound-fallback site (#1514).
-
-    ``site`` names the call that failed, ``fallback`` what the solve does
-    instead. The first occurrence of ``site`` in a solve is logged at WARNING with
-    the exception type and message; repeats are logged at DEBUG.
-    """
-    if site in _FALLBACK_WARNINGS.seen:
-        logger.debug("%s failed again (%s: %s); %s", site, type(exc).__name__, exc, fallback)
-        return
-    _FALLBACK_WARNINGS.seen.add(site)
-    logger.warning(
-        "%s failed (%s: %s); %s. Further failures at this site in this solve are "
-        "logged at DEBUG (#1514).",
-        site,
-        type(exc).__name__,
-        exc,
-        fallback,
-    )
+# #1514/#1520: the once-per-solve fallback record lives in ``_relax._fallback`` so
+# relaxation-layer modules report through the same record without importing
+# this module.
+_FALLBACK_WARNINGS = _fallback.FALLBACK_WARNINGS
+_warn_fallback_once = _fallback.warn_fallback_once
 
 
 def _structure_cut_declined(exc: BaseException) -> bool:
@@ -12363,8 +12600,8 @@ def solve_model(
     # can be slow on very large models. Skipped once the budget is blown (#654):
     # it only tightens bounds, so declining it leaves a valid looser box.
     if presolve and presolve_reverse_ad and not _deadline_exhausted():
-        # #1514: no ``except``. ``run_reverse_ad_tightening`` absorbs the
-        # propagation's own decline internally and returns a count; a raise is a defect.
+        # #1514/#1520: no ``except``. ``run_reverse_ad_tightening`` has no decline of its
+        # own (it returns a count); a raise from it or ``tighten_box`` is a defect.
         from discopt._relax.presolve_pipeline import run_reverse_ad_tightening
 
         n_rad = run_reverse_ad_tightening(model)
@@ -12634,13 +12871,11 @@ def solve_model(
         )
 
     # --- Problem classification: dispatch LP/QP to specialized solvers ---
-    try:
-        from discopt._relax.problem_classifier import ProblemClass, classify_problem
+    # #1520: no ``except``. ``classify_problem`` falls back to the always-valid
+    # NLP/MINLP class internally; a raise is a defect, not "general MINLP".
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
 
-        problem_class = classify_problem(model)
-    except Exception as e:
-        logger.debug("Problem classification failed: %s", e)
-        problem_class = None
+    problem_class = classify_problem(model)
 
     if _solver == "gurobi":
         if problem_class is None:
@@ -13069,7 +13304,12 @@ def solve_model(
                 from discopt._rust import model_to_repr
 
                 _model_repr = model_to_repr(model, getattr(model, "_builder", None))
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - same fallback as the first repr
+                # #1520: kept as a sound fallback, like the solve's first repr
+                # (#1516): no repr only disables FBBT/presolve.
+                _warn_fallback_once(
+                    "Rust model repr (cleared model)", exc, "FBBT/presolve disabled"
+                )
                 _model_repr = None
             # Fall through to the spatial B&B below (rebuilt from `model`).
         elif result.status == "error" and result.x is None:
@@ -13295,22 +13535,21 @@ def solve_model(
     _obbt_has_continuous = any(v.var_type == VarType.CONTINUOUS for v in model._variables)
     _obbt_has_nonlinear = False
     if not _obbt_has_continuous:
-        try:
-            from discopt._relax.term_classifier import classify_nonlinear_terms as _cnt
+        # #1520: no ``except``. ``classify_nonlinear_terms`` falls back internally through
+        # named routes (#1343); a raise is a defect.
+        from discopt._relax.term_classifier import classify_nonlinear_terms as _cnt
 
-            _ot = _cnt(model)
-            _obbt_has_nonlinear = bool(
-                _ot.bilinear
-                or _ot.trilinear
-                or _ot.multilinear
-                or _ot.monomial
-                or _ot.fractional_power
-                or _ot.bilinear_with_fp
-                or _ot.ratio_of_products
-                or _ot.general_nl
-            )
-        except Exception:
-            _obbt_has_nonlinear = False
+        _ot = _cnt(model)
+        _obbt_has_nonlinear = bool(
+            _ot.bilinear
+            or _ot.trilinear
+            or _ot.multilinear
+            or _ot.monomial
+            or _ot.fractional_power
+            or _ot.bilinear_with_fp
+            or _ot.ratio_of_products
+            or _ot.general_nl
+        )
     _obbt_known_convex = _root_convexity_known and _root_is_convex
     if (
         bool(kwargs.get("obbt_at_root", True))
@@ -13355,17 +13594,14 @@ def solve_model(
         _obbt_rounds = 3
         _obbt_min_impr: Optional[float] = None
         if _obbt_iterate_root_enabled():
-            try:
-                from discopt._relax.term_classifier import (
-                    classify_nonlinear_terms as _cnt_it,
-                )
+            # #1520: no ``except``. ``classify_nonlinear_terms`` falls back internally through
+            # named routes (#1343); a raise is a defect.
+            from discopt._relax.term_classifier import (
+                classify_nonlinear_terms as _cnt_it,
+            )
 
-                _ot_it = _cnt_it(model)
-                _is_quadratic = bool(_ot_it.bilinear) or any(
-                    int(p) == 2 for _, p in _ot_it.monomial
-                )
-            except Exception:
-                _is_quadratic = False
+            _ot_it = _cnt_it(model)
+            _is_quadratic = bool(_ot_it.bilinear) or any(int(p) == 2 for _, p in _ot_it.monomial)
             _fin_w = ub - lb
             _fin_w = _fin_w[np.isfinite(_fin_w)]
             _wide_box = bool(_fin_w.size) and float(_fin_w.max()) > _OBBT_ITERATE_MIN_BOX_WIDTH
@@ -13471,6 +13707,7 @@ def solve_model(
             rr_reserve_s=_rr_reserve_s if _root_bound_seed_enabled() else 0.0,
             psd_cuts=psd_cuts,
             abs_gap_tolerance=abs_gap_tolerance,
+            source=((_prereform_model, _prereform_nvars) if _prereform_model is not None else None),
         )
     if _native_result is not None:
         return _native_result
@@ -13664,16 +13901,11 @@ def solve_model(
     # classification import above stays the single-point-of-truth for
     # "convexity is available at all". ``None`` disables per-node
     # refresh below (the root mask is then used verbatim).
-    _refresh_mask: Any = None
-    try:
-        from discopt._relax.convexity import refresh_convex_mask as _refresh_mask_import
+    # #1520: no ``except``. An in-tree import has no decline; a failure is a defect,
+    # and swallowing it silently kept the root mask for the whole tree.
+    from discopt._relax.convexity import refresh_convex_mask as _refresh_mask_import
 
-        _refresh_mask = _refresh_mask_import
-    except Exception as exc:  # noqa: BLE001 - the root mask is then used verbatim
-        # Capability-disabling: with no per-node refresh the solver keeps the root
-        # convexity mask for the whole tree. A silent skip here makes a measurement
-        # of per-node refresh meaningless.
-        logger.debug("per-node convexity refresh unavailable: %s: %s", type(exc).__name__, exc)
+    _refresh_mask: Any = _refresh_mask_import
 
     # Enable nonconvex spatial branching so integer-feasible nodes are not
     # prematurely fathomed.  The NLP local optimum at such a node may not
@@ -15211,14 +15443,11 @@ def solve_model(
     _round_budget_enabled = _tuning().node_round_budget and _mc_lp_relaxer is not None
     _node_reduce_fn: Any = None
     if _phase2_dbbt_enabled:
-        try:
-            from discopt._relax.node_reduce import reduce_node as _node_reduce_fn
+        # #1520: no ``except``. An in-tree import has no decline; swallowing a
+        # failure silently disabled per-node DBBT.
+        from discopt._relax.node_reduce import reduce_node as _node_reduce_fn
 
-            logger.debug("per-node DBBT enabled (Phase 2, #764)")
-        except Exception as _nr_exc:  # pragma: no cover - defensive
-            logger.debug("reduce_node import failed; disabling Phase 2 DBBT: %s", _nr_exc)
-            _phase2_dbbt_enabled = False
-            _node_reduce_fn = None
+        logger.debug("per-node DBBT enabled (Phase 2, #764)")
 
     # --- Reduced-space McCormick per-node bounding (MAiNGO-parity §2 P2.3) ---
     # ``DISCOPT_RELAX_SPACE=reduced`` swaps the lifted per-node LP for a Kelley
@@ -15399,10 +15628,8 @@ def solve_model(
     while True:
         elapsed = time.perf_counter() - t_start
         if not _rr_reserve_released and elapsed >= time_limit - _rr_reserve_s:
-            try:
-                _rr_glb = float(tree.stats()["global_lower_bound"])
-            except Exception:  # pragma: no cover - defensive
-                _rr_glb = -np.inf
+            # #1520: no ``except`` -- ``tree.stats()`` has no error return.
+            _rr_glb = float(tree.stats()["global_lower_bound"])
             if np.isfinite(_rr_glb) or tree.is_finished():
                 # Either the tree has a dual bound of its own (the fallback will not
                 # run) or it is exhausted and the natural ``n_batch == 0`` exit below
@@ -15498,10 +15725,8 @@ def solve_model(
         # byte-identical.
         _lazy_probing = False
         if _cut_inherit_enabled and _root_cut_pool is not None:
-            try:
-                _glb_now = float(tree.stats()["global_lower_bound"])
-            except Exception:  # pragma: no cover - defensive
-                _glb_now = -np.inf
+            # #1520: no ``except`` -- ``tree.stats()`` has no error return.
+            _glb_now = float(tree.stats()["global_lower_bound"])
             if np.isfinite(_glb_now) and (
                 _lazy_glb_ref is None
                 or _glb_now > _lazy_glb_ref + _LAZY_RESEP_GLB_EPS * max(1.0, abs(_lazy_glb_ref))
@@ -16726,8 +16951,9 @@ def solve_model(
                     if best_var is not None:
                         sb_hint_ids.append(node_id)
                         sb_hint_vars.append(best_var)
-                except Exception as e:
-                    logger.debug("Strong branching failed for node %d: %s", node_id, e)
+                except Exception as e:  # noqa: BLE001 - branching choice only
+                    # #1520: kept as a sound fallback (a branching hint, never a bound).
+                    _warn_fallback_once("strong branching", e, "no branch hint for this node")
             if sb_hint_ids:
                 tree.set_branch_hints(
                     np.array(sb_hint_ids, dtype=np.int64),
@@ -17877,14 +18103,15 @@ def solve_model(
             for _bi, (_nlb, _nub) in _nr_pending.items():
                 if node_infeasible_mask[_bi] or result_lbs[_bi] >= _SENTINEL_THRESHOLD:
                     continue
-                try:
-                    tree.set_node_bounds(
-                        int(batch_ids[_bi]),
-                        np.asarray(_nlb, dtype=np.float64),
-                        np.asarray(_nub, dtype=np.float64),
-                    )
-                except Exception as _sb_exc:  # pragma: no cover - defensive
-                    logger.debug("set_node_bounds failed at node %d: %s", _bi, _sb_exc)
+                # #1520: no ``except``. ``PyTreeManager.set_node_bounds`` has no
+                # error return (a length mismatch is ignored in Rust, an unknown
+                # id panics), so a raise here is a defect: swallowing it dropped
+                # a node's reduced box without a trace.
+                tree.set_node_bounds(
+                    int(batch_ids[_bi]),
+                    np.asarray(_nlb, dtype=np.float64),
+                    np.asarray(_nub, dtype=np.float64),
+                )
             rust_time += time.perf_counter() - t_rust_start
 
         # Import results back to Rust tree.
@@ -18349,10 +18576,13 @@ def solve_model(
                 _inc_feasible = _check_constraint_feasibility(
                     evaluator, np.array(sol_array), cl_list, cu_list
                 )
-        except Exception as _pf_exc:  # pragma: no cover - defensive
+        except Exception as _pf_exc:  # noqa: BLE001 - see below
             # If the original-model re-check cannot be built, be conservative and
             # do NOT discard the incumbent (never risk a false infeasible).
-            logger.debug("prereform incumbent re-check skipped: %s", _pf_exc)
+            # #1520: kept (the evaluator build runs user expressions), now visible.
+            _warn_fallback_once(
+                "pre-reformulation incumbent re-check", _pf_exc, "keeping the incumbent"
+            )
             _inc_feasible = True
         if not _inc_feasible:
             logger.debug(
@@ -20318,7 +20548,12 @@ def _solve_nlp_bb(
             from discopt._relax.convexity import classify_model as _classify_model
 
             _model_is_convex, _ = _classify_model(model, use_certificate=True)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - see below
+            # #1520: kept as a sound fallback: "not convex" runs NLP-BB in its
+            # heuristic (uncertified) mode.
+            _warn_fallback_once(
+                "NLP-BB convexity classification", exc, "treating the model as nonconvex"
+            )
             _model_is_convex = False
 
     if not _model_is_convex and not skip_convex_check:
@@ -22279,8 +22514,10 @@ def _solve_node_nlp(
                             objective=_INFEASIBILITY_SENTINEL,
                         )
             except Exception as exc:  # noqa: BLE001 - falls through to the NLP solver
-                logger.debug(
-                    "fixed-box infeasibility probe skipped: %s: %s", type(exc).__name__, exc
+                # #1520: kept as a sound fallback (the probe only ever declares a
+                # node infeasible; skipping it leaves the NLP to decide).
+                _warn_fallback_once(
+                    "fixed-box infeasibility probe", exc, "deferring to the node NLP"
                 )
 
     if nlp_solver != "ipopt":
@@ -22379,8 +22616,10 @@ def _solve_node_nlp_pounce(
                 constraint_bounds=constraint_bounds,
                 options=attempt_opts,
             )
-        except Exception as e:
-            logger.debug("POUNCE solver failed: %s", e)
+        except Exception as e:  # noqa: BLE001 - see below
+            # #1520: kept as a sound fallback. POUNCE's native layer can raise
+            # rather than return a status; ``ERROR`` leaves the node unsettled.
+            _warn_fallback_once("node NLP (POUNCE)", e, "reporting the node NLP as ERROR")
             return NLPResult(status=SolveStatus.ERROR, x=start, objective=_INFEASIBILITY_SENTINEL)
 
     lb_c = np.clip(np.asarray(node_lb, dtype=np.float64), -_SPC, _SPC)
@@ -22656,7 +22895,8 @@ def _solve_batch_pounce(
     except Exception as e:
         # Whole-batch failure: fall back to per-node serial solves so one bad
         # instance can't sink the iteration (single warm start per node).
-        logger.debug("Batch POUNCE failed (%s); falling back to serial nodes", e)
+        # #1520: kept as a sound fallback, now visible.
+        _warn_fallback_once("batched POUNCE node NLPs", e, "solving the nodes serially")
         for i in range(n_batch):
             node_lb, node_ub = node_bounds[i]
             # x0s are in .nl column order when native; the JAX serial path wants
@@ -22811,8 +23051,11 @@ def _solve_node_nlp_ipopt(
 
     try:
         x, info = problem.solve(x0.astype(np.float64))
-    except Exception as e:
-        logger.debug("Ipopt solver failed: %s", e)
+    except Exception as e:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback. cyipopt raises from native code (and
+        # from user callbacks) rather than returning a status; ``ERROR`` leaves
+        # the node unsettled.
+        _warn_fallback_once("node NLP (Ipopt)", e, "reporting the node NLP as ERROR")
         return NLPResult(
             status=SolveStatus.ERROR,
             x=x0,
@@ -26398,15 +26641,16 @@ def _extract_clique_edges(model: Model) -> list[tuple[int, int]]:
     cannot both be 1. Best-effort: returns ``[]`` if the bridge/pass is
     unavailable."""
     from discopt._relax.presolve_pipeline import run_root_presolve
+    from discopt._relax.problem_classifier import MODEL_TO_REPR_DECLINES
     from discopt._rust import model_to_repr
 
-    # #1514: narrowed to the one documented decline. ``model_to_repr`` raises
-    # ``ValueError`` for a model the Rust IR cannot represent -- the same
-    # "repr unavailable" the root presolve setup treats as a skip. The clique pass
-    # itself reports through ``stats``; any other exception is a defect.
+    # #1514/#1520: narrowed to the documented declines. ``model_to_repr`` raises
+    # one of ``MODEL_TO_REPR_DECLINES`` for a model the Rust IR cannot represent --
+    # the same "repr unavailable" the root presolve setup treats as a skip. The
+    # clique pass itself reports through ``stats``; any other exception is a defect.
     try:
         repr_ = model_to_repr(model, getattr(model, "_builder", None))
-    except ValueError as e:
+    except MODEL_TO_REPR_DECLINES as e:
         logger.debug("clique edge extraction skipped, no Rust repr: %s", e)
         return []
     _, stats = run_root_presolve(
@@ -26922,7 +27166,10 @@ def _milp_is_exactly_linear(model: Model) -> bool:
         _fully_linear = bool(_repr.is_objective_linear()) and all(
             _repr.is_constraint_linear(i) for i in range(_repr.n_constraints)
         )
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # #1520: kept as a sound fallback, like the solve's own repr (#1516):
+        # "not provably linear" defers to the general path.
+        _warn_fallback_once("Rust model repr (MILP linearity check)", exc, "deferring")
         _fully_linear = False
     return _fully_linear
 
@@ -27713,36 +27960,33 @@ def _solve_milp_simplex(
         root_bound_val = None
         root_gap_val = None
         root_time_val = None
-        try:
-            _t_root = time.perf_counter()
-            _lp_status, _, _lp_obj, _lp_bound, _, _ = solve_milp_csc_py(
-                np.ascontiguousarray(lp_data.c, dtype=np.float64),
-                _A_m,
-                _A_n,
-                _A_ptr,
-                _A_idx,
-                _A_val,
-                np.ascontiguousarray(lp_data.b_eq, dtype=np.float64),
-                np.ascontiguousarray(lp_data.x_l, dtype=np.float64),
-                np.ascontiguousarray(lp_data.x_u, dtype=np.float64),
-                np.ascontiguousarray(np.empty(0, dtype=np.int64)),  # integers relaxed
-                n_orig,
-                float(lp_data.obj_const),
-                1000,  # a relaxed (integer-free) LP solves at the root; headroom to finalize
-                float(gap_tolerance),
-                time_limit_s=float(max(0.1, min(_milp_budget, 5.0))),
-            )
-            root_time_val = time.perf_counter() - _t_root
-            if (
-                _lp_status in ("optimal", "feasible")
-                and _lp_obj is not None
-                and np.isfinite(_lp_obj)
-            ):
-                root_bound_val = -_lp_obj if maximize else _lp_obj
-                if obj_val is not None and np.isfinite(obj_val):
-                    root_gap_val = abs(obj_val - root_bound_val) / max(1.0, abs(obj_val))
-        except Exception as _e:  # pragma: no cover - defensive
-            logger.debug("root LP relaxation bound failed: %s", _e)
+        # #1520: no ``except``. ``solve_milp_csc_py`` declines by status (a
+        # non-optimal status leaves ``root_bound_val`` unset); its one raising
+        # input check (a NaN box) already ran on this exact data in the solve
+        # above. A raise here is a defect, not "no root bound".
+        _t_root = time.perf_counter()
+        _lp_status, _, _lp_obj, _lp_bound, _, _ = solve_milp_csc_py(
+            np.ascontiguousarray(lp_data.c, dtype=np.float64),
+            _A_m,
+            _A_n,
+            _A_ptr,
+            _A_idx,
+            _A_val,
+            np.ascontiguousarray(lp_data.b_eq, dtype=np.float64),
+            np.ascontiguousarray(lp_data.x_l, dtype=np.float64),
+            np.ascontiguousarray(lp_data.x_u, dtype=np.float64),
+            np.ascontiguousarray(np.empty(0, dtype=np.int64)),  # integers relaxed
+            n_orig,
+            float(lp_data.obj_const),
+            1000,  # a relaxed (integer-free) LP solves at the root; headroom to finalize
+            float(gap_tolerance),
+            time_limit_s=float(max(0.1, min(_milp_budget, 5.0))),
+        )
+        root_time_val = time.perf_counter() - _t_root
+        if _lp_status in ("optimal", "feasible") and _lp_obj is not None and np.isfinite(_lp_obj):
+            root_bound_val = -_lp_obj if maximize else _lp_obj
+            if obj_val is not None and np.isfinite(obj_val):
+                root_gap_val = abs(obj_val - root_bound_val) / max(1.0, abs(obj_val))
 
         # Relaxation duals at the incumbent. ``SolveResult`` promises named
         # constraint duals / reduced costs for a MILP (test_solver_duals.py,

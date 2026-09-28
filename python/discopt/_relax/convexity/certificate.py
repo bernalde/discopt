@@ -190,39 +190,34 @@ def certify_quadratic_objective_convex(model: Model, *, deadline: Optional[float
     if n_flat == 0 or n_flat + len(model._constraints) > _QP_EXACT_CONVEXITY_MAX_N:
         return False
 
-    try:
-        from discopt._relax.problem_classifier import (
-            ProblemClass,
-            classify_problem,
-            dense_Q,
-            extract_qp_data,
-        )
+    # #1520: no except. Every step declines by return value: ``classify_problem``
+    # falls back to NLP/MINLP itself, ``extract_qp_data``'s rungs absorb their own
+    # declines, and the shape/size guards below return False. The old blanket
+    # handler answered "not convex" (the sound direction) for any exception, so a
+    # defect in the extractor was indistinguishable from a non-convex objective.
+    from discopt._relax.problem_classifier import (
+        ProblemClass,
+        classify_problem,
+        dense_Q,
+        extract_qp_data,
+    )
 
-        problem_class = classify_problem(model)
-        if problem_class not in (ProblemClass.QP, ProblemClass.MIQP):
-            return False
-        if deadline is not None and time.perf_counter() > deadline:
-            return False
-        quad = extract_qp_data(model).Q
-        # Re-check the dimension we actually got BEFORE densifying: builder-resident
-        # rows are not in ``model._constraints``, so the pre-gate above can still be
-        # cleared by a model whose extracted form is far larger. ``.shape`` is
-        # available on both dense arrays and scipy sparse matrices.
-        shape = getattr(quad, "shape", None)
-        if shape is None or len(shape) != 2 or shape[0] != shape[1]:
-            return False
-        if shape[0] > _QP_EXACT_CONVEXITY_MAX_N:
-            return False
-        hessian = dense_Q(quad)
-    except Exception as exc:  # noqa: BLE001 - abstention is the sound direction
-        # Capability-disabling, not cosmetic: every failure here is a convex QP
-        # that silently keeps routing to spatial B&B, so log the reason rather
-        # than let "the fast path didn't trigger" be indistinguishable from "the
-        # model isn't convex".
-        logger.debug(
-            "exact QP objective convexity route abstained: %s: %s", type(exc).__name__, exc
-        )
+    problem_class = classify_problem(model)
+    if problem_class not in (ProblemClass.QP, ProblemClass.MIQP):
         return False
+    if deadline is not None and time.perf_counter() > deadline:
+        return False
+    quad = extract_qp_data(model).Q
+    # Re-check the dimension we actually got BEFORE densifying: builder-resident
+    # rows are not in ``model._constraints``, so the pre-gate above can still be
+    # cleared by a model whose extracted form is far larger. ``.shape`` is
+    # available on both dense arrays and scipy sparse matrices.
+    shape = getattr(quad, "shape", None)
+    if shape is None or len(shape) != 2 or shape[0] != shape[1]:
+        return False
+    if shape[0] > _QP_EXACT_CONVEXITY_MAX_N:
+        return False
+    hessian = dense_Q(quad)
 
     from discopt._relax.quadratic_form import quadratic_is_psd
 
@@ -367,10 +362,10 @@ def refresh_convex_mask(
         if refreshed[constraint_index]:
             constraint_index += 1
             continue
-        try:
-            cert = certify_convex(c.body, model, box=box)
-        except Exception:
-            cert = None
+        # #1520: no except. ``certify_convex`` abstains by returning ``None`` (it
+        # absorbs the interval-Hessian's documented ``ValueError`` itself), so an
+        # exception here is a defect, not a "not convex" verdict.
+        cert = certify_convex(c.body, model, box=box)
         if cert is None:
             constraint_index += 1
             continue

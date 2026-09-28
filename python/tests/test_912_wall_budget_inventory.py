@@ -665,7 +665,9 @@ KNOWN: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "_relax/mccormick_lp.py",
-        "else time.perf_counter() + _INTEGER_RATIO_DIVE_BUDGET_S",
+        # #1520: one line since the enclosing ``try`` was removed and the
+        # conditional re-flowed; still suppressed by ``_tuning().deterministic``.
+        "None if _tuning().deterministic else time.perf_counter() + _INTEGER_RATIO_DIVE_BUDGET_S",
         "residual",
     ),
     (

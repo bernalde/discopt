@@ -160,28 +160,35 @@ def _qp_forward(qp_data) -> tuple[float, np.ndarray]:
 
 
 def _solve_objective(model: Model, problem_class: ProblemClass) -> float | None:
-    """Solve a model and return just the objective value."""
-    try:
-        if problem_class == ProblemClass.LP:
-            lp_data = extract_lp_data(model)
-            lp_obj, _ = _lp_forward(lp_data)
-            return lp_obj + lp_data.obj_const
-        elif problem_class == ProblemClass.QP:
-            qp_data = extract_qp_data(model)
-            qp_obj, _ = _qp_forward(qp_data)
-            return qp_obj + qp_data.obj_const
-        else:
-            from discopt._relax.nlp_evaluator import NLPEvaluator
-            from discopt.solvers.nlp_pounce import solve_nlp
+    """Solve a model and return just the objective value.
 
-            evaluator = NLPEvaluator(model)
-            lb, ub = evaluator.variable_bounds
-            x0 = 0.5 * (np.clip(lb, -100, 100) + np.clip(ub, -100, 100))
-            nlp_result = solve_nlp(evaluator, x0)
-            obj = nlp_result.objective
-            return float(obj) if obj is not None else None
-    except Exception:
-        return None
+    ``None`` when the NLP solve returns no objective. A failed LP/QP forward solve
+    raises (``PounceKKTError`` for a non-converged KKT point, ``ImportError``
+    without POUNCE) -- see #1520.
+    """
+    # #1520: no except. This used to return ``None`` on ANY exception, and
+    # ``gradient`` then left that parameter's entry at 0.0 -- a silently wrong
+    # sensitivity reported as a result. The forward solvers already refuse a
+    # non-converged point loudly (``PounceKKTError``); swallowing that refusal
+    # here defeated it.
+    if problem_class == ProblemClass.LP:
+        lp_data = extract_lp_data(model)
+        lp_obj, _ = _lp_forward(lp_data)
+        return lp_obj + lp_data.obj_const
+    elif problem_class == ProblemClass.QP:
+        qp_data = extract_qp_data(model)
+        qp_obj, _ = _qp_forward(qp_data)
+        return qp_obj + qp_data.obj_const
+    else:
+        from discopt._relax.nlp_evaluator import NLPEvaluator
+        from discopt.solvers.nlp_pounce import solve_nlp
+
+        evaluator = NLPEvaluator(model)
+        lb, ub = evaluator.variable_bounds
+        x0 = 0.5 * (np.clip(lb, -100, 100) + np.clip(ub, -100, 100))
+        nlp_result = solve_nlp(evaluator, x0)
+        obj = nlp_result.objective
+        return float(obj) if obj is not None else None
 
 
 def _unpack_solution(model: Model, x_flat):
@@ -270,6 +277,8 @@ def differentiable_solve(
         result = solve_model(model)
         relaxation_obj = None
 
+        from discopt.solvers.lp_pounce import PounceKKTError
+
         # Compute LP/QP relaxation for gradient
         try:
             if problem_class == ProblemClass.MILP:
@@ -278,7 +287,11 @@ def differentiable_solve(
             else:
                 qp_data = extract_qp_data(model)
                 relaxation_obj, _ = _qp_forward(qp_data)
-        except Exception as exc:  # noqa: BLE001 - the result is reported without a relaxation
+        except (ImportError, PounceKKTError) as exc:
+            # #1520: narrowed. The forward solvers' documented declines -- POUNCE not
+            # installed, or a KKT solve that did not converge (e.g. an unbounded or
+            # infeasible continuous relaxation). The result then honestly reports
+            # ``relaxation_obj=None``; any other exception is a defect and propagates.
             logger.debug(
                 "relaxation objective unavailable for %s: %s: %s",
                 problem_class,

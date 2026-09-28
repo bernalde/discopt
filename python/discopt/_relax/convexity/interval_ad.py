@@ -57,6 +57,7 @@ automatic differentiation).
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -119,6 +120,11 @@ def _expr_node_budget_exceeded(expr: Expression, limit: int) -> bool:
     :func:`_walk` uses), and early-exits the moment the count crosses ``limit``, so
     the check itself is O(limit) and never becomes the pathology it guards against.
     """
+    return _expr_node_count_capped(expr, limit) > limit
+
+
+def _expr_node_count_capped(expr: Expression, limit: int) -> int:
+    """Distinct-node count of ``expr``'s DAG, stopping at ``limit + 1``."""
     seen: set[int] = set()
     stack: list[Expression] = [expr]
     count = 0
@@ -130,7 +136,7 @@ def _expr_node_budget_exceeded(expr: Expression, limit: int) -> bool:
         seen.add(eid)
         count += 1
         if count > limit:
-            return True
+            return count
         if isinstance(e, (BinaryOp, MatMulExpression)):
             stack.append(e.left)
             stack.append(e.right)
@@ -145,7 +151,7 @@ def _expr_node_budget_exceeded(expr: Expression, limit: int) -> bool:
         elif isinstance(e, IndexExpression):
             stack.append(e.base)
         # Variable / Constant (and any other leaf) contribute no children.
-    return False
+    return count
 
 
 # Type aliases for the sparse carriers (documentation only).
@@ -517,20 +523,50 @@ def interval_hessian(
     # #654: refuse the minute-plus uninterruptible walk on a pathologically large
     # body. Cheap O(budget) pre-check with early-exit; abstaining is sound (the
     # interval Hessian is only ever a bound tightening).
-    if _expr_node_budget_exceeded(expr, _INTERVAL_HESSIAN_MAX_NODES):
+    n_nodes = _expr_node_count_capped(expr, _INTERVAL_HESSIAN_MAX_NODES)
+    if n_nodes > _INTERVAL_HESSIAN_MAX_NODES:
         raise IntervalHessianTooLarge(
             f"expression DAG exceeds {_INTERVAL_HESSIAN_MAX_NODES} nodes; "
             "interval-Hessian walk declined to protect the time budget (#654)"
         )
     box = box or {}
     cache: dict = {}
-    # Wide boxes intentionally overflow to ``±inf`` / ``0 * inf`` (the
-    # abstention sentinels the certificate reads as UNKNOWN). Those are
-    # sound interval results, not numerical bugs — suppress the warnings
-    # for the whole walk, mirroring the dense path's per-op errstate.
-    with np.errstate(over="ignore", invalid="ignore"):
-        sad = _walk(expr, model, box, cache, n)
-        return _densify(sad, n)
+
+    def _run() -> IntervalAD:
+        # Wide boxes intentionally overflow to ``±inf`` / ``0 * inf`` (the
+        # abstention sentinels the certificate reads as UNKNOWN). Those are
+        # sound interval results, not numerical bugs — suppress the warnings
+        # for the whole walk, mirroring the dense path's per-op errstate.
+        with np.errstate(over="ignore", invalid="ignore"):
+            sad = _walk(expr, model, box, cache, n)
+            return _densify(sad, n)
+
+    # #1520: ``_walk`` recurses once per DAG level (a few frames each), so a
+    # left-folded sum of a few hundred terms -- well inside the node budget --
+    # exhausted the default 1000-frame limit and raised ``RecursionError``, which
+    # callers' catch-alls read as "no verdict". Depth is bounded by the node
+    # count, so run deep bodies on the large-stack runner the convexity walk
+    # already uses (#266) instead of abstaining by accident.
+    from .rules import _run_with_deep_recursion
+
+    return _run_with_deep_recursion(
+        _run, depth_need=_stack_depth() + _WALK_FRAMES_PER_NODE * n_nodes + 200
+    )
+
+
+def _stack_depth() -> int:
+    """Number of Python frames currently on this thread's stack."""
+    depth = 0
+    frame = sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
+
+
+#: Upper bound on Python frames ``_walk`` uses per DAG level (``_walk`` ->
+#: ``_impl`` -> a per-op helper -> ``_walk``), for the recursion-limit estimate.
+_WALK_FRAMES_PER_NODE = 4
 
 
 # ──────────────────────────────────────────────────────────────────────

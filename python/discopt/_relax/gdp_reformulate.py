@@ -16,7 +16,6 @@ original model is returned unchanged (zero overhead).
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 
 import numpy as np
@@ -59,8 +58,6 @@ from discopt.modeling.core import (
     carry_validation_guards,
 )
 from discopt.mpec import carry_complementarities
-
-logger = logging.getLogger(__name__)
 
 _DEFAULT_BIG_M = 1e4
 
@@ -464,27 +461,21 @@ def _compute_big_m_lp(
     def _solve_bound(maximize: bool) -> float | None:
         """Solve LP to get bound. Returns None if LP fails."""
         obj = -c_vec if maximize else c_vec
-        try:
-            result = solve_lp(
-                c=obj,
-                A_ub=A_ub,
-                b_ub=b_ub,
-                A_eq=A_eq,
-                b_eq=b_eq,
-                bounds=bounds_list,
-            )
-            if result.status == SolveStatus.OPTIMAL and result.objective is not None:
-                val = -result.objective if maximize else result.objective
-                return float(val) + offset
-        except Exception as exc:  # noqa: BLE001 - the caller falls back to the default big-M
-            # Capability-disabling: without this LP bound the disjunction gets the
-            # loose default big-M, which reads as "tightened big-M doesn't help".
-            logger.debug(
-                "big-M LP bound (%s) failed: %s: %s",
-                "max" if maximize else "min",
-                type(exc).__name__,
-                exc,
-            )
+        # #1520: no except. The exact LP oracle (``lp_simplex.solve_lp``) declines
+        # by status, handled here; a raise is a defect -- e.g. the ``copy_from_slice``
+        # length mismatch described above, which this handler used to turn into
+        # "use the default big-M" instead of a bug report.
+        result = solve_lp(
+            c=obj,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds_list,
+        )
+        if result.status == SolveStatus.OPTIMAL and result.objective is not None:
+            val = -result.objective if maximize else result.objective
+            return float(val) + offset
         return None
 
     if constraint.sense == "<=":
@@ -748,7 +739,13 @@ def _bound_expression(
                 p = float(expr.right.value)
                 if p == int(p) and p > 0:
                     p_int = int(p)
-                    vals = [left_lo**p_int, left_hi**p_int]
+                    # #1520: float64 power, so an overflow is a signed inf (a
+                    # valid, looser endpoint) rather than Python's OverflowError.
+                    with np.errstate(over="ignore"):
+                        vals = [
+                            float(np.float64(left_lo) ** p_int),
+                            float(np.float64(left_hi) ** p_int),
+                        ]
                     if p_int % 2 == 0 and left_lo < 0 < left_hi:
                         # Even power over a base that straddles 0: x^p is not
                         # monotone here — its interior minimum is at x=0

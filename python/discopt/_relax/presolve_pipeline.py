@@ -357,12 +357,13 @@ def propagate_bounds_to_model(model, model_repr, presolve_stats: dict | None = N
     # bounded variables (e.g. gastransnlp) this fabricates empty boxes and a
     # false ``infeasible`` verdict. Matching on the Rust-side ``var_names``
     # keeps the mapping correct regardless of how many variables were removed.
-    try:
-        rust_names = list(model_repr.var_names())
-    except Exception:  # pragma: no cover - older repr without var_names
-        rust_names = None
+    # #1520: no except. ``PyModelRepr.var_names`` is part of the binding this
+    # package ships with (crates/discopt-python/src/expr_bindings.rs); the "older
+    # repr without var_names" it guarded against cannot be loaded, so a raise is a
+    # defect rather than a reason to fall back to the positional mapping.
+    rust_names = list(model_repr.var_names())
 
-    if rust_names is not None and len(rust_names) == model_repr.n_var_blocks:
+    if len(rust_names) == model_repr.n_var_blocks:
         py_by_name = {blk.name: blk for blk in py_blocks}
         block_iter = [(py_by_name[nm], ri) for ri, nm in enumerate(rust_names) if nm in py_by_name]
     else:
@@ -497,10 +498,10 @@ def run_reverse_ad_tightening(
     if not constraints:
         return 0
 
-    try:
-        new_box = tighten_box(constraints, model, max_iter=max_iter, tol=tol)
-    except Exception:
-        return 0
+    # #1520: no except. ``tighten_box`` has no documented failure mode (an operator
+    # the reverse walk does not know simply contributes no tightening), so a raise
+    # is a defect -- not "0 bounds tightened", which ``solver.py`` reports as such.
+    new_box = tighten_box(constraints, model, max_iter=max_iter, tol=tol)
 
     n_tightened = 0
     for v, iv in new_box.items():

@@ -170,19 +170,20 @@ def static_box_for_arg(arg, model) -> tuple[float, float] | None:
     Returns ``(lo, hi)`` or ``None`` if the bound cannot be inferred
     (e.g. the expression contains an unsupported operator).
     """
-    try:
-        from discopt._relax.convexity.interval_eval import evaluate_interval
-    except Exception:
+    # #1520: no except (three handlers removed). The import is an in-package
+    # module, ``evaluate_interval`` has no documented failure mode (an operator
+    # it does not know encloses to ``[-inf, inf]``, declined below), and the one
+    # expected shape decline -- a non-scalar argument -- is now an explicit size
+    # check instead of a ``reshape`` that raised into a bare ``except``.
+    from discopt._relax.convexity.interval_eval import evaluate_interval
+
+    iv = evaluate_interval(arg, model)
+    lo_arr = np.asarray(iv.lo, dtype=np.float64)
+    hi_arr = np.asarray(iv.hi, dtype=np.float64)
+    if lo_arr.size != 1 or hi_arr.size != 1:
         return None
-    try:
-        iv = evaluate_interval(arg, model)
-    except Exception:
-        return None
-    try:
-        lo = float(np.asarray(iv.lo).reshape(()))
-        hi = float(np.asarray(iv.hi).reshape(()))
-    except Exception:
-        return None
+    lo = float(lo_arr.reshape(()))
+    hi = float(hi_arr.reshape(()))
     if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
         return None
     return lo, hi

@@ -120,7 +120,10 @@ def _index_equal(ia, ib) -> bool:
         # int vs np.integer etc. — fall back to value comparison below.
         try:
             return bool(np.array_equal(np.asarray(ia, dtype=object), np.asarray(ib, dtype=object)))
-        except Exception:
+        except (TypeError, ValueError):
+            # #1520: narrowed to numpy's comparison failures (e.g. an ambiguous
+            # element-wise truth value); "not provably equal" is the conservative
+            # answer -- the residual is simply not merged.
             return False
     if isinstance(ia, slice):
         return bool(ia == ib)
@@ -128,7 +131,8 @@ def _index_equal(ia, ib) -> bool:
         return len(ia) == len(ib) and all(_index_equal(x, y) for x, y in zip(ia, ib))
     try:
         return bool(np.array_equal(ia, ib))
-    except Exception:
+    except (TypeError, ValueError):
+        # #1520: narrowed to numpy's comparison failures; other errors propagate.
         return bool(ia == ib)
 
 

@@ -173,10 +173,9 @@ class SeparabilityPass:
 
     def run(self, model_repr: Any) -> dict:
         delta = make_python_delta(self.name)
-        try:
-            report = detect_separability(self.model)
-        except Exception:
-            return delta
+        # #1520: no except. ``detect_separability`` is a structural walk with no
+        # documented failure mode; a raise is a defect, not "no structure found".
+        report = detect_separability(self.model)
         self.last_report = report
         delta["work_units"] = len(self.model._constraints) + 1
         delta["separable_blocks"] = [list(b) for b in report.blocks]

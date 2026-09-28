@@ -387,7 +387,18 @@ def reduced_mccormick_lp_bound(
                     xr = np.asarray(mres.x, dtype=float)
                 else:
                     raise RuntimeError(f"simplex status {st}")
-            except Exception:
+            except Exception as exc:
+                # #1520: kept as a sound fallback. The in-house simplex is native code
+                # (and the block above raises on its own non-finite / unknown-status
+                # outcomes); falling back re-solves the SAME Kelley LP on scipy/HiGHS,
+                # so the bound is unchanged in meaning. Reported, not silent.
+                from discopt._relax._fallback import warn_fallback_once
+
+                warn_fallback_once(
+                    "reduced-space Kelley LP (in-house simplex)",
+                    exc,
+                    "re-solving on scipy/HiGHS for this and later rounds",
+                )
                 backend = "scipy"  # fall back for this and subsequent rounds
                 milp = None
         if backend == "scipy":
@@ -424,7 +435,17 @@ def reduced_mccormick_lp_bound(
                         bounds=bounds,
                         method="highs",
                     )
-                except Exception:
+                except Exception as exc:
+                    # #1520: kept as a sound fallback. scipy/HiGHS is an external
+                    # solver; if the confirming solve raises, the infeasible verdict
+                    # stays unconfirmed and the node is NOT fathomed (below).
+                    from discopt._relax._fallback import warn_fallback_once
+
+                    warn_fallback_once(
+                        "reduced-space infeasibility cross-check (scipy/HiGHS)",
+                        exc,
+                        "the simplex infeasible verdict is not trusted; node not fathomed",
+                    )
                     _vres = None
                 _confirmed = _vres is not None and (
                     "infeasible" in (getattr(_vres, "message", "") or "").lower()

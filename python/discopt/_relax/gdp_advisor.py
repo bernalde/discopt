@@ -144,11 +144,10 @@ def recommend_method(
                 continue
             if not _is_linear(c.body):
                 has_nonlinear = True
-            try:
-                lo, hi = _bound_expression(c.body, model)
-            except Exception:
-                any_unbounded_M = True
-                continue
+            # #1520: no except. ``_bound_expression`` declines by returning an
+            # infinite endpoint (handled just below as ``any_unbounded_M``); a raise
+            # is a defect, not "unbounded".
+            lo, hi = _bound_expression(c.body, model)
             for v in (lo, hi):
                 fv = float(np.asarray(v).max() if np.ndim(v) > 0 else v)
                 if not np.isfinite(fv):

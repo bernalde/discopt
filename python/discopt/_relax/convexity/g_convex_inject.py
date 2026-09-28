@@ -158,8 +158,9 @@ def inject_g_convex_cuts(
     residual has an unbounded interval enclosure are skipped.
 
     This mutates ``model`` in place (via ``subject_to``) and is a no-op unless
-    :func:`g_convex_cuts_enabled`. Any per-constraint failure is swallowed so
-    the injector can never break a solve.
+    :func:`g_convex_cuts_enabled`. A body the certificate or the cut
+    construction cannot handle is skipped (they decline by returning ``None``);
+    an exception is a defect and propagates (#1520).
     """
     import discopt.modeling as dm
 
@@ -187,10 +188,9 @@ def inject_g_convex_cuts(
         # look for G-convexity of ``phi``.
         phi = c.body if c.sense == "<=" else -c.body
         want = "g_convex"
-        try:
-            cert = certify_g_convex(phi, model, box=box)
-        except Exception:
-            cert = None
+        # #1520: no except. ``certify_g_convex`` abstains by returning ``None``
+        # (it absorbs the interval-Hessian's documented ``ValueError`` itself).
+        cert = certify_g_convex(phi, model, box=box)
         if cert is None or cert.kind != want:
             continue
         rho = float(cert.rho)
@@ -198,10 +198,9 @@ def inject_g_convex_cuts(
             # Ordinary convex body — the existing OA path already handles it.
             continue
 
-        try:
-            n_new = _inject_for_body(model, phi, rho, box, offsets, lb, ub, n, points, applied, dm)
-        except Exception:
-            n_new = 0
+        # #1520: no except. ``rigorous_g_convex_cut_coeffs`` declines a point by
+        # returning ``None``, so an exception here is a defect, not "no cut".
+        n_new = _inject_for_body(model, phi, rho, box, offsets, lb, ub, n, points, applied, dm)
         applied += n_new
     return applied
 
@@ -261,10 +260,9 @@ def rigorous_g_convex_cut_coeffs(model, phi, rho, x0, box, *, offsets=None):
         offsets = {i: v for i, v in enumerate(variables)}
     lin = _linear_expr(g, offsets)
     residual = dm.exp(rho * phi) if lin is None else (dm.exp(rho * phi) - lin)
-    try:
-        psi0_iv = evaluate_interval(residual, model, box=pbox)
-    except Exception:
-        return None
+    # #1520: no except. ``evaluate_interval`` declines an atom it cannot enclose by
+    # returning an unbounded interval, which the finiteness check below rejects.
+    psi0_iv = evaluate_interval(residual, model, box=pbox)
     psi0_lo = float(np.asarray(psi0_iv.lo).ravel()[0])
     if not np.isfinite(psi0_lo):
         return None

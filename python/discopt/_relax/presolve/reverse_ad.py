@@ -94,20 +94,16 @@ class ReverseADPass:
         # count differs (aux vars from polynomial reformulation).
         box = _box_from_model_repr(self.model, model_repr)
 
-        try:
-            new_box = tighten_box(
-                constraints,
-                self.model,
-                box=box,
-                max_iter=self.max_iter,
-                tol=self.tol,
-            )
-        except Exception:
-            # Reverse AD does not support every operator combination
-            # (multidimensional indexing, certain transcendentals). On
-            # an unsupported atom abstain — the orchestrator will catch
-            # this as a no-op delta.
-            return delta
+        # #1520: no except. ``tighten_box`` has no documented exception: an
+        # operator the reverse walk does not support contributes no tightening
+        # (it is never a raise), so a raise is a defect, not a no-op delta.
+        new_box = tighten_box(
+            constraints,
+            self.model,
+            box=box,
+            max_iter=self.max_iter,
+            tol=self.tol,
+        )
 
         n_tightened = 0
         for v, iv in new_box.items():
