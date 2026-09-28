@@ -1133,10 +1133,28 @@ def _root_lp_probe_tight_enabled() -> bool:
 _NATIVE_SEED_HEURISTIC_S = 12.0
 
 
-def _native_kernel_verify_point(model, x_flat):
+def _native_kernel_verify_point(model, x_flat, source=None):
     """Rigorously verify that ``x_flat`` (length ``n_orig``, original-variable order)
     is feasible for the ORIGINAL model, and return ``(True, model_objective)`` with the
     point's TRUE objective in model units, or ``(False, None)``.
+
+    ``source`` is ``(pre_reform_model, pre_reform_nvars)`` when ``model`` is the
+    factorable lift of the problem the caller actually posed, else ``None``. The lift
+    appends aux columns after the originals, so ``x_flat[:pre_reform_nvars]`` is the
+    point in the pre-reform model, and it must verify THERE too (#1522). Verifying the
+    lift alone is not verification of the source: the lift distributes products
+    (``100*(y - x**2)**2`` becomes ``100*y*y - 200*_fr_aux*y + 100*x**4`` with
+    ``_fr_aux = x**2``), so the lifted row's term magnitudes are ~450 where the source
+    row's are ~2, and ``verify_point``'s scale-keyed allowance
+    ``ABS_TOL * max(1, term scale)`` grows with them. Measured on MINLPLib ``prob09``
+    at ``x = 1.03088, y = 1.05765``: the lifted row was allowed 4.5e-4, the source
+    row's residual was 1.6e-4, and the source row itself is allowed ~2e-6 — so the
+    kernel reported an incumbent that ``warm_start.check_feasibility`` rejects at its
+    default ``tol=1e-4``. Each lifted row's residual also composes through the aux
+    definitions into the source row, so a point can sit inside tolerance on every
+    lifted row and outside it on the source. The returned objective stays the lift's
+    (the kernel's own objective, in the same units), so callers that compare it with
+    the kernel's value are unchanged.
 
     Soundness (#764 Task 1): this gates whether a value may seed the native kernel's
     incumbent cutoff. An unverified seed would poison every downstream certificate.
@@ -1156,7 +1174,92 @@ def _native_kernel_verify_point(model, x_flat):
     if not res.ok:
         logger.debug("native seed verification declined: %s", res.reason)
         return False, None
+    if source is not None:
+        src_model, src_nvars = source
+        x_src = np.asarray(x_flat, dtype=np.float64)[: int(src_nvars)]
+        src_res = verify_point(src_model, x_src)
+        if not src_res.ok:
+            logger.debug(
+                "native verification declined: point verifies on the factorable lift "
+                "but not on the pre-reform model (#1522): %s",
+                src_res.reason,
+            )
+            return False, None
     return True, res.objective
+
+
+#: Wall-clock cap on the one local re-solve :func:`_native_kernel_repair_point` makes.
+_NATIVE_REPAIR_MAX_S = 5.0
+
+
+def _native_kernel_source_only_failure(model, x_flat, source) -> bool:
+    """``True`` when ``x_flat`` verifies on the factorable lift but not on its source.
+
+    This is the #1522 mechanism specifically: the lift's rows each sit inside their
+    own tolerance and the pre-reform row does not. A point that fails the lift itself
+    is the #789 class, which keeps its established response (decline to the Python
+    engine), so the two are told apart here rather than by the reason string.
+    """
+    if source is None:
+        return False
+    from discopt.validation.feasibility import verify_point
+
+    x = np.asarray(x_flat, dtype=np.float64)
+    if not verify_point(model, x).ok:
+        return False
+    src_model, src_nvars = source
+    return not verify_point(src_model, x[: int(src_nvars)]).ok
+
+
+def _native_kernel_repair_point(model, x_flat, source, outer_deadline):
+    """One KKT-accurate local re-solve of the lift from ``x_flat`` (#1522).
+
+    Returns ``(x_new, model_objective)`` for a point that verifies on the lift AND on
+    the pre-reform source (``_native_kernel_verify_point`` with ``source``), or
+    ``None``. The kernel's incumbent satisfies each lifted row to ``mccormick_tol``;
+    those residuals compose through the aux definitions into the source row, so the
+    repair is to drive the LIFTED residuals down to the NLP solver's own ``1e-8``
+    rather than to widen any tolerance. Integer columns are fixed at their rounded
+    values and the box is the lift's declared box, exactly as the Python engine's
+    terminal polish does. A point that does not verify is never adopted.
+    """
+    from discopt._tape_nlp_evaluator import make_evaluator
+    from discopt.validation.feasibility import model_integer_mask
+
+    budget = _NATIVE_REPAIR_MAX_S
+    if outer_deadline is not None:
+        budget = min(budget, float(outer_deadline) - time.perf_counter())
+    if budget <= 0.0:
+        return None
+    evaluator = make_evaluator(model)
+    lb, ub = flat_variable_bounds(model)
+    x0 = np.asarray(x_flat, dtype=np.float64)
+    if x0.shape[0] != lb.shape[0]:
+        return None
+    x0 = np.clip(x0, lb, ub)
+    int_mask = model_integer_mask(model)
+    fix_lb = lb.copy()
+    fix_ub = ub.copy()
+    if int_mask is not None and int_mask.shape[0] == x0.shape[0]:
+        x0 = np.where(int_mask, np.round(x0), x0)
+        fix_lb = np.where(int_mask, x0, fix_lb)
+        fix_ub = np.where(int_mask, x0, fix_ub)
+    cl, cu = _infer_constraint_bounds(model, evaluator)
+    constraint_bounds = list(zip(cl, cu)) if cl else None
+    opts = pounce_option_defaults()
+    opts.update(pounce_incumbent_options())
+    opts["max_wall_time"] = float(budget)
+    opts["print_level"] = 0
+    res = _solve_node_nlp_kkt(evaluator, x0, fix_lb, fix_ub, constraint_bounds, opts)
+    if res.status != SolveStatus.OPTIMAL or res.x is None:
+        return None
+    x_new = np.asarray(res.x, dtype=np.float64)
+    if x_new.shape != x0.shape or not np.all(np.isfinite(x_new)):
+        return None
+    ok, obj = _native_kernel_verify_point(model, x_new, source=source)
+    if not ok or obj is None:
+        return None
+    return x_new, float(obj)
 
 
 # Cap on the number of FREE integers (span > 0.5 in the presolved box) the seed
@@ -1392,7 +1495,7 @@ def _native_kernel_seed_candidates(model, lb, ub, n_orig, deadline):
             logger.debug("native seed multistart raised: %s", exc)
 
 
-def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None):
+def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None, source=None):
     """Return ``(internal_value, point)`` — a genuinely-attained incumbent to seed the
     native solve (``internal_value`` in kernel-internal minimize units, ``point`` the
     verified original-variable vector) — or ``(None, None)`` if no verified feasible
@@ -1421,7 +1524,7 @@ def _native_kernel_seed(model, lb, ub, sign, off, n_orig, outer_deadline=None):
         if x_cand.shape[0] < n_orig:
             continue
         point = x_cand[:n_orig].copy()
-        ok, model_obj = _native_kernel_verify_point(model, point)
+        ok, model_obj = _native_kernel_verify_point(model, point, source=source)
         if not ok:
             continue
         internal = sign * float(model_obj) - off
@@ -1451,7 +1554,9 @@ def _native_exit_polish_enabled() -> bool:
     return integer_box_polish_enabled()
 
 
-def _native_exit_primal_polish(model, x_flat, obj_val, bound_val, n_orig, outer_deadline):
+def _native_exit_primal_polish(
+    model, x_flat, obj_val, bound_val, n_orig, outer_deadline, source=None
+):
     """Improve an UNCERTIFIED native-kernel incumbent before reporting it (#1193).
 
     Returns ``(x_new, obj_new)`` — a strictly better, independently re-verified point
@@ -1506,7 +1611,7 @@ def _native_exit_primal_polish(model, x_flat, obj_val, bound_val, n_orig, outer_
     x_new = np.asarray(found[0], dtype=np.float64)
     if x_new.shape[0] < n_orig:
         return None
-    ok, obj_new = _native_kernel_verify_point(model, x_new[:n_orig])
+    ok, obj_new = _native_kernel_verify_point(model, x_new[:n_orig], source=source)
     if not ok or obj_new is None:
         # The box search's arbiter accepted a point the original-model verifier
         # rejects. Keep the reported incumbent; never widen an acceptance to make a
@@ -1562,6 +1667,10 @@ def _try_native_spatial_kernel(
     # (its ``gap_tol`` is applied absolutely), so "unset" has to stay
     # distinguishable from "set to the Python tree's 1e-6 default".
     abs_gap_tolerance: Optional[float] = None,
+    # #1522: ``(pre_reform_model, pre_reform_nvars)`` when ``model`` is the
+    # factorable lift, so every point the kernel reports or seeds is verified
+    # against the problem the caller posed and not only against the lift.
+    source=None,
 ):
     """Issue #764: if the native Rust spatial kernel is enabled and the model is in
     its covered subset — scalar variables; bilinear / monomial / affine-square / sqrt
@@ -1637,6 +1746,7 @@ def _try_native_spatial_kernel(
             off,
             n_orig,
             outer_deadline,
+            source=source,
         )
         # The seed is an NLP relaxation solve plus one sub-NLP per enumerated integer
         # assignment plus a verification of each candidate — all through the JAX
@@ -1804,8 +1914,68 @@ def _try_native_spatial_kernel(
         # ``abs(obj_val)`` below would raise if it were ever violated.
         assert obj_val is not None
         _t_phase = time.perf_counter()
-        _ok, _model_obj = _native_kernel_verify_point(model, x_flat[:n_orig])
+        _ok, _model_obj = _native_kernel_verify_point(model, x_flat[:n_orig], source=source)
         _native_jax_s += time.perf_counter() - _t_phase
+        if (
+            not _ok
+            and native_status != "optimal"
+            and _native_kernel_source_only_failure(model, x_flat[:n_orig], source)
+        ):
+            # #1522: the point is inside tolerance on every lifted row and outside it
+            # on the problem the caller posed. On an UNCERTIFIED exit, declining
+            # here would restart the Python engine with the budget already spent and
+            # discard the kernel's rigorous bound (the #1153 lesson), so repair the
+            # point instead, and if that fails report the bound with no primal
+            # rather than a point ``warm_start.check_feasibility`` rejects. The
+            # bound does not depend on the incumbent being feasible: every node
+            # pruned against it had a bound at or above its value, and the
+            # reported bound is never above it. A certified exit is NOT repaired
+            # here -- its gap was closed against the rejected value -- and keeps
+            # the decline below.
+            _t_phase = time.perf_counter()
+            _repaired = _native_kernel_repair_point(model, x_flat[:n_orig], source, outer_deadline)
+            _native_jax_s += time.perf_counter() - _t_phase
+            _crosses = False
+            if _repaired is not None:
+                # A VERIFIED feasible point beyond the dual bound means the bound is
+                # wrong; surface it and fall back to the trusted engine rather than
+                # report either number (the same rule as #1193's polish).
+                _bound_model = sign * (float(res["bound"]) + off)
+                _rep_obj = _repaired[1]
+                _crosses = math.isfinite(_bound_model) and (
+                    _rep_obj < _bound_model - 1e-6 * (1.0 + abs(_bound_model))
+                    if sign > 0
+                    else _rep_obj > _bound_model + 1e-6 * (1.0 + abs(_bound_model))
+                )
+                if _crosses:
+                    logger.error(
+                        "native spatial kernel: repaired incumbent %.12g is beyond the "
+                        "dual bound %.12g -- the bound is invalid; routing to the Python "
+                        "engine (#1522)",
+                        _rep_obj,
+                        _bound_model,
+                    )
+                    return None
+                logger.info(
+                    "native spatial kernel: incumbent obj=%.6g violated the pre-reform "
+                    "model; repaired to obj=%.6g (#1522)",
+                    obj_val,
+                    _rep_obj,
+                )
+                x_flat, obj_val = _repaired[0], _rep_obj
+                _model_obj = _rep_obj
+            else:
+                logger.info(
+                    "native spatial kernel: incumbent obj=%.6g violates the pre-reform "
+                    "model and could not be repaired; reporting the %s bound with no "
+                    "incumbent (#1522)",
+                    obj_val,
+                    native_status,
+                )
+                x_flat = None
+                obj_val = None
+                _model_obj = None
+            _ok = True
         if not _ok:
             logger.debug(
                 "native spatial kernel: final incumbent failed original-model "
@@ -1816,7 +1986,11 @@ def _try_native_spatial_kernel(
         # Prefer the independently-recomputed true objective (exact model units) over
         # the kernel's mapped relaxation reading when they agree within tolerance; a
         # gross disagreement is itself a decline signal.
-        if _model_obj is not None and abs(_model_obj - obj_val) > 1e-4 * (1.0 + abs(obj_val)):
+        if (
+            _model_obj is not None
+            and obj_val is not None
+            and abs(_model_obj - obj_val) > 1e-4 * (1.0 + abs(obj_val))
+        ):
             logger.debug(
                 "native spatial kernel: reported obj %.6g disagrees with verified "
                 "obj %.6g — routing to the Python engine (#789)",
@@ -1879,7 +2053,7 @@ def _try_native_spatial_kernel(
     if native_status != "optimal" and x_flat is not None and obj_val is not None:
         _t_phase = time.perf_counter()
         _polished = _native_exit_primal_polish(
-            model, x_flat, obj_val, bound_val, n_orig, outer_deadline
+            model, x_flat, obj_val, bound_val, n_orig, outer_deadline, source=source
         )
         _native_jax_s += time.perf_counter() - _t_phase
         if _polished is not None:
@@ -13471,6 +13645,7 @@ def solve_model(
             rr_reserve_s=_rr_reserve_s if _root_bound_seed_enabled() else 0.0,
             psd_cuts=psd_cuts,
             abs_gap_tolerance=abs_gap_tolerance,
+            source=((_prereform_model, _prereform_nvars) if _prereform_model is not None else None),
         )
     if _native_result is not None:
         return _native_result
