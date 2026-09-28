@@ -169,9 +169,13 @@ def _get_struct_cache(model: Model) -> dict:
             "rowstruct": {},
             "metadata": build_flat_variable_metadata(model),
         }
+        # #1520: narrowed. ``setattr`` refuses an object that cannot carry the
+        # attribute with ``AttributeError`` -- the docstring's documented
+        # degradation (a fresh cache per call, same results). Anything else is a
+        # defect and propagates.
         try:
             setattr(model, "_nl_struct_cache", cache)
-        except Exception as exc:  # noqa: BLE001 - the docstring's documented degradation
+        except AttributeError as exc:
             # Non-persistent cache -> recomputation per call, which is a real cost
             # the profile would otherwise attribute to the decomposition itself.
             logger.debug("FBBT structural cache not persisted: %s: %s", type(exc).__name__, exc)
@@ -2935,7 +2939,7 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
                 return [expr.left, expr.right]
             return []
 
-        def walk(expr):
+        def visit(expr):
             if (frac_base := _fractional_power_base(expr)) is not None:
                 # ``b ** p`` with a constant NON-integer ``p`` is undefined (NaN in
                 # every evaluator) for ``b < 0`` -- the same ``b >= 0`` domain as
@@ -2971,20 +2975,41 @@ class FunctionDomainBoundRule(NonlinearBoundTighteningRule):
                                 arg_lb=domain_lb,
                                 arg_ub=domain_ub,
                             )
-            for sub in _subexprs(expr):
-                walk(sub)
 
-        try:
-            if model._objective is not None:
-                walk(model._objective.expression)
-            for c in _rows_until(model, deadline):
-                walk(c.body)
-        except NonlinearBoundTighteningInfeasible:
-            # An empty argument domain is a genuine infeasibility proof; let it
-            # propagate so the caller can certify it.
-            raise
-        except Exception:
-            return np.asarray(flat_lb, dtype=np.float64), np.asarray(flat_ub, dtype=np.float64)
+        def walk(root):
+            # Iterative over an explicit stack (#1520): a long ``.nl`` row is a
+            # left-deep ``+`` chain as deep as its term count, and the recursive
+            # walk hit ``RecursionError`` on a few thousand terms -- which the old
+            # blanket handler turned into "no domain tightening" for the whole
+            # model. Each visit only intersects the box, so visit order does not
+            # change the result, and a shared subexpression need be visited once.
+            seen: set[int] = set()
+            stack = [root]
+            while stack:
+                expr = stack.pop()
+                if id(expr) in seen:
+                    continue
+                seen.add(id(expr))
+                visit(expr)
+                stack.extend(_subexprs(expr))
+
+        # #1520: no except. The walk declines by skipping (a non-affine or
+        # multi-variable argument is left alone), and an empty argument domain raises
+        # ``NonlinearBoundTighteningInfeasible``, which must reach the caller. Any
+        # other exception is a defect in the rule; the old handler turned it into
+        # "no tightening".
+        if model._objective is not None:
+            walk(model._objective.expression)
+        for c in _rows_until(model, deadline):
+            body = getattr(c, "body", None)
+            if body is None:
+                # A non-algebraic row (disjunction, logical, SOS) has no body. Its
+                # functions hold only inside a disjunct, so their domains imply
+                # nothing about the global box: skipping forgoes no valid
+                # tightening. It used to raise AttributeError, which the removed
+                # handler turned into "no tightening" for the WHOLE model (#1520).
+                continue
+            walk(body)
         return lb, ub
 
 
@@ -3038,100 +3063,123 @@ class PeriodicVariableBoundRule(NonlinearBoundTighteningRule):
         del deadline  # see row_scan_is_anytime above: this scan must be complete
         lb = np.asarray(flat_lb, dtype=np.float64).copy()
         ub = np.asarray(flat_ub, dtype=np.float64).copy()
-        try:
-            periodic: set[int] = set()
-            disqualified: set[int] = set()
-            complete = [True]  # cleared if an unrecognized node is encountered
+        # #1520: no except. The scan abstains by value (an unrecognized node or a
+        # non-algebraic row -> ``None`` -> the box comes back unchanged); any
+        # exception is a defect in the rule, which the old handler turned into
+        # "no tightening".
+        periodic: set[int] = set()
+        disqualified: set[int] = set()
+        complete = [True]  # cleared if an unrecognized node is encountered
 
-            def _subexprs(expr):
-                """Child sub-expressions, or ``None`` if the node type is unknown."""
-                if isinstance(expr, BinaryOp):
-                    return [expr.left, expr.right]
-                if isinstance(expr, UnaryOp):
-                    return [expr.operand]
-                if isinstance(expr, (FunctionCall, CustomCall)):
-                    return list(expr.args)
-                if isinstance(expr, IndexExpression):
-                    return [expr.base]
-                if isinstance(expr, SumExpression):
-                    return [expr.operand]
-                if isinstance(expr, SumOverExpression):
-                    return list(expr.terms)
-                if isinstance(expr, MatMulExpression):
-                    return [expr.left, expr.right]
-                return None
+        def _subexprs(expr):
+            """Child sub-expressions, or ``None`` if the node type is unknown."""
+            if isinstance(expr, BinaryOp):
+                return [expr.left, expr.right]
+            if isinstance(expr, UnaryOp):
+                return [expr.operand]
+            if isinstance(expr, (FunctionCall, CustomCall)):
+                return list(expr.args)
+            if isinstance(expr, IndexExpression):
+                return [expr.base]
+            if isinstance(expr, SumExpression):
+                return [expr.operand]
+            if isinstance(expr, SumOverExpression):
+                return list(expr.terms)
+            if isinstance(expr, MatMulExpression):
+                return [expr.left, expr.right]
+            return None
 
-            def walk(expr):
-                if not complete[0]:
-                    return
-                # A bare scalar-variable leaf reached here is a *non-periodic* use
-                # (the sin/cos branch below returns before recursing into its arg).
-                idx = metadata.scalar_flat_index(expr)
-                if idx is not None:
-                    disqualified.add(idx)
-                    return
-                if isinstance(expr, Variable):  # bare vector variable: non-periodic use
-                    off = metadata.base_offsets.get(id(expr))
-                    if off is not None:
-                        for k in range(expr.size):
-                            disqualified.add(off + k)
-                    return
-                if isinstance(expr, (Constant, Parameter)):
-                    return  # childless, no variables
-                if (
-                    isinstance(expr, FunctionCall)
-                    and expr.func_name in _PERIODIC_FUNCS
-                    and len(expr.args) == 1
-                ):
-                    aidx = metadata.scalar_flat_index(expr.args[0])
-                    if aidx is not None:
-                        periodic.add(aidx)
-                        return  # bare var inside sin/cos: accounted for
-                subs = _subexprs(expr)
-                if subs is None:
-                    # Unknown node type: cannot prove the variable is periodic-only,
-                    # so abstain from the whole rule (sound).
-                    complete[0] = False
-                    return
-                for sub in subs:
-                    walk(sub)
+        def visit(expr):
+            """Classify one node; return its children to scan (none for a leaf)."""
+            # A bare scalar-variable leaf reached here is a *non-periodic* use
+            # (the sin/cos branch below returns before recursing into its arg).
+            idx = metadata.scalar_flat_index(expr)
+            if idx is not None:
+                disqualified.add(idx)
+                return ()
+            if isinstance(expr, Variable):  # bare vector variable: non-periodic use
+                off = metadata.base_offsets.get(id(expr))
+                if off is not None:
+                    for k in range(expr.size):
+                        disqualified.add(off + k)
+                return ()
+            if isinstance(expr, (Constant, Parameter)):
+                return ()  # childless, no variables
+            if (
+                isinstance(expr, FunctionCall)
+                and expr.func_name in _PERIODIC_FUNCS
+                and len(expr.args) == 1
+            ):
+                aidx = metadata.scalar_flat_index(expr.args[0])
+                if aidx is not None:
+                    periodic.add(aidx)
+                    return ()  # bare var inside sin/cos: accounted for
+            subs = _subexprs(expr)
+            if subs is None:
+                # Unknown node type: cannot prove the variable is periodic-only,
+                # so abstain from the whole rule (sound).
+                complete[0] = False
+                return ()
+            return subs
 
-            def _scan():
-                """The whole bound-independent scan: which variables are
-                periodic-only, or ``None`` if an unrecognized node forbids the
-                conclusion. Depends on the expression graph, never on the box."""
-                if model._objective is not None:
-                    walk(model._objective.expression)
-                for c in model._constraints:  # must be complete; see row_scan_is_anytime
-                    walk(c.body)
-                if not complete[0]:
+        def walk(root):
+            # Iterative over an explicit stack (#1520): the recursive walk hit
+            # ``RecursionError`` on a long left-deep ``.nl`` row, which the old
+            # blanket handler absorbed. ``periodic``/``disqualified`` are sets, so
+            # visit order does not change the verdict, and a node reached twice
+            # contributes nothing new the second time.
+            seen: set[int] = set()
+            stack = [root]
+            while stack and complete[0]:
+                expr = stack.pop()
+                if id(expr) in seen:
+                    continue
+                seen.add(id(expr))
+                stack.extend(visit(expr))
+
+        def _scan():
+            """The whole bound-independent scan: which variables are
+            periodic-only, or ``None`` if an unrecognized node forbids the
+            conclusion. Depends on the expression graph, never on the box."""
+            if model._objective is not None:
+                walk(model._objective.expression)
+            for c in model._constraints:  # must be complete; see row_scan_is_anytime
+                body = getattr(c, "body", None)
+                if body is None:
+                    # A non-algebraic row (disjunction, logical, SOS) may use a
+                    # variable outside sin/cos in a form this walk cannot see,
+                    # so the scan cannot be complete: abstain from the whole
+                    # rule (sound). It used to raise AttributeError, which the
+                    # removed blanket handler absorbed into the same abstention
+                    # (#1520).
                     return None
-                return frozenset(periodic - disqualified)
+                walk(body)
+            if not complete[0]:
+                return None
+            return frozenset(periodic - disqualified)
 
-            periodic_only = _cached_model_structure(model, "periodic_only", metadata, _scan)
-            if periodic_only is None:
-                return lb, ub  # saw an unrecognized node -> change nothing
+        periodic_only = _cached_model_structure(model, "periodic_only", metadata, _scan)
+        if periodic_only is None:
+            return lb, ub  # saw an unrecognized node -> change nothing
 
-            for idx in periodic_only:
-                if idx >= len(metadata.flat_var_types):
-                    continue
-                if metadata.flat_var_types[idx] != VarType.CONTINUOUS:
-                    continue
-                lo, hi = float(lb[idx]), float(ub[idx])
-                finite_lo, finite_hi = lo > -1e15, hi < 1e15
-                if finite_lo and finite_hi:
-                    if hi - lo > _TWO_PI + 1e-9:
-                        hi = lo + _TWO_PI
-                elif finite_lo:
+        for idx in periodic_only:
+            if idx >= len(metadata.flat_var_types):
+                continue
+            if metadata.flat_var_types[idx] != VarType.CONTINUOUS:
+                continue
+            lo, hi = float(lb[idx]), float(ub[idx])
+            finite_lo, finite_hi = lo > -1e15, hi < 1e15
+            if finite_lo and finite_hi:
+                if hi - lo > _TWO_PI + 1e-9:
                     hi = lo + _TWO_PI
-                elif finite_hi:
-                    lo = hi - _TWO_PI
-                else:
-                    lo, hi = -np.pi, np.pi
-                lb[idx], ub[idx] = lo, hi
-            return lb, ub
-        except Exception:
-            return np.asarray(flat_lb, dtype=np.float64), np.asarray(flat_ub, dtype=np.float64)
+            elif finite_lo:
+                hi = lo + _TWO_PI
+            elif finite_hi:
+                lo = hi - _TWO_PI
+            else:
+                lo, hi = -np.pi, np.pi
+            lb[idx], ub[idx] = lo, hi
+        return lb, ub
 
 
 _EXPR_CHILD_ATTRS = ("left", "right", "operand", "base")

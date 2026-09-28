@@ -412,7 +412,11 @@ class IncrementalMcCormickLP:
         try:
             self._build_structure()
             self._validate()
-        except Exception as exc:
+        except (ValueError, _IncrementalStructureTooLarge) as exc:
+            # #1520: narrowed. ``_full_build``/``_build_structure``/``_validate`` decline
+            # with a ``ValueError`` (no valid bound, unmatched row pattern, row-set or
+            # offset mismatch against the cold build) or ``_IncrementalStructureTooLarge``;
+            # anything else is a defect and propagates instead of reading as "declined".
             # Declining is always SOUND (the caller falls back to the per-node cold
             # build) but it is never free: it costs the fast path, the cuts and the
             # feasibility pump. A silently-declined structure is exactly how #844's
@@ -596,12 +600,11 @@ class IncrementalMcCormickLP:
         # every node — a root cut pool (captured on the cold path over its own
         # varmap) is remapped onto these positions by matching identity. Built
         # from the same ``info`` (full varmap) the cold path returns.
-        try:
-            from discopt._relax.mccormick_lp import column_identities
+        # #1520: no except. ``column_identities`` is a pure structural map over
+        # ``info`` with no documented failure mode; a raise is a defect.
+        from discopt._relax.mccormick_lp import column_identities
 
-            self.col_identities = column_identities(info, self.ncol, self.n)
-        except Exception:
-            self.col_identities = None
+        self.col_identities = column_identities(info, self.ncol, self.n)
 
         # Map each product to its row indices. SPARSE + efficient: each product row
         # contains its aux column, so a product's rows are found among the rows that
@@ -1114,12 +1117,10 @@ class IncrementalMcCormickLP:
 
         cobj = self.c if c_override is None else np.asarray(c_override, dtype=np.float64)
         off = 0.0 if c_override is not None else self.obj_offset
-        try:
-            result, out_basis = solve_lp_warm_std(
-                cobj, sp.csr_matrix(A), b, bounds, in_basis=in_basis
-            )
-        except Exception:
-            return None, None, None
+        # #1520: no except. ``solve_lp_warm_std`` declines by return value (``None``
+        # on an iteration/numerical/deadline exit); it raises only on invalid input
+        # (a NaN bound, a negative time limit), which is a caller defect.
+        result, out_basis = solve_lp_warm_std(cobj, sp.csr_matrix(A), b, bounds, in_basis=in_basis)
         if result is None or result.status != SolveStatus.OPTIMAL or result.objective is None:
             return None, None, None
         return float(result.objective) + off, np.asarray(result.x, dtype=float), out_basis
@@ -1168,18 +1169,18 @@ class IncrementalMcCormickLP:
                 return status, bound, x, out_basis, farkas, cert
             return status, bound, x, out_basis, farkas
 
-        try:
-            result, out_basis, cert = solve_lp_warm_std(
-                cobj,
-                sp.csr_matrix(A),
-                b,
-                bounds,
-                in_basis=in_basis,
-                return_cert=True,
-                time_limit=time_limit,
-            )
-        except Exception:
-            return _ret("other", None, None, None, False)
+        # #1520: no except. ``solve_lp_warm_std`` declines by return value (``None``
+        # -> ``"other"`` below); it raises only on invalid input (a NaN bound, a
+        # negative time limit), which is a caller defect, not "no verdict".
+        result, out_basis, cert = solve_lp_warm_std(
+            cobj,
+            sp.csr_matrix(A),
+            b,
+            bounds,
+            in_basis=in_basis,
+            return_cert=True,
+            time_limit=time_limit,
+        )
         if result is None:
             return _ret("other", None, None, None, False)
         if result.status == SolveStatus.INFEASIBLE:

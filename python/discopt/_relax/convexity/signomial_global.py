@@ -109,6 +109,7 @@ from typing import Optional
 
 import numpy as np
 
+from discopt._relax._fallback import warn_fallback_once
 from discopt._relax.convexity.signomial import (
     SignomialForm,
     is_signomial,
@@ -598,7 +599,16 @@ def _constrained_node_bound(
                 options=dict(maxiter=80, ftol=1e-10),
             )
             return np.clip(res.x, u_lb, u_ub), bool(res.success)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - external SciPy solver; see below
+            # #1520: kept as a sound fallback. SLSQP is external (Fortran) code with
+            # no documented failure mode; it only picks the point ``certify`` builds
+            # the supporting hyperplane at, and a hyperplane at ANY point of the box
+            # is a valid (only looser) bound, so falling back to ``start`` is sound.
+            warn_fallback_once(
+                "signomial node bound: SLSQP local solve",
+                exc,
+                "the bound is certified at the start point instead (valid, possibly looser)",
+            )
             return np.clip(start, u_lb, u_ub), False
 
     def certify(u_star):
@@ -611,7 +621,15 @@ def _constrained_node_bound(
             # lam >= 0 fitting grad f + Gc^T lam ~ 0  (KKT stationarity proxy).
             try:
                 lam, _ = nnls(Gc.T, -g_obj)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - external SciPy solver; see below
+                # #1520: kept as a sound fallback. NNLS is external code; the
+                # corner bound is valid for ANY ``lam >= 0``, so ``lam = 0`` is
+                # sound (only looser).
+                warn_fallback_once(
+                    "signomial node bound: NNLS multiplier fit",
+                    exc,
+                    "multipliers set to 0 (bound stays valid, possibly looser)",
+                )
                 lam = np.zeros(Gc.shape[0])
             L_val = f_val + float(lam @ cvals)
             L_grad = g_obj + Gc.T @ lam
@@ -728,7 +746,14 @@ def _corner_lagrangian_bound(obj_val, obj_grad, con_vals, con_grads, u_lb, u_ub,
         Gc = np.asarray(con_grads)
         try:
             lam, _ = nnls(Gc.T, -obj_grad)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - external SciPy solver; see below
+            # #1520: kept as a sound fallback. NNLS is external code; the corner
+            # bound is valid for ANY ``lam >= 0``, so ``lam = 0`` is sound.
+            warn_fallback_once(
+                "signomial corner bound: NNLS multiplier fit",
+                exc,
+                "multipliers set to 0 (bound stays valid, possibly looser)",
+            )
             lam = np.zeros(Gc.shape[0])  # lam = 0 stays valid, only looser
         L_val = obj_val + float(lam @ np.asarray(con_vals))
         L_grad = obj_grad + Gc.T @ lam
@@ -772,7 +797,14 @@ def _cert_min_linear(w, con_specs, u_lb, u_ub):
             options=dict(maxiter=15, ftol=1e-8),
         )
         u_star = np.clip(res.x, u_lb, u_ub)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - external SciPy solver; see below
+        # #1520: kept as a sound fallback. SLSQP is external code and only picks the
+        # linearization point; a hyperplane at any point of the box stays valid.
+        warn_fallback_once(
+            "signomial linear certificate: SLSQP local solve",
+            exc,
+            "the bound is certified at the box midpoint instead (valid, possibly looser)",
+        )
         u_star = u0  # hyperplane at any point stays valid, only looser
     con_vals = []
     con_grads = []

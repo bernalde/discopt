@@ -79,11 +79,10 @@ def _min_vertex_cover(terms: NonlinearTerms) -> list[int]:
         # With ≤2 variables, max_cover and min_vertex_cover are the same
         return candidates
 
-    try:
-        return _solve_vertex_cover_milp(candidates, all_t)
-    except Exception:
-        greedy = _greedy_vertex_cover(candidates, all_t)
-        return greedy if greedy else candidates
+    # #1520: no except. ``_solve_vertex_cover_milp`` already falls back to the
+    # greedy cover itself (no MILP backend, non-optimal status, uncovered term), so
+    # a raise is a defect rather than a reason to silently pick another partition.
+    return _solve_vertex_cover_milp(candidates, all_t)
 
 
 def _weighted_min_vertex_cover(
@@ -99,11 +98,10 @@ def _weighted_min_vertex_cover(
     if len(candidates) <= 2:
         return candidates
 
-    try:
-        return _solve_vertex_cover_milp(candidates, all_t, weights=distance)
-    except Exception:
-        greedy = _greedy_vertex_cover(candidates, all_t, weights=distance)
-        return greedy if greedy else candidates
+    # #1520: no except. ``_solve_vertex_cover_milp`` already falls back to the
+    # greedy cover itself (no MILP backend, non-optimal status, uncovered term), so
+    # a raise is a defect rather than a reason to silently pick another partition.
+    return _solve_vertex_cover_milp(candidates, all_t, weights=distance)
 
 
 def _solve_vertex_cover_milp(

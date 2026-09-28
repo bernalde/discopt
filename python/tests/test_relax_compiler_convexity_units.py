@@ -642,15 +642,19 @@ class TestPatternHelpers:
         lo2, _ = pat._box_bounds(m)
         assert lo2[0] == pytest.approx(0.5)
 
-    def test_clear_cache_swallows_delattr_failure(self):
+    def test_clear_cache_propagates_delattr_failure(self):
+        """#1520: a cache that cannot be cleared stays stale, and the recognizers
+        would then classify against an older, narrower box -- a possible false
+        convexity proof. The failure propagates instead of being swallowed."""
+
         class Weird:
             def __delattr__(self, name):
                 raise RuntimeError("nope")
 
         w = Weird()
         w.__dict__[pat._DECLARED_BOX_CACHE_ATTR] = (1, None, None)
-        pat.clear_declared_box_cache(w)  # must not raise
-        assert hasattr(w, pat._DECLARED_BOX_CACHE_ATTR)
+        with pytest.raises(RuntimeError, match="nope"):
+            pat.clear_declared_box_cache(w)
 
     def test_box_bounds_empty_model(self):
         lo, hi = pat._box_bounds(Model("empty"))

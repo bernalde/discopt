@@ -25,7 +25,8 @@ with the *only* difference that an integer variable's tightened endpoint is roun
 on integrality. Soundness: the McCormick LP is a valid OUTER relaxation and both
 ``z_lp`` (the NS-safe bound) and ``z_inc`` (the incumbent) are valid bounds, so the
 true optimum satisfies these inequalities — the reduction never removes it. Every
-tightening is an intersection (never loosens); any failure returns the box unchanged.
+tightening is an intersection (never loosens); a move that declines leaves the box
+unchanged (an exception is a defect and propagates, #1520).
 
 Behind the ``node_reduce`` / ``DISCOPT_NODE_REDUCE`` flag at the solver integration
 point (default OFF until T2.6); this module is pure and flag-agnostic.
@@ -40,7 +41,8 @@ from typing import Optional
 import numpy as np
 
 from discopt._relax._numeric import FLOAT_EPS, ROUNDOFF_OPS
-from discopt.modeling.core import Model
+from discopt._relax.problem_classifier import MODEL_TO_REPR_DECLINES
+from discopt.modeling.core import Model, repr_space_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -180,38 +182,44 @@ def _fbbt_on_node(
     lb = np.asarray(node_lb, dtype=np.float64).copy()
     ub = np.asarray(node_ub, dtype=np.float64).copy()
     n = lb.size
-    try:
-        from discopt._rust import model_to_repr
-    except Exception:
-        return lb, ub, 0, False
+    # #1520: no except around the import (``discopt._rust`` is the core extension,
+    # not an optional dependency).
+    from discopt._rust import model_to_repr
 
     # Bounds are restored by ``saved_bounds`` on every exit path, the
     # ``return`` in the except arm included -- this pass must leave the
     # search tree exactly as it found it (C-41).
     with model.saved_bounds():
+        off = 0
+        for v in model._variables:
+            sz = v.size
+            if off + sz <= n:
+                v.lb = lb[off : off + sz].reshape(v.lb.shape)
+                v.ub = ub[off : off + sz].reshape(v.ub.shape)
+            off += sz
         try:
-            off = 0
-            for v in model._variables:
-                sz = v.size
-                if off + sz <= n:
-                    v.lb = lb[off : off + sz].reshape(v.lb.shape)
-                    v.ub = ub[off : off + sz].reshape(v.ub.shape)
-                off += sz
             repr_ = model_to_repr(model, getattr(model, "_builder", None))
-            fbbt_lbs, fbbt_ubs = repr_.fbbt_with_cutoff(
-                max_iter=max_iter,
-                tol=tol,
-                incumbent_bound=(
-                    float(cutoff) if cutoff is not None and np.isfinite(cutoff) else None
-                ),
-            )
-        except Exception as exc:
-            # C-41: surface, never silently swallow — a swallowed error here is the
-            # exact compounding smell behind C-40 (a misaligned map that corrupts a
-            # box, then eats the resulting IndexError). Tighten-only: on any failure
-            # keep the node box unchanged (a valid, looser box).
-            logger.debug("node cutoff-FBBT skipped (build/solve failed): %s", exc)
+        except MODEL_TO_REPR_DECLINES as exc:
+            # #1520: narrowed. ``model_to_repr``'s documented declines (the model has
+            # no Rust repr). Tighten-only: keep the node box. Box writes, the cutoff
+            # conversion and ``fbbt_with_cutoff`` (no error return in Rust) are
+            # outside the handler, so a defect there propagates (C-41: a swallowed
+            # IndexError from a misaligned map is how C-40 hid).
+            logger.debug("node cutoff-FBBT skipped (no Rust repr): %s", exc)
             return lb, ub, 0, False
+        # #1520 (found while narrowing): ``cutoff`` is in the INTERNAL minimization
+        # space (the DBBT move above subtracts it from the node LP bound), but
+        # ``fbbt_with_cutoff`` builds its cutoff row against the repr's objective
+        # under the repr's declared sense. This passed the internal value straight
+        # through -- the #1373 defect ``root_reduce`` already fixed: on a MAXIMIZE
+        # model the row became ``f >= -f_inc``, stricter than valid. Convert exactly
+        # as the root stage does; ``None`` (spaces not shown to agree) is
+        # cutoff-free FBBT, a looser sound box.
+        fbbt_lbs, fbbt_ubs = repr_.fbbt_with_cutoff(
+            max_iter=max_iter,
+            tol=tol,
+            incumbent_bound=repr_space_cutoff(repr_, cutoff),
+        )
 
     fbbt_lbs = np.asarray(fbbt_lbs, dtype=np.float64)
     fbbt_ubs = np.asarray(fbbt_ubs, dtype=np.float64)
@@ -295,7 +303,8 @@ def reduce_node(
         a boxed repr — kept for signature stability / future reuse).
 
     Returns a :class:`NodeReduceResult` (tighten-only; a subset box or an infeasible
-    fathom verdict). Never loosens a bound; any failure returns the box unchanged."""
+    fathom verdict). Never loosens a bound; a move that declines leaves the box
+    unchanged (an exception is a defect and propagates, #1520)."""
     lb = np.asarray(node_lb, dtype=np.float64).copy()
     ub = np.asarray(node_ub, dtype=np.float64).copy()
     n = lb.size

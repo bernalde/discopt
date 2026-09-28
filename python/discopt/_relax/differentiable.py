@@ -613,11 +613,19 @@ def _compute_sensitivity_at_solution(
         if nlp_solver == "ipm":
             try:
                 nlp_result = _dispatch_nlp_solve("pounce", evaluator, x0, opts)
-            except Exception as exc:  # noqa: BLE001 - the IPM status below is raised instead
-                # Exactly the #844 shape: swallowing this makes the POUNCE fallback
-                # an invisible no-op, and the RuntimeError below then reports the
-                # IPM's status as if the fallback had been tried and failed.
-                logger.debug("POUNCE sensitivity fallback failed: %s: %s", type(exc).__name__, exc)
+            except Exception as exc:
+                # #1520: kept as a sound fallback. POUNCE is native code reached
+                # through PyO3; if it raises, the RuntimeError below refuses the
+                # sensitivity with the IPM's status -- no result is returned, so
+                # nothing wrong is reported. Warned (the #844 shape: at DEBUG the
+                # fallback was an invisible no-op).
+                from discopt._relax._fallback import warn_fallback_once
+
+                warn_fallback_once(
+                    "POUNCE sensitivity fallback solve",
+                    exc,
+                    "the IPM's non-optimal status is raised instead",
+                )
         if nlp_result.status != SolveStatus.OPTIMAL:
             raise RuntimeError(f"Sensitivity NLP solve did not converge: {nlp_result.status.value}")
 
@@ -886,24 +894,41 @@ def find_active_set(
 
     Returns:
         Tuple of (active_constraint_indices, active_bound_var_indices).
-        active_bound_var_indices contains (var_flat_index, 'lb'|'ub') pairs.
+        ``active_constraint_indices`` are FLAT constraint-row indices: the rows of
+        ``concatenate([ravel(cf(x, p)) for cf in constraint_fns])``, the same
+        per-row ordering the multipliers use (#324). For a model whose
+        constraints are all scalar this is the constraint index.
+        active_bound_var_indices contains flat variable indices at a bound.
     """
+    # #1520: one entry per flat row. This used to call ``float(cf(...))`` per
+    # Constraint, which raises ``TypeError`` on a vector-valued constraint; the
+    # caller's ``except Exception`` turned that into ``l3_failed`` so every model
+    # with a vector constraint silently lost its L3 sensitivities. It also indexed
+    # ``model._constraints[i]`` although ``constraint_fns`` holds only the
+    # ``Constraint`` entries, so the two could be misaligned.
+    cons = [c for c in model._constraints if isinstance(c, Constraint)]
+    if len(cons) != len(constraint_fns):
+        raise ValueError(
+            f"find_active_set: {len(constraint_fns)} constraint functions for "
+            f"{len(cons)} Constraint objects"
+        )
     active_constraints: list[int] = []
-    for i, cf in enumerate(constraint_fns):
-        val = float(cf(x_star, p_flat))
-        c = model._constraints[i]
-        if isinstance(c, Constraint):
+    row = 0
+    for c, cf in zip(cons, constraint_fns):
+        vals = np.ravel(np.asarray(cf(x_star, p_flat), dtype=np.float64))
+        for val in vals:
             if c.sense == "==":
                 if abs(val) < tol:
-                    active_constraints.append(i)
+                    active_constraints.append(row)
             elif c.sense == "<=":
                 # body - rhs <= 0; active if val > -tol (close to 0)
                 if val > -tol:
-                    active_constraints.append(i)
+                    active_constraints.append(row)
             elif c.sense == ">=":
                 # body - rhs >= 0; active if val < tol (close to 0)
                 if val < tol:
-                    active_constraints.append(i)
+                    active_constraints.append(row)
+            row += 1
 
     # Check variable bounds
     active_bounds: list[int] = []
@@ -967,7 +992,8 @@ def implicit_differentiate(
         x_star: Optimal primal solution (flat vector).
         multipliers: Constraint multipliers from the solver.
         p_flat: Flat parameter vector.
-        active_constraint_indices: Indices of active constraints.
+        active_constraint_indices: Flat row indices of active constraints (as
+            returned by :func:`find_active_set`).
         active_bound_indices: Indices of variables at their bounds.
 
     Returns:
@@ -1027,12 +1053,19 @@ def implicit_differentiate(
     J_a_rows = []
     dg_dp_rows = []
 
-    for i in active_constraint_indices:
-        cf = constraint_fns[i]
-        jac_x_fn = jax.grad(cf, argnums=0)
-        jac_p_fn = jax.grad(cf, argnums=1)
-        J_a_rows.append(jac_x_fn(x_star, p_flat))
-        dg_dp_rows.append(jac_p_fn(x_star, p_flat))
+    if n_active_cons > 0:
+        # Flat rows (see ``find_active_set``): differentiate the concatenated,
+        # raveled constraint vector once and select the active rows, so a
+        # vector-valued constraint contributes one KKT row per active element
+        # (``jax.grad`` of a vector-valued function raised here, #1520).
+        def g_flat(x, p):
+            return jnp.concatenate([jnp.ravel(cf(x, p)) for cf in constraint_fns])
+
+        rows = jnp.asarray(active_constraint_indices, dtype=jnp.int32)
+        J_all = jax.jacobian(g_flat, argnums=0)(x_star, p_flat)
+        dP_all = jax.jacobian(g_flat, argnums=1)(x_star, p_flat)
+        J_a_rows.extend(list(J_all[rows]))
+        dg_dp_rows.extend(list(dP_all[rows]))
 
     # Active variable bounds: x_i = lb_i or x_i = ub_i
     # These are linear constraints with Jacobian row = e_i (unit vector)
@@ -1470,28 +1503,29 @@ def differentiable_solve_l3(
     l3_failed = False
     sens_info: Optional[SensitivityInfo] = None
 
-    try:
-        active_cons, active_bounds = find_active_set(
-            x_star, model, constraint_fns, p_flat, tol=active_tol
-        )
-        sens_info = implicit_differentiate(
-            model, x_star, multipliers, p_flat, active_cons, active_bounds
-        )
-        dx_dp = sens_info.dx_dp
+    # #1520: no except. ``implicit_differentiate`` declines by value -- a singular
+    # KKT system comes back from ``jnp.linalg.solve`` as inf/NaN, handled just below
+    # as ``l3_failed``. The old ``except Exception`` also turned any defect in the
+    # active-set or KKT assembly into ``l3_failed=True`` ("fallback_to_L1"), which
+    # reads as an ill-conditioned problem rather than a bug.
+    active_cons, active_bounds = find_active_set(
+        x_star, model, constraint_fns, p_flat, tol=active_tol
+    )
+    sens_info = implicit_differentiate(
+        model, x_star, multipliers, p_flat, active_cons, active_bounds
+    )
+    dx_dp = sens_info.dx_dp
 
-        # Check condition number of the result
-        if dx_dp is not None and jnp.any(jnp.isnan(dx_dp)) or jnp.any(jnp.isinf(dx_dp)):
-            l3_failed = True
-            # Fall back to perturbation smoothing
-            l1_sensitivity = _perturbation_gradient(
-                model, p_flat, None, nlp_solver=nlp_solver, solver_options=opts
-            )
-            dx_dp = None
-            sens_info = None
-
-    except Exception:
+    # Check condition number of the result. (Parenthesized in #1520: the old
+    # ``a and b or c`` evaluated ``jnp.isinf(None)`` when ``dx_dp`` was None.)
+    if dx_dp is not None and (jnp.any(jnp.isnan(dx_dp)) or jnp.any(jnp.isinf(dx_dp))):
         l3_failed = True
-        # Use L1 sensitivity as-is
+        # Fall back to perturbation smoothing
+        l1_sensitivity = _perturbation_gradient(
+            model, p_flat, None, nlp_solver=nlp_solver, solver_options=opts
+        )
+        dx_dp = None
+        sens_info = None
 
     # Unpack solution
     x_dict = {}

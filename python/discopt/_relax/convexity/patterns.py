@@ -96,19 +96,14 @@ def clear_declared_box_cache(model: Model) -> None:
     every point it resets its convexity-classification cache, so a re-classification
     after presolve/reformulation tightens the declared bounds sees fresh values.
     """
-    try:
-        if hasattr(model, _DECLARED_BOX_CACHE_ATTR):
-            delattr(model, _DECLARED_BOX_CACHE_ATTR)
-    except Exception as exc:  # noqa: BLE001 - invalidation must never break a classification
-        # The catch stays blind on purpose (a model with a custom ``__delattr__``
-        # must not break a solve; see test_clear_cache_swallows_delattr_failure),
-        # but it is no longer silent: a failed invalidation leaves the box cache
-        # STALE, so the recognizers keep classifying against pre-presolve bounds.
-        logger.debug(
-            "declared-box cache NOT invalidated — it is now stale: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
+    # #1520: no except -- the old blanket handler was an UNSOUND fallback. A failed
+    # invalidation leaves the box cache stale, and the recognizers then classify
+    # against bounds the model no longer has: after a caller *widens* a bound the
+    # stale, narrower box can prove a positivity/convexity the real box does not
+    # support, i.e. a false convex claim. A model whose attribute cannot be deleted
+    # must therefore fail the classification loudly, not continue on the stale box.
+    if hasattr(model, _DECLARED_BOX_CACHE_ATTR):
+        delattr(model, _DECLARED_BOX_CACHE_ATTR)
 
 
 def _total_scalar_variables(model: Model) -> int:
@@ -287,9 +282,13 @@ def _box_bounds(model: Model) -> tuple[np.ndarray, np.ndarray]:
         lo_arr, hi_arr = np.zeros(0), np.zeros(0)
     else:
         lo_arr, hi_arr = np.concatenate(los), np.concatenate(his)
+    # #1520: narrowed. ``setattr`` refuses an object that cannot carry the
+    # attribute (``__slots__``, a read-only proxy) with ``AttributeError``; then the
+    # box is simply rebuilt on the next call -- same arrays, only slower. Anything
+    # else is a defect and propagates.
     try:
         setattr(model, _DECLARED_BOX_CACHE_ATTR, (int(lo_arr.size), lo_arr, hi_arr))
-    except Exception as exc:  # noqa: BLE001 - memoization is optional, the box is rebuilt
+    except AttributeError as exc:
         logger.debug("declared box not memoized: %s: %s", type(exc).__name__, exc)
     return lo_arr, hi_arr
 
@@ -303,12 +302,14 @@ def _affine_lower_bound(expr: Expression, model: Model) -> Optional[float]:
     box, so ``0.001 + 0.999 * x18`` with ``x18 in [0, 1]`` correctly yields
     ``0.001`` even though the ``x18`` term alone is only non-negative.
     """
-    from discopt._relax.problem_classifier import _extract_linear_coefficients
+    from discopt._relax.problem_classifier import _extract_linear_coefficients, _NotLinearError
 
     n = _total_scalar_variables(model)
+    # #1520: narrowed. ``_NotLinearError`` is the extractor's documented decline
+    # ("not affine"); any other exception is a defect and propagates.
     try:
         vec, const = _extract_linear_coefficients(expr, model, n)
-    except Exception:
+    except _NotLinearError:
         return None
     vec = np.asarray(vec, dtype=np.float64).ravel()
     lo_box, hi_box = _box_bounds(model)
@@ -483,11 +484,17 @@ def _quadratic_data(expr: Expression, model: Model):
     behaviour, which allocated ``(n, n)`` unconditionally — 91 GB on
     watercontamination0202's 106,711 variables.
     """
-    from discopt._relax.problem_classifier import _extract_quadratic_coefficients
+    from discopt._relax.problem_classifier import (
+        _EXTRACTION_DECLINES,
+        _extract_quadratic_coefficients,
+    )
 
+    # #1520: narrowed to the extractor's documented declines: ``_NotQuadraticError``
+    # ("degree > 2") and ``_NotLinearError``, which its constant folding raises on a
+    # non-scalar array coefficient (``_eval_const``; test_944 exercises it).
     try:
         Q, c, const = _extract_quadratic_coefficients(expr, model, _total_scalar_variables(model))
-    except Exception:
+    except _EXTRACTION_DECLINES:
         return None
     if _sp.issparse(Q):
         return None
@@ -561,6 +568,7 @@ def _quadratic_sign_form(expr: Expression, model: Model):
       alters nothing but the clock.
     """
     from discopt._relax.problem_classifier import (
+        _EXTRACTION_DECLINES,
         _QP_DENSE_Q_MAX_BYTES,
         _extract_quadratic_terms,
     )
@@ -568,9 +576,10 @@ def _quadratic_sign_form(expr: Expression, model: Model):
     n = _total_scalar_variables(model)
     if (n * n * 8) > _QP_DENSE_Q_MAX_BYTES:
         return None
+    # #1520: narrowed to the extractor's documented declines (see ``_quadratic_data``).
     try:
         terms, c, const = _extract_quadratic_terms(expr, model, n)
-    except Exception:
+    except _EXTRACTION_DECLINES:
         return None
 
     # Symmetrise on the nonzeros only: ``0.5 * (Q + Q.T)`` restricted to the
@@ -672,7 +681,7 @@ def _affine_square_sum_matrix(
     affine-difference generalization of :func:`_sum_of_squares_linear_matrix`,
     which only matched homogeneous ``sum((A@x)*(A@x))`` MatMul forms.
     """
-    from discopt._relax.problem_classifier import _extract_linear_coefficients
+    from discopt._relax.problem_classifier import _extract_linear_coefficients, _NotLinearError
 
     n_total = _total_scalar_variables(model)
 
@@ -724,9 +733,10 @@ def _affine_square_sum_matrix(
             base = core.left
         if base is None:
             return None
+        # #1520: narrowed to the extractor's documented decline ("not affine").
         try:
             coeffs, const = _extract_linear_coefficients(base, model, n_total)
-        except Exception:
+        except _NotLinearError:
             return None
         root = float(np.sqrt(scale))
         rows.append(root * coeffs)
@@ -1173,7 +1183,7 @@ def classify_fractional_epigraph_constraint(
     bilinear + quadratic, but algebraically an epigraph of a convex
     quadratic-over-linear).
     """
-    from discopt._relax.problem_classifier import _extract_linear_coefficients
+    from discopt._relax.problem_classifier import _extract_linear_coefficients, _NotLinearError
 
     if constraint.sense != "<=":
         return None
@@ -1203,9 +1213,11 @@ def classify_fractional_epigraph_constraint(
         if not valid or coeff_expr is None or remainder_expr is None:
             continue
 
+        # #1520: narrowed to the extractor's documented decline ("not affine"): this
+        # constraint keeps its UNKNOWN verdict. Any other exception propagates.
         try:
             coeff_vec, coeff_const = _extract_linear_coefficients(coeff_expr, model, n)
-        except Exception as exc:  # noqa: BLE001 - this constraint keeps its UNKNOWN verdict
+        except _NotLinearError as exc:
             logger.debug(
                 "fractional-epigraph coefficient extraction failed: %s: %s",
                 type(exc).__name__,

@@ -1037,10 +1037,13 @@ def _compile_relax_node(
                                 return _oa_fn(mid, cv_a, cc_a)
 
                             return fn
-                        except Exception as exc:  # noqa: BLE001 - McCormick is the safe fallback
-                            # Fall through to McCormick on any OA failure. Logged
-                            # because a silently-skipped OA relaxation is measured
-                            # as "OA is no better than McCormick".
+                        except ValueError as exc:
+                            # #1520: narrowed to ``make_oa_relax``'s documented
+                            # decline (operator/box outside the OA provider's
+                            # domain); McCormick below is the sound fallback. Any
+                            # other exception is a defect and propagates. Logged
+                            # because a skipped OA relaxation is measured as "OA is
+                            # no better than McCormick".
                             logger.debug(
                                 "OA relaxation for %s unavailable, using McCormick: %s: %s",
                                 name,

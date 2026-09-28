@@ -409,7 +409,14 @@ def shor_sdp_lower_bound(
     try:
         solver = scs.SCS({"A": A, "b": b, "c": prob.c_svec}, cone, **settings)
         sol = solver.solve()
-    except Exception:
+    except Exception as exc:
+        # #1520: kept as a sound fallback. SCS is an optional native conic solver;
+        # an exception from it yields no bound at all (``None``), which is sound --
+        # the node keeps its other bounds. Reported, not silent, so a broken SCS
+        # install does not read as "Shor never helps".
+        from discopt._relax._fallback import warn_fallback_once
+
+        warn_fallback_once("Shor SDP (SCS) solve", exc, "no Shor bound is used")
         return (None, prob.dim)
     status = str(sol.get("info", {}).get("status", "")).lower()
     y = sol.get("y")

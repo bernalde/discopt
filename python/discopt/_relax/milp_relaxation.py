@@ -954,10 +954,9 @@ class MilpRelaxationModel:
         """
         from discopt.solvers import SolveStatus
 
-        try:
-            from discopt.solvers.milp_simplex import solve_lp_warm_std
-        except Exception:  # pragma: no cover - binding absent
-            return None
+        # #1520: no except. ``milp_simplex`` is part of this package and binds the
+        # Rust extension lazily inside the call, so the import has no failure mode.
+        from discopt.solvers.milp_simplex import solve_lp_warm_std
 
         n_struct = np.asarray(self._c, dtype=np.float64).ravel().shape[0]
         m_now = 0 if self._A_ub is None else sp.csr_matrix(self._A_ub).shape[0]
@@ -970,18 +969,18 @@ class MilpRelaxationModel:
         ):
             in_basis = self._warm_basis
 
-        try:
-            result, out_basis, cert = solve_lp_warm_std(
-                self._c,
-                self._A_ub,
-                self._b_ub,
-                self._bounds,
-                in_basis=in_basis,
-                return_cert=True,
-                time_limit=time_limit,
-            )
-        except Exception:  # pragma: no cover - defensive; fall back to generic path
-            return None
+        # #1520: no except. ``solve_lp_warm_std`` declines by return value (``None``
+        # below); it raises only on invalid input (a NaN bound, a negative time
+        # limit), which is a defect, not "defer to the generic path".
+        result, out_basis, cert = solve_lp_warm_std(
+            self._c,
+            self._A_ub,
+            self._b_ub,
+            self._bounds,
+            in_basis=in_basis,
+            return_cert=True,
+            time_limit=time_limit,
+        )
         if result is None:
             # iter_limit / numerical: let the generic path (with its HiGHS option)
             # handle it; drop the stale basis so the next round cold-starts.
@@ -1029,19 +1028,16 @@ class MilpRelaxationModel:
             # gap, so compute them on the stored ``self._c`` (the solver's own
             # objective row) to stay self-consistent with ``safe_bound``. A shape
             # mismatch (cuts changed the column count vs the cached ``_c``) yields
-            # ``None`` — sound, DBBT no-ops. Never raises into the solve path.
-            try:
-                y = np.asarray(cert.dual, dtype=np.float64).ravel()
-                c_vec = np.asarray(self._c, dtype=np.float64).ravel()
-                A_csr = sp.csr_matrix(self._A_ub)
-                if A_csr.shape[0] == y.shape[0] and A_csr.shape[1] == c_vec.shape[0]:
-                    d = c_vec - np.asarray(A_csr.T @ y, dtype=np.float64).ravel()
-                    if np.all(np.isfinite(d)):
-                        row_dual = y
-                        reduced_costs = d
-            except Exception:  # pragma: no cover - defensive; marginals are optional
-                row_dual = None
-                reduced_costs = None
+            # ``None`` — sound, DBBT no-ops. #1520: no except. The shape check above
+            # is the decline; the rest is numpy arithmetic with no failure mode.
+            y = np.asarray(cert.dual, dtype=np.float64).ravel()
+            c_vec = np.asarray(self._c, dtype=np.float64).ravel()
+            A_csr = sp.csr_matrix(self._A_ub)
+            if A_csr.shape[0] == y.shape[0] and A_csr.shape[1] == c_vec.shape[0]:
+                d = c_vec - np.asarray(A_csr.T @ y, dtype=np.float64).ravel()
+                if np.all(np.isfinite(d)):
+                    row_dual = y
+                    reduced_costs = d
         return MilpRelaxationResult(
             status=status_str,
             objective=obj,
@@ -1074,25 +1070,23 @@ class MilpRelaxationModel:
 
         if self._A_ub is None:
             return None
-        try:
-            from discopt.solvers.milp_simplex import solve_lp_warm_std
-        except Exception:  # pragma: no cover - binding absent
-            return None
-        try:
-            c_s, A_s, b_s, bounds_s, col_scale = equilibrate_relaxation_lp(
-                self._c, self._A_ub, self._b_ub, self._bounds, None
-            )
-            result, _, cert = solve_lp_warm_std(
-                c_s,
-                sp.csr_matrix(A_s),
-                b_s,
-                bounds_s,
-                in_basis=None,
-                return_cert=True,
-                time_limit=time_limit,
-            )
-        except Exception:  # pragma: no cover - defensive
-            return None
+        # #1520: no except (both former handlers). ``milp_simplex`` is in-package;
+        # ``equilibrate_relaxation_lp`` is an exact numpy rescale with no documented
+        # failure mode; ``solve_lp_warm_std`` declines by return value (``None``).
+        from discopt.solvers.milp_simplex import solve_lp_warm_std
+
+        c_s, A_s, b_s, bounds_s, col_scale = equilibrate_relaxation_lp(
+            self._c, self._A_ub, self._b_ub, self._bounds, None
+        )
+        result, _, cert = solve_lp_warm_std(
+            c_s,
+            sp.csr_matrix(A_s),
+            b_s,
+            bounds_s,
+            in_basis=None,
+            return_cert=True,
+            time_limit=time_limit,
+        )
         if result is None:
             self._stash_numerical_bound(cert)  # #517 last-resort floor (flag-gated)
             self._stash_deadline_bound(cert)
@@ -2247,7 +2241,12 @@ def _multivar_box_curvature(
                 )
             try:
                 ad = interval_hessian(expr, model, box=box)
-            except Exception:
+            except ValueError:
+                # #1520: narrowed. ``interval_hessian``'s documented decline (array-
+                # shaped values, ``IntervalHessianTooLarge``) is "no verdict", the
+                # conservative answer; anything else propagates. (A deep left-folded
+                # body used to arrive here as ``RecursionError``; ``interval_hessian``
+                # now runs deep walks on a large stack instead.)
                 return None
             h_lo = np.asarray(ad.hess.lo, dtype=np.float64)[ix]
             h_hi = np.asarray(ad.hess.hi, dtype=np.float64)[ix]
@@ -2419,7 +2418,7 @@ def _uniform_relaxation_delegate(
     # / gradient over the ORIGINAL affine-free variables and its aux column; the
     # tangent of a certified convex (resp. concave) function is a global under-
     # (over-) estimator, so the cut never removes a feasible point (sound by
-    # construction; the loop is a sound no-op on any failure).
+    # construction; a tangent whose evaluation fails is skipped, #1520).
     vm["composite_multivar_relaxations"] = list(rel.composite_multivar_specs)
     # Vertical-tangent facets deferred to separation (#1115): the facet ``_emit_1d``
     # drops where ``f`` is finite but ``f'`` diverges at a box endpoint, recovered as
