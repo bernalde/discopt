@@ -21,14 +21,11 @@ box, which is precisely what the ``nlp`` mode computes.
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Callable, Optional
 
 import jax.numpy as jnp
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 # Per-(relaxation, options) jit caches. Keyed by Python id() of the
 # relaxation functions plus negate/max_iter so repeat B&B nodes hit the
@@ -40,55 +37,6 @@ _pounce_evaluator_cache: dict = {}
 
 def _deadline_expired(deadline: float | None) -> bool:
     return deadline is not None and time.perf_counter() >= deadline
-
-
-def _filter_well_behaved_constraints(
-    con_relax_fns: list[Callable],
-    con_senses: list[str],
-    lb: jnp.ndarray,
-    ub: jnp.ndarray,
-) -> tuple[list[Callable], list[str]]:
-    """Filter out constraints whose McCormick relaxation produces inf/NaN.
-
-    Constraints involving singularities (e.g. 1/(x^3 * sin(x))) can produce
-    inf/NaN in their McCormick relaxation at wide bounds. Dropping these
-    constraints weakens the relaxation but keeps the NLP well-conditioned.
-    The resulting lower bound is still valid (just weaker).
-    """
-    good_fns = []
-    good_senses = []
-
-    # Test at several points to see if the relaxation is well-behaved
-    test_points = [
-        0.5 * (lb + ub),
-        lb + 0.25 * (ub - lb),
-        lb + 0.75 * (ub - lb),
-    ]
-
-    for fn, sense in zip(con_relax_fns, con_senses):
-        is_ok = False
-        for pt in test_points:
-            try:
-                cv, cc = fn(pt, pt, lb, ub)
-                cv_val = float(cv)
-                cc_val = float(cc)
-                if np.isfinite(cv_val) and np.isfinite(cc_val):
-                    if abs(cv_val) < 1e12 and abs(cc_val) < 1e12:
-                        is_ok = True
-                        break
-            except Exception as exc:  # noqa: BLE001 - the next probe point is tried instead
-                # Capability-disabling in aggregate: a relaxation whose probes all
-                # raise is dropped from ``good_fns``, silently shrinking the
-                # relaxation the NLP actually sees.
-                logger.debug(
-                    "relaxation probe raised at a test point: %s: %s", type(exc).__name__, exc
-                )
-                continue
-        if is_ok:
-            good_fns.append(fn)
-            good_senses.append(sense)
-
-    return good_fns, good_senses
 
 
 def _get_or_build_pounce_evaluator(
@@ -165,18 +113,25 @@ def _solve_relaxation_with_pounce(
 
     try:
         result = solve_nlp_pounce(ev, x0, constraint_bounds=constraint_bounds, options=opts)
-    except Exception:
+    except Exception as exc:
+        # #1520: kept as a sound fallback. POUNCE is native code reached through
+        # PyO3; if it raises, the node gets ``-inf`` (no bound from this path),
+        # which is always valid. Reported, not silent.
+        from discopt._relax._fallback import warn_fallback_once
+
+        warn_fallback_once(
+            "McCormick relaxation NLP (POUNCE) solve", exc, "no bound from this path (-inf)"
+        )
         return float("-inf")
 
-    # Mirror the POUNCE/Ipopt acceptance set: optimal, acceptable, stalled
-    # (Search_Direction_Becomes_Too_Small → UNBOUNDED in the discopt enum),
-    # and max-iterations are all valid B&B lower bounds because the
-    # McCormick underestimator is convex.
-    if result.status not in (
-        SolveStatus.OPTIMAL,
-        SolveStatus.ITERATION_LIMIT,
-        SolveStatus.UNBOUNDED,
-    ):
+    # #1520: only a CONVERGED solve is a lower bound. Convexity of the McCormick
+    # underestimator makes its *minimum* a valid bound, but an interior-point
+    # iterate stopped at ``max_iter`` (``ITERATION_LIMIT``) or on a stalled
+    # search direction (mapped to ``UNBOUNDED``) is not a minimum: its objective
+    # can sit anywhere above it (and, primal-infeasible, anywhere at all). This
+    # used to accept both, handing the tree a node bound nothing proved. The
+    # node now keeps its inherited bound (``-inf`` here), which is always valid.
+    if result.status != SolveStatus.OPTIMAL:
         return float("-inf")
     if result.objective is None:
         return float("-inf")
@@ -226,13 +181,13 @@ def solve_mccormick_relaxation_nlp(
     # per-constraint filter) — still cheaper than entering the IPM only
     # to have it blow up on inf/NaN.
     mid = 0.5 * (lb + ub)
-    try:
-        cv_test, cc_test = obj_relax_fn(mid, mid, lb, ub)
-        cv_t = float(cv_test)
-        cc_t = float(cc_test)
-        if not (np.isfinite(cv_t) and np.isfinite(cc_t)):
-            return float("-inf")
-    except Exception:
+    # #1520: no except. A compiled relaxation declines by value (inf/NaN, handled
+    # here); it has no documented exception, so a raise is a defect -- not a
+    # silent ``-inf`` that reads as "the NLP bound never helps".
+    cv_test, cc_test = obj_relax_fn(mid, mid, lb, ub)
+    cv_t = float(cv_test)
+    cc_t = float(cc_test)
+    if not (np.isfinite(cv_t) and np.isfinite(cc_t)):
         return float("-inf")
 
     if _deadline_expired(deadline):

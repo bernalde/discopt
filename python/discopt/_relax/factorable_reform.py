@@ -59,7 +59,7 @@ from discopt.modeling.core import (
     VarType,
     carry_validation_guards,
 )
-from discopt.mpec import ComplementarityProvenanceError, carry_complementarities
+from discopt.mpec import carry_complementarities
 
 from .gdp_reformulate import (
     _bound_expression,
@@ -259,10 +259,10 @@ def _recursion_headroom_need(model: Model) -> int:
     bounded by node count); it only affects whether the deep-stack path engages,
     never what the walk detects.
     """
-    try:
-        size = _max_expr_node_count(model)
-    except Exception:
-        return 0
+    # #1520: no except. ``_max_expr_node_count`` is an iterative walk over the
+    # model's own expressions with no failure mode; the old handler could only turn
+    # a defect into "no headroom" and a later unexplained RecursionError.
+    size = _max_expr_node_count(model)
     if size <= _DEEP_RECURSION_SIZE_GATE:
         return 0
     # A few Python frames are entered per expression node along the deepest path;
@@ -1577,50 +1577,56 @@ def canonicalize_entropy(model: Model) -> Model:
     The rewrites are exact (``entropy(x) ≡ x·log(x)``, ``centropy(x,y) ≡
     x·log(x/y)``) and convexity-preserving, so they run unconditionally. If
     nothing matches, *model* is returned unchanged (zero overhead, zero
-    behavioural change). On any unexpected error the original model is returned,
-    so the pass can never break a previously-solvable model.
+    behavioural change). An exception is a defect and propagates (#1520).
+
+    The rewrite recurses one frame per expression node, so it runs with the same
+    size-scaled recursion headroom as :func:`factorable_reformulate` (#1520: a
+    3000-term ``.nl`` row used to ``RecursionError``, which a blanket handler
+    turned into "no entropy term found").
     """
-    try:
-        changed = False
+    return _run_factorable_with_headroom(model, lambda: _canonicalize_entropy_inner(model))
 
-        new_objective = model._objective
-        if model._objective is not None:
-            new_expr = _canonicalize_entropy_expr(model._objective.expression, model)
-            if new_expr is not model._objective.expression:
-                from discopt.modeling.core import Objective
 
-                new_objective = Objective(new_expr, model._objective.sense)
+def _canonicalize_entropy_inner(model: Model) -> Model:
+    # #1520: no except. The walk declines by returning the model unchanged; the
+    # old ``except Exception: return model`` could only hide a defect as "no
+    # entropy term found". ``ComplementarityProvenanceError`` already propagated.
+    changed = False
+
+    new_objective = model._objective
+    if model._objective is not None:
+        new_expr = _canonicalize_entropy_expr(model._objective.expression, model)
+        if new_expr is not model._objective.expression:
+            from discopt.modeling.core import Objective
+
+            new_objective = Objective(new_expr, model._objective.sense)
+            changed = True
+
+    new_constraints: list = []
+    for c in model._constraints:
+        if isinstance(c, Constraint):
+            new_body = _canonicalize_entropy_expr(c.body, model)
+            if new_body is not c.body:
+                new_constraints.append(Constraint(new_body, c.sense, c.rhs, c.name))
                 changed = True
+                continue
+        new_constraints.append(c)
 
-        new_constraints: list = []
-        for c in model._constraints:
-            if isinstance(c, Constraint):
-                new_body = _canonicalize_entropy_expr(c.body, model)
-                if new_body is not c.body:
-                    new_constraints.append(Constraint(new_body, c.sense, c.rhs, c.name))
-                    changed = True
-                    continue
-            new_constraints.append(c)
-
-        if not changed:
-            return model
-
-        new_model = Model(model.name)
-        new_model._variables = list(model._variables)
-        new_model._parameters = list(model._parameters)
-        new_model._rebuild_name_index()  # keep the name cache in sync (M7)
-        new_model._objective = new_objective
-        new_model._constraints = new_constraints
-        # Complementarity provenance (#1147): forward the relation set onto the
-        # rebuilt model. An unresolvable relation raises past the defensive
-        # handler rather than degrading to a silent drop.
-        carry_complementarities(model, new_model, pass_name="entropy canonicalization")
-        carry_validation_guards(model, new_model)  # #1498
-        return new_model
-    except ComplementarityProvenanceError:
-        raise
-    except Exception:  # pragma: no cover - defensive: never break a solve
+    if not changed:
         return model
+
+    new_model = Model(model.name)
+    new_model._variables = list(model._variables)
+    new_model._parameters = list(model._parameters)
+    new_model._rebuild_name_index()  # keep the name cache in sync (M7)
+    new_model._objective = new_objective
+    new_model._constraints = new_constraints
+    # Complementarity provenance (#1147): forward the relation set onto the
+    # rebuilt model. An unresolvable relation raises rather than degrading to a
+    # silent drop.
+    carry_complementarities(model, new_model, pass_name="entropy canonicalization")
+    carry_validation_guards(model, new_model)  # #1498
+    return new_model
 
 
 def factorable_reformulate(
@@ -1654,9 +1660,9 @@ def factorable_reformulate(
     a partially rewritten model.  That is what makes a clock admissible here —
     it selects between two states the pass already produces, and cannot invent
     a third.  It is not even a new escape: the rebuild loop has always been able
-    to bail to the original model from any point inside itself (the defensive
-    ``except Exception: return model`` below), so abandoning is an existing,
-    exercised return path reached for a new reason.
+    to bail to the original model from any point inside itself (the explicit
+    ``return model`` declines), so abandoning is an existing, exercised return
+    path reached for a new reason.
     """
     return _run_factorable_with_headroom(
         model,
@@ -1670,87 +1676,85 @@ def _factorable_reformulate_inner(
     clear_only: bool = False,
     deadline: Optional[Callable[[], bool]] = None,
 ) -> Model:
-    try:
-        if not _has_factorable_work_inner(model, deadline=deadline):
+    # #1520: no except. Every decline is an explicit ``return model`` (no work, the
+    # deadline, the soundness gates); the old ``except Exception: return model``
+    # could only hide a defect in the rewrite as "nothing to reformulate".
+    if not _has_factorable_work_inner(model, deadline=deadline):
+        return model
+
+    new_model = Model(model.name)
+    new_model._variables = list(model._variables)
+    new_model._parameters = list(model._parameters)
+    new_model._rebuild_name_index()  # keep the name cache in sync (M7)
+    new_model._objective = model._objective
+
+    lifter = _Lifter(new_model)
+
+    rebuilt: list[Constraint] = []
+    for c in model._constraints:
+        # #1456 item 2. Wholesale abandonment: ``new_model`` and everything
+        # ``lifter`` has built for it are dropped on the floor, and the
+        # caller gets the model it passed in. A partial rewrite would be a
+        # third state nothing downstream is written against.
+        if deadline is not None and deadline():
             return model
-
-        new_model = Model(model.name)
-        new_model._variables = list(model._variables)
-        new_model._parameters = list(model._parameters)
-        new_model._rebuild_name_index()  # keep the name cache in sync (M7)
-        new_model._objective = model._objective
-
-        lifter = _Lifter(new_model)
-
-        rebuilt: list[Constraint] = []
-        for c in model._constraints:
-            # #1456 item 2. Wholesale abandonment: ``new_model`` and everything
-            # ``lifter`` has built for it are dropped on the floor, and the
-            # caller gets the model it passed in. A partial rewrite would be a
-            # third state nothing downstream is written against.
-            if deadline is not None and deadline():
-                return model
-            if not isinstance(c, Constraint):
-                rebuilt.append(c)  # pass through anything exotic untouched
-                continue
-            body, sense = _clear_divisions(c.body, c.sense, new_model)
-            # Soundness gate: clearing multiplies the constraint through by the
-            # denominator, which can pull an unbounded linear term into a
-            # nonlinear product (``x4 * D``) that has no valid finite envelope.
-            # Such a cleared relaxation can exclude feasible points and certify a
-            # false infeasibility (gear4). Keep the original quotient in that case.
-            if (body is not c.body or sense != c.sense) and _has_unbounded_nonlinear_term(
-                body, new_model
-            ):
-                rebuilt.append(c)
-                continue
-            if clear_only:
-                # Only touch constraints the clearing actually rewrote; leave
-                # everything else byte-for-byte identical so convex structure
-                # elsewhere is preserved.
-                if body is c.body and sense == c.sense:
-                    rebuilt.append(c)
-                else:
-                    rebuilt.append(Constraint(distribute_products(body), sense, c.rhs, c.name))
-                continue
-            body = _prelift_call_powers(body, new_model, lifter)
-            body = _prelift_blowup_products(body, new_model, lifter)
-            body = distribute_products(body)
-            body = _lift_objective_atoms(body, new_model, lifter)
-            body = _lift_expr(body, new_model, lifter)
+        if not isinstance(c, Constraint):
+            rebuilt.append(c)  # pass through anything exotic untouched
+            continue
+        body, sense = _clear_divisions(c.body, c.sense, new_model)
+        # Soundness gate: clearing multiplies the constraint through by the
+        # denominator, which can pull an unbounded linear term into a
+        # nonlinear product (``x4 * D``) that has no valid finite envelope.
+        # Such a cleared relaxation can exclude feasible points and certify a
+        # false infeasibility (gear4). Keep the original quotient in that case.
+        if (body is not c.body or sense != c.sense) and _has_unbounded_nonlinear_term(
+            body, new_model
+        ):
+            rebuilt.append(c)
+            continue
+        if clear_only:
+            # Only touch constraints the clearing actually rewrote; leave
+            # everything else byte-for-byte identical so convex structure
+            # elsewhere is preserved.
             if body is c.body and sense == c.sense:
                 rebuilt.append(c)
             else:
-                rebuilt.append(Constraint(body, sense, c.rhs, c.name))
+                rebuilt.append(Constraint(distribute_products(body), sense, c.rhs, c.name))
+            continue
+        body = _prelift_call_powers(body, new_model, lifter)
+        body = _prelift_blowup_products(body, new_model, lifter)
+        body = distribute_products(body)
+        body = _lift_objective_atoms(body, new_model, lifter)
+        body = _lift_expr(body, new_model, lifter)
+        if body is c.body and sense == c.sense:
+            rebuilt.append(c)
+        else:
+            rebuilt.append(Constraint(body, sense, c.rhs, c.name))
 
-        # Lift the objective too (it may contain a mixed product or a fractional
-        # power of a polynomial base); division clearing is meaningless for an
-        # objective so only the lifts apply.
-        if not clear_only and new_model._objective is not None:
-            obj_expr = _prelift_call_powers(new_model._objective.expression, new_model, lifter)
-            obj_expr = _prelift_blowup_products(obj_expr, new_model, lifter)
-            obj_expr = distribute_products(obj_expr)
-            obj_expr = _lift_objective_atoms(obj_expr, new_model, lifter)
-            lifted_obj = _lift_expr(obj_expr, new_model, lifter)
-            if lifted_obj is not new_model._objective.expression:
-                from discopt.modeling.core import Objective
+    # Lift the objective too (it may contain a mixed product or a fractional
+    # power of a polynomial base); division clearing is meaningless for an
+    # objective so only the lifts apply.
+    if not clear_only and new_model._objective is not None:
+        obj_expr = _prelift_call_powers(new_model._objective.expression, new_model, lifter)
+        obj_expr = _prelift_blowup_products(obj_expr, new_model, lifter)
+        obj_expr = distribute_products(obj_expr)
+        obj_expr = _lift_objective_atoms(obj_expr, new_model, lifter)
+        lifted_obj = _lift_expr(obj_expr, new_model, lifter)
+        if lifted_obj is not new_model._objective.expression:
+            from discopt.modeling.core import Objective
 
-                new_model._objective = Objective(lifted_obj, new_model._objective.sense)
+            new_model._objective = Objective(lifted_obj, new_model._objective.sense)
 
-        # Defining equalities for the aux variables come first so downstream
-        # bound propagation sees them early.
-        new_model._constraints = lifter.aux_constraints + rebuilt
-        # R4: surface the zero-spanning product-factor auxes (if any were tagged
-        # under the flag) so the solver can keep them branchable. Always set the
-        # attribute (empty by default) for a stable, easy-to-read contract.
-        new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
-        # Complementarity provenance (#1147). The lifts rewrite constraint
-        # *bodies*; the relation's source operands are untouched and still read
-        # the shared Variable objects, so the relation set forwards intact.
-        carry_complementarities(model, new_model, pass_name="factorable reformulation")
-        carry_validation_guards(model, new_model)  # #1498
-        return new_model
-    except ComplementarityProvenanceError:
-        raise
-    except Exception:  # pragma: no cover - defensive: never break a solve
-        return model
+    # Defining equalities for the aux variables come first so downstream
+    # bound propagation sees them early.
+    new_model._constraints = lifter.aux_constraints + rebuilt
+    # R4: surface the zero-spanning product-factor auxes (if any were tagged
+    # under the flag) so the solver can keep them branchable. Always set the
+    # attribute (empty by default) for a stable, easy-to-read contract.
+    new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
+    # Complementarity provenance (#1147). The lifts rewrite constraint
+    # *bodies*; the relation's source operands are untouched and still read
+    # the shared Variable objects, so the relation set forwards intact.
+    carry_complementarities(model, new_model, pass_name="factorable reformulation")
+    carry_validation_guards(model, new_model)  # #1498
+    return new_model

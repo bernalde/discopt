@@ -115,11 +115,12 @@ def _box_fbbt(model: Model, lb: np.ndarray, ub: np.ndarray):
     layout does not match the flat box. Any other exception is a defect and
     propagates (#1514).
     """
+    from discopt._relax.problem_classifier import MODEL_TO_REPR_DECLINES
     from discopt._rust import model_to_repr
 
     try:
         rep = model_to_repr(model, getattr(model, "_builder", None))
-    except ValueError as exc:
+    except MODEL_TO_REPR_DECLINES as exc:  # #1520: the full documented set
         logger.debug("disjunctive pass: per-box FBBT abstained, no Rust repr: %s", exc)
         return lb, ub, False
     off = 0

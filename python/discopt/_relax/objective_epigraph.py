@@ -485,10 +485,10 @@ def relax_objective_defining_equality(model):
 
     from discopt._relax.convexity import Curvature, classify_expr
 
-    try:
-        curv = classify_expr(defining.body, model)
-    except Exception:
-        return model, False
+    # #1520: no except. ``classify_expr`` answers ``Curvature.UNKNOWN`` when it
+    # cannot prove curvature (rejected just below); without a deadline cache it has
+    # no documented exception, so a raise is a defect, not "not convex".
+    curv = classify_expr(defining.body, model)
     if curv == Curvature.AFFINE:
         return model, False
     relaxed_is_convex = (relaxed_sense == ">=" and curv == Curvature.CONCAVE) or (

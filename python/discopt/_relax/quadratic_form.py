@@ -152,13 +152,10 @@ def extract_quadratic_support(
     from discopt._relax.milp_relaxation import _expr_to_polynomial
     from discopt._relax.term_classifier import distribute_products
 
-    try:
-        poly = _expr_to_polynomial(distribute_products(expr), model)
-    except Exception:
-        # The trusted walker abstains loudly on shapes it cannot reduce
-        # (array variables, etc.). Treat any failure as "not recognized"
-        # — abstain rather than guess.
-        return None
+    # #1520: no except. ``_expr_to_polynomial`` abstains by returning ``None`` on
+    # any shape it cannot reduce (checked just below); it has no documented
+    # exception, so a raise is a defect and must not read as "not quadratic".
+    poly = _expr_to_polynomial(distribute_products(expr), model)
 
     if poly is None:
         return None

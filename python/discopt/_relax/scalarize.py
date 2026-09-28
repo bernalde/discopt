@@ -396,7 +396,9 @@ def _elem(expr: Expression, idx: tuple[int, ...]) -> Expression:
         try:
             positions = np.arange(int(np.prod(base_shape))).reshape(base_shape)[expr.index]
             base_flat = int(np.asarray(positions)[idx])
-        except Exception as exc:  # index numpy cannot resolve statically
+        except (IndexError, TypeError, ValueError) as exc:
+            # #1520: narrowed to numpy's documented indexing failures (an index it
+            # cannot resolve statically); anything else is a defect.
             raise _Unscalarizable(f"unresolvable index {expr.index!r}: {exc}") from exc
         return _elem(expr.base, tuple(int(i) for i in np.unravel_index(base_flat, base_shape)))
 

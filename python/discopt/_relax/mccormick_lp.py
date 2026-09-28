@@ -654,42 +654,41 @@ class MccormickLPRelaxer:
         # callers that only want the relaxer's model/terms/disc and never invoke
         # ``solve_at_node`` (e.g. structural OBBT), avoiding wasted cold builds.
         if build_incremental and os.environ.get("DISCOPT_INCREMENTAL_MC", "1") != "0":
-            try:
-                from discopt._relax.incremental_mccormick import IncrementalMcCormickLP
+            # #1520: no except. ``IncrementalMcCormickLP`` declines by ``ok=False`` (its
+            # constructor absorbs its documented decline types itself), so a raise here is a
+            # defect.
+            from discopt._relax.incremental_mccormick import IncrementalMcCormickLP
 
-                # Scope gate (cert:T1.3): gate ONLY on the constructor's row-for-row
-                # self-validation (`ok`), for ANY model — any variable mix, any
-                # objective sense. The prior `_is_in_scope` (pure-integer, minimize)
-                # was a conservative rollout limit inherited from the opt-in
-                # lp_spatial engine (#355), not a soundness boundary: the fast path
-                # solves the *McCormick LP relaxation* (a valid lower bound for
-                # continuous, mixed, and integer models alike), and `_validate`
-                # proves the patched rows reproduce the cold `build_milp_relaxation`
-                # exactly; any uncovered term (univariate/NN-embedding smooth
-                # activations, RLT-lifted rows, …) makes `_validate` fail → `ok=False`
-                # → the trusted cold build runs unchanged.
-                #
-                # A first attempt at this widening collapsed the spatial bound
-                # (``dispatch`` 3 → 9843 nodes) because the fast path returns before
-                # the per-node separation chain and no root cut pool was built off
-                # the PSD path. That is fixed by the *general* root-cut-pool capture
-                # in solver.py (built whenever ``_inc`` is set) which the fast path
-                # inherits; and by skipping the fast path during pool capture
-                # (``out_cuts``) so the pool actually separates. Bound-changing
-                # behaviour is verified by the differential-neutrality check.
-                # No ``box=`` here, deliberately: this relaxer is constructed before
-                # it knows which box the caller will branch in, so the structure
-                # anchors its probe/validation boxes to the model's own bounds
-                # (#861's default). ``lp_spatial_bb`` DOES have a post-OBBT root box
-                # and passes it. Handing this call site a guessed box would be worse
-                # than the default — the boxes must be reachable, and only the caller
-                # knows what it tightened.
-                _inc = IncrementalMcCormickLP(model, self._terms)
-                if _inc.ok:
-                    self._inc = _inc
-            except Exception:
-                logger.debug("__init__ failed; using fallback", exc_info=True)
-                self._inc = None
+            # Scope gate (cert:T1.3): gate ONLY on the constructor's row-for-row
+            # self-validation (`ok`), for ANY model — any variable mix, any
+            # objective sense. The prior `_is_in_scope` (pure-integer, minimize)
+            # was a conservative rollout limit inherited from the opt-in
+            # lp_spatial engine (#355), not a soundness boundary: the fast path
+            # solves the *McCormick LP relaxation* (a valid lower bound for
+            # continuous, mixed, and integer models alike), and `_validate`
+            # proves the patched rows reproduce the cold `build_milp_relaxation`
+            # exactly; any uncovered term (univariate/NN-embedding smooth
+            # activations, RLT-lifted rows, …) makes `_validate` fail → `ok=False`
+            # → the trusted cold build runs unchanged.
+            #
+            # A first attempt at this widening collapsed the spatial bound
+            # (``dispatch`` 3 → 9843 nodes) because the fast path returns before
+            # the per-node separation chain and no root cut pool was built off
+            # the PSD path. That is fixed by the *general* root-cut-pool capture
+            # in solver.py (built whenever ``_inc`` is set) which the fast path
+            # inherits; and by skipping the fast path during pool capture
+            # (``out_cuts``) so the pool actually separates. Bound-changing
+            # behaviour is verified by the differential-neutrality check.
+            # No ``box=`` here, deliberately: this relaxer is constructed before
+            # it knows which box the caller will branch in, so the structure
+            # anchors its probe/validation boxes to the model's own bounds
+            # (#861's default). ``lp_spatial_bb`` DOES have a post-OBBT root box
+            # and passes it. Handing this call site a guessed box would be worse
+            # than the default — the boxes must be reachable, and only the caller
+            # knows what it tightened.
+            _inc = IncrementalMcCormickLP(model, self._terms)
+            if _inc.ok:
+                self._inc = _inc
 
         # Composite convex/concave OA lift detection is LAZY (see
         # ``_model_has_composite_lift``): computed at most once, and only the first
@@ -709,16 +708,14 @@ class MccormickLPRelaxer:
         one probe build stays off every other relaxer's hot path."""
         if self._has_composite_lift_cache is None:
             self._has_composite_lift_cache = False
-            try:
-                from discopt._relax.model_utils import flat_variable_bounds
-                from discopt._relax.uniform_relax import build_uniform_relaxation
+            # #1520: no except. ``build_uniform_relaxation`` is the same builder every node uses
+            # and has no documented decline; a raise is a defect, not "no composite lift".
+            from discopt._relax.model_utils import flat_variable_bounds
+            from discopt._relax.uniform_relax import build_uniform_relaxation
 
-                _flb, _fub = flat_variable_bounds(self._model)
-                _probe = build_uniform_relaxation(self._model, box=(_flb, _fub))
-                self._has_composite_lift_cache = bool(_probe.composite_multivar_specs)
-            except Exception:
-                logger.debug("_model_has_composite_lift failed; using fallback", exc_info=True)
-                self._has_composite_lift_cache = False
+            _flb, _fub = flat_variable_bounds(self._model)
+            _probe = build_uniform_relaxation(self._model, box=(_flb, _fub))
+            self._has_composite_lift_cache = bool(_probe.composite_multivar_specs)
         return self._has_composite_lift_cache
 
     @property
@@ -820,92 +817,90 @@ class MccormickLPRelaxer:
                 np.abs(ub[idx]) >= _RELAX_NUMERIC_CAP
             ):
                 return None
-        try:
-            cut_rows = None
-            if inherited_cuts is not None:
-                a_rows = inherited_cuts[0]
-                b_rows = inherited_cuts[1]
-                root_idents = inherited_cuts[2] if len(inherited_cuts) > 2 else None
-                if a_rows is not None and _sparse_rows(a_rows) > 0:
-                    a_rows = _as_csr(a_rows).toarray()
-                    b_rows = np.asarray(b_rows, dtype=np.float64).ravel()
-                    node_idents = getattr(inc, "col_identities", None)
-                    # A pool captured over a WIDER column layout than this incremental
-                    # structure carries (``a_rows.shape[1] != inc.ncol``) cannot be
-                    # applied here — decline the incremental path (fall to the cold
-                    # build, which re-lifts to the pool's own layout and can inherit
-                    # it there). This preserves the pre-C-44 routing (the count check
-                    # gated inheritance to the cold path on such models, e.g.
-                    # dispatch: pool 23 cols vs incremental 10 cols) while C-44 makes
-                    # the equal-count case IDENTITY-safe below.
-                    _count_ok = (
-                        a_rows.ndim == 2
-                        and a_rows.shape[1] == inc.ncol
-                        and len(b_rows) == a_rows.shape[0]
+        # #1520: no except. Pool remapping, ``assemble`` and ``solve_assembled_full`` all decline
+        # by return value (``None`` / a non-optimal status -> cold fallback); a raise is a defect.
+        cut_rows = None
+        if inherited_cuts is not None:
+            a_rows = inherited_cuts[0]
+            b_rows = inherited_cuts[1]
+            root_idents = inherited_cuts[2] if len(inherited_cuts) > 2 else None
+            if a_rows is not None and _sparse_rows(a_rows) > 0:
+                a_rows = _as_csr(a_rows).toarray()
+                b_rows = np.asarray(b_rows, dtype=np.float64).ravel()
+                node_idents = getattr(inc, "col_identities", None)
+                # A pool captured over a WIDER column layout than this incremental
+                # structure carries (``a_rows.shape[1] != inc.ncol``) cannot be
+                # applied here — decline the incremental path (fall to the cold
+                # build, which re-lifts to the pool's own layout and can inherit
+                # it there). This preserves the pre-C-44 routing (the count check
+                # gated inheritance to the cold path on such models, e.g.
+                # dispatch: pool 23 cols vs incremental 10 cols) while C-44 makes
+                # the equal-count case IDENTITY-safe below.
+                _count_ok = (
+                    a_rows.ndim == 2
+                    and a_rows.shape[1] == inc.ncol
+                    and len(b_rows) == a_rows.shape[0]
+                )
+                if not _count_ok:
+                    return None
+                # C-44: at the SAME column count, remap the root pool from its
+                # ROOT column identities onto this structure's layout by matching
+                # identity — the old count-only gate appended a row by position
+                # even when a re-lift remapped which lifted variable each position
+                # means (same count, different semantics → the C-43 false-fathom).
+                # A row referencing a lifted term this layout does not carry at
+                # that count is skipped (sound — fewer cuts only loosen).
+                if root_idents is not None and node_idents is not None:
+                    A_rm, b_rm, n_kept, n_skip = _remap_pool_rows(
+                        a_rows, b_rows, root_idents, node_idents, inc.ncol
                     )
-                    if not _count_ok:
-                        return None
-                    # C-44: at the SAME column count, remap the root pool from its
-                    # ROOT column identities onto this structure's layout by matching
-                    # identity — the old count-only gate appended a row by position
-                    # even when a re-lift remapped which lifted variable each position
-                    # means (same count, different semantics → the C-43 false-fathom).
-                    # A row referencing a lifted term this layout does not carry at
-                    # that count is skipped (sound — fewer cuts only loosen).
-                    if root_idents is not None and node_idents is not None:
-                        A_rm, b_rm, n_kept, n_skip = _remap_pool_rows(
-                            a_rows, b_rows, root_idents, node_idents, inc.ncol
-                        )
-                        self._pool_stats["inherited_rows_skipped"] += n_skip
-                        if A_rm is not None and n_kept > 0:
-                            cut_rows = list(zip(A_rm, b_rm))
-                            self._pool_stats["inherited_nodes"] += 1
-                            self._pool_stats["inherited_rows"] += n_kept
-                    elif root_idents is None or node_idents is None:
-                        # Untagged pool or unavailable node identities (defensive
-                        # fallback): legacy count-gated positional append (we already
-                        # passed the equal-count precondition). Should not occur once
-                        # every capture tags idents and the structure builds them.
-                        cut_rows = list(zip(a_rows, b_rows))
+                    self._pool_stats["inherited_rows_skipped"] += n_skip
+                    if A_rm is not None and n_kept > 0:
+                        cut_rows = list(zip(A_rm, b_rm))
                         self._pool_stats["inherited_nodes"] += 1
-                        self._pool_stats["inherited_rows"] += len(cut_rows)
-            A, b, bounds = inc.assemble(lb, ub, cut_rows=cut_rows)
-            nrows = int(A.shape[0])
-            # Densification guard (Issue #20), same cap as the cold path below.
-            # T1.3 widened the fast path to any model, so a large multilinear lift
-            # can now reach it; decline an oversize node here too rather than force
-            # a multi-GB dense solve. Sound: no bound is returned, so the caller
-            # keeps the rigorous alphaBB/interval underestimator (identical to the
-            # cold-path decline). Falling back to the cold build would only hit the
-            # same guard, so return the oversize verdict directly. Under the opt-in
-            # ``sparse_large_lp`` flag the check is nnz-based (the path is sparse; see
-            # ``_lp_lift_too_large``), so a large sparse lift is solved, not declined.
-            import scipy.sparse as sp
+                        self._pool_stats["inherited_rows"] += n_kept
+                elif root_idents is None or node_idents is None:
+                    # Untagged pool or unavailable node identities (defensive
+                    # fallback): legacy count-gated positional append (we already
+                    # passed the equal-count precondition). Should not occur once
+                    # every capture tags idents and the structure builds them.
+                    cut_rows = list(zip(a_rows, b_rows))
+                    self._pool_stats["inherited_nodes"] += 1
+                    self._pool_stats["inherited_rows"] += len(cut_rows)
+        A, b, bounds = inc.assemble(lb, ub, cut_rows=cut_rows)
+        nrows = int(A.shape[0])
+        # Densification guard (Issue #20), same cap as the cold path below.
+        # T1.3 widened the fast path to any model, so a large multilinear lift
+        # can now reach it; decline an oversize node here too rather than force
+        # a multi-GB dense solve. Sound: no bound is returned, so the caller
+        # keeps the rigorous alphaBB/interval underestimator (identical to the
+        # cold-path decline). Falling back to the cold build would only hit the
+        # same guard, so return the oversize verdict directly. Under the opt-in
+        # ``sparse_large_lp`` flag the check is nnz-based (the path is sparse; see
+        # ``_lp_lift_too_large``), so a large sparse lift is solved, not declined.
+        import scipy.sparse as sp
 
-            _nnz = int(A.nnz) if sp.issparse(A) else int(np.count_nonzero(A))
-            if _lp_lift_too_large(inc.ncol, nrows, _nnz):
-                return MccormickLPResult(status="skipped_oversize")
-            in_basis = (
-                self._inc_warm_basis
-                if (self._inc_warm_basis is not None and self._inc_basis_nrows == nrows)
-                else None
-            )
-            _solved = inc.solve_assembled_full(
-                A,
-                b,
-                bounds,
-                in_basis=in_basis,
-                return_cert=want_marginals,
-                time_limit=_lp_budget(),
-            )
-            if want_marginals:
-                status, bound, x_full, basis, farkas_certified, cert = _solved
-            else:
-                status, bound, x_full, basis, farkas_certified = _solved
-                cert = None
-        except Exception:
-            logger.debug("incremental McCormick node failed; cold fallback", exc_info=True)
-            return None
+        _nnz = int(A.nnz) if sp.issparse(A) else int(np.count_nonzero(A))
+        if _lp_lift_too_large(inc.ncol, nrows, _nnz):
+            return MccormickLPResult(status="skipped_oversize")
+        in_basis = (
+            self._inc_warm_basis
+            if (self._inc_warm_basis is not None and self._inc_basis_nrows == nrows)
+            else None
+        )
+        _solved = inc.solve_assembled_full(
+            A,
+            b,
+            bounds,
+            in_basis=in_basis,
+            return_cert=want_marginals,
+            time_limit=_lp_budget(),
+        )
+        if want_marginals:
+            status, bound, x_full, basis, farkas_certified, cert = _solved
+        else:
+            status, bound, x_full, basis, farkas_certified = _solved
+            cert = None
 
         if status == "optimal" and bound is not None and np.isfinite(bound):
             self._inc_warm_basis = basis
@@ -919,37 +914,36 @@ class MccormickLPRelaxer:
                 # one entry per row of ``A``. Only the first ``n_orig`` structural
                 # columns are needed by DBBT / RC-fixing (aux columns are branched
                 # by the tree, never reduced here).
-                try:
-                    y = np.asarray(cert.dual, dtype=np.float64)
-                    n0 = self._n_orig
-                    # ``A`` is the assembled node matrix — SPARSE CSR since the
-                    # incremental structure went sparse (T11). Compute the structural
-                    # reduced costs ``d_j = c_j - (Aᵀy)_j`` with a sparse matvec on the
-                    # first ``n0`` columns; never densify ``A`` (would reintroduce the
-                    # O(rows*cols) blow-up on a large lift).
-                    A_sp = A if sp.issparse(A) else sp.csr_matrix(np.asarray(A, dtype=np.float64))
-                    if A_sp.shape[0] == y.shape[0] and A_sp.shape[1] >= n0:
-                        c_full = np.asarray(inc.c, dtype=np.float64)
-                        Ay = np.asarray(A_sp[:, :n0].T @ y, dtype=np.float64).ravel()
-                        rc = c_full[:n0] - Ay
-                        res.reduced_costs = rc
-                        # #1397: the two terms this difference is taken of, summed in
-                        # absolute value -- the only scale that says how much of a
-                        # small ``d_j`` could be round-off. ``|A|^T|y|`` (not
-                        # ``|A^T y|``) because the dot product's own cancellation is
-                        # part of the error, and the same sparse structure makes it
-                        # one extra matvec.
-                        res.rc_absum = (
-                            np.abs(c_full[:n0])
-                            + np.asarray(abs(A_sp[:, :n0]).T @ np.abs(y), dtype=np.float64).ravel()
-                        )
-                        res.dual = y
-                        res.col_status = cert.col_status
-                        res.safe_bound = (
-                            float(cert.safe_bound) if cert.safe_bound is not None else float(bound)
-                        )
-                except Exception:
-                    logger.debug("node-LP marginal extraction failed (non-fatal)", exc_info=True)
+                # #1520: no except. The shape check is the decline; the rest is sparse arithmetic
+                # with no failure mode.
+                y = np.asarray(cert.dual, dtype=np.float64)
+                n0 = self._n_orig
+                # ``A`` is the assembled node matrix — SPARSE CSR since the
+                # incremental structure went sparse (T11). Compute the structural
+                # reduced costs ``d_j = c_j - (Aᵀy)_j`` with a sparse matvec on the
+                # first ``n0`` columns; never densify ``A`` (would reintroduce the
+                # O(rows*cols) blow-up on a large lift).
+                A_sp = A if sp.issparse(A) else sp.csr_matrix(np.asarray(A, dtype=np.float64))
+                if A_sp.shape[0] == y.shape[0] and A_sp.shape[1] >= n0:
+                    c_full = np.asarray(inc.c, dtype=np.float64)
+                    Ay = np.asarray(A_sp[:, :n0].T @ y, dtype=np.float64).ravel()
+                    rc = c_full[:n0] - Ay
+                    res.reduced_costs = rc
+                    # #1397: the two terms this difference is taken of, summed in
+                    # absolute value -- the only scale that says how much of a
+                    # small ``d_j`` could be round-off. ``|A|^T|y|`` (not
+                    # ``|A^T y|``) because the dot product's own cancellation is
+                    # part of the error, and the same sparse structure makes it
+                    # one extra matvec.
+                    res.rc_absum = (
+                        np.abs(c_full[:n0])
+                        + np.asarray(abs(A_sp[:, :n0]).T @ np.abs(y), dtype=np.float64).ravel()
+                    )
+                    res.dual = y
+                    res.col_status = cert.col_status
+                    res.safe_bound = (
+                        float(cert.safe_bound) if cert.safe_bound is not None else float(bound)
+                    )
             return res
 
         if status == "infeasible":
@@ -976,22 +970,15 @@ class MccormickLPRelaxer:
             # infeasible (fathom); a false one re-solves to ``optimal`` (keep the node
             # with its valid bound). This restores both soundness and completeness.
             if in_basis is not None:
-                try:
-                    (
-                        c_status,
-                        c_bound,
-                        c_x,
-                        _c_basis,
-                        c_farkas,
-                    ) = inc.solve_assembled_full(
-                        A, b, bounds, in_basis=None, time_limit=_lp_budget()
-                    )
-                except Exception:
-                    logger.debug("_try_incremental_node failed; using fallback", exc_info=True)
-                    c_status = None
-                    c_bound = None
-                    c_x = None
-                    c_farkas = False
+                # #1520: no except. ``solve_assembled_full`` declines by returning a non-optimal
+                # status.
+                (
+                    c_status,
+                    c_bound,
+                    c_x,
+                    _c_basis,
+                    c_farkas,
+                ) = inc.solve_assembled_full(A, b, bounds, in_basis=None, time_limit=_lp_budget())
                 if c_status == "optimal" and c_bound is not None and np.isfinite(c_bound):
                     x_orig = np.asarray(c_x, dtype=np.float64)[: self._n_orig]
                     return MccormickLPResult(status="optimal", lower_bound=float(c_bound), x=x_orig)
@@ -1047,26 +1034,21 @@ class MccormickLPRelaxer:
 
         from discopt._relax.milp_relaxation import equilibrate_relaxation_lp
 
-        try:
-            a_csr = sp.csr_matrix(A)
-        except Exception:
-            logger.debug("_reverify_incremental_infeasible failed; using fallback", exc_info=True)
-            return None
+        # #1520: no except. ``csr_matrix`` of the assembled node matrix has no failure mode.
+        a_csr = sp.csr_matrix(A)
 
-        try:
-            bl = [(float(bounds[i, 0]), float(bounds[i, 1])) for i in range(bounds.shape[0])]
-            c2, a2, b2, bd2, col_scale = equilibrate_relaxation_lp(inc.c, a_csr, b, bl, None)
-            status, bound, x_s, _, farkas = inc.solve_assembled_full(
-                a2,
-                b2,
-                np.asarray(bd2, dtype=np.float64),
-                in_basis=None,
-                c_override=c2,
-                time_limit=time_limit,
-            )
-        except Exception:
-            logger.debug("_reverify_incremental_infeasible failed; using fallback", exc_info=True)
-            return None  # re-verify failed -> trusted cold rebuild
+        # #1520: no except. ``equilibrate_relaxation_lp`` is an exact numpy rescale and
+        # ``solve_assembled_full`` declines by status (``"other"`` -> ``None`` below).
+        bl = [(float(bounds[i, 0]), float(bounds[i, 1])) for i in range(bounds.shape[0])]
+        c2, a2, b2, bd2, col_scale = equilibrate_relaxation_lp(inc.c, a_csr, b, bl, None)
+        status, bound, x_s, _, farkas = inc.solve_assembled_full(
+            a2,
+            b2,
+            np.asarray(bd2, dtype=np.float64),
+            in_basis=None,
+            c_override=c2,
+            time_limit=time_limit,
+        )
         if status == "infeasible":
             # Fathom ONLY on a verified Farkas ray; an uncertified infeasible is not a
             # rigorous emptiness proof and must not prune (C-38). Cold fallback lets
@@ -1297,21 +1279,17 @@ class MccormickLPRelaxer:
             or not np.isfinite(res.lower_bound)
         ):
             return res
-        try:
-            # #1116: a fixed per-node second count is a role-2 clock — it decides
-            # how many piece LPs the dive runs, so the BOUND it returns is a
-            # function of machine speed. Under ``deterministic`` the
-            # partitioner's own LP cap is the only bound (see
-            # ``solver_tuning.SolverTuning.deterministic``).
-            deadline = (
-                None
-                if _tuning().deterministic
-                else time.perf_counter() + _INTEGER_RATIO_DIVE_BUDGET_S
-            )
-            lifted = p.node_bound(node_lb, node_ub, deadline=deadline)
-        except Exception:
-            logger.debug("integer-ratio partition bound abstained", exc_info=True)
-            return res
+        # #1520: no except. ``IntegerRatioPartitioner.node_bound`` documents "never raises" and
+        # abstains with ``None``; a raise is a defect.
+        # #1116: a fixed per-node second count is a role-2 clock — it decides
+        # how many piece LPs the dive runs, so the BOUND it returns is a
+        # function of machine speed. Under ``deterministic`` the
+        # partitioner's own LP cap is the only bound (see
+        # ``solver_tuning.SolverTuning.deterministic``).
+        deadline = (
+            None if _tuning().deterministic else time.perf_counter() + _INTEGER_RATIO_DIVE_BUDGET_S
+        )
+        lifted = p.node_bound(node_lb, node_ub, deadline=deadline)
         if lifted is not None and np.isfinite(lifted) and lifted > res.lower_bound:
             lifted_res: MccormickLPResult = dataclasses.replace(res, lower_bound=float(lifted))
             return lifted_res
@@ -1656,10 +1634,9 @@ class MccormickLPRelaxer:
             _root_idents = inherited_cuts[2] if len(inherited_cuts) > 2 else None
             if _ia is not None and _sparse_rows(_ia) > 0:
                 _node_idents = None
-                try:
-                    _node_idents = column_identities(varmap, n_total, self._n_orig)
-                except Exception:
-                    logger.debug("node column-identity build failed; skipping pool", exc_info=True)
+                # #1520: no except. ``column_identities`` is a pure structural map with no failure
+                # mode.
+                _node_idents = column_identities(varmap, n_total, self._n_orig)
                 # Equal-count precondition (matches the legacy ``sparse_cols ==
                 # n_total`` gate): only inherit when the pool was captured over the
                 # same column count as this build, so C-44 stays behaviour-neutral on
@@ -1852,13 +1829,9 @@ class MccormickLPRelaxer:
             _A = _as_csr(milp._A_ub)
             if _A.shape[0] > _n_base_rows:
                 _n_total_cap = int(np.size(milp._c))
-                try:
-                    _idents = column_identities(varmap, _n_total_cap, self._n_orig)
-                except Exception:
-                    logger.debug(
-                        "column-identity capture failed; pool chunk untagged", exc_info=True
-                    )
-                    _idents = None
+                # #1520: no except. ``column_identities`` is a pure structural map with no failure
+                # mode.
+                _idents = column_identities(varmap, _n_total_cap, self._n_orig)
                 out_cuts.append(
                     (
                         _A[_n_base_rows:].copy(),
@@ -2218,88 +2191,87 @@ class MccormickLPRelaxer:
         relaxation, separate the convex/concave envelope cuts the current point
         violates (``multilinear_separation``), append them, and re-solve — up to
         a small round limit. Each cut is a valid supporting hyperplane, so the
-        returned bound is always sound; on any failure the input ``res`` is
-        returned unchanged.
+        returned bound is always sound; a re-solve that is not ``optimal`` keeps the
+        prior ``res`` (an exception is a defect and propagates, #1520).
         """
         if not _tuning().multilinear_separate:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            from discopt._relax.multilinear_separation import separate_multilinear_envelope
+        from discopt._relax.multilinear_separation import separate_multilinear_envelope
 
-            cap = _tuning().multilinear_rlt_max
-            n_total = len(milp._c)
-            # Build (factor-columns, product-column) specs for over-cap products.
-            specs: list[tuple[list[int], int]] = []
-            for src in ("multilinear", "trilinear"):
-                for term, prod_col in (varmap.get(src) or {}).items():
-                    cols = sorted(set(int(c) for c in term))
-                    if len(cols) > cap and len(cols) == len(set(term)):
-                        specs.append((cols, int(prod_col)))
-            if not specs:
-                return res
-
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub = R
-                    milp._b_ub = b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([np.asarray(milp._b_ub), b])
-
-            for _round in range(8):
-                # Stop separating once the node's wall-clock budget is spent;
-                # each round costs a full MILP re-solve.
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                rows: list[np.ndarray] = []
-                rhs: list[float] = []
-                for cols, prod_col in specs:
-                    lb = np.array([milp._bounds[c][0] for c in cols], dtype=np.float64)
-                    ub = np.array([milp._bounds[c][1] for c in cols], dtype=np.float64)
-                    xs = x[cols]
-                    ws = float(x[prod_col])
-                    for cut in separate_multilinear_envelope(lb, ub, xs, ws):
-                        row = np.zeros(n_total)
-                        if cut.sense == "under":
-                            # w >= a.x + b  ->  a.x - w <= -b
-                            for d, c in enumerate(cols):
-                                row[c] += float(cut.a[d])
-                            row[prod_col] += -1.0
-                            rows.append(row)
-                            rhs.append(-float(cut.b))
-                        else:
-                            # w <= a.x + b  ->  w - a.x <= b
-                            for d, c in enumerate(cols):
-                                row[c] += -float(cut.a[d])
-                            row[prod_col] += 1.0
-                            rows.append(row)
-                            rhs.append(float(cut.b))
-                if not rows:
-                    break
-                _append(rows, rhs)
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                res = new_res
+        cap = _tuning().multilinear_rlt_max
+        n_total = len(milp._c)
+        # Build (factor-columns, product-column) specs for over-cap products.
+        specs: list[tuple[list[int], int]] = []
+        for src in ("multilinear", "trilinear"):
+            for term, prod_col in (varmap.get(src) or {}).items():
+                cols = sorted(set(int(c) for c in term))
+                if len(cols) > cap and len(cols) == len(set(term)):
+                    specs.append((cols, int(prod_col)))
+        if not specs:
             return res
-        except Exception:
-            logger.debug("_separate_multilinear failed; using fallback", exc_info=True)
-            return res
+
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub = R
+                milp._b_ub = b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([np.asarray(milp._b_ub), b])
+
+        for _round in range(8):
+            # Stop separating once the node's wall-clock budget is spent;
+            # each round costs a full MILP re-solve.
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            for cols, prod_col in specs:
+                lb = np.array([milp._bounds[c][0] for c in cols], dtype=np.float64)
+                ub = np.array([milp._bounds[c][1] for c in cols], dtype=np.float64)
+                xs = x[cols]
+                ws = float(x[prod_col])
+                for cut in separate_multilinear_envelope(lb, ub, xs, ws):
+                    row = np.zeros(n_total)
+                    if cut.sense == "under":
+                        # w >= a.x + b  ->  a.x - w <= -b
+                        for d, c in enumerate(cols):
+                            row[c] += float(cut.a[d])
+                        row[prod_col] += -1.0
+                        rows.append(row)
+                        rhs.append(-float(cut.b))
+                    else:
+                        # w <= a.x + b  ->  w - a.x <= b
+                        for d, c in enumerate(cols):
+                            row[c] += -float(cut.a[d])
+                        row[prod_col] += 1.0
+                        rows.append(row)
+                        rhs.append(float(cut.b))
+            if not rows:
+                break
+            _append(rows, rhs)
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            res = new_res
+        return res
 
     def _separate_univariate_square(self, milp, varmap, res, deadline):
         """Tighten lifted univariate squares ``s = x**2`` by tangent separation.
@@ -2312,92 +2284,92 @@ class MccormickLPRelaxer:
         ``s >= 2 x0 x - x0**2``. A tangent of a convex function is a global
         underestimator and every original point has ``s = x**2 >= 2 x0 x - x0**2``,
         so no feasible point is ever cut -- the bound stays sound at any round.
-        On any failure the input ``res`` is returned unchanged.
+        A re-solve that is not ``optimal`` keeps the prior ``res`` (an exception is
+        a defect and propagates, #1520).
         """
         if not _tuning().square_separate:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            monomial = varmap.get("monomial") or {}
-            # (base_col, aux_col) for every lifted univariate square ``x**2``.
-            specs: list[tuple[int, int]] = []
-            for key, aux in monomial.items():
-                base, power = key
-                if int(power) == 2:
-                    specs.append((int(base), int(aux)))
-            if not specs:
-                return res
-            n_total = len(milp._c)
-
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-
-            tol = 1e-7
-            # Per-node univariate-square (``s = x**2``) tangent-separation loop: up
-            # to 8 MILP re-solves adding valid tangent cuts. (The former
-            # ``DISCOPT_SQUARE_COST_GATE`` cost-aware early-exit was default-OFF and
-            # graduated-gated net-negative — removed in #581. This is the loop's
-            # pre-THRU-3, shipped-default behaviour.)
-            for _round in range(8):
-                # Each round costs a full re-solve.
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                rows: list[np.ndarray] = []
-                rhs: list[float] = []
-                for base, aux in specs:
-                    if base >= x.size or aux >= x.size:
-                        continue
-                    x0 = float(x[base])
-                    s = float(x[aux])
-                    if not (np.isfinite(x0) and np.isfinite(s)):
-                        continue
-                    # Conditioning guard (mirrors ``_separate_convex``): on a very
-                    # wide box the tangent ``s >= 2 x0 x - x0**2`` has coefficient
-                    # ``2 x0`` and intercept ``x0**2`` that blow up (``x0`` ~ 1e15
-                    # on st_miqp4's ``[0,1e15]`` square), and a cut with ~1e30
-                    # entries fools the fast simplex into an uncertifiable basis —
-                    # the node then reports no finite bound at all. Skip it; the
-                    # static envelope still bounds ``s`` and the relaxation stays
-                    # sound, just looser at this point (dropping a cut only loosens).
-                    if abs(x0) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE:
-                        continue
-                    # Separate only where the convex underestimator is slack:
-                    # the LP put ``s`` below the true parabola at ``x0``.
-                    if x0 * x0 - s > tol * max(1.0, abs(x0 * x0)):
-                        row = np.zeros(n_total)
-                        row[base] += 2.0 * x0
-                        row[aux] += -1.0
-                        rows.append(row)
-                        rhs.append(x0 * x0)
-                if not rows:
-                    break
-                _append(rows, rhs)
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                res = new_res
+        monomial = varmap.get("monomial") or {}
+        # (base_col, aux_col) for every lifted univariate square ``x**2``.
+        specs: list[tuple[int, int]] = []
+        for key, aux in monomial.items():
+            base, power = key
+            if int(power) == 2:
+                specs.append((int(base), int(aux)))
+        if not specs:
             return res
-        except Exception:
-            logger.debug("_separate_univariate_square failed; using fallback", exc_info=True)
-            return res
+        n_total = len(milp._c)
+
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+
+        tol = 1e-7
+        # Per-node univariate-square (``s = x**2``) tangent-separation loop: up
+        # to 8 MILP re-solves adding valid tangent cuts. (The former
+        # ``DISCOPT_SQUARE_COST_GATE`` cost-aware early-exit was default-OFF and
+        # graduated-gated net-negative — removed in #581. This is the loop's
+        # pre-THRU-3, shipped-default behaviour.)
+        for _round in range(8):
+            # Each round costs a full re-solve.
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            for base, aux in specs:
+                if base >= x.size or aux >= x.size:
+                    continue
+                x0 = float(x[base])
+                s = float(x[aux])
+                if not (np.isfinite(x0) and np.isfinite(s)):
+                    continue
+                # Conditioning guard (mirrors ``_separate_convex``): on a very
+                # wide box the tangent ``s >= 2 x0 x - x0**2`` has coefficient
+                # ``2 x0`` and intercept ``x0**2`` that blow up (``x0`` ~ 1e15
+                # on st_miqp4's ``[0,1e15]`` square), and a cut with ~1e30
+                # entries fools the fast simplex into an uncertifiable basis —
+                # the node then reports no finite bound at all. Skip it; the
+                # static envelope still bounds ``s`` and the relaxation stays
+                # sound, just looser at this point (dropping a cut only loosens).
+                if abs(x0) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE:
+                    continue
+                # Separate only where the convex underestimator is slack:
+                # the LP put ``s`` below the true parabola at ``x0``.
+                if x0 * x0 - s > tol * max(1.0, abs(x0 * x0)):
+                    row = np.zeros(n_total)
+                    row[base] += 2.0 * x0
+                    row[aux] += -1.0
+                    rows.append(row)
+                    rhs.append(x0 * x0)
+            if not rows:
+                break
+            _append(rows, rhs)
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            res = new_res
+        return res
 
     def _record_singular_tangent_hits(self, rows, rhs, x) -> None:
         """Tally how many just-emitted singular-tangent rows BIND at the new optimum.
@@ -2474,7 +2446,8 @@ class MccormickLPRelaxer:
         that point is violated. A tangent of a concave (resp. convex) function is a
         global over- (under-) estimator wherever the curvature holds, and ``curv``
         was certified for the whole box, so no feasible point is ever cut — the
-        bound stays sound at every round. Sound no-op on any failure.
+        bound stays sound at every round. A non-``optimal`` re-solve keeps the prior
+        ``res`` (an exception is a defect and propagates, #1520).
 
         Inert unless ``SolverTuning.singular_tangent`` is on: the spec list is only
         populated then.
@@ -2493,151 +2466,150 @@ class MccormickLPRelaxer:
         # the two would read as a 0 % binding rate on an instance that was never
         # asked a question.
         self._st_calls += 1
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            from discopt._relax.uniform_relax import _interior_tangent_point
+        from discopt._relax.uniform_relax import _interior_tangent_point
 
-            n_total = len(milp._c)
+        n_total = len(milp._c)
 
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([milp._b_ub, b])
 
-            tol = 1e-7
-            for _round in range(8):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                rows: list[np.ndarray] = []
-                rhs: list[float] = []
-                for s in specs:
-                    aux = s.aux_col
-                    if aux >= x.size:
+        tol = 1e-7
+        for _round in range(8):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            for s in specs:
+                aux = s.aux_col
+                if aux >= x.size:
+                    continue
+                wv = float(x[aux])
+                if not np.isfinite(wv):
+                    continue
+                t0 = float(s.const)
+                ok = True
+                for j, c in s.coeffs.items():
+                    if j >= x.size or not np.isfinite(x[j]):
+                        ok = False
+                        break
+                    t0 += float(c) * float(x[j])
+                if not ok or not np.isfinite(t0):
+                    continue
+                # The tangent is only a valid global estimator where the box's
+                # certified curvature holds, i.e. for t in [lo, hi]. An LP point
+                # a hair outside (simplex tolerance) is clamped back in rather
+                # than extrapolated; a point far outside is skipped.
+                if t0 < s.lo:
+                    if s.lo - t0 > 1e-6 * max(1.0, abs(s.lo)):
                         continue
-                    wv = float(x[aux])
-                    if not np.isfinite(wv):
+                    t0 = s.lo
+                elif t0 > s.hi:
+                    if t0 - s.hi > 1e-6 * max(1.0, abs(s.hi)):
                         continue
-                    t0 = float(s.const)
-                    ok = True
-                    for j, c in s.coeffs.items():
-                        if j >= x.size or not np.isfinite(x[j]):
-                            ok = False
-                            break
-                        t0 += float(c) * float(x[j])
-                    if not ok or not np.isfinite(t0):
+                    t0 = s.hi
+                # ``ta`` is where the tangent TOUCHES the graph; ``t0`` is where
+                # the LP sits. They coincide except at the singularity itself.
+                ta = t0
+                try:
+                    g, gp = float(s.f(ta)), float(s.fp(ta))
+                except (ValueError, ArithmeticError):
+                    continue
+                if not (np.isfinite(g) and np.isfinite(gp)):
+                    # The LP point landed ON the vertical tangent, where no
+                    # finite-slope facet exists — and this is exactly the point
+                    # the dropped facet was supposed to cover, so skipping here
+                    # would make the separator a no-op precisely where it is
+                    # needed (measured: ``min 2x - sqrt(x)`` over ``[0,4]`` puts
+                    # the LP vertex at ``t=0``). Fall back to #1111's
+                    # conditioning-capped ladder anchor for the touch point; the
+                    # violation test below still decides whether the row goes in,
+                    # so this stays lazy — the facet appears only at nodes whose
+                    # LP the static envelope actually fails to bound.
+                    ta_l = _interior_tangent_point(s.f, s.fp, s.lo, s.hi, s.slope, s.edge)
+                    if ta_l is None:
                         continue
-                    # The tangent is only a valid global estimator where the box's
-                    # certified curvature holds, i.e. for t in [lo, hi]. An LP point
-                    # a hair outside (simplex tolerance) is clamped back in rather
-                    # than extrapolated; a point far outside is skipped.
-                    if t0 < s.lo:
-                        if s.lo - t0 > 1e-6 * max(1.0, abs(s.lo)):
-                            continue
-                        t0 = s.lo
-                    elif t0 > s.hi:
-                        if t0 - s.hi > 1e-6 * max(1.0, abs(s.hi)):
-                            continue
-                        t0 = s.hi
-                    # ``ta`` is where the tangent TOUCHES the graph; ``t0`` is where
-                    # the LP sits. They coincide except at the singularity itself.
-                    ta = t0
+                    ta = float(ta_l)
                     try:
                         g, gp = float(s.f(ta)), float(s.fp(ta))
                     except (ValueError, ArithmeticError):
                         continue
                     if not (np.isfinite(g) and np.isfinite(gp)):
-                        # The LP point landed ON the vertical tangent, where no
-                        # finite-slope facet exists — and this is exactly the point
-                        # the dropped facet was supposed to cover, so skipping here
-                        # would make the separator a no-op precisely where it is
-                        # needed (measured: ``min 2x - sqrt(x)`` over ``[0,4]`` puts
-                        # the LP vertex at ``t=0``). Fall back to #1111's
-                        # conditioning-capped ladder anchor for the touch point; the
-                        # violation test below still decides whether the row goes in,
-                        # so this stays lazy — the facet appears only at nodes whose
-                        # LP the static envelope actually fails to bound.
-                        ta_l = _interior_tangent_point(s.f, s.fp, s.lo, s.hi, s.slope, s.edge)
-                        if ta_l is None:
-                            continue
-                        ta = float(ta_l)
-                        try:
-                            g, gp = float(s.f(ta)), float(s.fp(ta))
-                        except (ValueError, ArithmeticError):
-                            continue
-                        if not (np.isfinite(g) and np.isfinite(gp)):
-                            continue
-                    # Conditioning guard, mirroring ``_separate_convex``: a cut whose
-                    # coefficients have blown up (the slope diverges as the LP point
-                    # approaches the singular endpoint) fools the fast simplex into an
-                    # uncertifiable basis. Dropping a cut only loosens, never unsounds.
-                    if abs(gp) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE:
                         continue
-                    if any(
-                        abs(gp * float(c)) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE
-                        for c in s.coeffs.values()
-                    ):
-                        continue
-                    # Tangent line value AT THE LP POINT. When ``ta == t0`` this is
-                    # just ``g``; at the ladder fallback it is the extrapolation of
-                    # the anchor's tangent out to where the LP sits, which is what
-                    # decides violation.
-                    pred = g + gp * (t0 - ta)
-                    scale = tol * max(1.0, abs(pred))
-                    if s.sign > 0.0:
-                        # convex: w >= g + gp*(t - ta)
-                        #   -> sum(gp*c_j x_j) - w <= gp*ta - g - gp*const
-                        if pred - wv > scale:
-                            row = np.zeros(n_total)
-                            for j, c in s.coeffs.items():
-                                row[j] += gp * float(c)
-                            row[aux] += -1.0
-                            rows.append(row)
-                            rhs.append(gp * ta - g - gp * float(s.const))
-                    else:
-                        # concave: w <= g + gp*(t - ta)
-                        #   -> w - sum(gp*c_j x_j) <= g - gp*ta + gp*const
-                        if wv - pred > scale:
-                            row = np.zeros(n_total)
-                            for j, c in s.coeffs.items():
-                                row[j] += -gp * float(c)
-                            row[aux] += 1.0
-                            rows.append(row)
-                            rhs.append(g - gp * ta + gp * float(s.const))
-                if not rows:
-                    break
-                _append(rows, rhs)
-                _prev_obj = res.objective
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                if _round == 0:
-                    self._st_nodes += 1
-                self._st_rounds += 1
-                self._record_singular_tangent_hits(rows, rhs, new_res.x)
-                if _prev_obj is not None:
-                    # Minimisation form throughout the LP layer, so a tightening
-                    # RAISES the objective; record the gain with that sign so a
-                    # negative total is visible as the anomaly it would be.
-                    self._st_obj_gain += float(new_res.objective) - float(_prev_obj)
-                res = new_res
-            return res
-        except Exception:
-            logger.debug("singular-tangent separation failed; keeping prior result", exc_info=True)
-            return res
+                # Conditioning guard, mirroring ``_separate_convex``: a cut whose
+                # coefficients have blown up (the slope diverges as the LP point
+                # approaches the singular endpoint) fools the fast simplex into an
+                # uncertifiable basis. Dropping a cut only loosens, never unsounds.
+                if abs(gp) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE:
+                    continue
+                if any(
+                    abs(gp * float(c)) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE
+                    for c in s.coeffs.values()
+                ):
+                    continue
+                # Tangent line value AT THE LP POINT. When ``ta == t0`` this is
+                # just ``g``; at the ladder fallback it is the extrapolation of
+                # the anchor's tangent out to where the LP sits, which is what
+                # decides violation.
+                pred = g + gp * (t0 - ta)
+                scale = tol * max(1.0, abs(pred))
+                if s.sign > 0.0:
+                    # convex: w >= g + gp*(t - ta)
+                    #   -> sum(gp*c_j x_j) - w <= gp*ta - g - gp*const
+                    if pred - wv > scale:
+                        row = np.zeros(n_total)
+                        for j, c in s.coeffs.items():
+                            row[j] += gp * float(c)
+                        row[aux] += -1.0
+                        rows.append(row)
+                        rhs.append(gp * ta - g - gp * float(s.const))
+                else:
+                    # concave: w <= g + gp*(t - ta)
+                    #   -> w - sum(gp*c_j x_j) <= g - gp*ta + gp*const
+                    if wv - pred > scale:
+                        row = np.zeros(n_total)
+                        for j, c in s.coeffs.items():
+                            row[j] += -gp * float(c)
+                        row[aux] += 1.0
+                        rows.append(row)
+                        rhs.append(g - gp * ta + gp * float(s.const))
+            if not rows:
+                break
+            _append(rows, rhs)
+            _prev_obj = res.objective
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            if _round == 0:
+                self._st_nodes += 1
+            self._st_rounds += 1
+            self._record_singular_tangent_hits(rows, rhs, new_res.x)
+            if _prev_obj is not None:
+                # Minimisation form throughout the LP layer, so a tightening
+                # RAISES the objective; record the gain with that sign so a
+                # negative total is visible as the anomaly it would be.
+                self._st_obj_gain += float(new_res.objective) - float(_prev_obj)
+            res = new_res
+        return res
 
     def _separate_convex(self, milp, varmap, res, deadline):
         """Tighten lifted convex/concave composite nodes by supporting-hyperplane
@@ -2653,7 +2625,8 @@ class MccormickLPRelaxer:
 
         A tangent of a convex (resp. secant-free concave) function is a global
         under- (over-) estimator, so no feasible point is ever cut — the bound
-        stays sound at every round. Sound no-op on any failure.
+        stays sound at every round. A tangent whose evaluation fails is skipped
+        (reported once, #1520); a non-``optimal`` re-solve keeps the prior ``res``.
         """
         relaxations = varmap.get("composite_multivar_relaxations") or []
         specs = [
@@ -2667,119 +2640,124 @@ class MccormickLPRelaxer:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            # #75 Stage 2: import jax ONLY to marshal an argument for JAX-backed
-            # tangent callables. Tape-backed ones take plain numpy and mark
-            # themselves ``numpy_native``, so a fully tape-backed model must not
-            # pay a jax import here -- this function was the last thing pulling
-            # JAX onto an otherwise JAX-free separation path.
-            _jnp = None
-            if any(not getattr(r.value_fn, "numpy_native", False) for r in specs):
-                import jax.numpy as _jnp_mod
+        # #75 Stage 2: import jax ONLY to marshal an argument for JAX-backed
+        # tangent callables. Tape-backed ones take plain numpy and mark
+        # themselves ``numpy_native``, so a fully tape-backed model must not
+        # pay a jax import here -- this function was the last thing pulling
+        # JAX onto an otherwise JAX-free separation path.
+        _jnp = None
+        if any(not getattr(r.value_fn, "numpy_native", False) for r in specs):
+            import jax.numpy as _jnp_mod
 
-                _jnp = _jnp_mod
+            _jnp = _jnp_mod
 
-            n_total = len(milp._c)
-            n_orig = self._n_orig
+        n_total = len(milp._c)
+        n_orig = self._n_orig
 
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([milp._b_ub, b])
 
-            tol = 1e-7
-            for _round in range(8):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                xv = (
-                    np.asarray(x[:n_orig], dtype=np.float64)
-                    if _jnp is None
-                    else _jnp.asarray(x[:n_orig], dtype=_jnp.float64)
-                )
-                rows: list[np.ndarray] = []
-                rhs: list[float] = []
-                for r in specs:
-                    aux = r.aux_col
-                    if aux >= x.size:
-                        continue
-                    d = float(x[aux])
-                    try:
-                        _raw = r.value_fn(xv)
-                        gval = float(_raw if _jnp is None else _jnp.reshape(_raw, ()))
-                        grad = np.asarray(r.grad_fn(xv), dtype=np.float64).ravel()
-                    except Exception as exc:  # noqa: BLE001 - a missing cut is always safe
-                        logger.debug("OA cut evaluation skipped: %s: %s", type(exc).__name__, exc)
-                        continue
-                    if not np.isfinite(gval) or not all(
-                        j < grad.size and np.isfinite(grad[j]) for j in r.idxs
-                    ):
-                        continue
-                    # Conditioning guard (#358): a cut whose coefficients have blown
-                    # up (steep gradient on a wide box) fools the fast simplex into a
-                    # garbage bound. Skip it — the static cuts still bound ``d`` and
-                    # the relaxation stays sound, just looser at this point.
-                    if any(
-                        abs(float(grad[j])) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE for j in r.idxs
-                    ):
-                        continue
-                    # ``slope·x0`` with x0 the LP point restricted to dependent cols.
-                    slope_dot_x0 = float(sum(float(grad[j]) * float(x[j]) for j in r.idxs))
-                    if r.curvature == "convex":
-                        # slack iff the LP put d below g at x0; cut d >= g(x0)+∇g·(x−x0)
-                        # i.e. ∇g·x − d <= ∇g·x0 − g(x0).
-                        if gval - d > tol * max(1.0, abs(gval)):
-                            row = np.zeros(n_total)
-                            for j in r.idxs:
-                                row[j] += float(grad[j])
-                            row[aux] += -1.0
-                            rows.append(row)
-                            rhs.append(slope_dot_x0 - gval)
-                    else:  # concave: d <= g(x0)+∇g·(x−x0)  ->  −∇g·x + d <= g(x0)−∇g·x0
-                        if d - gval > tol * max(1.0, abs(gval)):
-                            row = np.zeros(n_total)
-                            for j in r.idxs:
-                                row[j] += -float(grad[j])
-                            row[aux] += 1.0
-                            rows.append(row)
-                            rhs.append(gval - slope_dot_x0)
-                if not rows:
-                    break
-                _append(rows, rhs)
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                res = new_res
-            return res
-        except Exception:
-            logger.debug("_separate_convex failed; using fallback", exc_info=True)
-            return res
+        tol = 1e-7
+        for _round in range(8):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            xv = (
+                np.asarray(x[:n_orig], dtype=np.float64)
+                if _jnp is None
+                else _jnp.asarray(x[:n_orig], dtype=_jnp.float64)
+            )
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            for r in specs:
+                aux = r.aux_col
+                if aux >= x.size:
+                    continue
+                d = float(x[aux])
+                try:
+                    _raw = r.value_fn(xv)
+                    gval = float(_raw if _jnp is None else _jnp.reshape(_raw, ()))
+                    grad = np.asarray(r.grad_fn(xv), dtype=np.float64).ravel()
+                except Exception as exc:  # noqa: BLE001 - a missing cut is always safe
+                    # #1520: kept as a sound fallback. ``value_fn``/``grad_fn`` run the
+                    # POUNCE tape (native code) or the JAX opt-out on a subexpression of
+                    # the user's model at an LP point; a failure there is external to
+                    # this loop, and skipping the tangent only forgoes a cut (the static
+                    # rows still bound ``d``). Reported, no longer silent.
+                    from discopt._relax._fallback import warn_fallback_once
+
+                    warn_fallback_once(
+                        "composite OA cut evaluation (_separate_convex)",
+                        exc,
+                        "that composite's Kelley tangent is skipped at this point",
+                    )
+                    continue
+                if not np.isfinite(gval) or not all(
+                    j < grad.size and np.isfinite(grad[j]) for j in r.idxs
+                ):
+                    continue
+                # Conditioning guard (#358): a cut whose coefficients have blown
+                # up (steep gradient on a wide box) fools the fast simplex into a
+                # garbage bound. Skip it — the static cuts still bound ``d`` and
+                # the relaxation stays sound, just looser at this point.
+                if any(abs(float(grad[j])) > _LIFT_MAX_CROSS_TERM_ARG_MAGNITUDE for j in r.idxs):
+                    continue
+                # ``slope·x0`` with x0 the LP point restricted to dependent cols.
+                slope_dot_x0 = float(sum(float(grad[j]) * float(x[j]) for j in r.idxs))
+                if r.curvature == "convex":
+                    # slack iff the LP put d below g at x0; cut d >= g(x0)+∇g·(x−x0)
+                    # i.e. ∇g·x − d <= ∇g·x0 − g(x0).
+                    if gval - d > tol * max(1.0, abs(gval)):
+                        row = np.zeros(n_total)
+                        for j in r.idxs:
+                            row[j] += float(grad[j])
+                        row[aux] += -1.0
+                        rows.append(row)
+                        rhs.append(slope_dot_x0 - gval)
+                else:  # concave: d <= g(x0)+∇g·(x−x0)  ->  −∇g·x + d <= g(x0)−∇g·x0
+                    if d - gval > tol * max(1.0, abs(gval)):
+                        row = np.zeros(n_total)
+                        for j in r.idxs:
+                            row[j] += -float(grad[j])
+                        row[aux] += 1.0
+                        rows.append(row)
+                        rhs.append(gval - slope_dot_x0)
+            if not rows:
+                break
+            _append(rows, rhs)
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            res = new_res
+        return res
 
     def _g_convex_enabled(self) -> bool:
         """Cached read of the ``DISCOPT_G_CONVEX_CUTS`` flag (default OFF)."""
         v = getattr(self, "_gconv_flag", None)
         if v is None:
-            try:
-                from discopt._relax.convexity.g_convex_inject import g_convex_cuts_enabled
+            # #1520: no except. ``g_convex_cuts_enabled`` reads an env flag; no failure mode.
+            from discopt._relax.convexity.g_convex_inject import g_convex_cuts_enabled
 
-                v = bool(g_convex_cuts_enabled())
-            except Exception:
-                logger.debug("_g_convex_enabled failed; using fallback", exc_info=True)
-                v = False
+            v = bool(g_convex_cuts_enabled())
             self._gconv_flag = v
         return v
 
@@ -2821,17 +2799,16 @@ class MccormickLPRelaxer:
         pool-capture solve); the box-local rows are used for this one solve and
         discarded with the per-node ``milp``.
 
-        Sound no-op on any failure or abstention.
+        Sound no-op on abstention (no certificate, no candidate, a non-``optimal``
+        re-solve); an exception is a defect and propagates (#1520).
         """
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. in-package imports; no failure mode.
+        import scipy.sparse as sp
 
-            from discopt._relax.convexity.g_convex_inject import rigorous_g_convex_cut_coeffs
-            from discopt._relax.convexity.g_convexity import certify_g_convex
-            from discopt._relax.convexity.interval import Interval
-        except Exception:
-            logger.debug("_separate_g_convex failed; using fallback", exc_info=True)
-            return res
+        from discopt._relax.convexity.g_convex_inject import rigorous_g_convex_cut_coeffs
+        from discopt._relax.convexity.g_convexity import certify_g_convex
+        from discopt._relax.convexity.interval import Interval
+
         cands = self._gconv_candidate_constraints()
         if not cands:
             return res
@@ -2864,11 +2841,9 @@ class MccormickLPRelaxer:
         rows, rhs = [], []
         for c in cands[:_GCONV_MAX_CONSTRAINTS]:
             phi = c.body if c.sense == "<=" else -c.body
-            try:
-                cert = certify_g_convex(phi, self._model, box=box)
-            except Exception:
-                logger.debug("_separate_g_convex failed; using fallback", exc_info=True)
-                cert = None
+            # #1520: no except. ``certify_g_convex`` abstains with ``None`` (it absorbs
+            # ``interval_hessian``'s documented ``ValueError`` itself); a raise is a defect.
+            cert = certify_g_convex(phi, self._model, box=box)
             if cert is None or cert.kind != "g_convex" or not (cert.rho > 0.0):
                 continue
             coeffs = rigorous_g_convex_cut_coeffs(self._model, phi, float(cert.rho), x0, box)
@@ -2908,86 +2883,85 @@ class MccormickLPRelaxer:
         ``x_j - l >= 0`` / ``u - x_j >= 0``, the product ``(b - a^T x)(factor)``
         is non-negative; linearized over the lifted columns it is a valid cut.
         Separates only violated ones (targeted) and re-solves. Each cut is valid
-        for every feasible point, so the bound only tightens; on any failure the
-        input ``res`` is returned unchanged. Off unless ``rlt_cuts=True``.
+        for every feasible point, so the bound only tightens; a non-``optimal``
+        re-solve keeps the prior ``res``. Off unless ``rlt_cuts=True``.
         """
         if not self._rlt_cuts:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            from discopt._relax.milp_relaxation import _linear_constraint_forms
-            from discopt._relax.rlt_cuts import rlt_constraint_bound_cut
+        from discopt._relax.milp_relaxation import _linear_constraint_forms
+        from discopt._relax.rlt_cuts import rlt_constraint_bound_cut
 
-            forms = _linear_constraint_forms(self._model, self._n_orig)
-            if not forms:
-                return res
-            n_total = len(milp._c)
-            bounds = milp._bounds  # original-variable bounds live in cols 0..n_orig-1
-            max_cuts_per_round = 128
+        forms = _linear_constraint_forms(self._model, self._n_orig)
+        if not forms:
+            return res
+        n_total = len(milp._c)
+        bounds = milp._bounds  # original-variable bounds live in cols 0..n_orig-1
+        max_cuts_per_round = 128
 
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                bb = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, bb
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, bb])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([milp._b_ub, bb])
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            bb = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, bb
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, bb])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([milp._b_ub, bb])
 
-            for _round in range(6):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                rows: list[np.ndarray] = []
-                rhs: list[float] = []
-                for coeff, const in forms:
-                    # coeff . x + const <= 0  ==>  a^T x <= b with a=coeff, b=-const.
-                    a = {i: float(coeff[i]) for i in range(self._n_orig) if coeff[i] != 0.0}
-                    if not a:
-                        continue
-                    b = -float(const)
-                    for j in range(self._n_orig):
-                        if j >= len(bounds):
-                            break
-                        lo, hi = bounds[j]
-                        for lower, bnd in ((True, lo), (False, hi)):
-                            if not np.isfinite(bnd):
-                                continue
-                            cut = rlt_constraint_bound_cut(
-                                a, b, j, float(bnd), lower, varmap, x, n_total
-                            )
-                            if cut is not None:
-                                rows.append(cut.coeffs)
-                                rhs.append(cut.rhs)
-                                if len(rows) >= max_cuts_per_round:
-                                    break
-                        if len(rows) >= max_cuts_per_round:
-                            break
+        for _round in range(6):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            for coeff, const in forms:
+                # coeff . x + const <= 0  ==>  a^T x <= b with a=coeff, b=-const.
+                a = {i: float(coeff[i]) for i in range(self._n_orig) if coeff[i] != 0.0}
+                if not a:
+                    continue
+                b = -float(const)
+                for j in range(self._n_orig):
+                    if j >= len(bounds):
+                        break
+                    lo, hi = bounds[j]
+                    for lower, bnd in ((True, lo), (False, hi)):
+                        if not np.isfinite(bnd):
+                            continue
+                        cut = rlt_constraint_bound_cut(
+                            a, b, j, float(bnd), lower, varmap, x, n_total
+                        )
+                        if cut is not None:
+                            rows.append(cut.coeffs)
+                            rhs.append(cut.rhs)
+                            if len(rows) >= max_cuts_per_round:
+                                break
                     if len(rows) >= max_cuts_per_round:
                         break
-                if not rows:
+                if len(rows) >= max_cuts_per_round:
                     break
-                # cut is ``coeffs . z >= rhs`` -> ``(-coeffs) . z <= -rhs``.
-                _append([-r for r in rows], [-v for v in rhs])
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                res = new_res
-            return res
-        except Exception:
-            logger.debug("_separate_rlt failed; using fallback", exc_info=True)
-            return res
+            if not rows:
+                break
+            # cut is ``coeffs . z >= rhs`` -> ``(-coeffs) . z <= -rhs``.
+            _append([-r for r in rows], [-v for v in rhs])
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            res = new_res
+        return res
 
     def _separate_psd(self, milp, varmap, res, deadline, max_rounds: int = 8):
         """Separate moment (PSD) cuts on the lifted relaxation at the LP point.
@@ -2995,8 +2969,8 @@ class MccormickLPRelaxer:
         Enforces ``M = [[1, x^T], [x, X]] >= 0`` over cliques of variables whose
         pairwise products and squares are all lifted. Each separated cut
         ``v^T M v >= 0`` is valid for every feasible point (``X = x x^T`` makes
-        ``M`` rank-1 PSD), so the bound only tightens; on any failure the input
-        ``res`` is returned unchanged. Off unless ``psd_cuts=True``.
+        ``M`` rank-1 PSD), so the bound only tightens; a non-``optimal`` re-solve
+        keeps the prior ``res``. Off unless ``psd_cuts=True``.
 
         The spectral cutting plane converges to the Shor SDP bound only with many
         rounds (each adds a few eigenvector cuts), so ``max_rounds`` is large for a
@@ -3008,231 +2982,229 @@ class MccormickLPRelaxer:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            from discopt._relax.psd_cuts import separate_psd_cuts_on_relaxation
+        from discopt._relax.psd_cuts import separate_psd_cuts_on_relaxation
 
-            n_total = len(milp._c)
+        n_total = len(milp._c)
 
-            def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
+        def _append(rows: list[np.ndarray], rhs: list[float]) -> None:
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([milp._b_ub, b])
 
-            # Cost-aware gate (THRU-2a, DISCOPT_PSD_COST_GATE, default OFF). PSD
-            # separation dominates the QCQP node wall (~60% on nvs17/19/24) while
-            # the certified bound is set by McCormick+RLT and recovered by branching
-            # when PSD is absent, so unbudgeted PSD starves the tree search. When on,
-            # cap this node's PSD wall to ``budget × base_solve_wall`` and abandon on
-            # per-round diminishing returns. SOUND: dropping cuts can only loosen the
-            # relaxation — never cut a feasible point or cross the optimum. Keying is
-            # purely on observed per-node cost/bound-delta (§0.2, general). The gate
-            # only ever *shortens* the loop, so the default (gate-off) path below is
-            # bit-identical to the pre-THRU-2a code.
-            _tun = _tuning()
-            _gate = _tun.psd_cost_gate
-            _gate_budget = _tun.psd_cost_gate_budget
-            _gate_tau = _tun.psd_cost_gate_tau
-            _psd_t0 = time.perf_counter()
-            _base_solve_wall: Optional[float] = None
-            _psd_stop = "max_rounds"
-            _psd_rounds = 0
-            for _round in range(max_rounds):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    _psd_stop = "deadline"
+        # Cost-aware gate (THRU-2a, DISCOPT_PSD_COST_GATE, default OFF). PSD
+        # separation dominates the QCQP node wall (~60% on nvs17/19/24) while
+        # the certified bound is set by McCormick+RLT and recovered by branching
+        # when PSD is absent, so unbudgeted PSD starves the tree search. When on,
+        # cap this node's PSD wall to ``budget × base_solve_wall`` and abandon on
+        # per-round diminishing returns. SOUND: dropping cuts can only loosen the
+        # relaxation — never cut a feasible point or cross the optimum. Keying is
+        # purely on observed per-node cost/bound-delta (§0.2, general). The gate
+        # only ever *shortens* the loop, so the default (gate-off) path below is
+        # bit-identical to the pre-THRU-2a code.
+        _tun = _tuning()
+        _gate = _tun.psd_cost_gate
+        _gate_budget = _tun.psd_cost_gate_budget
+        _gate_tau = _tun.psd_cost_gate_tau
+        _psd_t0 = time.perf_counter()
+        _base_solve_wall: Optional[float] = None
+        _psd_stop = "max_rounds"
+        _psd_rounds = 0
+        for _round in range(max_rounds):
+            if deadline is not None and time.perf_counter() >= deadline:
+                _psd_stop = "deadline"
+                break
+            if (
+                _gate
+                and _base_solve_wall is not None
+                and (time.perf_counter() - _psd_t0) > _gate_budget * _base_solve_wall
+            ):
+                # Per-node PSD wall budget spent — stop feeding the search.
+                # #912 instrumentation: this criterion compares one measured
+                # wall against another, so which round it fires on is a
+                # function of machine speed — and unlike the primal
+                # heuristics this loop moves the node's DUAL BOUND. The log
+                # line records whether a node was decided by it or by the
+                # deterministic diminishing-returns test.
+                _psd_stop = "wall_gate"
+                break
+            if self._binary_cols_cache is None:
+                from discopt._relax.model_utils import binary_flat_cols
+
+                self._binary_cols_cache = binary_flat_cols(self._model)
+            cuts = separate_psd_cuts_on_relaxation(
+                varmap,
+                np.asarray(res.x, dtype=np.float64),
+                n_total,
+                binary_vars=self._binary_cols_cache,
+            )
+            if not cuts:
+                _psd_stop = "no_cuts"
+                break
+            _psd_rounds += 1
+            _lb_before = res.objective if _gate else None
+            # ``coeffs . z >= rhs``  ->  ``(-coeffs) . z <= -rhs`` for A_ub<=b_ub.
+            _append([-c.coeffs for c in cuts], [-c.rhs for c in cuts])
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            _solve_t0 = time.perf_counter()
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if _gate and _base_solve_wall is None:
+                _base_solve_wall = max(time.perf_counter() - _solve_t0, 1e-4)
+            if new_res.status != "optimal" or new_res.objective is None:
+                _psd_stop = "lp_status"
+                break
+            res = new_res
+            if _gate and _lb_before is not None:
+                _delta = new_res.objective - _lb_before
+                if _delta <= _gate_tau * (1.0 + abs(_lb_before)):
+                    # Diminishing returns — abandon the remaining PSD rounds.
+                    _psd_stop = "tau"
                     break
-                if (
-                    _gate
-                    and _base_solve_wall is not None
-                    and (time.perf_counter() - _psd_t0) > _gate_budget * _base_solve_wall
-                ):
-                    # Per-node PSD wall budget spent — stop feeding the search.
-                    # #912 instrumentation: this criterion compares one measured
-                    # wall against another, so which round it fires on is a
-                    # function of machine speed — and unlike the primal
-                    # heuristics this loop moves the node's DUAL BOUND. The log
-                    # line records whether a node was decided by it or by the
-                    # deterministic diminishing-returns test.
-                    _psd_stop = "wall_gate"
-                    break
-                if self._binary_cols_cache is None:
-                    from discopt._relax.model_utils import binary_flat_cols
-
-                    self._binary_cols_cache = binary_flat_cols(self._model)
-                cuts = separate_psd_cuts_on_relaxation(
-                    varmap,
-                    np.asarray(res.x, dtype=np.float64),
-                    n_total,
-                    binary_vars=self._binary_cols_cache,
-                )
-                if not cuts:
-                    _psd_stop = "no_cuts"
-                    break
-                _psd_rounds += 1
-                _lb_before = res.objective if _gate else None
-                # ``coeffs . z >= rhs``  ->  ``(-coeffs) . z <= -rhs`` for A_ub<=b_ub.
-                _append([-c.coeffs for c in cuts], [-c.rhs for c in cuts])
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                _solve_t0 = time.perf_counter()
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if _gate and _base_solve_wall is None:
-                    _base_solve_wall = max(time.perf_counter() - _solve_t0, 1e-4)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    _psd_stop = "lp_status"
-                    break
-                res = new_res
-                if _gate and _lb_before is not None:
-                    _delta = new_res.objective - _lb_before
-                    if _delta <= _gate_tau * (1.0 + abs(_lb_before)):
-                        # Diminishing returns — abandon the remaining PSD rounds.
-                        _psd_stop = "tau"
-                        break
-            logger.debug("psd_cut_loop: rounds=%d stopped_on=%s", _psd_rounds, _psd_stop)
-            return res
-        except Exception:
-            logger.debug("_separate_psd failed; using fallback", exc_info=True)
-            return res
+        logger.debug("psd_cut_loop: rounds=%d stopped_on=%s", _psd_rounds, _psd_stop)
+        return res
 
     def _separate_edge_concave(self, milp, varmap, res, deadline):
         """Tighten edge-concave/edge-convex quadratic blocks by hull separation.
 
         Each block's vertex-hull supporting hyperplane gives a valid cut on the
         existing ``x_i^2`` / ``x_i x_j`` auxiliary columns (no lifting). Sound at
-        any round; any failure returns the input ``res`` unchanged.
+        any round; a non-``optimal`` re-solve keeps the prior ``res``.
         """
         if not _tuning().edge_concave:
             return res
         if res is None or res.status != "optimal" or res.x is None:
             return res
-        try:
-            import scipy.sparse as sp
+        # #1520: no except. The separator's rows are built in-house and ``milp.solve`` declines by
+        # status (a non-optimal re-solve breaks the loop with the prior bound), so a raise is a
+        # defect, not "no cut".
+        import scipy.sparse as sp
 
-            from discopt._relax.edge_concave import (
-                collect_edge_concave_quadratics,
-                separate_edge_concave_quadratic,
-            )
+        from discopt._relax.edge_concave import (
+            collect_edge_concave_quadratics,
+            separate_edge_concave_quadratic,
+        )
 
-            if getattr(self, "_ec_blocks", None) is None:
-                self._ec_blocks = collect_edge_concave_quadratics(self._model)
-            blocks = self._ec_blocks
-            if not blocks:
-                return res
+        if getattr(self, "_ec_blocks", None) is None:
+            self._ec_blocks = collect_edge_concave_quadratics(self._model)
+        blocks = self._ec_blocks
+        if not blocks:
+            return res
 
-            bilinear = varmap.get("bilinear") or {}
-            monomial = varmap.get("monomial") or {}
-            n_total = len(milp._c)
-            lb = np.array([b[0] for b in milp._bounds], dtype=np.float64)
-            ub = np.array([b[1] for b in milp._bounds], dtype=np.float64)
+        bilinear = varmap.get("bilinear") or {}
+        monomial = varmap.get("monomial") or {}
+        n_total = len(milp._c)
+        lb = np.array([b[0] for b in milp._bounds], dtype=np.float64)
+        ub = np.array([b[1] for b in milp._bounds], dtype=np.float64)
 
-            # Resolve each block's aux columns once; drop blocks missing any aux.
-            specs = []
-            for blk in blocks:
-                cols_sq = {}
-                cols_bl = {}
-                ok = True
-                for i in blk.sq:
-                    col = monomial.get((i, 2))
+        # Resolve each block's aux columns once; drop blocks missing any aux.
+        specs = []
+        for blk in blocks:
+            cols_sq = {}
+            cols_bl = {}
+            ok = True
+            for i in blk.sq:
+                col = monomial.get((i, 2))
+                if col is None:
+                    ok = False
+                    break
+                cols_sq[i] = col
+            if ok:
+                for key in blk.bilin:
+                    col = bilinear.get(key)
                     if col is None:
                         ok = False
                         break
-                    cols_sq[i] = col
-                if ok:
-                    for key in blk.bilin:
-                        col = bilinear.get(key)
-                        if col is None:
-                            ok = False
-                            break
-                        cols_bl[key] = col
-                if ok:
-                    specs.append((blk, cols_sq, cols_bl))
-            if not specs:
-                return res
+                    cols_bl[key] = col
+            if ok:
+                specs.append((blk, cols_sq, cols_bl))
+        if not specs:
+            return res
 
-            def _append(rows, rhs):
-                R = np.asarray(rows, dtype=np.float64)
-                b = np.asarray(rhs, dtype=np.float64)
-                if milp._A_ub is None:
-                    milp._A_ub, milp._b_ub = R, b
-                elif sp.issparse(milp._A_ub):
-                    milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
-                    milp._b_ub = np.concatenate([milp._b_ub, b])
-                else:
-                    milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
-                    milp._b_ub = np.concatenate([np.asarray(milp._b_ub), b])
+        def _append(rows, rhs):
+            R = np.asarray(rows, dtype=np.float64)
+            b = np.asarray(rhs, dtype=np.float64)
+            if milp._A_ub is None:
+                milp._A_ub, milp._b_ub = R, b
+            elif sp.issparse(milp._A_ub):
+                milp._A_ub = sp.vstack([milp._A_ub, sp.csr_matrix(R)], format="csr")
+                milp._b_ub = np.concatenate([milp._b_ub, b])
+            else:
+                milp._A_ub = np.vstack([np.asarray(milp._A_ub), R])
+                milp._b_ub = np.concatenate([np.asarray(milp._b_ub), b])
 
-            for _round in range(6):
-                # Stop separating once the node's wall-clock budget is spent;
-                # each round costs a full MILP re-solve.
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-                x = np.asarray(res.x, dtype=np.float64)
-                rows, rhs = [], []
-                for blk, cols_sq, cols_bl in specs:
-                    vi = list(blk.var_idxs)
-                    blk_lb = lb[vi]
-                    blk_ub = ub[vi]
-                    x_star = x[vi]
-                    q_star = blk.const
+        for _round in range(6):
+            # Stop separating once the node's wall-clock budget is spent;
+            # each round costs a full MILP re-solve.
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            x = np.asarray(res.x, dtype=np.float64)
+            rows, rhs = [], []
+            for blk, cols_sq, cols_bl in specs:
+                vi = list(blk.var_idxs)
+                blk_lb = lb[vi]
+                blk_ub = ub[vi]
+                x_star = x[vi]
+                q_star = blk.const
+                for i, coeff in blk.sq.items():
+                    q_star += coeff * x[cols_sq[i]]
+                for key, coeff in blk.bilin.items():
+                    q_star += coeff * x[cols_bl[key]]
+                for i, coeff in blk.lin.items():
+                    q_star += coeff * x[i]
+                cut = separate_edge_concave_quadratic(blk, blk_lb, blk_ub, x_star, q_star)
+                if cut is None:
+                    continue
+                A, B = cut
+                row = np.zeros(n_total)
+                if blk.sense == "under":
+                    # q >= A.x + B  ->  A.x - q <= -B
+                    for d, v in enumerate(vi):
+                        row[v] += float(A[d])
                     for i, coeff in blk.sq.items():
-                        q_star += coeff * x[cols_sq[i]]
+                        row[cols_sq[i]] += -coeff
                     for key, coeff in blk.bilin.items():
-                        q_star += coeff * x[cols_bl[key]]
+                        row[cols_bl[key]] += -coeff
                     for i, coeff in blk.lin.items():
-                        q_star += coeff * x[i]
-                    cut = separate_edge_concave_quadratic(blk, blk_lb, blk_ub, x_star, q_star)
-                    if cut is None:
-                        continue
-                    A, B = cut
-                    row = np.zeros(n_total)
-                    if blk.sense == "under":
-                        # q >= A.x + B  ->  A.x - q <= -B
-                        for d, v in enumerate(vi):
-                            row[v] += float(A[d])
-                        for i, coeff in blk.sq.items():
-                            row[cols_sq[i]] += -coeff
-                        for key, coeff in blk.bilin.items():
-                            row[cols_bl[key]] += -coeff
-                        for i, coeff in blk.lin.items():
-                            row[i] += -coeff
-                        rows.append(row)
-                        rhs.append(blk.const - float(B))
-                    else:
-                        # q <= A.x + B  ->  q - A.x <= B
-                        for i, coeff in blk.sq.items():
-                            row[cols_sq[i]] += coeff
-                        for key, coeff in blk.bilin.items():
-                            row[cols_bl[key]] += coeff
-                        for i, coeff in blk.lin.items():
-                            row[i] += coeff
-                        for d, v in enumerate(vi):
-                            row[v] += -float(A[d])
-                        rows.append(row)
-                        rhs.append(float(B) - blk.const)
-                if not rows:
-                    break
-                _append(rows, rhs)
-                _tl = (
-                    None
-                    if deadline is None
-                    else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
-                )
-                new_res = milp.solve(time_limit=_tl, backend=self._backend)
-                if new_res.status != "optimal" or new_res.objective is None:
-                    break
-                res = new_res
-            return res
-        except Exception:
-            logger.debug("_separate_edge_concave failed; using fallback", exc_info=True)
-            return res
+                        row[i] += -coeff
+                    rows.append(row)
+                    rhs.append(blk.const - float(B))
+                else:
+                    # q <= A.x + B  ->  q - A.x <= B
+                    for i, coeff in blk.sq.items():
+                        row[cols_sq[i]] += coeff
+                    for key, coeff in blk.bilin.items():
+                        row[cols_bl[key]] += coeff
+                    for i, coeff in blk.lin.items():
+                        row[i] += coeff
+                    for d, v in enumerate(vi):
+                        row[v] += -float(A[d])
+                    rows.append(row)
+                    rhs.append(float(B) - blk.const)
+            if not rows:
+                break
+            _append(rows, rhs)
+            _tl = (
+                None
+                if deadline is None
+                else max(deadline - time.perf_counter(), _SOLVE_DEADLINE_FLOOR_S)
+            )
+            new_res = milp.solve(time_limit=_tl, backend=self._backend)
+            if new_res.status != "optimal" or new_res.objective is None:
+                break
+            res = new_res
+        return res

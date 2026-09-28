@@ -995,9 +995,11 @@ def _classify_nonlinear_terms_rust(model: Model) -> _RustAttempt:
     discarding it — a Rust failure and a Rust success must not look alike
     (#1343).
     """
+    # #1520: narrowed. An unbuilt extension is the one failure this arm names
+    # (``ROUTE_PY_IMPORT_FAILED``); anything else raised by the import is a defect.
     try:
         from discopt._rust import model_to_repr
-    except Exception as exc:
+    except ImportError as exc:
         return _RustAttempt(None, ROUTE_PY_IMPORT_FAILED, repr(exc))
 
     # Named ``model_repr``, not ``repr``: assigning the builtin's name makes it a

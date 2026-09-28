@@ -468,8 +468,11 @@ class TestIncrementalAndPoolPaths:
         # Abstentions leave the LP bound untouched.
         r.set_integer_ratio_partitioner(FakePartitioner(None))
         assert r.solve_at_node(lb, ub).lower_bound == pytest.approx(base.lower_bound)
+        # #1520: a raising partitioner is a defect, not an abstention; it used to
+        # be swallowed into "LP bound unchanged".
         r.set_integer_ratio_partitioner(FakePartitioner(RuntimeError("boom")))
-        assert r.solve_at_node(lb, ub).lower_bound == pytest.approx(base.lower_bound)
+        with pytest.raises(RuntimeError, match="boom"):
+            r.solve_at_node(lb, ub)
 
 
 # ═════════════════════════════════════════════════════════════
