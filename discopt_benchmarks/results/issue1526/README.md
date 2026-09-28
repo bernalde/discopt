@@ -20,9 +20,9 @@ branches. Across all 15 cells, the worst errors/residuals are:
 | measurement | maximum |
 |---|---:|
 | beta error versus oracle | `4.054e-7` |
-| material balance | `6.224e-13` |
+| material balance / normalization | `6.260e-13` |
 | isofugacity | `2.712e-14` |
-| active-root EOS | `1.609e-13` |
+| active-root EOS | `1.565e-13` |
 | root selection | `1.256e-12` |
 | source complementarity | `6.490e-9` |
 

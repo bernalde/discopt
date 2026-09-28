@@ -11,7 +11,7 @@
    },
    "discopt": {
     "present": true,
-    "commit": "ac5dcf760b5e65aae58c9b8ac6a5bb66378d97cd",
+    "commit": "fc6c85fff99b6941173f0fc8f8a1878fed9fa423",
     "comparison_run": true,
     "reason": "Gate-1 reduced comparison completed by jkitchin/discopt#1526.",
     "version": "0.9.1.dev0"
@@ -8675,7 +8675,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 8.449838243017439,
+    "wall_s": 7.918444920971524,
     "point": {
      "beta": 2.241065413033534e-12,
      "x": [
@@ -8709,8 +8709,8 @@
     },
     "source": {
      "balance": {
-      "value": 5.529465774145592e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 5.573319583618286e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -8719,18 +8719,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 1.4998158964774078e-13,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 1.4642800860720229e-13,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 8.999745393367675e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -8780,7 +8780,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 6.465213126968592,
+    "wall_s": 6.372350894991541,
     "point": {
      "beta": 2.7048355465721335e-12,
      "x": [
@@ -8814,8 +8814,8 @@
     },
     "source": {
      "balance": {
-      "value": 6.055156376305604e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 6.09734485124136e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -8824,18 +8824,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 1.3267772297487213e-13,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 1.292238885342023e-13,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 7.940800794692393e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -8885,7 +8885,7 @@
     "bound": null,
     "gap": null,
     "node_count": 0,
-    "wall_s": 0.1174302969884593,
+    "wall_s": 0.10709170298650861,
     "point": {
      "beta": 1.941311380471744e-08,
      "x": [
@@ -8920,7 +8920,7 @@
     "source": {
      "balance": {
       "value": 5.551115123125783e-17,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -8929,18 +8929,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 4.7704895589362195e-17,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 2.7755575615628914e-17,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 2.220446049250313e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -8990,7 +8990,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 16.2197103590006,
+    "wall_s": 16.283300353970844,
     "point": {
      "beta": 1.8087442970729498e-12,
      "x": [
@@ -9024,8 +9024,8 @@
     },
     "source": {
      "balance": {
-      "value": 3.4205971388701073e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 3.4217073618947325e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9034,18 +9034,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 7.046967176460583e-14,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 6.870198854258547e-14,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 5.513436929227566e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9095,7 +9095,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 6.966372934984975,
+    "wall_s": 6.55980729899602,
     "point": {
      "beta": 2.2008365798484636e-12,
      "x": [
@@ -9130,7 +9130,7 @@
     "source": {
      "balance": {
       "value": 4.073963388862012e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9139,18 +9139,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 1.608409586073556e-13,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 1.5642435263751864e-13,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 1.2554679518217426e-12,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9200,7 +9200,7 @@
     "bound": null,
     "gap": null,
     "node_count": 0,
-    "wall_s": 0.12288414701470174,
+    "wall_s": 0.1206309319823049,
     "point": {
      "beta": 2.918831676805484e-07,
      "x": [
@@ -9234,8 +9234,8 @@
     },
     "source": {
      "balance": {
-      "value": 0.0,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 1.1102230246251565e-16,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9244,18 +9244,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 3.8163916471489756e-17,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 2.7755575615628914e-17,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 1.1102230246251565e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9305,7 +9305,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 8.788657352968585,
+    "wall_s": 9.064757393993204,
     "point": {
      "beta": 0.5032612565514706,
      "x": [
@@ -9340,7 +9340,7 @@
     "source": {
      "balance": {
       "value": 4.550804177938517e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9349,18 +9349,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 4.354155924701786e-16,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 4.440892098500626e-16,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 7.008282842946301e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9410,7 +9410,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 13.108380806981586,
+    "wall_s": 12.745340535009746,
     "point": {
      "beta": 0.5032612565547006,
      "x": [
@@ -9445,7 +9445,7 @@
     "source": {
      "balance": {
       "value": 5.864198016070077e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9454,18 +9454,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 1.4137259071733688e-13,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 1.316316847188581e-13,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 4.2187087156975167e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9515,7 +9515,7 @@
     "bound": null,
     "gap": null,
     "node_count": 0,
-    "wall_s": 0.11363498101127334,
+    "wall_s": 0.10132568399421871,
     "point": {
      "beta": 0.503261256823647,
      "x": [
@@ -9549,8 +9549,8 @@
     },
     "source": {
      "balance": {
-      "value": 0.0,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 2.7755575615628914e-17,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9559,18 +9559,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 7.112366251504909e-17,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 2.7755575615628914e-17,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 6.661338147750939e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9620,7 +9620,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 16.563494732021354,
+    "wall_s": 16.095775847992627,
     "point": {
      "beta": 0.9999999999983322,
      "x": [
@@ -9654,8 +9654,8 @@
     },
     "source": {
      "balance": {
-      "value": 3.3861802251067274e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 3.486655408835304e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9664,18 +9664,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 9.664578165535787e-14,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 9.522330840505688e-14,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 9.767672781713088e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9725,7 +9725,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 7.567526048980653,
+    "wall_s": 7.350555529992562,
     "point": {
      "beta": 0.9999999999976501,
      "x": [
@@ -9759,8 +9759,8 @@
     },
     "source": {
      "balance": {
-      "value": 3.356759314954161e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 3.3584246494910985e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9769,18 +9769,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 2.0383000842727483e-16,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 2.7755575615628914e-16,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 2.1094237467877974e-15,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9830,7 +9830,7 @@
     "bound": null,
     "gap": null,
     "node_count": 0,
-    "wall_s": 0.12022493800031953,
+    "wall_s": 0.1128878919989802,
     "point": {
      "beta": 0.9999995946829355,
      "x": [
@@ -9864,8 +9864,8 @@
     },
     "source": {
      "balance": {
-      "value": 0.0,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 1.1102230246251565e-16,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9874,18 +9874,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 1.3704315460216776e-16,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 1.1102230246251565e-16,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 9.992007221626409e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -9935,7 +9935,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 12.045253427961143,
+    "wall_s": 11.614387544977944,
     "point": {
      "beta": 0.9999999999981862,
      "x": [
@@ -9969,8 +9969,8 @@
     },
     "source": {
      "balance": {
-      "value": 4.54081217071689e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 4.587441537751147e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -9979,18 +9979,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 4.450606549966096e-14,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 4.4529050585717656e-14,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 7.994646611386713e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -10040,7 +10040,7 @@
     "bound": 0.0,
     "gap": 0.0,
     "node_count": 1,
-    "wall_s": 7.139141997991828,
+    "wall_s": 6.878603471035603,
     "point": {
      "beta": 0.999999999996668,
      "x": [
@@ -10074,8 +10074,8 @@
     },
     "source": {
      "balance": {
-      "value": 6.223355164536315e-13,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 6.259437412836633e-13,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -10084,18 +10084,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 4.431047542774458e-14,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 4.434994038682305e-14,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 7.959466419293904e-13,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
@@ -10145,7 +10145,7 @@
     "bound": null,
     "gap": null,
     "node_count": 0,
-    "wall_s": 0.10984877400915138,
+    "wall_s": 0.11144028897979297,
     "point": {
      "beta": 0.9999999836379245,
      "x": [
@@ -10179,8 +10179,8 @@
     },
     "source": {
      "balance": {
-      "value": 5.551115123125783e-17,
-      "definition": "max_i |(1-beta)*x_i + beta*y_i - z_i|",
+      "value": 1.1102230246251565e-16,
+      "definition": "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex equality residual",
       "admitted_scale": null
      },
      "isofugacity": {
@@ -10189,18 +10189,18 @@
       "admitted_scale": null
      },
      "eos": {
-      "value": 6.201636426617085e-17,
-      "definition": "max absolute Peng--Robinson cubic residual on active roots",
+      "value": 8.326672684688674e-17,
+      "definition": "max active Peng--Robinson source-row residual: cubic in the one-root branch; Vieta sum, pair, and product identities in the three-root branch",
       "admitted_scale": null
      },
      "root_selection": {
       "value": 2.220446049250313e-16,
-      "definition": "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+      "definition": "max root-count sign, ordering, selected-root identity, numeric extreme-root error, and root-branch selector identity/integrality residual",
       "admitted_scale": null
      },
      "nontriviality": {
       "value": 0.0,
-      "definition": "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+      "definition": "max violation of the selected signed log(K_i) >= 1e-4 row and, for the disjunctive model, its selector identity/integrality residual",
       "admitted_scale": null
      },
      "bound": {
