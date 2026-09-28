@@ -100,6 +100,8 @@ The release procedure that produces these entries is documented in
 
 - **Exact MPEC warm starts now lift generated operand auxiliaries** (`fix`, #1528). `solve_mpec(..., method="sos1"|"gdp", initial_solution=...)` evaluates every generated continuous operand auxiliary at the source point before handing the model to the exact solve, instead of midpoint-filling those columns and silently discarding a source-feasible incumbent.
 
+- **Source residual reports now evaluate active indicator constraints** (`fix`, #1529). A Boolean-active implication reports its wrapped-row violation, an inactive implication reports zero, and fractional selectors remain a separate integrality failure; GDP/MPEC reports no longer become unmeasurable merely because their source model contains explicit one-way indicator rows.
+
 - **`solver="amp"` now refuses an opaque body instead of failing internally.** AMP
   certifies by linearizing a partitioned relaxation, and an opaque `dm.custom` /
   `dm.external` body has no algebraic form to linearize. It produced no false
