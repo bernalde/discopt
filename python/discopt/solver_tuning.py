@@ -1213,6 +1213,28 @@ class SolverTuning:
     objective sign selects — keep the primal path exactly as before.
     """
 
+    native_nlp_primal: bool = field(
+        default_factory=lambda: _env_flag("DISCOPT_NATIVE_NLP_PRIMAL", default=False)
+    )
+    """Run a local NLP inside the native spatial kernel's tree (#1522,
+    ``DISCOPT_NATIVE_NLP_PRIMAL``).
+
+    The kernel's only internal source of incumbents is an LP vertex at which every
+    lifted term is McCormick-tight to ``mccormick_tol``; everything else depends on
+    the one-shot NLP seed taken before the search. When the seed returns nothing and
+    the optimum lies on a curved manifold, the tree cannot close. Measured on
+    MINLPLib ``prob09`` with no seed: 100k nodes produced incumbents 2.3e-3 above an
+    optimum of 0 that the root bound (``t >= 0`` from FBBT) had already proven, while
+    the same kernel seeded with a local-NLP polish of its FIRST such incumbent
+    certified at node 1.
+
+    With this ON the kernel calls back into Python (``_native_kernel_primal_hook``)
+    when it accepts a new incumbent and at nodes 1, 2, 4, 8, ...; the hook runs one
+    KKT re-solve of the lift from the node's LP point and returns the point only if
+    it verifies on the lift AND on the pre-reform model. Primal only: the reported
+    bound is still the min of the closed regions' rigorous bounds.
+    """
+
     # --- determinism (#1116) --------------------------------------------------
     deterministic: bool = field(
         default_factory=lambda: _env_flag("DISCOPT_DETERMINISTIC", default=False)
