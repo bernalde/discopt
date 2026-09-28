@@ -12,6 +12,15 @@ The release procedure that produces these entries is documented in
 
 ### Added
 
+- **POUNCE Gate-1 phase-changing flash cross-validation** (#1526). A reusable
+  ethane/n-butane benchmark rebuilds POUNCE's MPCC fixture with algebraic
+  Peng--Robinson root identities, explicit root-count and nontrivial-stationary-
+  point disjunctions, and the original named complementarity pairs. GDP and
+  SOS1 produce global comparison records; a fixed-branch Scholtes formulation
+  retains the distinct local/no-bound contract. The five-point PR path and
+  optional 34-point runner preserve source and lowered residuals separately and
+  augment a real POUNCE artifact under the shared version-2 JSON schema.
+
 - **`Model.piecewise` / `dm.piecewise`: declared piecewise-linear functions**
   (#1482). `y = m.piecewise(x, breakpoints, values, method=..., name=...)`
   declares a tabulated univariate function (a pump curve, a tariff schedule, a
