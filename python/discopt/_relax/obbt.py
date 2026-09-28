@@ -2032,7 +2032,18 @@ def obbt_tighten_root(
     # (it never calls ``solve_at_node``), so skip the incremental fast-path
     # structure build + its row-for-row validation (a wasted handful of cold
     # builds — they re-derive the relaxation only to validate it).
-    relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    # Constructor failure is the one relaxer decline no status can carry. The
+    # solver's node-loop and root-bound relaxer setups keep it as a sound
+    # fallback (#1514), so root OBBT does the same: no sweep, the box so far
+    # (every step above sound), reported once per solve. Only the constructor is
+    # guarded; a defect inside the sweep still propagates (#1520).
+    try:
+        relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    except Exception as exc:  # noqa: BLE001 - see above
+        from discopt._relax._fallback import warn_fallback_once
+
+        warn_fallback_once("McCormick LP relaxer setup (root OBBT)", exc, "skipping the OBBT sweep")
+        return RootObbtResult(lb, ub, total_tight, 0, total_lp_time)
     if not relaxer.has_relaxable_nonlinearity:
         return RootObbtResult(lb, ub, 0, 0, 0.0)
 

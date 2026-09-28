@@ -208,12 +208,19 @@ def _stage_fbbt_with_cutoff(
 def _root_lp_bound(model: Model, lb: np.ndarray, ub: np.ndarray) -> Optional[float]:
     """The McCormick-LP root dual bound over the box, for fixpoint convergence
     detection only (never used as a certificate here). Returns None if no bound."""
-    # #1520: no except. ``solve_at_node`` declines by status (a build failure is
-    # reported at WARNING inside it and comes back as ``status="error"``), so a raise
-    # is a defect, not "no bound".
+    # #1520: ``solve_at_node`` declines by status (a build failure is reported at
+    # WARNING inside it and comes back as ``status="error"``), so a raise from it is
+    # a defect, not "no bound". Only the constructor -- the one decline no status
+    # can carry -- is kept as a sound fallback, as in the solver's relaxer setups
+    # (#1514): no bound here only stops the fixpoint's convergence test.
+    from discopt._relax._fallback import warn_fallback_once
     from discopt._relax.mccormick_lp import MccormickLPRelaxer
 
-    relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    try:
+        relaxer = MccormickLPRelaxer(model, build_incremental=False)
+    except Exception as exc:  # noqa: BLE001 - see above
+        warn_fallback_once("McCormick LP relaxer setup (root fixpoint)", exc, "no root LP bound")
+        return None
     if not relaxer.has_relaxable_nonlinearity:
         return None
     res = relaxer.solve_at_node(

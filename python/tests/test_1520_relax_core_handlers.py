@@ -220,12 +220,13 @@ def test_multivar_box_curvature_narrowed_to_value_error(monkeypatch):
         _counting_raiser(lambda: interval_ad.IntervalHessianTooLarge("big"), calls),
     )
     assert mr._multivar_box_curvature(expr, m, [0, 1], flb, fub, box) is None
-    # A DAG deep enough to exhaust the recursive walk is the same "too big" decline
-    # (measured: the 900-product synthetic QAP in ``test_rlt_root_bound``).
+    # ``RecursionError`` is no longer a decline: ``interval_hessian`` runs deep
+    # walks on a large stack (#1520 root fix), so one reaching here is a defect.
     monkeypatch.setattr(
         interval_ad, "interval_hessian", _counting_raiser(lambda: RecursionError("deep"), calls)
     )
-    assert mr._multivar_box_curvature(expr, m, [0, 1], flb, fub, box) is None
+    with pytest.raises(RecursionError, match="deep"):
+        mr._multivar_box_curvature(expr, m, [0, 1], flb, fub, box)
     monkeypatch.setattr(
         interval_ad, "interval_hessian", _counting_raiser(lambda: _Boom("h"), calls)
     )
@@ -739,6 +740,36 @@ def test_root_cutoff_fbbt_declines_only_on_missing_repr(monkeypatch):
         rr._stage_fbbt_with_cutoff(m, lb, ub, None, max_iter=5, tol=1e-9)
     assert len(calls) == 2
     assert float(m._variables[0].lb) == -1.0  # saved_bounds restored on the raise
+
+
+def _raising_relaxer_init(calls):
+    def _init(self, *a, **k):
+        calls.append(1)
+        raise _Boom("ctor")
+
+    return _init
+
+
+def test_obbt_relaxer_constructor_failure_warns_once(monkeypatch, fresh_fallbacks):
+    """Kept, as in the solver's relaxer setups (#1514 / 07ceed3): a relaxer that
+    cannot be constructed skips the sweep and returns the box, reported once."""
+    calls: list[int] = []
+    monkeypatch.setattr(mlp.MccormickLPRelaxer, "__init__", _raising_relaxer_init(calls))
+    lb, ub = _box()
+    for _ in range(2):
+        r = obbt_mod.obbt_tighten_root(_bilinear(), lb, ub)
+        assert r.infeasible is False
+        assert np.array_equal(r.lb, lb) and np.array_equal(r.ub, ub)
+    assert len(calls) == 2
+    assert len(_warnings(fresh_fallbacks, "relaxer setup (root OBBT) failed")) == 1
+
+
+def test_root_lp_bound_relaxer_constructor_failure_warns(monkeypatch, fresh_fallbacks):
+    calls: list[int] = []
+    monkeypatch.setattr(mlp.MccormickLPRelaxer, "__init__", _raising_relaxer_init(calls))
+    assert rr._root_lp_bound(_bilinear(), *_box()) is None
+    assert calls
+    assert len(_warnings(fresh_fallbacks, "relaxer setup (root fixpoint) failed")) == 1
 
 
 def test_root_lp_bound_defect_propagates(monkeypatch):
