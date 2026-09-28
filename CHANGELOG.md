@@ -98,6 +98,8 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **Source residual reports now evaluate active indicator constraints** (`fix`, #1529). A Boolean-active implication reports its wrapped-row violation, an inactive implication reports zero, and fractional selectors remain a separate integrality failure; GDP/MPEC reports no longer become unmeasurable merely because their source model contains explicit one-way indicator rows.
+
 - **`solver="amp"` now refuses an opaque body instead of failing internally.** AMP
   certifies by linearizing a partitioned relaxation, and an opaque `dm.custom` /
   `dm.external` body has no algebraic form to linearize. It produced no false
