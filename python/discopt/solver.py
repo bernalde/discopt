@@ -8741,14 +8741,27 @@ def _root_relaxation_lower_bound(
         # Neumaier-Shcherbina floor via ``_time_limit_result``, so the clamp
         # weakens the candidate at worst — it never invalidates one.
         _sep_budget = min(budget, _fb_left()) if _have else budget
-        node_res = MccormickLPRelaxer(model).solve_at_node(
-            root_lb,
-            root_ub,
-            time_limit=_role2_budget(_sep_budget),
-            build_deadline=_build_deadline,
-        )
-        if node_res.lower_bound is not None and np.isfinite(node_res.lower_bound):
-            sep_bound = float(node_res.lower_bound)
+        # Constructor failure is the one decline ``solve_at_node`` cannot return
+        # by status. The node loop's relaxer setup treats it as a sound fallback
+        # (no relaxer -> the NLP/alphaBB route), so this site does the same:
+        # no separated candidate, reported once per solve. Only the constructor
+        # is guarded; a defect inside ``solve_at_node`` still propagates.
+        try:
+            _sep_relaxer = MccormickLPRelaxer(model)
+        except Exception as e:
+            _warn_fallback_once(
+                "McCormick LP relaxer setup (root bound)", e, "no separated root bound"
+            )
+            _sep_relaxer = None
+        if _sep_relaxer is not None:
+            node_res = _sep_relaxer.solve_at_node(
+                root_lb,
+                root_ub,
+                time_limit=_role2_budget(_sep_budget),
+                build_deadline=_build_deadline,
+            )
+            if node_res.lower_bound is not None and np.isfinite(node_res.lower_bound):
+                sep_bound = float(node_res.lower_bound)
 
     # Both values are valid lower bounds for a minimization, so the larger
     # (tighter) one is the better rigorous bound.

@@ -53,6 +53,17 @@ def _install_fake_rust_classifier(monkeypatch, problem_kind: str) -> None:
     )
     monkeypatch.setitem(sys.modules, "discopt._rust", fake_rust)
 
+    # The fake repr only answers classification queries. Root presolve would
+    # call Rust methods it does not have; before #1514 the resulting
+    # AttributeError was swallowed, so these dispatch tests silently relied on
+    # it. Make presolve an explicit no-op for the fake instead.
+    import discopt._relax.presolve_pipeline as presolve_pipeline
+
+    monkeypatch.setattr(
+        presolve_pipeline, "run_root_presolve", lambda model_repr, **_kw: (model_repr, {})
+    )
+    monkeypatch.setattr(presolve_pipeline, "propagate_bounds_to_model", lambda *_a, **_kw: 0)
+
 
 def _require_gurobi():
     gp = pytest.importorskip("gurobipy")
