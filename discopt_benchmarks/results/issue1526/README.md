@@ -31,11 +31,13 @@ comparison is decided by the physical point, explicit root-count and
 nontriviality identities, regime, and source residuals. Lowered-row residuals
 are retained separately in every record.
 
-Regenerate the DiscOpt half from a POUNCE version-1 artifact with:
+Regenerate the DiscOpt half from the tracked version-2 artifact (or substitute a
+fresh POUNCE version-1 artifact) with:
 
 ```bash
 python discopt_benchmarks/scripts/issue1526_pounce_flash.py \
-  pounce-results-v1.json pounce_gate1_smoke_v2.json
+  discopt_benchmarks/results/issue1526/pounce_gate1_smoke_v2.json \
+  discopt_benchmarks/results/issue1526/pounce_gate1_smoke_v2.json
 ```
 
 Pass `--full` for POUNCE's 34-temperature path. The runner refuses a missing

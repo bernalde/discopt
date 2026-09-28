@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.resources
+import json
+from pathlib import Path
 
+import numpy as np
 import pytest
 from discopt.benchmarks.problems.pounce_flash import (
     FULL_TEMPERATURES,
@@ -11,7 +15,9 @@ from discopt.benchmarks.problems.pounce_flash import (
     accepted_exact_warm_start,
     augment_pounce_artifact,
     build_pounce_flash,
+    comparison_record_failures,
     solve_flash_temperature,
+    source_residuals,
     validate_comparison_artifact,
     validate_oracle_equivalence,
 )
@@ -53,6 +59,58 @@ def test_source_model_exposes_explicit_boolean_identities():
         "component_1_above",
         "component_1_below",
     }
+
+
+def _copied_initial_solution(problem):
+    return {
+        variable: np.asarray(value).copy() for variable, value in problem.initial_solution.items()
+    }
+
+
+def test_source_residuals_measure_active_vieta_rows_not_only_rootwise_cubics():
+    problem = build_pounce_flash(300.0, root_encoding="disjunctive")
+    solution = _copied_initial_solution(problem)
+    roots = solution[problem.variables["three_root_z"]]
+    roots[0, 2] = roots[0, 1]
+
+    measured = source_residuals(problem, solution)
+
+    assert measured["eos"]["value"] > 0.1
+
+
+def test_source_residuals_measure_the_selected_nontriviality_row():
+    problem = build_pounce_flash(300.0, root_encoding="disjunctive")
+    solution = _copied_initial_solution(problem)
+    for indicator in problem.nontrivial_indicators:
+        solution[indicator] = np.asarray(0.0)
+    solution[problem.nontrivial_indicators[1]] = np.asarray(1.0)
+
+    measured = source_residuals(problem, solution)
+
+    assert measured["nontriviality"]["value"] > 1.0
+
+
+def test_source_residuals_measure_normalization_rows():
+    problem = build_pounce_flash(300.0, root_encoding="disjunctive")
+    solution = _copied_initial_solution(problem)
+    solution[problem.variables["sum_x"]] = np.asarray(0.8)
+
+    measured = source_residuals(problem, solution)
+
+    assert measured["balance"]["value"] > 0.01
+
+
+def test_source_residuals_measure_boolean_selector_identities():
+    problem = build_pounce_flash(300.0, root_encoding="disjunctive")
+    solution = _copied_initial_solution(problem)
+    one, three = problem.root_indicators[0]
+    assert one is not None and three is not None
+    solution[one] = np.asarray(0.5)
+    solution[three] = np.asarray(0.5)
+
+    measured = source_residuals(problem, solution)
+
+    assert measured["root_selection"]["value"] >= 0.5
 
 
 def test_pounce_point_passes_the_only_exact_warm_start_gate():
@@ -108,6 +166,46 @@ def _failed_record(method: str) -> dict:
     }
 
 
+def _successful_record(method: str) -> dict:
+    path = (
+        Path(__file__).parents[2]
+        / "discopt_benchmarks"
+        / "results"
+        / "issue1526"
+        / "pounce_gate1_smoke_v2.json"
+    )
+    with path.open("r", encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    return copy.deepcopy(
+        next(
+            row
+            for row in artifact["comparison"]["records"]
+            if row["temperature_k"] == 300.0 and row["method"] == method
+        )
+    )
+
+
+@pytest.mark.parametrize("method", ["gdp", "sos1", "scholtes"])
+def test_gate_acceptance_contract_accepts_committed_successful_records(method):
+    assert comparison_record_failures(_successful_record(method)) == []
+
+
+def test_gate_acceptance_contract_rejects_success_lookalikes():
+    mutations = [
+        ("local-limit", "gdp", lambda row: row.update(status="local_limit")),
+        ("regime", "gdp", lambda row: row["oracle"].update(regime_match=False)),
+        ("roots", "gdp", lambda row: row["oracle"].update(root_branches_match=False)),
+        ("beta", "gdp", lambda row: row["oracle"].update(beta_error=1.0e-3)),
+        ("biactive", "gdp", lambda row: row["oracle"].update(biactive_branch_admissible=False)),
+        ("source", "gdp", lambda row: row["source"]["balance"].update(value=1.0e-3)),
+        ("lowered", "gdp", lambda row: row["lowered"]["row"].update(value=1.0e-3)),
+    ]
+    for label, method, mutate in mutations:
+        record = _successful_record(method)
+        mutate(record)
+        assert comparison_record_failures(record), label
+
+
 def _v1_artifact() -> dict:
     return {
         "schema": "pounce-flash-results/1",
@@ -160,6 +258,32 @@ def test_v2_augmentation_preserves_pounce_evidence_and_stamps_discopt():
     assert artifact["stamp"]["repositories"]["pounce"] == source["stamp"]["repositories"]["pounce"]
     assert artifact["stamp"]["repositories"]["discopt"]["commit"] == "abcdef0123456789"
     assert artifact["comparison"]["state"] == "complete"
+
+
+def test_tracked_v2_artifact_is_a_reproducible_input():
+    path = (
+        Path(__file__).parents[2]
+        / "discopt_benchmarks"
+        / "results"
+        / "issue1526"
+        / "pounce_gate1_smoke_v2.json"
+    )
+    with path.open("r", encoding="utf-8") as handle:
+        source = json.load(handle)
+    original = copy.deepcopy(source)
+    records = [_failed_record(method) for method in ("gdp", "sos1", "scholtes")]
+
+    artifact = augment_pounce_artifact(
+        source,
+        records,
+        discopt_commit="abcdef0123456789",
+        discopt_version="test",
+    )
+
+    assert source == original, "input must not be mutated"
+    assert artifact["oracle"] == source["oracle"]
+    assert artifact["legs"] == source["legs"]
+    assert artifact["comparison"]["records"] == records
 
 
 def test_v2_artifact_validates_when_companion_schema_is_installed():

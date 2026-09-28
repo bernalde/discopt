@@ -39,6 +39,7 @@ SQRT_TWO = math.sqrt(2.0)
 MOLE_FLOOR = 1.0e-12
 TRIVIAL_LOG_K = 1.0e-4
 DISCRIMINANT_GUARD = 1.0e-8
+COMPARISON_TOLERANCE = 1.0e-6
 CRITICAL_TEMPERATURE_K = np.array([305.3, 425.1])
 CRITICAL_PRESSURE_PA = np.array([48.72, 37.96]) * 1.0e5
 ACENTRIC_FACTOR = np.array([0.100, 0.200])
@@ -493,7 +494,13 @@ def source_residuals(
     single, three = values["one_root_z"], values["three_root_z"]
     branches = _active_root_branches(problem, values)
 
-    balance = float(np.max(np.abs((1.0 - beta) * x + beta * y - FEED_COMPOSITION)))
+    balance = max(
+        float(np.max(np.abs((1.0 - beta) * x + beta * y - FEED_COMPOSITION))),
+        float(np.max(np.abs(x - sx * wl))),
+        float(np.max(np.abs(y - sy * wv))),
+        abs(float(np.sum(wl)) - 1.0),
+        abs(float(np.sum(wv)) - 1.0),
+    )
     lnphi_l = _numeric_lnphi(wl, problem.temperature_k, float(selected[0]))
     lnphi_v = _numeric_lnphi(wv, problem.temperature_k, float(selected[1]))
     isofugacity = float(np.max(np.abs(np.log(x) + lnphi_l - np.log(y) - lnphi_v)))
@@ -517,7 +524,12 @@ def source_residuals(
             )
         else:
             r = np.asarray(three[phase], dtype=float)
-            eos = max(eos, *(abs(cubic(float(z))) for z in r))
+            eos = max(
+                eos,
+                abs(float(r[0] + r[1] + r[2] + c2)),
+                abs(float(r[0] * r[1] + r[0] * r[2] + r[1] * r[2] - c1)),
+                abs(float(r[0] * r[1] * r[2] + c0)),
+            )
             root_selection = max(
                 root_selection,
                 max(0.0, discriminant),
@@ -526,9 +538,32 @@ def source_residuals(
                 abs(float(selected[phase] - (r[0] if phase == 0 else r[2]))),
             )
         root_selection = max(root_selection, abs(float(selected[phase]) - float(desired)))
+        if problem.root_encoding == "disjunctive":
+            one, tri = problem.root_indicators[phase]
+            assert one is not None and tri is not None
+            selectors = np.asarray([float(values[one.name]), float(values[tri.name])])
+            root_selection = max(
+                root_selection,
+                abs(float(np.sum(selectors)) - 1.0),
+                float(np.max(np.minimum(np.abs(selectors), np.abs(1.0 - selectors)))),
+            )
 
     log_k = np.log(wv) - np.log(wl)
-    nontriviality = max(0.0, TRIVIAL_LOG_K - float(np.max(np.abs(log_k))))
+    candidates = np.asarray([log_k[0], -log_k[0], log_k[1], -log_k[1]], dtype=float)
+    if problem.root_encoding == "disjunctive":
+        selectors = np.asarray(
+            [float(values[indicator.name]) for indicator in problem.nontrivial_indicators]
+        )
+        active_nontrivial = int(np.argmax(selectors))
+        nontriviality = max(
+            0.0,
+            TRIVIAL_LOG_K - float(candidates[active_nontrivial]),
+            abs(float(np.sum(selectors)) - 1.0),
+            float(np.max(np.minimum(np.abs(selectors), np.abs(1.0 - selectors)))),
+        )
+    else:
+        active_nontrivial = _NONTRIVIAL_NAMES.index(problem.nontrivial_branch)
+        nontriviality = max(0.0, TRIVIAL_LOG_K - float(candidates[active_nontrivial]))
     bounds = 0.0
     for variable in problem.source_variables:
         if variable.name not in values:
@@ -547,19 +582,29 @@ def source_residuals(
         admitted = getattr(mpec_report.complementarity, "admitted_scale", None)
 
     return {
-        "balance": _residual(balance, "max_i |(1-beta)*x_i + beta*y_i - z_i|"),
+        "balance": _residual(
+            balance,
+            "max material-balance, x=sum_x*w_liquid, y=sum_y*w_vapor, and phase-simplex "
+            "equality residual",
+        ),
         "isofugacity": _residual(
             isofugacity,
             "max_i |ln(x_i)+ln(phi_i^L(w_L))-ln(y_i)-ln(phi_i^V(w_V))|",
         ),
-        "eos": _residual(eos, "max absolute Peng--Robinson cubic residual on active roots"),
+        "eos": _residual(
+            eos,
+            "max active Peng--Robinson source-row residual: cubic in the one-root branch; "
+            "Vieta sum, pair, and product identities in the three-root branch",
+        ),
         "root_selection": _residual(
             root_selection,
-            "max root-count sign, ordering, selected-root identity, and numeric extreme-root error",
+            "max root-count sign, ordering, selected-root identity, numeric extreme-root error, "
+            "and root-branch selector identity/integrality residual",
         ),
         "nontriviality": _residual(
             nontriviality,
-            "max(0, 1e-4 - max_i |ln(w_vapor_i/w_liquid_i)|)",
+            "max violation of the selected signed log(K_i) >= 1e-4 row and, for the "
+            "disjunctive model, its selector identity/integrality residual",
         ),
         "bound": _residual(bounds, "max source-variable bound violation"),
         "sign": _residual(sign, "max complementarity-operand sign violation"),
@@ -706,7 +751,10 @@ def _oracle_comparison(problem: FlashProblem, point: Mapping[str, Any]) -> dict[
 def _finite_or_none(value: Any) -> Optional[float]:
     if value is None:
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -745,7 +793,7 @@ def _comparison_record(problem: FlashProblem, method: Method, result: Any) -> di
         record["objective"] = None
         return record
 
-    tolerance = 1.0e-6
+    tolerance = COMPARISON_TOLERANCE
     if report is not None and getattr(report, "continuation", None) is not None:
         admitted = report.continuation.admitted_residual_scale
         if admitted is not None:
@@ -777,6 +825,113 @@ def _comparison_record(problem: FlashProblem, method: Method, result: Any) -> di
     }
     record["oracle"] = _oracle_comparison(problem, point)
     return record
+
+
+def comparison_record_failures(
+    record: Mapping[str, Any],
+    *,
+    tolerance: float = COMPARISON_TOLERANCE,
+) -> list[str]:
+    """Return every Gate-1 acceptance-contract violation in one record."""
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("tolerance must be finite and nonnegative")
+
+    failures: list[str] = []
+
+    def finite(label: str, value: Any) -> Optional[float]:
+        number = _finite_or_none(value)
+        if number is None:
+            failures.append(f"{label} is not finite")
+        return number
+
+    def bounded(label: str, value: Any) -> None:
+        number = finite(label, value)
+        if number is not None and not 0.0 <= number <= tolerance:
+            failures.append(f"{label}={number:.3e} exceeds {tolerance:.3e}")
+
+    method = str(record.get("method"))
+    if record.get("error") not in (None, ""):
+        failures.append(f"record has error: {record['error']}")
+
+    if method in ("gdp", "sos1"):
+        if record.get("state") != "certified":
+            failures.append("exact method state is not certified")
+        if record.get("status") != "optimal":
+            failures.append("exact method status is not optimal")
+        if record.get("gap_certified") is not True:
+            failures.append("exact method gap is not certified")
+        finite("objective", record.get("objective"))
+        finite("bound", record.get("bound"))
+        gap = finite("gap", record.get("gap"))
+        if gap is not None and not 0.0 <= gap <= tolerance:
+            failures.append(f"gap={gap:.3e} exceeds {tolerance:.3e}")
+    elif method == "scholtes":
+        if record.get("state") != "local":
+            failures.append("Scholtes state is not local")
+        if record.get("status") != "local_optimal":
+            failures.append("Scholtes status is not local_optimal")
+        if record.get("gap_certified") is not False:
+            failures.append("Scholtes result claims a certified gap")
+        finite("objective", record.get("objective"))
+        if record.get("bound") is not None:
+            failures.append("Scholtes bound must be null")
+        if record.get("gap") is not None:
+            failures.append("Scholtes gap must be null")
+    else:
+        failures.append(f"unsupported method {method!r}")
+
+    if not isinstance(record.get("point"), Mapping):
+        failures.append("physical point is missing")
+
+    source = record.get("source")
+    source_names = (
+        "balance",
+        "isofugacity",
+        "eos",
+        "root_selection",
+        "nontriviality",
+        "bound",
+        "sign",
+        "complementarity",
+    )
+    if not isinstance(source, Mapping):
+        failures.append("source residuals are missing")
+    else:
+        for name in source_names:
+            row = source.get(name)
+            if not isinstance(row, Mapping):
+                failures.append(f"source.{name} is missing")
+                continue
+            bounded(f"source.{name}", row.get("value"))
+
+    lowered = record.get("lowered")
+    lowered_row = lowered.get("row") if isinstance(lowered, Mapping) else None
+    if not isinstance(lowered_row, Mapping):
+        failures.append("lowered.row is missing")
+    else:
+        bounded("lowered.row", lowered_row.get("value"))
+
+    oracle = record.get("oracle")
+    if not isinstance(oracle, Mapping):
+        failures.append("oracle comparison is missing")
+    else:
+        if oracle.get("regime_match") is not True:
+            failures.append("oracle regime does not match")
+        if oracle.get("root_branches_match") is not True:
+            failures.append("oracle root branches do not match")
+        if oracle.get("biactive_branch_admissible") is False:
+            failures.append("oracle biactive branch is inadmissible")
+        for name in (
+            "beta_error",
+            "x_error",
+            "y_error",
+            "sum_x_error",
+            "sum_y_error",
+            "z_liquid_error",
+            "z_vapor_error",
+        ):
+            bounded(f"oracle.{name}", oracle.get(name))
+    return failures
 
 
 def solve_flash_temperature(
@@ -848,9 +1003,9 @@ def augment_pounce_artifact(
     discopt_commit: str,
     discopt_version: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Turn a real POUNCE v1 artifact into the shared v2 artifact."""
-    if pounce_artifact.get("schema") != "pounce-flash-results/1":
-        raise ValueError("input must be a real pounce-flash-results/1 artifact")
+    """Add or replace DiscOpt comparison records in a real POUNCE artifact."""
+    if pounce_artifact.get("schema") not in ("pounce-flash-results/1", "pounce-flash-results/2"):
+        raise ValueError("input must be a real pounce-flash-results/1 or /2 artifact")
     if len(discopt_commit) < 7:
         raise ValueError("discopt_commit must identify the exact repository revision")
     rows = [copy.deepcopy(dict(row)) for row in records]
@@ -908,6 +1063,7 @@ def validate_comparison_artifact(
 
 
 __all__ = [
+    "COMPARISON_TOLERANCE",
     "DISCRIMINANT_GUARD",
     "FULL_TEMPERATURES",
     "FlashPoint",
@@ -917,6 +1073,7 @@ __all__ = [
     "accepted_exact_warm_start",
     "augment_pounce_artifact",
     "build_pounce_flash",
+    "comparison_record_failures",
     "oracle_point",
     "pounce_seed",
     "solve_flash_temperature",

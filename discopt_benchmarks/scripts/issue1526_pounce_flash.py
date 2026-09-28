@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the shared POUNCE/DiscOpt Gate-1 flash comparison artifact.
 
-The input is a real ``pounce-flash-results/1`` file emitted by POUNCE's full
-harness.  This script preserves that evidence, appends the reduced DiscOpt
+The input is a real ``pounce-flash-results/1`` or ``/2`` file emitted by POUNCE's
+full harness.  This script preserves that evidence, replaces the reduced DiscOpt
 comparison, validates the result against POUNCE's packaged version-2 schema,
 and writes one ``pounce-flash-results/2`` file.
 """
@@ -18,6 +18,7 @@ from discopt.benchmarks.problems.pounce_flash import (
     FULL_TEMPERATURES,
     SMOKE_TEMPERATURES,
     augment_pounce_artifact,
+    comparison_record_failures,
     pounce_seed,
     solve_flash_temperature,
     validate_comparison_artifact,
@@ -76,10 +77,8 @@ def main() -> int:
             records.append(solved.record)
             if method != "scholtes" and not solved.warm_start_accepted:
                 failures.append(f"T={temperature:g} {method}: POUNCE seed was not accepted")
-            if solved.record["state"] == "failed":
-                failures.append(
-                    f"T={temperature:g} {method}: {solved.record.get('error') or 'failed'}"
-                )
+            for failure in comparison_record_failures(solved.record):
+                failures.append(f"T={temperature:g} {method}: {failure}")
 
     artifact = augment_pounce_artifact(
         pounce_artifact,
