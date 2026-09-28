@@ -1174,7 +1174,12 @@ def reformulate_scholtes(model: Model, pairs: list[Complementarity], t) -> None:
     _lower_each(model, todo, "scholtes", emit)
 
 
-def reformulate_sos1(model: Model, pairs: list[Complementarity]) -> None:
+def reformulate_sos1(
+    model: Model,
+    pairs: list[Complementarity],
+    *,
+    _operand_lifts: Optional[list[tuple[Variable, Expression]]] = None,
+) -> None:
     """Encode each complementarity exactly with an SOS1 set.
 
     Requires ``f >= 0`` and ``g >= 0`` and that at most one is nonzero. When
@@ -1203,13 +1208,20 @@ def reformulate_sos1(model: Model, pairs: list[Complementarity]) -> None:
                     f"{tag}_{side}_aux", lb=0.0, ub=_aux_upper_bound(model, expr)
                 )
                 model.subject_to(aux == expr, name=f"{tag}_{side}_link")
+                if _operand_lifts is not None:
+                    _operand_lifts.append((aux, expr))
                 members.append(aux)
         model.sos1(members, name=f"{tag}_sos1")
 
     _lower_each(model, todo, "sos1", emit)
 
 
-def reformulate_gdp(model: Model, pairs: list[Complementarity]) -> None:
+def reformulate_gdp(
+    model: Model,
+    pairs: list[Complementarity],
+    *,
+    _operand_lifts: Optional[list[tuple[Variable, Expression]]] = None,
+) -> None:
     """Encode each complementarity exactly as a disjunction ``(f==0) ∨ (g==0)``.
 
     With ``f, g >= 0`` this is equivalent to ``f·g == 0``. The disjunction is
@@ -1239,8 +1251,8 @@ def reformulate_gdp(model: Model, pairs: list[Complementarity]) -> None:
     def emit(p: Complementarity) -> None:
         # _scalarize_pairs always assigns a name; narrow Optional[str] -> str.
         tag = p.name or "compl"
-        fv = _gdp_operand(model, p.f, tag, "f")
-        gv = _gdp_operand(model, p.g, tag, "g")
+        fv = _gdp_operand(model, p.f, tag, "f", _operand_lifts)
+        gv = _gdp_operand(model, p.g, tag, "g", _operand_lifts)
         model.subject_to(fv >= 0, name=f"{tag}_f_nonneg")
         model.subject_to(gv >= 0, name=f"{tag}_g_nonneg")
         model.either_or([[fv == 0], [gv == 0]], name=tag)
@@ -1248,7 +1260,13 @@ def reformulate_gdp(model: Model, pairs: list[Complementarity]) -> None:
     _lower_each(model, todo, "gdp", emit)
 
 
-def _gdp_operand(model: Model, expr: Expression, tag: str, side: str) -> Expression:
+def _gdp_operand(
+    model: Model,
+    expr: Expression,
+    tag: str,
+    side: str,
+    operand_lifts: Optional[list[tuple[Variable, Expression]]] = None,
+) -> Expression:
     """Return a linear operand for a GDP complementarity disjunct.
 
     Linear expressions are used directly; nonlinear bodies are lifted to a
@@ -1262,6 +1280,8 @@ def _gdp_operand(model: Model, expr: Expression, tag: str, side: str) -> Express
     model._aux_counter += 1
     u = model.continuous(f"_{tag}_{side}_{model._aux_counter}", lb=lo, ub=hi)
     model.subject_to(u == expr, name=f"{tag}_{side}_lift")
+    if operand_lifts is not None:
+        operand_lifts.append((u, expr))
     return u
 
 
@@ -1566,9 +1586,62 @@ def solve_mpec(
             )
         from discopt.transformations import get as _get_transformation
 
+        # Flatten the caller's point while the model still has exactly the
+        # source variables.  The exact lowerings below may append continuous
+        # operand auxiliaries.  If validation waits until Model.solve, those
+        # new columns receive midpoint defaults and the vector is already full
+        # width by the time solve-time completion runs (#1528).
+        initial_solution = solve_kwargs.get("initial_solution")
+        source_point = None
+        if initial_solution is not None:
+            from discopt.mpec_report import point_from_flat
+            from discopt.warm_start import validate_initial_solution
+
+            source_x = validate_initial_solution(model, initial_solution)
+            source_point = point_from_flat(model, source_x)
+
+        operand_lifts: list[tuple[Variable, Expression]] = []
+
         _get_transformation("mpec.sos1" if method == "sos1" else "mpec.gdp").apply(
-            model, pairs=pairs
+            model, pairs=pairs, _operand_lifts=operand_lifts
         )
+        if source_point is not None and operand_lifts:
+            import warnings
+
+            from discopt.mpec_report import evaluate_at_point
+
+            assert initial_solution is not None  # narrowed with source_point above
+            lifted = dict(initial_solution)
+            lift_error = None
+            for auxiliary, expression in operand_lifts:
+                try:
+                    value = np.asarray(
+                        evaluate_at_point(model, expression, source_point),
+                        dtype=np.float64,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a warm start is only a hint
+                    lift_error = f"{auxiliary.name!r}: {type(exc).__name__}: {exc}"
+                    break
+                if value.size != auxiliary.size or not np.all(np.isfinite(value)):
+                    lift_error = (
+                        f"{auxiliary.name!r}: source expression produced shape "
+                        f"{value.shape} with {value.size} entries and finite="
+                        f"{bool(np.all(np.isfinite(value)))}"
+                    )
+                    break
+                lifted[auxiliary] = value.reshape(auxiliary.shape)
+            solve_kwargs = dict(solve_kwargs)
+            if lift_error is None:
+                solve_kwargs["initial_solution"] = lifted
+            else:
+                solve_kwargs.pop("initial_solution", None)
+                warnings.warn(
+                    "solve_mpec dropped initial_solution because it could not lift "
+                    f"a generated exact-MPEC operand auxiliary ({lift_error}). The "
+                    "solve continues cold; a warm-start hint must not fail it.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         result = cast("SolveResult", model.solve(**solve_kwargs))
         result.mpec_report = _report_for(
             model,
