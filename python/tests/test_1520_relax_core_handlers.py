@@ -725,13 +725,16 @@ def test_lp_spatial_root_obbt_defect_propagates(monkeypatch):
 # ── root_reduce / node_reduce ────────────────────────────────────────────────
 
 
-def test_root_cutoff_fbbt_declines_only_on_missing_repr(monkeypatch):
+# Every documented ``model_to_repr`` refusal, IndexError included (a boolean
+# subscript; CI caught ``classify_problem`` missing it, test_1290).
+@pytest.mark.parametrize("decline", [ValueError, TypeError, IndexError])
+def test_root_cutoff_fbbt_declines_only_on_missing_repr(monkeypatch, decline):
     import discopt._rust as rust
 
     m = _bilinear()
     lb, ub = _box()
     calls: list[int] = []
-    monkeypatch.setattr(rust, "model_to_repr", _counting_raiser(lambda: ValueError("x"), calls))
+    monkeypatch.setattr(rust, "model_to_repr", _counting_raiser(lambda: decline("x"), calls))
     out_lb, out_ub, n, infeas = rr._stage_fbbt_with_cutoff(m, lb, ub, None, max_iter=5, tol=1e-9)
     assert calls and n == 0 and infeas is False
     assert np.array_equal(out_lb, lb) and np.array_equal(out_ub, ub)
@@ -790,13 +793,16 @@ def test_root_stage_obbt_defect_propagates(monkeypatch):
     assert calls
 
 
-def test_node_cutoff_fbbt_declines_only_on_missing_repr(monkeypatch):
+# Every documented ``model_to_repr`` refusal, IndexError included (a boolean
+# subscript; CI caught ``classify_problem`` missing it, test_1290).
+@pytest.mark.parametrize("decline", [ValueError, TypeError, IndexError])
+def test_node_cutoff_fbbt_declines_only_on_missing_repr(monkeypatch, decline):
     import discopt._rust as rust
 
     m = _bilinear()
     lb, ub = _box()
     calls: list[int] = []
-    monkeypatch.setattr(rust, "model_to_repr", _counting_raiser(lambda: ValueError("x"), calls))
+    monkeypatch.setattr(rust, "model_to_repr", _counting_raiser(lambda: decline("x"), calls))
     res = nr.reduce_node(m, lb, ub, None, None, do_fbbt=True)
     assert calls and res.n_tightened == 0 and not res.infeasible
     monkeypatch.setattr(rust, "model_to_repr", _counting_raiser(lambda: _Boom("nr"), calls))

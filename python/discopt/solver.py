@@ -26399,15 +26399,16 @@ def _extract_clique_edges(model: Model) -> list[tuple[int, int]]:
     cannot both be 1. Best-effort: returns ``[]`` if the bridge/pass is
     unavailable."""
     from discopt._relax.presolve_pipeline import run_root_presolve
+    from discopt._relax.problem_classifier import MODEL_TO_REPR_DECLINES
     from discopt._rust import model_to_repr
 
-    # #1514: narrowed to the one documented decline. ``model_to_repr`` raises
-    # ``ValueError`` for a model the Rust IR cannot represent -- the same
-    # "repr unavailable" the root presolve setup treats as a skip. The clique pass
-    # itself reports through ``stats``; any other exception is a defect.
+    # #1514/#1520: narrowed to the documented declines. ``model_to_repr`` raises
+    # one of ``MODEL_TO_REPR_DECLINES`` for a model the Rust IR cannot represent --
+    # the same "repr unavailable" the root presolve setup treats as a skip. The
+    # clique pass itself reports through ``stats``; any other exception is a defect.
     try:
         repr_ = model_to_repr(model, getattr(model, "_builder", None))
-    except ValueError as e:
+    except MODEL_TO_REPR_DECLINES as e:
         logger.debug("clique edge extraction skipped, no Rust repr: %s", e)
         return []
     _, stats = run_root_presolve(

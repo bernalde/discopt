@@ -56,6 +56,7 @@ from typing import Optional
 
 import numpy as np
 
+from discopt._relax.problem_classifier import MODEL_TO_REPR_DECLINES
 from discopt.modeling.core import Model, repr_space_cutoff
 
 logger = logging.getLogger(__name__)
@@ -139,8 +140,8 @@ def _stage_fbbt_with_cutoff(
             off += sz
         try:
             repr_ = model_to_repr(model, getattr(model, "_builder", None))
-        except ValueError as exc:
-            # #1520: narrowed. ``model_to_repr``'s documented decline (the model has
+        except MODEL_TO_REPR_DECLINES as exc:
+            # #1520: narrowed. ``model_to_repr``'s documented declines (the model has
             # no Rust repr). Tighten-only: keep the box. Box writes, the cutoff
             # conversion and ``fbbt_with_cutoff`` (no error return in Rust) are
             # outside the handler, so a defect there propagates (C-41: a swallowed

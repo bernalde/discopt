@@ -381,9 +381,12 @@ _EXTRACTION_DECLINES = (_NotLinearError, _NotQuadraticError)
 
 #: What ``discopt._rust.model_to_repr`` raises for a model it cannot represent
 #: (#1520): ``ValueError`` for an unrepresentable construct (a disjunctive row, a
-#: bad sense, a shape it cannot lower) and ``TypeError`` for an expression type
-#: its converter has no arm for (``CustomCall``, an unsupported index component).
-_MODEL_TO_REPR_DECLINES = (ValueError, TypeError)
+#: bad sense, a shape it cannot lower), ``TypeError`` for an expression type its
+#: converter has no arm for (``CustomCall``, an unsupported index component) and
+#: ``IndexError`` for a subscript it refuses (a boolean index, an out-of-range
+#: component). Every narrowed ``model_to_repr`` call site absorbs exactly these.
+MODEL_TO_REPR_DECLINES: tuple[type[Exception], ...] = (ValueError, TypeError, IndexError)
+_MODEL_TO_REPR_DECLINES = MODEL_TO_REPR_DECLINES
 
 
 def _repr_needs_objective(model: Model) -> bool:
