@@ -53,8 +53,12 @@ def test_solve_mpec_lifts_source_start_into_generated_operand_auxiliaries(monkey
         assert float(np.asarray(captured[auxiliary])) == pytest.approx(0.0)
 
 
-def test_solve_mpec_drops_an_unliftable_exact_start_instead_of_failing(monkeypatch):
-    """A warm-start hint stays optional when source evaluation is unavailable."""
+@pytest.mark.parametrize("method", ["sos1", "gdp"])
+@pytest.mark.parametrize("failure", ["exception", "nonfinite", "shape"])
+def test_solve_mpec_preserves_source_start_when_an_auxiliary_cannot_be_lifted(
+    monkeypatch, method, failure
+):
+    """One failed lift must preserve source values and other successful lifts."""
     import discopt.mpec_report as report
     from discopt.mpec import solve_mpec
 
@@ -62,21 +66,88 @@ def test_solve_mpec_drops_an_unliftable_exact_start_instead_of_failing(monkeypat
     x = m.continuous("x", lb=0.0, ub=1.0)
     y = m.continuous("y", lb=0.0, ub=1.0)
     m.minimize(x)
-    pair = complementarity(x**2, y, name="square")
+    pairs = [complementarity(x**power, y, name=f"power{power}") for power in (2, 3, 4)]
+    source_variables = set(m._variables)
     captured = {}
+    evaluate = report.evaluate_at_point
+    calls = 0
 
-    def unavailable(*args, **kwargs):
-        raise ValueError("measurement unavailable")
+    def unavailable(model, expression, point):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if failure == "exception":
+                raise ValueError("measurement unavailable")
+            return np.nan if failure == "nonfinite" else np.array([0.0, 0.0])
+        return evaluate(model, expression, point)
 
     def fake_solve(self, **kwargs):
-        captured.update(kwargs)
+        captured.update(kwargs["initial_solution"])
         return dm.SolveResult(status="time_limit")
 
     monkeypatch.setattr(report, "evaluate_at_point", unavailable)
     monkeypatch.setattr(dm.Model, "solve", fake_solve)
-    with pytest.warns(RuntimeWarning, match="dropped initial_solution"):
-        solve_mpec(m, [pair], method="sos1", initial_solution={x: 0.0, y: 0.75})
-    assert "initial_solution" not in captured
+    initial_solution = {x: 0.25, y: 0.75}
+    with pytest.warns(RuntimeWarning, match="could not lift") as caught:
+        solve_mpec(m, pairs, method=method, initial_solution=initial_solution)
+
+    assert initial_solution == {x: 0.25, y: 0.75}
+    assert captured[x] == pytest.approx(0.25)
+    assert captured[y] == pytest.approx(0.75)
+    generated = [v for v in m._variables if v not in source_variables]
+    assert len(generated) == 3
+    before, failed, after = generated
+    assert float(np.asarray(captured[before])) == pytest.approx(0.25**2)
+    assert failed not in captured
+    assert float(np.asarray(captured[after])) == pytest.approx(0.25**4)
+    assert calls == 3
+    assert len(caught) == 1
+    assert failed.name in str(caught[0].message)
+    # The failed column still receives Model.solve's ordinary midpoint default.
+    flat = validate_initial_solution(m, captured)
+    assert flat[3] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("method", ["sos1", "gdp"])
+@pytest.mark.parametrize("nonlinear", [False, True])
+def test_solve_mpec_warns_once_and_lifts_the_validated_source_point(monkeypatch, method, nonlinear):
+    """Clamping/rounding warns once, without changing defaults for omitted vars."""
+    from discopt.mpec import solve_mpec
+
+    m = dm.Model("mpec_validated_start")
+    x = m.continuous("x", lb=0.0, ub=1.0)
+    y = m.integer("y", lb=0, ub=2)
+    omitted = m.integer("omitted", lb=0, ub=3)
+    m.minimize(x)
+    pair = complementarity(x**2 if nonlinear else x, y, name="validated")
+    source_variables = set(m._variables)
+    captured = {}
+    validated = None
+
+    def fake_solve(self, **kwargs):
+        nonlocal validated
+        captured.update(kwargs["initial_solution"])
+        validated = validate_initial_solution(self, kwargs["initial_solution"])
+        return dm.SolveResult(status="time_limit")
+
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    initial_solution = {x: -0.25, y: 0.75}
+    with pytest.warns(UserWarning) as caught:
+        solve_mpec(m, [pair], method=method, initial_solution=initial_solution)
+
+    assert initial_solution == {x: -0.25, y: 0.75}
+    assert len(caught) == 2
+    assert "Clamping" in str(caught[0].message)
+    assert "Rounding" in str(caught[1].message)
+    assert all(w.filename == __file__ for w in caught)
+    assert captured[x] == pytest.approx(0.0)
+    assert captured[y] == pytest.approx(1.0)
+    assert omitted not in captured
+    np.testing.assert_array_equal(validated[:3], [0.0, 1.0, 1.5])
+    generated = [v for v in m._variables if v not in source_variables]
+    assert bool(generated) == nonlinear
+    for auxiliary in generated:
+        assert float(np.asarray(captured[auxiliary])) == pytest.approx(0.0)
 
 
 def _gdp_model():

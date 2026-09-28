@@ -1540,6 +1540,12 @@ def solve_mpec(
         Which complementarity residual definition to report; see
         :class:`discopt.mpec_report.ComplementarityKind`. Reporting only — it
         changes no lowering and no solver behaviour.
+    initial_solution : dict, optional
+        For exact methods, a source-variable warm start forwarded through
+        ``solve_kwargs``. Generated operand auxiliaries are evaluated at the
+        validated source point. An auxiliary that cannot be evaluated is
+        omitted with a warning and receives the usual midpoint default; source
+        values and other successfully lifted auxiliaries are retained.
 
     Returns
     -------
@@ -1595,10 +1601,17 @@ def solve_mpec(
         source_point = None
         if initial_solution is not None:
             from discopt.mpec_report import point_from_flat
-            from discopt.warm_start import validate_initial_solution
+            from discopt.warm_start import unflatten_solution, validate_initial_solution
 
             source_x = validate_initial_solution(model, initial_solution)
             source_point = point_from_flat(model, source_x)
+            validated = unflatten_solution(model, source_x)
+            # Forward clamped/rounded values so Model.solve does not warn twice.
+            # Keep omitted variables omitted: explicitly supplying an integer
+            # midpoint would make the second validation round that default.
+            initial_solution = {v: validated[v] for v in initial_solution}
+            solve_kwargs = dict(solve_kwargs)
+            solve_kwargs["initial_solution"] = initial_solution
 
         operand_lifts: list[tuple[Variable, Expression]] = []
 
@@ -1612,8 +1625,8 @@ def solve_mpec(
 
             assert initial_solution is not None  # narrowed with source_point above
             lifted = dict(initial_solution)
-            lift_error = None
             for auxiliary, expression in operand_lifts:
+                lift_error = None
                 try:
                     value = np.asarray(
                         evaluate_at_point(model, expression, source_point),
@@ -1621,27 +1634,24 @@ def solve_mpec(
                     )
                 except Exception as exc:  # noqa: BLE001 - a warm start is only a hint
                     lift_error = f"{auxiliary.name!r}: {type(exc).__name__}: {exc}"
-                    break
-                if value.size != auxiliary.size or not np.all(np.isfinite(value)):
-                    lift_error = (
-                        f"{auxiliary.name!r}: source expression produced shape "
-                        f"{value.shape} with {value.size} entries and finite="
-                        f"{bool(np.all(np.isfinite(value)))}"
+                else:
+                    if value.size != auxiliary.size or not np.all(np.isfinite(value)):
+                        lift_error = (
+                            f"{auxiliary.name!r}: source expression produced shape "
+                            f"{value.shape} with {value.size} entries and finite="
+                            f"{bool(np.all(np.isfinite(value)))}"
+                        )
+                    else:
+                        lifted[auxiliary] = value.reshape(auxiliary.shape)
+                if lift_error is not None:
+                    warnings.warn(
+                        "solve_mpec could not lift a generated exact-MPEC operand "
+                        f"auxiliary ({lift_error}). Using its midpoint default; "
+                        "source values and other lifted auxiliaries are retained.",
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
-                    break
-                lifted[auxiliary] = value.reshape(auxiliary.shape)
-            solve_kwargs = dict(solve_kwargs)
-            if lift_error is None:
-                solve_kwargs["initial_solution"] = lifted
-            else:
-                solve_kwargs.pop("initial_solution", None)
-                warnings.warn(
-                    "solve_mpec dropped initial_solution because it could not lift "
-                    f"a generated exact-MPEC operand auxiliary ({lift_error}). The "
-                    "solve continues cold; a warm-start hint must not fail it.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            solve_kwargs["initial_solution"] = lifted
         result = cast("SolveResult", model.solve(**solve_kwargs))
         result.mpec_report = _report_for(
             model,
