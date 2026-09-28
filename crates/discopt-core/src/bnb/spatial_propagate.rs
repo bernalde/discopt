@@ -318,23 +318,6 @@ fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<boo
                 nlo = nlo.max(rl);
             } else if t_hi <= 0.0 {
                 nhi = nhi.min(-rl);
-            } else if crate::presolve::fbbt::even_pow_hole_enabled() {
-                // Straddling t: keep the side(s) of the hole `|t| < h` that t's
-                // box reaches (DISCOPT_FBBT_EVEN_POW_HOLE; see fbbt.rs).
-                let h = crate::presolve::directed::root_down(
-                    (lo[w] - crate::presolve::fbbt::FEAS_TOL).max(0.0),
-                    2,
-                );
-                let pre = crate::presolve::fbbt::even_pow_hole_preimage(
-                    crate::presolve::fbbt::Interval::new(t_lo, t_hi),
-                    h,
-                    r,
-                );
-                if pre.lo > pre.hi {
-                    return None;
-                }
-                nlo = pre.lo;
-                nhi = pre.hi;
             }
             changed |= tighten_form_to(&[j], &[coeff], cst, nlo, nhi, lo, hi)?;
         }
@@ -660,39 +643,5 @@ mod tests {
         let mut hi = vec![2.7];
         assert!(propagate_spec_fixpoint(&spec, &mut lo, &mut hi, None, 5));
         assert!((lo[0] - 1.0).abs() < 1e-9 && (hi[0] - 2.0).abs() < 1e-9);
-    }
-
-    /// `DISCOPT_FBBT_EVEN_POW_HOLE`: `w = (x - 5)^2 >= 1` with `x ∈ [4.5, 10]`.
-    /// `x - 5 ∈ [-0.5, 5]` cannot reach `-1`, so `x - 5 >= 1`, so `x >= 6`.
-    #[test]
-    fn affine_square_keeps_hole_when_flag_on() {
-        use crate::presolve::fbbt::EVEN_POW_HOLE_OVERRIDE;
-        let mut spec = empty_spec(2);
-        spec.terms = vec![EnvTerm::AffineSquare {
-            j: 0,
-            w: 1,
-            coeff: 1.0,
-            cst: -5.0,
-        }];
-        let run = |on: bool| {
-            EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(Some(on)));
-            let mut lo = vec![4.5, 1.0];
-            let mut hi = vec![10.0, 100.0];
-            let ok = propagate_spec_fixpoint(&spec, &mut lo, &mut hi, None, 10);
-            EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(None));
-            (ok, lo, hi)
-        };
-        let (ok, lo, _) = run(false);
-        assert!(ok);
-        assert_eq!(lo[0], 4.5, "OFF arm must be the legacy hull");
-        let (ok, lo, _) = run(true);
-        assert!(ok);
-        assert!(lo[0] > 5.99999 && lo[0] <= 6.0, "x lo = {}", lo[0]);
-        // Box inside the hole: proven empty.
-        EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(Some(true)));
-        let mut lo = vec![4.5, 1.0];
-        let mut hi = vec![5.5, 100.0];
-        assert!(!propagate_spec_fixpoint(&spec, &mut lo, &mut hi, None, 10));
-        EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(None));
     }
 }

@@ -25,79 +25,6 @@ use std::time::Instant;
 pub const FEAS_TOL: f64 = 1e-6;
 
 // ─────────────────────────────────────────────────────────────
-// Reverse-convex even powers: keep the hole
-// ─────────────────────────────────────────────────────────────
-
-/// Whether backward propagation through an even power keeps the hole of a
-/// reverse-convex bound (`DISCOPT_FBBT_EVEN_POW_HOLE=1`, default OFF).
-///
-/// `u^n >= r` with `n` even means `|u| >= r^(1/n)`, i.e. `u` lies in the union
-/// `[-R, -h] U [h, R]`. Without the flag, a base whose forward box straddles zero
-/// is relaxed to the hull `[-R, R]` and the hole `(-h, h)` is discarded. That loses
-/// the case where the base's own box reaches only one side of the hole: `u ∈
-/// [-11, 0.5]` with `|u| >= 1` forces `u <= -1`, which on `u = y - z` is a new
-/// bound on `y` or `z`. This is the per-coordinate rule of Hojny & Liberti (ORL
-/// 2027, Prop. 1) for minimum distance constraints `Σ (y_i - z_i)^2 >= δ^2`,
-/// obtained here for *every* even power: the sum node's backward step already
-/// yields their `q_j` (Lemma 1), and only the hole was missing.
-///
-/// Bound-changing (CLAUDE.md §5). Panel re-run 2026-09-27 on the tree with #1513
-/// (`discopt_benchmarks/scripts/even_pow_hole_panel.py`): **cert-clean** on all
-/// 66 in-repo corpus instances and 10 unit-square point-dispersion models (n = 2..6,
-/// built from scalars and from arrays), 0 violations. **Net-positive only on the
-/// min-distance class**: the corpus has no minimum-distance constraints, so the rule
-/// never fires there and node counts match. On dispersion it fires in both
-/// forms (disp3/adisp3 247 -> 57 nodes, disp4/adisp4 311 -> 175/173), but those
-/// are generated probes, not a corpus. **Not the default because** its
-/// net-positive bar has only been scored on synthetic instances (the #727
-/// lesson). **What would change that:** the same panel over the MINLPLib
-/// instances with minimum-distance constraints (Hojny & Liberti's 46-instance
-/// set), graduating on a gain there, retiring on none. Row in
-/// `docs/dev/flag-retirement-audit.md`. Read once.
-pub(crate) fn even_pow_hole_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(v) = EVEN_POW_HOLE_OVERRIDE.with(|c| c.get()) {
-        return v;
-    }
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DISCOPT_FBBT_EVEN_POW_HOLE").is_ok_and(|v| v.trim() == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Per-thread test override of [`even_pow_hole_enabled`], so both arms can be
-    /// exercised in one process without racing on the environment.
-    pub(crate) static EVEN_POW_HOLE_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Preimage of an even power's output bound on a base that straddles zero.
-///
-/// The output bound gives `|u| ∈ [h, r_hi]` (`h` = lower root, `r_hi` = upper
-/// root); `base` is the base's current forward box. Returns the hull `[-r_hi,
-/// r_hi]` unless `base` reaches only one side of the hole `(-h, h)`, in which case
-/// that side alone, or empty when it reaches neither.
-///
-/// The caller passes `h` already shrunk by the feasibility tolerance, so the
-/// decision to drop a side never rests on a point that is feasible within
-/// [`FEAS_TOL`]: a smaller hole is a weaker (hence still valid) inference.
-pub(crate) fn even_pow_hole_preimage(base: Interval, h: f64, r_hi: f64) -> Interval {
-    let hull = Interval::new(-r_hi, r_hi);
-    if h.is_nan() || h <= 0.0 {
-        return hull;
-    }
-    let reaches_neg = base.lo <= -h;
-    let reaches_pos = base.hi >= h;
-    match (reaches_neg, reaches_pos) {
-        (true, true) => hull,
-        (true, false) => Interval::new(-r_hi, -h),
-        (false, true) => Interval::new(h, r_hi),
-        (false, false) => Interval::empty(),
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
 // Interval type
 // ─────────────────────────────────────────────────────────────
 
@@ -1283,13 +1210,6 @@ fn backward_propagate_with(
                                 } else if l.hi <= 0.0 {
                                     // Base known nonpositive: u in [-root_hi, -root_lo].
                                     Interval::new(-root_hi, -root_lo)
-                                } else if even_pow_hole_enabled() {
-                                    // Base straddles zero: the feasible set is
-                                    // [-root_hi, -root_lo] U [root_lo, root_hi];
-                                    // keep the side(s) the base box can reach.
-                                    // The hole is taken from `lo - FEAS_TOL`.
-                                    let h = root_down((tightened.lo - FEAS_TOL).max(0.0), n);
-                                    even_pow_hole_preimage(l, h, root_hi)
                                 } else {
                                     // Base straddles zero: the feasible set is
                                     // [-root_hi, -root_lo] U [root_lo, root_hi]; we
@@ -4245,17 +4165,21 @@ mod entropy_tests {
 }
 
 #[cfg(test)]
-mod even_pow_hole_tests {
-    //! `DISCOPT_FBBT_EVEN_POW_HOLE`: backward propagation through an even power
-    //! keeps the hole of a reverse-convex bound (Hojny & Liberti, ORL 2027).
+mod min_distance_fixture_tests {
+    //! Regression fixtures kept from the retired `DISCOPT_FBBT_EVEN_POW_HOLE`
+    //! (#1521; measurement in `docs/dev/flag-retirement-audit.md`): minimum
+    //! distance rows `Σ (x_a - x_b)^2 >= rhs`, written as `^2` and as the
+    //! self-product `(x_a - x_b)*(x_a - x_b)` (shared and copied difference node)
+    //! that real MINLPLib instances use. FBBT must never cut a feasible point of
+    //! them, whatever it infers.
     use super::*;
     use crate::expr::*;
 
-    fn with_hole<T>(on: bool, f: impl FnOnce() -> T) -> T {
-        EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(Some(on)));
-        let out = f();
-        EVEN_POW_HOLE_OVERRIDE.with(|c| c.set(None));
-        out
+    #[derive(Clone, Copy, Debug)]
+    enum SqForm {
+        Pow,
+        MulShared,
+        MulCopy,
     }
 
     fn var(arena: &mut ExprArena, i: usize) -> ExprId {
@@ -4267,23 +4191,32 @@ mod even_pow_hole_tests {
         })
     }
 
-    /// `Σ_k (x[pairs[k].0] - x[pairs[k].1])^2 >= rhs` over the box `(lb, ub)`.
-    fn min_distance_model(pairs: &[(usize, usize)], rhs: f64, lb: &[f64], ub: &[f64]) -> ModelRepr {
+    fn min_distance_model(
+        form: SqForm,
+        pairs: &[(usize, usize)],
+        rhs: f64,
+        lb: &[f64],
+        ub: &[f64],
+    ) -> ModelRepr {
         let mut arena = ExprArena::new();
         let vars: Vec<ExprId> = (0..lb.len()).map(|i| var(&mut arena, i)).collect();
         let two = arena.add(ExprNode::Constant(2.0));
         let mut body: Option<ExprId> = None;
         for &(a, b) in pairs {
-            let d = arena.add(ExprNode::BinaryOp {
-                op: BinOp::Sub,
-                left: vars[a],
-                right: vars[b],
-            });
-            let sq = arena.add(ExprNode::BinaryOp {
-                op: BinOp::Pow,
-                left: d,
-                right: two,
-            });
+            let diff = |arena: &mut ExprArena| {
+                arena.add(ExprNode::BinaryOp {
+                    op: BinOp::Sub,
+                    left: vars[a],
+                    right: vars[b],
+                })
+            };
+            let d = diff(&mut arena);
+            let (op, right) = match form {
+                SqForm::Pow => (BinOp::Pow, two),
+                SqForm::MulShared => (BinOp::Mul, d),
+                SqForm::MulCopy => (BinOp::Mul, diff(&mut arena)),
+            };
+            let sq = arena.add(ExprNode::BinaryOp { op, left: d, right });
             body = Some(match body {
                 None => sq,
                 Some(acc) => arena.add(ExprNode::BinaryOp {
@@ -4318,150 +4251,57 @@ mod even_pow_hole_tests {
         }
     }
 
+    /// Random min-distance boxes in all three forms: no sampled feasible point
+    /// leaves the FBBT box and no feasible box is declared empty. Ends with
+    /// executed-assertion counts per form (CLAUDE.md §6).
     #[test]
-    fn preimage_cases() {
-        let h = 1.0;
-        let r = 5.0;
-        let both = even_pow_hole_preimage(Interval::new(-3.0, 3.0), h, r);
-        assert_eq!((both.lo, both.hi), (-5.0, 5.0));
-        let neg = even_pow_hole_preimage(Interval::new(-11.0, 0.5), h, r);
-        assert_eq!((neg.lo, neg.hi), (-5.0, -1.0));
-        let pos = even_pow_hole_preimage(Interval::new(-0.5, 4.0), h, r);
-        assert_eq!((pos.lo, pos.hi), (1.0, 5.0));
-        let e = even_pow_hole_preimage(Interval::new(-0.5, 0.5), h, r);
-        assert!(e.lo > e.hi);
-        // No hole (h = 0) is always the hull.
-        let hull = even_pow_hole_preimage(Interval::new(-0.5, 0.5), 0.0, r);
-        assert_eq!((hull.lo, hull.hi), (-5.0, 5.0));
-    }
-
-    /// The motivating case: `(y - z)^2 >= 1`, `y ∈ [9, 10]`, `z ∈ [9.5, 20]`.
-    /// `y - z ∈ [-11, 0.5]` cannot reach `+1`, so `y - z <= -1`, so `z >= 10`.
-    /// Fails with the flag OFF (the hull discards the hole).
-    #[test]
-    fn one_sided_difference_tightens_partner() {
-        let m = min_distance_model(&[(0, 1)], 1.0, &[9.0, 9.5], &[10.0, 20.0]);
-        let off = with_hole(false, || fbbt(&m, 20, 1e-9));
-        assert_eq!(off[1].lo, 9.5, "OFF arm must be the legacy hull");
-        let on = with_hole(true, || fbbt(&m, 20, 1e-9));
-        assert!(
-            on[1].lo > 9.99999 && on[1].lo <= 10.0,
-            "z lo = {}",
-            on[1].lo
-        );
-        assert_eq!((on[0].lo, on[0].hi), (9.0, 10.0));
-    }
-
-    /// Two-dimensional minimum distance constraint (Lemma 1 + Prop. 1):
-    /// `(y1 - z1)^2 + (y2 - z2)^2 >= 1` with `|y2 - z2| <= 0.5` leaves
-    /// `(y1 - z1)^2 >= 0.75`; `y1 - z1 ∈ [-3, 0.1]` then forces `z1 >= y1 + √0.75`.
-    #[test]
-    fn two_dimensional_min_distance() {
-        // x0 = y1, x1 = z1, x2 = y2, x3 = z2.
-        let m = min_distance_model(
-            &[(0, 1), (2, 3)],
-            1.0,
-            &[0.0, 0.1, 0.0, 0.0],
-            &[0.2, 3.0, 0.5, 0.5],
-        );
-        let off = with_hole(false, || fbbt(&m, 20, 1e-9));
-        assert_eq!(off[1].lo, 0.1);
-        let on = with_hole(true, || fbbt(&m, 20, 1e-9));
-        let want = 0.75_f64.sqrt();
-        assert!(
-            on[1].lo > want - 1e-5 && on[1].lo <= want,
-            "z1 lo = {}",
-            on[1].lo
-        );
-    }
-
-    /// Both sides of the hole unreachable: the box is proven infeasible.
-    #[test]
-    fn hole_covering_box_is_infeasible() {
-        let m = min_distance_model(&[(0, 1)], 1.0, &[0.0, 0.2], &[0.5, 0.6]);
-        let on = with_hole(true, || fbbt(&m, 20, 1e-9));
-        assert!(on.iter().any(|b| b.lo > b.hi), "expected empty, got {on:?}");
-    }
-
-    /// A point feasible only within FEAS_TOL is not cut: `(y - z)^2 >= 1` at
-    /// `y - z = 1 - 4e-7` (violation 8e-7 < 1e-6) must survive.
-    #[test]
-    fn tolerance_feasible_point_survives() {
-        let m = min_distance_model(&[(0, 1)], 1.0, &[0.0, 0.0], &[1.0 - 4e-7, 0.0]);
-        let on = with_hole(true, || fbbt(&m, 20, 1e-9));
-        assert!(
-            !on.iter().any(|b| b.lo > b.hi),
-            "cut a tolerance-feasible point: {on:?}"
-        );
-        assert!(on[0].hi >= 1.0 - 4e-7);
-    }
-
-    /// Differential soundness on random minimum-distance boxes (CLAUDE.md §5):
-    /// ON bounds are never looser than OFF bounds, and no sampled feasible point
-    /// leaves the ON box. Ends with an executed-assertion count (§6).
-    #[test]
-    fn randomized_soundness_and_monotonicity() {
-        // Deterministic LCG; no rand dependency.
-        let mut s: u64 = 0x9e3779b97f4a7c15;
-        let mut next = move || {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((s >> 11) as f64) / ((1u64 << 53) as f64)
-        };
-        let (mut feasible_checked, mut monotone_checked, mut strictly_tighter) = (0, 0, 0);
-        for _ in 0..400 {
-            let d = 1 + (next() * 3.0) as usize; // 1..=3
-            let n = 2 * d;
-            let mut lb = vec![0.0; n];
-            let mut ub = vec![0.0; n];
-            for i in 0..n {
-                let c = next() * 4.0 - 2.0;
-                let w = 0.05 + next() * 2.0;
-                lb[i] = c - w * next();
-                ub[i] = c + w * next();
-            }
-            let pairs: Vec<(usize, usize)> = (0..d).map(|k| (k, d + k)).collect();
-            let rhs = next() * 2.0;
-            let m = min_distance_model(&pairs, rhs, &lb, &ub);
-            let off = with_hole(false, || fbbt(&m, 50, 1e-9));
-            let on = with_hole(true, || fbbt(&m, 50, 1e-9));
-            let on_empty = on.iter().any(|b| b.lo > b.hi);
-            if !off.iter().any(|b| b.lo > b.hi) && !on_empty {
+    fn min_distance_rows_never_cut_a_feasible_point() {
+        for form in [SqForm::Pow, SqForm::MulShared, SqForm::MulCopy] {
+            let mut s: u64 = 0x9e3779b97f4a7c15;
+            let mut next = move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 11) as f64) / ((1u64 << 53) as f64)
+            };
+            let mut feasible_checked = 0usize;
+            for _ in 0..400 {
+                let d = 1 + (next() * 3.0) as usize;
+                let n = 2 * d;
+                let mut lb = vec![0.0; n];
+                let mut ub = vec![0.0; n];
                 for i in 0..n {
-                    assert!(on[i].lo >= off[i].lo - 1e-12 && on[i].hi <= off[i].hi + 1e-12);
-                    monotone_checked += 1;
-                    if on[i].lo > off[i].lo + 1e-9 || on[i].hi < off[i].hi - 1e-9 {
-                        strictly_tighter += 1;
+                    let c = next() * 4.0 - 2.0;
+                    let w = 0.05 + next() * 2.0;
+                    lb[i] = c - w * next();
+                    ub[i] = c + w * next();
+                }
+                let pairs: Vec<(usize, usize)> = (0..d).map(|k| (k, d + k)).collect();
+                let rhs = next() * 2.0;
+                let got = fbbt(&min_distance_model(form, &pairs, rhs, &lb, &ub), 50, 1e-9);
+                let empty = got.iter().any(|b| b.lo > b.hi);
+                for _ in 0..300 {
+                    let x: Vec<f64> = (0..n).map(|i| lb[i] + next() * (ub[i] - lb[i])).collect();
+                    let lhs: f64 = pairs.iter().map(|&(a, b)| (x[a] - x[b]).powi(2)).sum();
+                    if lhs < rhs {
+                        continue;
                     }
-                }
-            }
-            for _ in 0..300 {
-                let x: Vec<f64> = (0..n).map(|i| lb[i] + next() * (ub[i] - lb[i])).collect();
-                let lhs: f64 = pairs.iter().map(|&(a, b)| (x[a] - x[b]).powi(2)).sum();
-                if lhs < rhs {
-                    continue;
-                }
-                assert!(!on_empty, "ON declared infeasible but {x:?} is feasible");
-                for i in 0..n {
                     assert!(
-                        x[i] >= on[i].lo - 1e-9 && x[i] <= on[i].hi + 1e-9,
-                        "feasible {x:?} cut at x{i}: {:?} (rhs {rhs}, box {lb:?}/{ub:?})",
-                        on[i]
+                        !empty,
+                        "{form:?}: declared infeasible but {x:?} is feasible"
                     );
+                    for i in 0..n {
+                        assert!(
+                            x[i] >= got[i].lo - 1e-9 && x[i] <= got[i].hi + 1e-9,
+                            "{form:?}: feasible {x:?} cut at x{i}: {:?}",
+                            got[i]
+                        );
+                    }
+                    feasible_checked += 1;
                 }
-                feasible_checked += 1;
             }
+            println!("min_distance[{form:?}]: feasible_checked={feasible_checked}");
+            assert!(feasible_checked > 1000, "{form:?}: probe did not fire");
         }
-        println!(
-            "even_pow_hole: feasible_checked={feasible_checked} \
-             monotone_checked={monotone_checked} strictly_tighter={strictly_tighter}"
-        );
-        assert!(feasible_checked > 1000, "probe did not fire");
-        assert!(monotone_checked > 100, "probe did not fire");
-        assert!(
-            strictly_tighter > 0,
-            "ON never tightened anything: the flag is a no-op here"
-        );
     }
 }
