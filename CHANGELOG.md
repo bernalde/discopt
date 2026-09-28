@@ -98,6 +98,8 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **Exact MPEC warm starts now lift generated operand auxiliaries** (`fix`, #1528). `solve_mpec(..., method="sos1"|"gdp", initial_solution=...)` evaluates every generated continuous operand auxiliary at the source point before handing the model to the exact solve, instead of midpoint-filling those columns and silently discarding a source-feasible incumbent.
+
 - **`solver="amp"` now refuses an opaque body instead of failing internally.** AMP
   certifies by linearizing a partitioned relaxation, and an opaque `dm.custom` /
   `dm.external` body has no algebraic form to linearize. It produced no false

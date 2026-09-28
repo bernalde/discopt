@@ -26,6 +26,59 @@ from discopt.mpec import complementarity, reformulate_gdp
 from discopt.warm_start import complete_initial_point, validate_initial_solution
 
 
+@pytest.mark.parametrize("method", ["sos1", "gdp"])
+def test_solve_mpec_lifts_source_start_into_generated_operand_auxiliaries(monkeypatch, method):
+    """#1528: exact MPEC lowering must not midpoint-fill an operand lift."""
+    from discopt.mpec import solve_mpec
+
+    m = dm.Model(f"mpec_source_start_{method}")
+    x = m.continuous("x", lb=0.0, ub=1.0)
+    y = m.continuous("y", lb=0.0, ub=1.0)
+    m.minimize(x)
+    pair = complementarity(x**2, y, name="square")
+    source_variables = set(m._variables)
+    captured = {}
+
+    def fake_solve(self, **kwargs):
+        captured.update(kwargs["initial_solution"])
+        return dm.SolveResult(status="time_limit")
+
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    solve_mpec(m, [pair], method=method, initial_solution={x: 0.0, y: 0.75})
+
+    generated = [v for v in m._variables if v not in source_variables]
+    assert generated, f"{method} must lift the nonlinear operand"
+    for auxiliary in generated:
+        assert auxiliary in captured, f"{auxiliary.name} was midpoint-filled"
+        assert float(np.asarray(captured[auxiliary])) == pytest.approx(0.0)
+
+
+def test_solve_mpec_drops_an_unliftable_exact_start_instead_of_failing(monkeypatch):
+    """A warm-start hint stays optional when source evaluation is unavailable."""
+    import discopt.mpec_report as report
+    from discopt.mpec import solve_mpec
+
+    m = dm.Model("mpec_unliftable_start")
+    x = m.continuous("x", lb=0.0, ub=1.0)
+    y = m.continuous("y", lb=0.0, ub=1.0)
+    m.minimize(x)
+    pair = complementarity(x**2, y, name="square")
+    captured = {}
+
+    def unavailable(*args, **kwargs):
+        raise ValueError("measurement unavailable")
+
+    def fake_solve(self, **kwargs):
+        captured.update(kwargs)
+        return dm.SolveResult(status="time_limit")
+
+    monkeypatch.setattr(report, "evaluate_at_point", unavailable)
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    with pytest.warns(RuntimeWarning, match="dropped initial_solution"):
+        solve_mpec(m, [pair], method="sos1", initial_solution={x: 0.0, y: 0.75})
+    assert "initial_solution" not in captured
+
+
 def _gdp_model():
     """The #1255 model; optimum ``z = -4``."""
     m = dm.Model("warmstart_gdp")
