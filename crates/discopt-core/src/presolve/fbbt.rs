@@ -4163,3 +4163,145 @@ mod entropy_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod min_distance_fixture_tests {
+    //! Regression fixtures kept from the retired `DISCOPT_FBBT_EVEN_POW_HOLE`
+    //! (#1521; measurement in `docs/dev/flag-retirement-audit.md`): minimum
+    //! distance rows `Σ (x_a - x_b)^2 >= rhs`, written as `^2` and as the
+    //! self-product `(x_a - x_b)*(x_a - x_b)` (shared and copied difference node)
+    //! that real MINLPLib instances use. FBBT must never cut a feasible point of
+    //! them, whatever it infers.
+    use super::*;
+    use crate::expr::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum SqForm {
+        Pow,
+        MulShared,
+        MulCopy,
+    }
+
+    fn var(arena: &mut ExprArena, i: usize) -> ExprId {
+        arena.add(ExprNode::Variable {
+            name: format!("x{i}"),
+            index: i,
+            size: 1,
+            shape: vec![],
+        })
+    }
+
+    fn min_distance_model(
+        form: SqForm,
+        pairs: &[(usize, usize)],
+        rhs: f64,
+        lb: &[f64],
+        ub: &[f64],
+    ) -> ModelRepr {
+        let mut arena = ExprArena::new();
+        let vars: Vec<ExprId> = (0..lb.len()).map(|i| var(&mut arena, i)).collect();
+        let two = arena.add(ExprNode::Constant(2.0));
+        let mut body: Option<ExprId> = None;
+        for &(a, b) in pairs {
+            let diff = |arena: &mut ExprArena| {
+                arena.add(ExprNode::BinaryOp {
+                    op: BinOp::Sub,
+                    left: vars[a],
+                    right: vars[b],
+                })
+            };
+            let d = diff(&mut arena);
+            let (op, right) = match form {
+                SqForm::Pow => (BinOp::Pow, two),
+                SqForm::MulShared => (BinOp::Mul, d),
+                SqForm::MulCopy => (BinOp::Mul, diff(&mut arena)),
+            };
+            let sq = arena.add(ExprNode::BinaryOp { op, left: d, right });
+            body = Some(match body {
+                None => sq,
+                Some(acc) => arena.add(ExprNode::BinaryOp {
+                    op: BinOp::Add,
+                    left: acc,
+                    right: sq,
+                }),
+            });
+        }
+        ModelRepr {
+            arena,
+            objective: ExprId(0),
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body: body.unwrap(),
+                sense: ConstraintSense::Ge,
+                rhs,
+                name: None,
+            }],
+            variables: (0..lb.len())
+                .map(|i| VarInfo {
+                    name: format!("x{i}"),
+                    var_type: VarType::Continuous,
+                    offset: i,
+                    size: 1,
+                    shape: vec![],
+                    lb: vec![lb[i]],
+                    ub: vec![ub[i]],
+                })
+                .collect(),
+            n_vars: lb.len(),
+        }
+    }
+
+    /// Random min-distance boxes in all three forms: no sampled feasible point
+    /// leaves the FBBT box and no feasible box is declared empty. Ends with
+    /// executed-assertion counts per form (CLAUDE.md §6).
+    #[test]
+    fn min_distance_rows_never_cut_a_feasible_point() {
+        for form in [SqForm::Pow, SqForm::MulShared, SqForm::MulCopy] {
+            let mut s: u64 = 0x9e3779b97f4a7c15;
+            let mut next = move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 11) as f64) / ((1u64 << 53) as f64)
+            };
+            let mut feasible_checked = 0usize;
+            for _ in 0..400 {
+                let d = 1 + (next() * 3.0) as usize;
+                let n = 2 * d;
+                let mut lb = vec![0.0; n];
+                let mut ub = vec![0.0; n];
+                for i in 0..n {
+                    let c = next() * 4.0 - 2.0;
+                    let w = 0.05 + next() * 2.0;
+                    lb[i] = c - w * next();
+                    ub[i] = c + w * next();
+                }
+                let pairs: Vec<(usize, usize)> = (0..d).map(|k| (k, d + k)).collect();
+                let rhs = next() * 2.0;
+                let got = fbbt(&min_distance_model(form, &pairs, rhs, &lb, &ub), 50, 1e-9);
+                let empty = got.iter().any(|b| b.lo > b.hi);
+                for _ in 0..300 {
+                    let x: Vec<f64> = (0..n).map(|i| lb[i] + next() * (ub[i] - lb[i])).collect();
+                    let lhs: f64 = pairs.iter().map(|&(a, b)| (x[a] - x[b]).powi(2)).sum();
+                    if lhs < rhs {
+                        continue;
+                    }
+                    assert!(
+                        !empty,
+                        "{form:?}: declared infeasible but {x:?} is feasible"
+                    );
+                    for i in 0..n {
+                        assert!(
+                            x[i] >= got[i].lo - 1e-9 && x[i] <= got[i].hi + 1e-9,
+                            "{form:?}: feasible {x:?} cut at x{i}: {:?}",
+                            got[i]
+                        );
+                    }
+                    feasible_checked += 1;
+                }
+            }
+            println!("min_distance[{form:?}]: feasible_checked={feasible_checked}");
+            assert!(feasible_checked > 1000, "{form:?}: probe did not fire");
+        }
+    }
+}

@@ -680,18 +680,40 @@ class TestPartitionSelection:
         assert self.pick(terms, method="min_vertex_cover") == []
 
     def test_min_vertex_cover_falls_back_to_greedy_cover(self, monkeypatch):
-        """When the MILP cover solve fails, the greedy fallback should still cover all terms."""
+        """When the cover MILP does not solve to optimality, the greedy fallback
+        inside ``_solve_vertex_cover_milp`` should still cover all terms.
+
+        #1520 removed the catch-all around ``_solve_vertex_cover_milp`` (a raise
+        there now propagates -- see ``test_1520_relax_misc_handlers.py``), so the
+        fallback is exercised through its real trigger: a non-optimal MILP status.
+        """
+        from types import SimpleNamespace
+
         import discopt._relax.partition_selection as part_sel
+        import discopt.solvers.lp_backend as lp_backend
+        from discopt.solvers import SolveStatus
+
+        milp_calls: list[int] = []
+        greedy_calls: list[int] = []
+
+        def _time_limited_milp(**_kwargs):
+            milp_calls.append(1)
+            return SimpleNamespace(status=SolveStatus.TIME_LIMIT, x=None)
+
+        real_greedy = part_sel._greedy_vertex_cover
+
+        def _counting_greedy(*args, **kwargs):
+            greedy_calls.append(1)
+            return real_greedy(*args, **kwargs)
+
+        monkeypatch.setattr(lp_backend, "get_milp_solver", lambda *a, **k: _time_limited_milp)
+        monkeypatch.setattr(part_sel, "_greedy_vertex_cover", _counting_greedy)
 
         terms = self._make_terms(bilinear=[(0, 1), (0, 2), (0, 3), (0, 4)])
-        monkeypatch.setattr(
-            part_sel,
-            "_solve_vertex_cover_milp",
-            lambda candidates, all_t: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
-
         selected = self.pick(terms, method="min_vertex_cover")
 
+        assert milp_calls, "the cover MILP was never called"
+        assert greedy_calls, "the greedy fallback was never used"
         assert set(selected) == {0}
 
     def test_adaptive_vertex_cover_uses_distance_weights(self):
