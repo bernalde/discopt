@@ -1091,9 +1091,20 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
                 "only Boolean active values 0 and 1 have a residual definition"
             )
         selector = float(values[0])
-        if abs(selector - float(con.active_value)) <= _INTEGRALITY_TOL:
+        # Use the same effective-integrality predicate as
+        # ``_integrality_residual`` below. A distance-to-nearest-integer check
+        # is not equivalent at the tolerance boundary: for
+        # y = 1 - 1.000005e-5, y(1-y) is just below 1e-5 while |1-y| is just
+        # above it. The old split let the integrality residual pass while this
+        # dispatch treated the indicator as fractional and skipped an active,
+        # violated row.
+        in_tolerated_box = -_INTEGRALITY_TOL <= selector <= 1.0 + _INTEGRALITY_TOL
+        effectively_integral = selector * (1.0 - selector) <= _INTEGRALITY_TOL
+        boolean_value = int(selector >= 0.5)
+        if in_tolerated_box and effectively_integral and boolean_value == con.active_value:
             return _one_row_violation(model, con.constraint, point)
-        # At a fractional selector the Boolean implication has no arithmetic
+        # An effectively integral inactive selector contributes zero. At a
+        # genuinely fractional selector the Boolean implication has no arithmetic
         # row residual of its own. The dedicated selector-integrality residual
         # remains nonzero, so SourceResidualReport.source_satisfied is false.
         return 0.0

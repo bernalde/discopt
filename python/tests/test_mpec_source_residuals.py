@@ -483,11 +483,11 @@ def test_selector_outside_its_box_is_not_hidden_by_the_product():
     )
 
 
-def _indicator_report(*, active_value=1, selector, body_value):
-    """One indicator plus a harmless relation, measured at ``(x, selector)``."""
+def _indicator_model(*, active_value=1):
+    """One indicator plus a harmless relation."""
     from discopt.modeling.core import _IndicatorConstraint
 
-    m = dm.Model(f"indicator_{active_value}_{selector}_{body_value}")
+    m = dm.Model(f"indicator_{active_value}")
     x = m.continuous("x", lb=0.0, ub=2.0)
     s = m.binary("s")
     m.minimize(x)
@@ -501,6 +501,12 @@ def _indicator_report(*, active_value=1, selector, body_value):
     )
     pair = complementarity(0.0 * x, 1.0 + 0.0 * x, name="harmless")
     m._complementarities.append(pair)
+    return m, pair
+
+
+def _indicator_report(*, active_value=1, selector, body_value):
+    """Measure the indicator model at ``(x, selector)``."""
+    m, pair = _indicator_model(active_value=active_value)
     return source_residual_report(m, [pair], x_flat=np.array([body_value, selector], dtype=float))
 
 
@@ -539,6 +545,38 @@ def test_fractional_indicator_fails_through_the_separate_integrality_residual():
         not report.source_satisfied,
         "a clean implication body must not hide a non-integral selector",
     )
+
+
+@pytest.mark.parametrize(
+    "active_value,selector",
+    [
+        pytest.param(1, 1.0 - 1.000005e-5, id="near-one"),
+        pytest.param(0, 1.000005e-5, id="near-zero"),
+    ],
+)
+def test_indicator_activation_matches_the_integrality_residual_tolerance(active_value, selector):
+    """An effectively integral selector cannot skip its active violated row."""
+    report = _indicator_report(active_value=active_value, selector=selector, body_value=1.5)
+    _checked(
+        report.integrality is not None and report.integrality.value <= 1e-5,
+        "the boundary selector must pass the report's declared integrality gate",
+    )
+    _checked(
+        report.primal_feasibility.value == pytest.approx(0.5),
+        "the same boundary selector must activate and measure its violated row",
+    )
+    _checked(not report.source_satisfied, "the active row violation must fail the whole report")
+
+
+def test_accept_local_incumbent_accepts_a_satisfied_integral_indicator_model():
+    """#1529 acceptance: the complete indicator report can pass the handoff gate."""
+    m, _pair = _indicator_model(active_value=1)
+
+    class _LocalResult:
+        x = {"x": np.array(0.5), "s": np.array(1.0)}
+
+    accepted = accept_local_incumbent(m, _LocalResult())
+    _checked(accepted == pytest.approx(0.5), f"the verified objective is {accepted!r}")
 
 
 @pytest.mark.parametrize(
