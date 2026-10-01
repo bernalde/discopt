@@ -580,10 +580,39 @@ def test_accept_local_incumbent_accepts_a_satisfied_integral_indicator_model():
 
 
 @pytest.mark.parametrize(
+    "selector_kind,selector_value",
+    [
+        pytest.param("continuous", 0.5, id="continuous-fractional"),
+        pytest.param("continuous", 1.0, id="continuous-at-one"),
+        pytest.param("integer", 2.0, id="integer-outside-boolean-box"),
+        pytest.param("integer", 1.0, id="integer-at-one"),
+    ],
+)
+def test_indicator_source_residual_refuses_nonbinary_variables(selector_kind, selector_value):
+    """An if_then selector must be covered by the binary-integrality gate."""
+    m = dm.Model("nonbinary_indicator")
+    x = m.continuous("x", lb=0.0, ub=2.0)
+    selector = getattr(m, selector_kind)("selector", lb=0.0, ub=2.0)
+    m.minimize(x)
+    m.if_then(selector, [x <= 1.0])
+    pair = complementarity(0.0 * x, 1.0 + 0.0 * x, name="harmless")
+    m._complementarities.append(pair)
+    point = np.array([1.5, selector_value])
+
+    with pytest.raises(ValueError, match="requires a binary variable selector"):
+        source_residual_report(m, [pair], x_flat=point)
+    _checked(
+        accept_local_incumbent(m, None, x_flat=point) is None,
+        "an undefined indicator must not become an accepted local incumbent",
+    )
+
+
+@pytest.mark.parametrize(
     "selector_shape,selector_values,active_value,error",
     [
         pytest.param((2,), [1.0, 0.0], 1, "one finite scalar", id="vector"),
-        pytest.param((), np.nan, 1, "not finite", id="nonfinite"),
+        # evaluate_at_point rejects NaN before indicator dispatch sees a value.
+        pytest.param((), np.nan, 1, "point evaluation of .* is not finite", id="nonfinite"),
         pytest.param((), 1.0, 2, "active_value=2", id="nonboolean-active-value"),
     ],
 )

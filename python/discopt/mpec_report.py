@@ -1048,6 +1048,7 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
     * ``_IndicatorConstraint`` — the wrapped row when its binary indicator is
       active, zero when inactive. Selector integrality is reported separately;
       a fractional selector cannot make the complete source report pass.
+      Non-binary selectors are refused because that gate does not cover them.
     * ``_DisjunctiveConstraint`` — ``min`` over disjuncts of the ``max``
       violation inside that disjunct: zero exactly when *some* disjunct holds,
       which is what the disjunction asserts.
@@ -1058,6 +1059,8 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
     """
     from discopt.modeling.core import (
         Constraint,
+        Variable,
+        VarType,
         _DisjunctiveConstraint,
         _IndicatorConstraint,
         _SOSConstraint,
@@ -1079,6 +1082,10 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
         return float(np.max(viol)) if viol.size else 0.0
 
     if isinstance(con, _IndicatorConstraint):
+        # Only binary variables participate in _integrality_residual. Refuse
+        # other selectors before a fractional value can skip the wrapped row.
+        if not isinstance(con.indicator, Variable) or con.indicator.var_type is not VarType.BINARY:
+            raise ValueError(f"indicator row {con.name!r} requires a binary variable selector")
         values = evaluate_at_point(model, con.indicator, point).ravel()
         if values.size != 1 or not np.all(np.isfinite(values)):
             raise ValueError(
