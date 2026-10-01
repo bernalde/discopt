@@ -1018,13 +1018,22 @@ def _relax_huge_box(sf: StdForm, huge_lo: np.ndarray, huge_hi: np.ndarray) -> St
     )
 
 
-def _pass_model(h, highspy, sf: StdForm, integer: bool) -> tuple[Any, str]:
+def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> tuple[Any, str]:
     """Hand ``sf`` to HiGHS; returns ``(passModel status, reason)``, ``reason`` empty on kOk.
 
     kWarning means HiGHS changed the model on the way in -- it drops every matrix entry
     with ``|a| <= small_matrix_value`` -- so the caller decides whether its certificates
     survive that. kError means HiGHS holds no model. Neither is raised: both are
     properties of the input, not defects, and the route reports them as ``error``.
+
+    ``offset`` is HiGHS's objective constant. Every HiGHS objective value and bound
+    then includes it (``objective_function_value`` and ``mip_dual_bound`` both do,
+    measured), so a caller that passes ``sf.obj_const`` must not add it again. The
+    MILP route passes it because ``mip_rel_gap`` is measured on HiGHS's objective:
+    with a constant-free one, a change of variables ``x = y - 1e6`` makes ``c . y``
+    ~1e6 at every feasible point and HiGHS stops on a gap that is 3.6e-5 of that
+    but 35 units of the objective discopt publishes (#1536). The LP callers keep
+    the default -- they read no HiGHS objective value.
     """
     from discopt.solvers.milp_highs import _to_highs_inf
 
@@ -1038,8 +1047,7 @@ def _pass_model(h, highspy, sf: StdForm, integer: bool) -> tuple[Any, str]:
     lp.col_upper_ = _to_highs_inf(sf.xu, highspy)
     lp.row_lower_ = sf.b
     lp.row_upper_ = sf.b
-    # obj_const is added by discopt, so every HiGHS objective/bound is constant-free.
-    lp.offset_ = 0.0
+    lp.offset_ = float(offset)
     lp.sense_ = highspy.ObjSense.kMinimize
     lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
     lp.a_matrix_.num_col_ = sf.n
@@ -1540,7 +1548,11 @@ def solve_milp_std(
     huge_lo, huge_hi = _huge_box(sf)
     if huge_lo.any() or huge_hi.any():
         stats["milp/huge_box_relaxed"] = 1.0
-    pass_st, pass_why = _pass_model(h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True)
+    # HiGHS gets ``obj_const`` so ``mip_rel_gap`` is measured on the objective this
+    # route publishes (#1536); both values read back below therefore include it.
+    pass_st, pass_why = _pass_model(
+        h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True, offset=sf.obj_const
+    )
     if pass_why:
         # No MILP certificate is re-derivable from ``sf`` (HiGHS's infeasible label and
         # tree bound are trusted as-is), so a model HiGHS changed on the way in -- or
@@ -1599,7 +1611,7 @@ def solve_milp_std(
                 )
             )  # fmt: skip
         obj = float(sf.c @ x) + sf.obj_const
-        h_obj = float(info.objective_function_value) + sf.obj_const
+        h_obj = float(info.objective_function_value)  # includes the passed offset
         mismatch = abs(obj - h_obj)
         stats["milp/objective_mismatch"] = mismatch
         if mismatch > 1e-6 * (1.0 + abs(obj)):
@@ -1607,8 +1619,8 @@ def solve_milp_std(
                 "HiGHS MILP objective %.12g differs from the recomputed %.12g", h_obj, obj
             )
 
-    raw = float(info.mip_dual_bound)
-    bound = raw + sf.obj_const if np.isfinite(raw) else None
+    raw = float(info.mip_dual_bound)  # includes the passed offset
+    bound = raw if np.isfinite(raw) else None
     out = HighsOutcome("error", x=x, objective=obj, highs_status=name, node_count=nodes)
     out.iterations = int(info.simplex_iteration_count)
 
