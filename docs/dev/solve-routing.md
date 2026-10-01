@@ -57,6 +57,7 @@ classify_problem(model)                                   [problem_classifier.py
   │
   ├─ LP    default ───────────────────► _solve_lp_highs  (verified HiGHS route, #1229; lp-milp-highs-routing-plan.md §3)
   │        DISCOPT_LP_MILP_BACKEND=rust► _solve_lp        → Rust simplex | POUNCE (nlp_solver="pounce")
+  │        milp_backend="native" ──────► _solve_lp        (same engine; route "native-lp", #1535)
   │
   ├─ QP    convex?     ──► _solve_qp     (POUNCE; HiGHS-free, #359; JAX-IPM last resort)
   │        indefinite? ──► force_spatial ─────────────────┐ (→ Subtree A)
@@ -66,6 +67,11 @@ classify_problem(model)                                   [problem_classifier.py
   │        DISCOPT_LP_MILP_BACKEND=rust, or nlp_solver="simplex":
   │                              ──► _solve_milp_simplex  (monolithic Rust B&B; defers on stall)
   │        else ─────────────────► _solve_milp_bb         (Rust tree; node-LP = warm simplex | POUNCE-IPM)
+  │        milp_backend="native" (#1535) ► _solve_milp_bb directly — skips HiGHS AND the monolithic
+  │                                   engine; honours strategy, batch_size, max_nodes, node_callback,
+  │                                   milp_cuts=False (no root cut loop); route "native-milp".
+  │                                   lazy_constraints / incumbent_callback still → Subtree A (#748),
+  │                                   route "native-spatial".
   │
   ├─ MIQP  convexity check (eigenvalue):
   │          convex    ──► _solve_miqp_bb  (self-hosted B&B, POUNCE node QPs; HiGHS-free, #359)
@@ -90,7 +96,7 @@ classify_problem(model)                                   [problem_classifier.py
 | reformulations | structural detectors | factorable clear/lift; integer-bilinear→MILP (only if *pure*) |
 | classify_problem | obj degree × all-cons-linear × has-int | LP / QP / MILP / MIQP / NLP / MINLP |
 | QP·MIQP convexity | eigenvalue test | convex→fast solver; indefinite→spatial (avoids false-optimal) |
-| LP / MILP engine | `DISCOPT_LP_MILP_BACKEND` (default `highs`, opt-out `rust`), `nlp_solver` | HiGHS (verified route) / Rust simplex B&B / Rust tree + POUNCE |
+| LP / MILP engine | `milp_backend=` keyword (`highs`/`native`, wins), else `DISCOPT_LP_MILP_BACKEND` (default `highs`, opt-out `rust`), `nlp_solver` | HiGHS (verified route) / Rust simplex B&B / Rust tree + POUNCE |
 | NLP·MINLP convexity | eigenvalue, memoized | convex→single-NLP or NLP-BB; nonconvex→spatial |
 | `nlp_bb` | None(auto) / True / False | auto picks NLP-BB for convex MINLP; True forces it |
 

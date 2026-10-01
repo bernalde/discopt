@@ -7551,6 +7551,32 @@ class Model:
             legacy ``DISCOPT_RLT=1`` environment variable. Sound regardless of
             setting (a constraint×bound product never removes a feasible point).
             Passed through to :func:`discopt.solver.solve_model`.
+        milp_backend : {"highs", "native"}, optional
+            Engine for a pure LP or MILP model. ``"highs"`` (the default) is
+            HiGHS with discopt-verified certificates and is by far the faster
+            choice; it reports ``node_count == 0``. ``"native"`` forces
+            discopt's own branch and bound so the search can be studied: the
+            in-house simplex for an LP, discopt's MILP tree for a MILP. On the
+            MILP tree ``node_count`` is the tree's, ``strategy`` selects the
+            next node (``"best_first"``, ``"depth_first"``, ``"best_estimate"``),
+            ``batch_size=1`` evaluates one node at a time (default 16 per
+            batch), ``node_callback`` fires after every batch, ``max_nodes``
+            caps the tree and ``milp_cuts`` switches the root cut loop.
+            ``algorithm_route`` names the engine that ran. Refused for a model
+            that is not an LP or MILP. ``lazy_constraints`` and
+            ``incumbent_callback`` still route a MILP to spatial branch and
+            bound, the engine that screens them. Overrides the
+            ``DISCOPT_LP_MILP_BACKEND`` environment variable. Passed through to
+            :func:`discopt.solver.solve_model`::
+
+                r = m.solve(milp_backend="native", strategy="depth_first",
+                            batch_size=1, milp_cuts=False)
+                r.node_count, r.algorithm_route
+
+        milp_cuts : bool, optional
+            Only with ``milp_backend="native"`` on a MILP. ``False`` skips the
+            root cut loop (cover, clique and Gomory cuts), so the tree branches
+            on the plain LP relaxation; the default keeps it.
         initial_solution : dict, optional
             Initial feasible solution mapping Variable objects to values
             (scalars, lists, or numpy arrays).  Used as a warm-start point
@@ -7603,7 +7629,9 @@ class Model:
             return ``True`` to accept or ``False`` to reject.
         node_callback : callable, optional
             Node callback. Called after each batch of nodes is processed.
-            Should accept ``(ctx, model)`` and return ``None``.
+            Should accept ``(ctx, model)`` and return ``None``. A pure LP or
+            MILP on the default HiGHS route has no discopt tree to observe;
+            pass ``milp_backend="native"`` to watch one.
         cut_callback : callable, optional
             Cut callback, invoked at **every** node — spatial ones included,
             unlike ``lazy_constraints``, which fires only at integer-feasible

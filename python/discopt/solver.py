@@ -9879,6 +9879,9 @@ def solve_model(
     root_cut_max: Optional[int] = None,
     _lns_enabled: bool = True,
     rens: bool = True,
+    # #1535: which engine solves a pure LP / MILP; see ``_resolve_lp_milp_backend``.
+    milp_backend: Optional[str] = None,
+    milp_cuts: Optional[bool] = None,
     # #917: extra wall-clock seconds this solve may take *only if* it holds an
     # incumbent when ``time_limit`` expires. Set by ``Model.solve`` to the #844
     # fallback reserve it withheld, so a primary that found a primal reclaims the
@@ -9964,6 +9967,25 @@ def solve_model(
         ``best_first`` still drives the proof of optimality).
     max_nodes : int, default 100_000
         Maximum number of B&B nodes before stopping.
+    milp_backend : {"highs", "native"}, optional
+        Engine for a pure LP or MILP model (#1535). ``"highs"`` is HiGHS with
+        discopt-verified certificates; it is the default (``None`` defers to the
+        ``DISCOPT_LP_MILP_BACKEND`` env var, which defaults to ``"highs"``) and
+        is by far the faster choice. ``"native"`` forces discopt's own branch
+        and bound -- the in-house simplex for an LP, discopt's MILP tree for a
+        MILP -- so the search can be watched: ``node_count`` is the tree's,
+        ``strategy`` selects nodes, ``node_callback`` fires after every batch,
+        and ``milp_cuts`` switches the root cut loop. Meant for teaching and
+        inspection on small models, not for performance. ``lazy_constraints`` /
+        ``incumbent_callback`` still send a MILP to spatial branch and bound,
+        which honours them (#748); ``algorithm_route`` names the engine that
+        ran. Refused for a model that is not an LP or MILP, and with
+        ``nlp_solver="simplex"`` or an explicit ``solver``.
+    milp_cuts : bool, optional
+        Only with ``milp_backend="native"`` on a MILP. ``False`` skips the root
+        cut loop (cover, clique and Gomory cuts) so the tree branches on the
+        plain LP relaxation; ``None``/``True`` keeps it (the default). Lets the
+        effect of cutting planes be shown one switch at a time.
     ipopt_options : dict, optional
         Options passed to cyipopt (only used when ``nlp_solver="ipopt"``).
     nlp_solver : str, default "pounce"
@@ -10608,6 +10630,48 @@ def solve_model(
             f"Unknown solver={_solver!r}. Choose one of None, 'amp', 'gurobi', "
             "'mip-nlp', 'gp', 'gp-minlp', 'sgo', 'bb', 'direct', 'surrogate'."
         )
+
+    # #1535: resolve the LP/MILP engine once. An explicit ``milp_backend`` names an
+    # engine; every combination that would quietly run a different one is refused
+    # rather than ignored (CLAUDE.md §3).
+    _lpm_backend = _resolve_lp_milp_backend(milp_backend)
+    if milp_cuts is not None and _lpm_backend != "native":
+        raise ValueError(
+            "milp_cuts is an option of discopt's native MILP tree; pass "
+            "milp_backend='native' with it (the HiGHS route runs its own cut loop)."
+        )
+    if milp_backend is not None:
+        from discopt._relax.problem_classifier import ProblemClass as _PC
+        from discopt._relax.problem_classifier import classify_problem as _classify
+
+        _lpm_class = _classify(model)
+        if _lpm_class not in (_PC.LP, _PC.MILP):
+            raise ValueError(
+                f"milp_backend={milp_backend!r} selects the engine for an LP or MILP "
+                f"model; this model is {_lpm_class.value}."
+            )
+        if _lpm_backend == "native" and _solver not in (None, "bb"):
+            raise ValueError(
+                f"milp_backend='native' and solver={_solver!r} name different engines."
+            )
+        if _lpm_backend == "native" and nlp_solver == "simplex":
+            raise ValueError(
+                "milp_backend='native' runs discopt's MILP tree; nlp_solver='simplex' "
+                "names the monolithic Rust MILP engine. Pass one or the other."
+            )
+        if milp_cuts is not None and (
+            _lpm_class != _PC.MILP
+            or _feasibility_callback_names(lazy_constraints, incumbent_callback)
+        ):
+            raise ValueError(
+                "milp_cuts switches the root cut loop of discopt's MILP tree, which "
+                + (
+                    "does not run for an LP."
+                    if _lpm_class != _PC.MILP
+                    else "lazy_constraints/incumbent_callback bypass (they route to "
+                    "spatial branch and bound, #748)."
+                )
+            )
     gurobi_options = kwargs.pop("gurobi_options", None) if _solver == "gurobi" else None
 
     # --- #1500: feasibility callbacks are enforced by the spatial B&B only ---
@@ -11485,6 +11549,9 @@ def solve_model(
     # lazy_constraints, which the GP path would drop just the same.
     if (
         _solver is None
+        # #1535: an explicit ``milp_backend`` names the LP/MILP engine; a linear GP
+        # must reach it rather than leave on the log-space route.
+        and milp_backend is None
         and not _has_bb_callbacks
         and not _feasibility_callbacks
         and not skip_convex_check
@@ -11501,6 +11568,7 @@ def solve_model(
             nlp_solver=nlp_solver,
             lagrangian_bound=lagrangian_bound,
             has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+            backend=_lpm_backend,
         ):
             gp_result = solve_gp(
                 model,
@@ -12506,6 +12574,7 @@ def solve_model(
         nlp_solver=nlp_solver,
         lagrangian_bound=lagrangian_bound,
         has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+        backend=_lpm_backend,
     ):
         logger.info("Root presolve skipped: the HiGHS LP/MILP route presolves internally")
         presolve = False
@@ -12994,9 +13063,12 @@ def solve_model(
     _pure_continuous_force_spatial = _callbacks_force_bb and _pure_continuous
     if problem_class is not None:
         if problem_class == ProblemClass.LP and not _callbacks_force_bb:
-            if _lp_milp_backend() == "highs":
+            if _lpm_backend == "highs":
                 return _solve_lp_highs(model, t_start, time_limit)
-            return _solve_lp(model, t_start, time_limit)
+            _lp_res = _solve_lp(model, t_start, time_limit)
+            if _lpm_backend == "native" and _lp_res.algorithm_route is None:
+                _lp_res.algorithm_route = "native-lp: discopt simplex (milp_backend='native')"
+            return _lp_res
         elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
                 if _pure_continuous_convexity_known and _pure_continuous_is_convex:
@@ -13022,11 +13094,7 @@ def solve_model(
                 # #1229 HiGHS route (default; DISCOPT_LP_MILP_BACKEND=rust opts out). An explicit
                 # ``nlp_solver="simplex"`` still names the Rust engine, and
                 # ``lagrangian_bound`` still needs the per-node Python path.
-                if (
-                    _lp_milp_backend() == "highs"
-                    and nlp_solver != "simplex"
-                    and not lagrangian_bound
-                ):
+                if _lpm_backend == "highs" and nlp_solver != "simplex" and not lagrangian_bound:
                     _highs_res = _solve_milp_highs(
                         model,
                         time_limit,
@@ -13054,8 +13122,10 @@ def solve_model(
                 # Carries the engine's valid dual bound and the work it spent
                 # back out when it DEFERS, so neither is thrown away (see below).
                 _deferred: dict = {}
-                _want_engine = nlp_solver == "simplex" or (
-                    _milp_engine_default_on() and not lagrangian_bound
+                # #1535: ``milp_backend="native"`` asks for the MILP tree below,
+                # the engine whose search the caller's options actually steer.
+                _want_engine = _lpm_backend != "native" and (
+                    nlp_solver == "simplex" or (_milp_engine_default_on() and not lagrangian_bound)
                 )
                 # #1243: the monolithic engine's RELATIVE arm is
                 # ``TreeManager::gap()``, whose denominator is FLOORED AT 1.0, so
@@ -13137,10 +13207,26 @@ def solve_model(
                     initial_point=initial_point,
                     incumbent_time_extension=incumbent_time_extension,
                     abs_gap_tol=abs_gap_tol,
+                    node_callback=node_callback,
+                    root_cuts=milp_cuts is not False,
                 )
+                if _lpm_backend == "native" and _bb_res.algorithm_route is None:
+                    _bb_res.algorithm_route = (
+                        f"native-milp: discopt MILP branch and bound "
+                        f"(milp_backend='native', strategy={strategy!r}, "
+                        f"root cuts {'off' if milp_cuts is False else 'on'})"
+                    )
                 return _merge_engine_stats(
                     _merge_engine_bound(_bb_res, _engine_bound, model),
                     _deferred.get("stats"),
+                )
+            if _lpm_backend == "native":
+                # #1535: the caller asked for discopt's own search and gets it -- the
+                # spatial tree, the one engine that screens these callbacks (#748).
+                # Say so on the result rather than let it read as the MILP tree.
+                _ROUTE_FALLBACK_NOTE.append(
+                    "native-spatial: discopt spatial branch and bound (milp_backend="
+                    "'native' with lazy_constraints/incumbent_callback, #748)"
                 )
             logger.info(
                 "MILP with a lazy_constraints/incumbent_callback — routing to spatial "
@@ -27085,6 +27171,38 @@ def _lp_milp_backend() -> str:
     return val
 
 
+#: Values the ``milp_backend=`` keyword of :func:`solve_model` accepts (#1535).
+_MILP_BACKEND_VALUES = ("highs", "native")
+
+
+def _resolve_lp_milp_backend(milp_backend: Optional[str]) -> str:
+    """The engine for a pure LP / MILP: ``"highs"``, ``"rust"`` or ``"native"``.
+
+    ``milp_backend=None`` defers to :func:`_lp_milp_backend` (the
+    ``DISCOPT_LP_MILP_BACKEND`` env var, default ``"highs"``), so a solve that does
+    not name a backend is unchanged. An explicit keyword wins over the env var:
+
+    * ``"highs"`` -- the #1229 HiGHS route, with discopt-verified certificates.
+    * ``"native"`` (#1535) -- discopt's own branch and bound, for teaching and for
+      inspecting the search: an LP goes to the in-house Rust simplex, a MILP to the
+      Python-driven MILP tree (``_solve_milp_bb``), the engine that honours
+      ``strategy``, ``max_nodes``, ``node_callback`` and ``milp_cuts``. It does NOT
+      go to the monolithic Rust engine (``_solve_milp_simplex``), which takes none
+      of those options. Far slower than HiGHS on anything but small models.
+
+    ``"rust"`` is reachable only through the env var: it is the legacy opt-out to the
+    monolithic Rust engine, kept for A/B runs, not a documented interface.
+    """
+    if milp_backend is None:
+        return _lp_milp_backend()
+    val = milp_backend.strip().lower() if isinstance(milp_backend, str) else milp_backend
+    if val not in _MILP_BACKEND_VALUES:
+        raise ValueError(
+            f"milp_backend={milp_backend!r}: expected one of {', '.join(_MILP_BACKEND_VALUES)}"
+        )
+    return val
+
+
 def _highs_takes_pure_lp_milp(
     model: Model,
     *,
@@ -27093,8 +27211,12 @@ def _highs_takes_pure_lp_milp(
     nlp_solver: str,
     lagrangian_bound: bool,
     has_callbacks: bool,
+    backend: Optional[str] = None,
 ) -> bool:
     """Whether the #1229 HiGHS route will solve *model*, decided before root presolve.
+
+    ``backend`` is the solve's resolved LP/MILP engine (``_resolve_lp_milp_backend``);
+    ``None`` reads the env var, for callers that have no ``milp_backend`` keyword.
 
     Mirrors the LP / MILP HiGHS dispatch conditions in ``_solve_impl``. discopt's root
     presolve only tightens bounds, and HiGHS presolves the model itself, so running it
@@ -27103,7 +27225,9 @@ def _highs_takes_pure_lp_milp(
     which this answers ``True`` but that later leaves the route still gets a valid,
     merely looser, declared box -- skipping presolve is never unsound.
     """
-    if _lp_milp_backend() != "highs" or solver_name == "gurobi":
+    if backend is None:
+        backend = _lp_milp_backend()
+    if backend != "highs" or solver_name == "gurobi":
         return False
     from discopt._relax.problem_classifier import ProblemClass, classify_problem
 
@@ -28091,6 +28215,54 @@ def _solve_milp_simplex(
     )
 
 
+def _fire_milp_node_callback(
+    node_callback: Callable,
+    model: Model,
+    tree,
+    result_lbs: np.ndarray,
+    result_sols: np.ndarray,
+    n_orig: int,
+    tree_bound_valid: bool,
+    t_start: float,
+) -> None:
+    """Call ``node_callback(ctx, model)`` once for a processed MILP-tree batch (#1535).
+
+    The MILP tree minimizes internally (``-obj`` for a MAXIMIZE), so every
+    objective-valued field is mapped back to the user's sense: ``incumbent_obj`` is
+    the best objective found, ``best_bound`` the certified global dual bound
+    (:func:`_certified_callback_bound`), and ``node_bound`` the relaxation bound of
+    the batch's best node -- all three comparable with ``SolveResult.objective``.
+    ``x_relaxation`` is that node's LP point over the model's own variables (the
+    standard-form slack columns are dropped). A raising callback is logged and the
+    search continues, as on the spatial path.
+    """
+    from discopt.callbacks import CallbackContext
+    from discopt.modeling.core import ObjectiveSense as _ObjSense
+
+    is_max = model._objective is not None and model._objective.sense == _ObjSense.MAXIMIZE
+    sign = -1.0 if is_max else 1.0
+    stats = tree.stats()
+    inc = tree.incumbent()
+    inc_obj = None
+    if inc is not None and inc[1] < _SENTINEL_THRESHOLD:
+        inc_obj = sign * float(inc[1])
+    best = int(np.argmin(result_lbs))
+    bound = _certified_callback_bound(stats.get("global_lower_bound"), tree_bound_valid, is_max)
+    ctx = CallbackContext(
+        node_count=stats["total_nodes"],
+        incumbent_obj=inc_obj,
+        best_bound=bound,
+        gap=(stats.get("gap") if bound is not None else None),
+        elapsed_time=time.perf_counter() - t_start,
+        x_relaxation=np.asarray(result_sols[best][:n_orig]).copy(),
+        node_bound=sign * float(result_lbs[best]),
+    )
+    try:
+        node_callback(ctx, model)
+    except Exception as e:  # noqa: BLE001 - a user callback must not abort the solve
+        logger.warning("Node callback raised an exception: %s", e)
+
+
 def _solve_milp_bb(
     model: Model,
     time_limit: float,
@@ -28111,6 +28283,10 @@ def _solve_milp_bb(
     # ``solve_model``. Defaulted so a direct caller of this driver keeps the
     # established behaviour exactly.
     abs_gap_tol: float = _DEFAULT_ABS_GAP_TOL,
+    # #1535: observe the search (called after every processed batch, as on the
+    # spatial path) and switch the root cut loop off to show what it buys.
+    node_callback: Optional[Callable] = None,
+    root_cuts: bool = True,
 ) -> SolveResult:
     """Solve a MILP via B&B with LP relaxation solves at each node.
 
@@ -28224,6 +28400,9 @@ def _solve_milp_bb(
         clique_edges=_clique_edges,
         int_idx=_cut_int_idx,
         prefer_pounce=prefer_pounce,
+        # ``root_cuts=False`` (#1535, ``milp_cuts=False``): zero rounds leaves
+        # ``lp_data`` untouched -- the plain LP relaxation, which is always valid.
+        max_rounds=5 if root_cuts else 0,
     )
     if _n_cuts:
         logger.info(
@@ -28717,6 +28896,20 @@ def _solve_milp_bb(
         ):
             _debug_quit = True
             break
+
+        # #1535: node callback, after the tree has applied this batch -- the same
+        # hook and ``CallbackContext`` the spatial path fires. Observation only.
+        if node_callback is not None:
+            _fire_milp_node_callback(
+                node_callback,
+                model,
+                tree,
+                result_lbs,
+                result_sols,
+                n_orig,
+                _gap_certified,
+                t_start,
+            )
 
         # Root-node certification snapshot (cert:T0.1).
         if iteration == 0:
