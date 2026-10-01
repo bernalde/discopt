@@ -12476,6 +12476,12 @@ def solve_model(
                     root_cut_max=root_cut_max,
                     _lns_enabled=_lns_enabled,
                     rens=rens,
+                    # #1535: always None here in practice (refused upfront for a
+                    # model that is not an LP or MILP), forwarded so the probe can
+                    # never answer under a different engine choice than the caller's.
+                    milp_backend=milp_backend,
+                    milp_cuts=milp_cuts,
+                    branching_rule=branching_rule,
                     **kwargs,
                 )
                 if _ipx_probe is not None:
