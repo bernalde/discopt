@@ -23,7 +23,7 @@ The release procedure that produces these entries is documented in
   on the same solve: the main-phase rows match column for column except `inf_pr`,
   which in the report is POUNCE's internal slack-form residual. The inner
   restoration rows (`24r`, ...) are not in the report; only the `"R"` entry row and
-  the counts are. Both gaps are on the POUNCE side. Costs about 1 ms per solve to
+  the counts are. Both gaps are on the POUNCE side (jkitchin/pounce#979). Costs about 1 ms per solve to
   write and parse; branch-and-bound node solves do not request it. Also exposed
   as `solve_report=True` on `solvers.nlp_pounce.solve_nlp`, `lp_pounce.solve_lp`
   and `qp_pounce.solve_qp`.

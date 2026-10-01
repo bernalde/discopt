@@ -9,7 +9,8 @@ The line-for-line tests compare the report against the table POUNCE prints at
 ``print_level=5`` on the same solve. Every column but ``inf_pr`` must match to the
 printed digits; ``inf_pr`` is a different quantity in the report (POUNCE's internal
 slack-form residual), which ``SolveResult``'s docstring records, and the inner
-restoration rows (``24r``) are not in the report at all.
+restoration rows (``24r``) are not in the report at all. Both are POUNCE-side,
+tracked as jkitchin/pounce#979; when it lands, assert ``inf_pr`` and the ``r`` rows too.
 """
 
 from __future__ import annotations

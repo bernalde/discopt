@@ -20,7 +20,8 @@ What the report holds, measured on pounce-solver 0.12.0 (not assumed):
   that entered restoration) and ``ls_trials``.
 * ``solution``, ``problem`` and ``fair_metadata`` (solver version, timestamps).
 
-Two places the report does **not** reproduce the printed table, both POUNCE-side:
+Two places the report does **not** reproduce the printed table, both POUNCE-side
+(tracked upstream as jkitchin/pounce#979):
 
 1. The inner restoration-phase rows (printed with an ``r`` suffix, e.g. ``24r``)
    are not in ``iterations``; the restoration phase appears only as the ``"R"``
