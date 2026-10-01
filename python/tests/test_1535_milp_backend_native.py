@@ -302,3 +302,88 @@ def test_cut_callback_with_explicit_nlp_bb_is_refused():
 def test_node_callback_on_an_lp_warns_that_it_is_not_called():
     with pytest.warns(UserWarning, match="node_callback not called"):
         _lp().solve(node_callback=lambda ctx, m: None)
+
+
+# ── review of #1538 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"milp_backend": "native", "nlp_bb": True},
+        {"milp_backend": "native", "nlp_bb": True, "branching_rule": "strong", "milp_cuts": False},
+        {"milp_backend": "highs", "nlp_bb": True},
+    ],
+)
+def test_nlp_bb_true_with_an_explicit_backend_is_refused(kwargs):
+    """Review 1 (blocking): nlp_bb=True returned from NLP-BB before the LP/MILP
+    dispatch, so the named engine and every tree option silently did not run
+    (measured: optimal, node_count=1, route None)."""
+    with pytest.raises(ValueError, match="nlp_bb=True"):
+        _knapsack().solve(**kwargs)
+
+
+@pytest.mark.parametrize("model", [_knapsack, _lp])
+@pytest.mark.parametrize("cb", ["lazy_constraints", "incumbent_callback"])
+def test_highs_with_a_feasibility_callback_is_refused(model, cb):
+    """Review 2: these callbacks route to spatial B&B; HiGHS never runs."""
+    with pytest.raises(ValueError, match="milp_backend='highs' cannot honour"):
+        model().solve(milp_backend="highs", **{cb: lambda *a: None})
+
+
+def test_native_lp_route_names_the_engine_that_answered():
+    """Review 3: the label used to say "simplex" whatever answered."""
+    res = _lp().solve(milp_backend="native")
+    stats = res.solver_stats or {}
+    assert ("lp/engine_simplex" in stats) != ("lp/engine_pounce" in stats)
+    engine = "Rust simplex" if "lp/engine_simplex" in stats else "POUNCE"
+    assert engine in res.algorithm_route
+
+
+def test_tree_options_on_a_model_dispatched_as_an_lp_warn(monkeypatch):
+    """Review 4: the options are validated against the raw model's class. Should
+    the dispatch see an LP (every integer gone), they would do nothing, so warn.
+
+    No in-tree pass changes a variable's type today, so the dispatch-time class is
+    forced here: the validation's call (the first) reports MILP, later calls the
+    model's true class (LP)."""
+    import discopt._relax.problem_classifier as pc
+
+    real = pc.classify_problem
+    calls = []
+
+    def stub(model):
+        calls.append(1)
+        return pc.ProblemClass.MILP if len(calls) == 1 else real(model)
+
+    monkeypatch.setattr(pc, "classify_problem", stub)
+    with pytest.warns(UserWarning, match="branching_rule unused"):
+        res = _lp().solve(milp_backend="native", branching_rule="strong")
+    assert len(calls) > 1
+    assert res.status == "optimal"
+
+
+def test_node_callback_reports_no_bound_for_a_batch_without_a_relaxation():
+    """Review 5: an all-sentinel batch used to report node_bound ~ +-1e30 and the
+    box midpoint as x_relaxation."""
+
+    class _Tree:
+        def stats(self):
+            return {"total_nodes": 3, "global_lower_bound": 1.0, "gap": 0.5}
+
+        def incumbent(self):
+            return None
+
+    seen = []
+    m = _knapsack(n=4)
+    lbs = np.full(2, S._INFEASIBILITY_SENTINEL)
+    sols = np.full((2, 6), 0.5)
+    S._fire_milp_node_callback(lambda c, mm: seen.append(c), m, _Tree(), lbs, sols, 4, True, 0.0)
+    assert len(seen) == 1
+    assert seen[0].node_bound is None and seen[0].x_relaxation is None
+    # A batch with one real bound still reports it (and its point), in user sense.
+    lbs[1] = -7.0
+    sols[1, :4] = [1.0, 0.0, 1.0, 0.0]
+    S._fire_milp_node_callback(lambda c, mm: seen.append(c), m, _Tree(), lbs, sols, 4, True, 0.0)
+    assert seen[1].node_bound == pytest.approx(7.0)  # maximize: internal -obj
+    assert seen[1].x_relaxation.tolist() == [1.0, 0.0, 1.0, 0.0]

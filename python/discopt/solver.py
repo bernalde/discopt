@@ -9969,19 +9969,22 @@ def solve_model(
     max_nodes : int, default 100_000
         Maximum number of B&B nodes before stopping.
     milp_backend : {"highs", "native"}, optional
-        Engine for a pure LP or MILP model (#1535). ``"highs"`` is HiGHS with
-        discopt-verified certificates; it is the default (``None`` defers to the
-        ``DISCOPT_LP_MILP_BACKEND`` env var, which defaults to ``"highs"``) and
-        is by far the faster choice. ``"native"`` forces discopt's own branch
-        and bound -- the in-house simplex for an LP, discopt's MILP tree for a
-        MILP -- so the search can be watched: ``node_count`` is the tree's,
-        ``strategy`` selects nodes, ``node_callback`` fires after every batch,
-        and ``milp_cuts`` switches the root cut loop. Meant for teaching and
-        inspection on small models, not for performance. ``lazy_constraints`` /
-        ``incumbent_callback`` still send a MILP to spatial branch and bound,
-        which honours them (#748); ``algorithm_route`` names the engine that
-        ran. Refused for a model that is not an LP or MILP, and with
-        ``nlp_solver="simplex"`` or an explicit ``solver``.
+        Engine for a pure LP or MILP model (#1535). The default ``None`` defers
+        to the ``DISCOPT_LP_MILP_BACKEND`` env var, which itself defaults to
+        HiGHS. ``"highs"`` names HiGHS with discopt-verified certificates, by
+        far the faster choice. ``"native"`` forces discopt's own branch and
+        bound -- the in-house LP solve (Rust simplex, POUNCE if it declines)
+        for an LP, discopt's MILP tree for a MILP -- so the search can be
+        watched: ``node_count`` is the tree's, ``strategy`` selects nodes,
+        ``branching_rule`` picks the branching variable, ``node_callback``
+        fires after every batch, and ``milp_cuts`` switches the root cut loop.
+        Meant for teaching and inspection on small models, not for
+        performance. ``lazy_constraints`` / ``incumbent_callback`` /
+        ``cut_callback`` send a MILP to spatial branch and bound, which honours
+        them (#748); ``algorithm_route`` names the engine that ran. Refused for
+        a model that is not an LP or MILP, with ``nlp_bb=True``, and (for
+        ``"native"``) with ``nlp_solver="simplex"`` or an explicit ``solver``;
+        ``"highs"`` is refused with any callback, since HiGHS runs none.
     milp_cuts : bool, optional
         Only with ``milp_backend="native"`` on a MILP. ``False`` skips the root
         cut loop (cover, clique and Gomory cuts) so the tree branches on the
@@ -10704,6 +10707,26 @@ def solve_model(
                 "milp_backend='highs' runs HiGHS, which exposes no node or cut hook; "
                 "node_callback/cut_callback need discopt's own search (leave "
                 "milp_backend unset, or pass milp_backend='native')."
+            )
+        if _lpm_backend == "highs" and _feasibility_callback_names(
+            lazy_constraints, incumbent_callback
+        ):
+            # #1535 review 2: these callbacks route an LP/MILP to spatial branch and
+            # bound (#748, #1500); HiGHS never runs, so naming it is a contradiction.
+            raise ValueError(
+                "milp_backend='highs' cannot honour lazy_constraints/"
+                "incumbent_callback: they need discopt's spatial branch and bound, "
+                "which screens candidate incumbents. Leave milp_backend unset, or "
+                "pass milp_backend='native'."
+            )
+        if nlp_bb is True:
+            # #1535 review 1: ``nlp_bb=True`` returns from NLP-based B&B before the
+            # LP/MILP dispatch is reached, so the named engine (and any tree option)
+            # would silently not run.
+            raise ValueError(
+                f"milp_backend={milp_backend!r} and nlp_bb=True name different "
+                "engines: nlp_bb=True runs NLP-based branch and bound, which takes "
+                "neither milp_backend nor branching_rule/milp_cuts."
             )
     gurobi_options = kwargs.pop("gurobi_options", None) if _solver == "gurobi" else None
 
@@ -13126,6 +13149,16 @@ def solve_model(
                 for n, cb in (("node_callback", node_callback), ("cut_callback", cut_callback))
                 if cb is not None
             ]
+            if _tree_opts:
+                # #1535 review 4: validated against the RAW model's class, which was
+                # a MILP; root presolve fixed every integer, so no tree will run.
+                warnings.warn(
+                    f"{', '.join(_tree_opts)} unused: presolve fixed every integer "
+                    "variable, so the model was solved as an LP with no "
+                    "branch-and-bound tree.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             if _lp_unused:
                 # #1535: an LP is solved without branch and bound -- there is no
                 # node to report and no relaxation to cut. Say so instead of
@@ -13140,7 +13173,17 @@ def solve_model(
                 return _solve_lp_highs(model, t_start, time_limit)
             _lp_res = _solve_lp(model, t_start, time_limit)
             if _lpm_backend == "native" and _lp_res.algorithm_route is None:
-                _lp_res.algorithm_route = "native-lp: discopt simplex (milp_backend='native')"
+                _lp_stats = _lp_res.solver_stats or {}
+                _lp_engine = (
+                    "Rust simplex"
+                    if "lp/engine_simplex" in _lp_stats
+                    else "POUNCE (simplex declined)"
+                    if "lp/engine_pounce" in _lp_stats
+                    else "no engine certified"
+                )
+                _lp_res.algorithm_route = (
+                    f"native-lp: discopt LP solve, {_lp_engine} (milp_backend='native')"
+                )
             return _lp_res
         elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
@@ -24032,6 +24075,13 @@ def _solve_lp(
                 held = held or result
                 continue
             if result is not None:
+                # #1535: record which engine answered, so a route label can name
+                # it (POUNCE answers when the simplex declines). Instrumentation.
+                if isinstance(result, SolveResult):
+                    _tag = (
+                        "lp/engine_simplex" if engine is _solve_lp_simplex else "lp/engine_pounce"
+                    )
+                    result.solver_stats = {**(result.solver_stats or {}), _tag: 1.0}
                 return result
         return held
 
@@ -28423,7 +28473,9 @@ def _fire_milp_node_callback(
     (:func:`_certified_callback_bound`), and ``node_bound`` the relaxation bound of
     the batch's best node -- all three comparable with ``SolveResult.objective``.
     ``x_relaxation`` is that node's LP point over the model's own variables (the
-    standard-form slack columns are dropped). A raising callback is logged and the
+    standard-form slack columns are dropped). When no node of the batch has a
+    relaxation (all infeasible or unsettled), ``node_bound`` and ``x_relaxation``
+    are ``None``. A raising callback is logged and the
     search continues, as on the spatial path.
     """
     from discopt.callbacks import CallbackContext
@@ -28437,6 +28489,10 @@ def _fire_milp_node_callback(
     if inc is not None and inc[1] < _SENTINEL_THRESHOLD:
         inc_obj = sign * float(inc[1])
     best = int(np.argmin(result_lbs))
+    # #1535 review 5: a batch whose every node is infeasible or unsettled holds only
+    # sentinels -- no relaxation bound and no relaxation point (the stored row is
+    # the box midpoint). Report that as ``None`` rather than a +-1e30 "bound".
+    has_relaxation = bool(result_lbs[best] < _SENTINEL_THRESHOLD)
     bound = _certified_callback_bound(stats.get("global_lower_bound"), tree_bound_valid, is_max)
     ctx = CallbackContext(
         node_count=stats["total_nodes"],
@@ -28444,8 +28500,8 @@ def _fire_milp_node_callback(
         best_bound=bound,
         gap=(stats.get("gap") if bound is not None else None),
         elapsed_time=time.perf_counter() - t_start,
-        x_relaxation=np.asarray(result_sols[best][:n_orig]).copy(),
-        node_bound=sign * float(result_lbs[best]),
+        x_relaxation=(np.asarray(result_sols[best][:n_orig]).copy() if has_relaxation else None),
+        node_bound=(sign * float(result_lbs[best]) if has_relaxation else None),
     )
     try:
         node_callback(ctx, model)

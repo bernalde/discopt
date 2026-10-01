@@ -7552,11 +7552,14 @@ class Model:
             setting (a constraint×bound product never removes a feasible point).
             Passed through to :func:`discopt.solver.solve_model`.
         milp_backend : {"highs", "native"}, optional
-            Engine for a pure LP or MILP model. ``"highs"`` (the default) is
-            HiGHS with discopt-verified certificates and is by far the faster
-            choice; it reports ``node_count == 0``. ``"native"`` forces
-            discopt's own branch and bound so the search can be studied: the
-            in-house simplex for an LP, discopt's MILP tree for a MILP. On the
+            Engine for a pure LP or MILP model. The default ``None`` defers to
+            the ``DISCOPT_LP_MILP_BACKEND`` environment variable, which itself
+            defaults to HiGHS. ``"highs"`` names HiGHS with discopt-verified
+            certificates, by far the faster choice; it reports
+            ``node_count == 0``. ``"native"`` forces discopt's own branch and
+            bound so the search can be studied: the in-house LP solve (Rust
+            simplex, POUNCE if it declines) for an LP, discopt's MILP tree for
+            a MILP. On the
             MILP tree ``node_count`` is the tree's, ``strategy`` selects the
             next node (``"best_first"``, ``"depth_first"``, ``"best_estimate"``),
             ``batch_size=1`` evaluates one node at a time (default 16 per
@@ -7564,9 +7567,12 @@ class Model:
             ``node_callback`` fires after every batch, ``max_nodes`` caps the
             tree and ``milp_cuts`` switches the root cut loop.
             ``algorithm_route`` names the engine that ran. Refused for a model
-            that is not an LP or MILP. ``lazy_constraints`` and
-            ``incumbent_callback`` still route a MILP to spatial branch and
-            bound, the engine that screens them. Overrides the
+            that is not an LP or MILP and with ``nlp_bb=True``; ``"highs"`` is
+            refused with any callback, since HiGHS runs none. ``lazy_constraints``,
+            ``incumbent_callback`` and ``cut_callback`` route a MILP to spatial
+            branch and bound, the engine that screens them. If presolve fixes
+            every integer the model is solved as an LP and ``branching_rule`` /
+            ``milp_cuts`` are unused (a warning says so). Overrides the
             ``DISCOPT_LP_MILP_BACKEND`` environment variable. Passed through to
             :func:`discopt.solver.solve_model`::
 
