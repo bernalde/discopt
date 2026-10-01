@@ -392,7 +392,10 @@ def _settle_ambiguous_unbounded(
         "'unbounded' (#940)."
     )
     return LPResult(
-        status=SolveStatus.ERROR, iterations=result.iterations, wall_time=result.wall_time
+        status=SolveStatus.ERROR,
+        iterations=result.iterations,
+        wall_time=result.wall_time,
+        solve_report=result.solve_report,
     )
 
 
@@ -535,6 +538,7 @@ def solve_lp(
     x0: Optional[np.ndarray] = None,
     options: Optional[dict] = None,
     certificate: bool = False,
+    solve_report: bool = False,
 ) -> LPResult:
     """Solve ``min c^T x`` s.t. linear constraints and bounds via POUNCE.
 
@@ -555,6 +559,10 @@ def solve_lp(
     (the Phase-1 solve already ran to confirm it). ``certificate`` is
     retained for call-site compatibility; it no longer changes whether the
     check runs, since soundness cannot be conditional on an opt-in flag.
+
+    ``solve_report=True`` attaches POUNCE's ``pounce.solve-report/v1`` document for
+    the main LP solve as ``LPResult.solve_report`` (#1534). The elastic Phase-1 and
+    recession-ray probes are separate problems and are not part of it.
 
     Raises:
         ImportError: If POUNCE is not installed.
@@ -625,7 +633,7 @@ def solve_lp(
     if time_limit is not None:
         opts.setdefault("max_wall_time", float(time_limit))
 
-    result = _solve_core(c_arr, A, cl, cu, lb, ub, x0, opts)
+    result = _solve_core(c_arr, A, cl, cu, lb, ub, x0, opts, solve_report=solve_report)
 
     # ---- infeasibility certificate (roadmap P0.2) ---------------------------
     # An IPM does not always certify infeasibility: an inconsistent system can
@@ -672,6 +680,7 @@ def solve_lp(
                 status=SolveStatus.INFEASIBLE,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
                 # The witness comes from Phase-1 when it produced one; the oracle
                 # proves emptiness without per-row violations, and a certificate is
                 # a witness, never a requirement for the verdict.
@@ -698,6 +707,7 @@ def solve_lp(
                 status=SolveStatus.ERROR,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
             )
         if result.status == SolveStatus.INFEASIBLE:
             # POUNCE's own code-2 verdict did NOT survive the exact Phase-1
@@ -717,6 +727,7 @@ def solve_lp(
                 status=SolveStatus.ERROR,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
             )
 
     # Phase-1 above settles the "was it really infeasible?" reading of an ambiguous
@@ -1082,6 +1093,7 @@ def _solve_core(
     ub: np.ndarray,
     x0: np.ndarray,
     opts: dict,
+    solve_report: bool = False,
 ) -> LPResult:
     """Solve ``min c^T x`` over stacked rows ``cl <= A x <= cu`` and bounds.
 
@@ -1105,15 +1117,21 @@ def _solve_core(
             pass
 
     t0 = time.perf_counter()
+    report = None
     with _timing.charge("pounce"):
-        x, info = problem.solve(x0)
+        if solve_report:
+            from discopt.solvers._pounce_report import solve_with_report
+
+            x, info, report = solve_with_report(problem, x0)
+        else:
+            x, info = problem.solve(x0)
     wall_time = time.perf_counter() - t0
 
     status = _LP_STATUS_MAP.get(info.get("status", -100), SolveStatus.ERROR)
     iters = int(info.get("iter_count", 0))
 
     if status != SolveStatus.OPTIMAL:
-        return LPResult(status=status, iterations=iters, wall_time=wall_time)
+        return LPResult(status=status, iterations=iters, wall_time=wall_time, solve_report=report)
 
     x_arr = np.asarray(x, dtype=np.float64)
     obj = float(info.get("obj_val", c @ x_arr))
@@ -1144,6 +1162,7 @@ def _solve_core(
         basis=None,
         iterations=iters,
         wall_time=wall_time,
+        solve_report=report,
     )
 
 

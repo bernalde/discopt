@@ -12,6 +12,22 @@ The release procedure that produces these entries is documented in
 
 ### Added
 
+- **`SolveResult.solve_report`: POUNCE's structured solve report** (#1534). On
+  the routes that make a single POUNCE call (the continuous single-NLP route, the
+  continuous QP route, and the LP route when POUNCE answered it) the result now
+  carries the `pounce.solve-report/v1` document, the same data as
+  `pounce --json-output <file> --json-detail full`: iteration count, the
+  per-iteration trajectory (objective, `inf_pr`, `inf_du`, `mu`, step sizes,
+  regularization, line-search flag), restoration counts, and timing. It is `None`
+  on branch-and-bound routes, as `kkt` is. Tested against the table POUNCE prints
+  on the same solve: the main-phase rows match column for column except `inf_pr`,
+  which in the report is POUNCE's internal slack-form residual. The inner
+  restoration rows (`24r`, ...) are not in the report; only the `"R"` entry row and
+  the counts are. Both gaps are on the POUNCE side (jkitchin/pounce#979). Costs about 1 ms per solve to
+  write and parse; branch-and-bound node solves do not request it. Also exposed
+  as `solve_report=True` on `solvers.nlp_pounce.solve_nlp`, `lp_pounce.solve_lp`
+  and `qp_pounce.solve_qp`.
+
 - **`Model.piecewise` / `dm.piecewise`: declared piecewise-linear functions**
   (#1482). `y = m.piecewise(x, breakpoints, values, method=..., name=...)`
   declares a tabulated univariate function (a pump curve, a tariff schedule, a

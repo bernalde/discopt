@@ -47,18 +47,27 @@ _logger = logging.getLogger(__name__)
 _WARNED_REJECTED_OPTIONS: set[str] = set()
 
 
-def _run_solve(problem, x0: np.ndarray, warm_start: Optional[object]):
+def _run_solve(
+    problem, x0: np.ndarray, warm_start: Optional[object], solve_report: bool = False
+) -> tuple[np.ndarray, dict, Optional[dict]]:
     """Call ``pounce.Problem.solve``, with or without a warm start.
 
     ``x0`` still wins over ``warm_start.x`` inside pounce, and the caller has
     already clipped it into the box this NLP is solved on, so both are passed:
     the point from the box in force now, the multipliers and barrier parameter
     from the previous solve.
+
+    Returns ``(x, info, report)``; ``report`` is POUNCE's structured solve report
+    when ``solve_report`` is set (#1534), else ``None``.
     """
+    kwargs = {"warm_start": warm_start} if warm_start is not None else {}
     with _timing.charge("pounce"):
-        if warm_start is not None:
-            return problem.solve(x0.astype(np.float64), warm_start=warm_start)
-        return problem.solve(x0.astype(np.float64))
+        if solve_report:
+            from discopt.solvers._pounce_report import solve_with_report
+
+            return solve_with_report(problem, x0.astype(np.float64), **kwargs)
+        x, info = problem.solve(x0.astype(np.float64), **kwargs)
+        return x, info, None
 
 
 def _kkt_from_info(info: dict) -> Optional[dict[str, float]]:
@@ -128,6 +137,7 @@ def solve_nlp(
     ordering: Optional[Sequence[int]] = None,
     block_structure: Optional[tuple[Sequence[int], Sequence[int]]] = None,
     warm_start: Optional[object] = None,
+    solve_report: bool = False,
 ) -> NLPResult:
     """Solve an NLP using pounce with the NLPEvaluator callbacks.
 
@@ -172,6 +182,12 @@ def solve_nlp(
             starts cannot change what it certifies at termination — though on a
             *nonconvex* NLP it can change which local stationary point is
             reached.
+
+        solve_report: When ``True``, attach POUNCE's structured
+            ``pounce.solve-report/v1`` document (iteration trajectory,
+            restoration statistics, timing) as ``NLPResult.solve_report``
+            (#1534). Off by default: the single-NLP route asks for it, the
+            thousands of node solves inside a branch-and-bound do not.
     """
     if not POUNCE_AVAILABLE:
         raise ImportError(
@@ -323,7 +339,7 @@ def solve_nlp(
 
     t0 = time.perf_counter()
     try:
-        x, info = _run_solve(problem, x0, warm_start)
+        x, info, report = _run_solve(problem, x0, warm_start, solve_report)
     except RuntimeError as exc:
         # #1247: pounce validates option NAMES at solve time, not at
         # ``add_option`` time, so a misspelled key reaches here as a raw Rust
@@ -369,6 +385,7 @@ def solve_nlp(
         objective=float(info.get("obj_val", np.nan)),
         kkt=_kkt_from_info(info),
         linear_solver=_linear_solver_from_info(info),
+        solve_report=report,
         multipliers=np.asarray(multipliers) if multipliers is not None else None,
         bound_multipliers_lower=np.asarray(mult_x_L) if mult_x_L is not None else None,
         bound_multipliers_upper=np.asarray(mult_x_U) if mult_x_U is not None else None,
