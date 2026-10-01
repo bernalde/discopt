@@ -232,12 +232,36 @@ def test_generated_panel(family, transform):
     assert not false, false
 
 
+TRANSFORM_GROUPS = {
+    "shift": {k: v for k, v in TRANSFORMS.items() if k.startswith("shift")},
+    "rows": {k: v for k, v in TRANSFORMS.items() if k.startswith("rows")},
+}
+
+#: Known corpus failures, per (instance, transform group) so the group that still
+#: passes keeps guarding the instance. ``strict``: a fix flips the xfail to a failure.
+KNOWN_CORPUS = {
+    ("st_miqp3.nl", "shift"): "#1543: shifted integer QP certifies infeasible",
+    ("st_miqp4.nl", "shift"): "#1543: shifted integer QP certifies infeasible",
+    ("alan.nl", "shift"): "#1543: MIQP-BB refuses its own infeasible point (RuntimeError)",
+    ("nvs09.nl", "shift"): "#1544: RecursionError in the native spatial kernel builder",
+}
+
+
+def _corpus_params():
+    for path in CORPUS:
+        for group in TRANSFORM_GROUPS:
+            name = os.path.basename(path)
+            reason = KNOWN_CORPUS.get((name, group))
+            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
+            yield pytest.param(path, group, marks=marks, id=f"{name}-{group}")
+
+
 @pytest.mark.slow
 @pytest.mark.correctness
-@pytest.mark.parametrize("path", CORPUS, ids=os.path.basename)
-def test_corpus_panel(path):
+@pytest.mark.parametrize("path, group", list(_corpus_params()))
+def test_corpus_panel(path, group):
     cases = [(os.path.basename(path), dm.from_nl(path))]
-    compared, lost, false = _run_panel(cases, TRANSFORMS, time_limit=20)
+    compared, lost, false = _run_panel(cases, TRANSFORM_GROUPS[group], time_limit=20)
     if compared == 0:
         pytest.skip("base solve not certified within 20 s: no certificate to compare against")
     for row in lost:
