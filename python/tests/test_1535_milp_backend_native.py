@@ -187,3 +187,118 @@ def test_refused_for_a_nonlinear_model():
     m.subject_to(x <= 3 * z + 1)
     with pytest.raises(ValueError, match="LP or MILP"):
         m.solve(milp_backend="native")
+
+
+# ── branching rules ─────────────────────────────────────────────────────
+
+
+def _multi_knapsack(n: int = 20, k: int = 5, seed: int = 0) -> dm.Model:
+    """Several rows, so a node LP has several fractional columns to choose from (a
+    single-row knapsack vertex has at most one, which makes every rule agree)."""
+    rng = np.random.default_rng(seed)
+    W = rng.integers(5, 40, (k, n))
+    v = rng.integers(10, 50, n)
+    m = dm.Model("multi_knapsack")
+    x = m.binary("x", shape=(n,))
+    m.maximize(sum(int(v[i]) * x[i] for i in range(n)))
+    for r in range(k):
+        m.subject_to(sum(int(W[r, i]) * x[i] for i in range(n)) <= int(W[r].sum() // 2))
+    return m
+
+
+def test_branching_rules_change_the_search_but_not_the_answer(monkeypatch):
+    ref = _multi_knapsack().solve()
+    hinted = []
+    real = S._milp_branching_hints
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        hinted.append((args[0], len(out[0])))
+        return out
+
+    monkeypatch.setattr(S, "_milp_branching_hints", spy)
+    nodes = {}
+    for rule in S._MILP_BRANCHING_RULES:
+        res = _multi_knapsack().solve(
+            milp_backend="native", milp_cuts=False, branching_rule=rule, batch_size=1
+        )
+        assert res.status == "optimal" and res.gap_certified
+        assert res.objective == pytest.approx(ref.objective, abs=1e-6)
+        assert f"branching_rule={rule!r}" in res.algorithm_route
+        nodes[rule] = res.node_count
+        probes = (res.solver_stats or {}).get("branching/strong_probe_lps", 0)
+        assert (probes > 0) == (rule == "strong")
+    # Every non-default rule handed the tree hints (the probe fired), and the
+    # rules did not all explore the same tree.
+    for rule in ("most_fractional", "least_fractional", "strong"):
+        assert sum(n for r, n in hinted if r == rule) > 0, rule
+    assert not any(r == "pseudocost" for r, _ in hinted)
+    assert len(set(nodes.values())) > 1, nodes
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"branching_rule": "strong"}, "milp_backend='native'"),
+        ({"milp_backend": "native", "branching_rule": "random"}, "expected one of"),
+        (
+            {"milp_backend": "native", "branching_rule": "strong", "cut_callback": lambda c, m: []},
+            "spatial",
+        ),
+    ],
+)
+def test_branching_rule_refusals(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _knapsack().solve(**kwargs)
+
+
+def test_branching_rule_refused_on_an_lp():
+    with pytest.raises(ValueError, match="does not run for an LP"):
+        _lp().solve(milp_backend="native", branching_rule="strong")
+
+
+# ── callbacks on a MILP without milp_backend ────────────────────────────
+
+
+def test_node_callback_on_a_default_milp_runs_the_tree(monkeypatch):
+    """Previously the HiGHS route returned with the callback never called."""
+    monkeypatch.delenv("DISCOPT_LP_MILP_BACKEND", raising=False)
+    highs = _spy(monkeypatch, "_solve_milp_highs")
+    seen = []
+    ref = _knapsack().solve()
+    highs.clear()
+    res = _knapsack().solve(node_callback=lambda ctx, m: seen.append(ctx))
+    assert highs == []
+    assert seen and res.node_count > 0
+    assert res.algorithm_route.startswith("milp-tree")
+    assert res.objective == pytest.approx(ref.objective, abs=1e-6)
+
+
+def test_node_callback_with_explicit_highs_is_refused():
+    with pytest.raises(ValueError, match="no node or cut hook"):
+        _knapsack().solve(milp_backend="highs", node_callback=lambda ctx, m: None)
+
+
+def test_cut_callback_on_a_milp_is_called():
+    """Neither MILP engine nor the NLP-BB auto-select has a cut hook; the callback
+    used to be silently skipped (0 calls) on every pure-MILP route."""
+    calls = []
+
+    def cut(ctx, model):
+        calls.append(ctx.node_id)
+        return []
+
+    ref = _knapsack(n=10).solve()
+    res = _knapsack(n=10).solve(cut_callback=cut)
+    assert calls
+    assert res.objective == pytest.approx(ref.objective, abs=1e-6)
+
+
+def test_cut_callback_with_explicit_nlp_bb_is_refused():
+    with pytest.raises(ValueError, match="nlp_bb=True"):
+        _knapsack(n=10).solve(cut_callback=lambda ctx, m: [], nlp_bb=True)
+
+
+def test_node_callback_on_an_lp_warns_that_it_is_not_called():
+    with pytest.warns(UserWarning, match="node_callback not called"):
+        _lp().solve(node_callback=lambda ctx, m: None)

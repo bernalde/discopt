@@ -9882,6 +9882,7 @@ def solve_model(
     # #1535: which engine solves a pure LP / MILP; see ``_resolve_lp_milp_backend``.
     milp_backend: Optional[str] = None,
     milp_cuts: Optional[bool] = None,
+    branching_rule: Optional[str] = None,
     # #917: extra wall-clock seconds this solve may take *only if* it holds an
     # incumbent when ``time_limit`` expires. Set by ``Model.solve`` to the #844
     # fallback reserve it withheld, so a primary that found a primal reclaims the
@@ -9986,6 +9987,16 @@ def solve_model(
         cut loop (cover, clique and Gomory cuts) so the tree branches on the
         plain LP relaxation; ``None``/``True`` keeps it (the default). Lets the
         effect of cutting planes be shown one switch at a time.
+    branching_rule : str, optional
+        Only with ``milp_backend="native"`` on a MILP: which fractional integer
+        variable a node branches on. ``"pseudocost"`` (the tree's default:
+        reliability pseudocosts, most-fractional until a variable has
+        observations), ``"most_fractional"``, ``"least_fractional"`` or
+        ``"strong"`` (full strong branching: both child LPs of every candidate
+        are solved and the largest product of objective degradations wins; the
+        probe LPs are counted in ``solver_stats["branching/strong_probe_lps"]``,
+        not in ``node_count``). Changes only the order of the search, never a
+        bound.
     ipopt_options : dict, optional
         Options passed to cyipopt (only used when ``nlp_solver="ipopt"``).
     nlp_solver : str, default "pounce"
@@ -10635,10 +10646,19 @@ def solve_model(
     # engine; every combination that would quietly run a different one is refused
     # rather than ignored (CLAUDE.md §3).
     _lpm_backend = _resolve_lp_milp_backend(milp_backend)
-    if milp_cuts is not None and _lpm_backend != "native":
+    _tree_opts = [
+        n
+        for n, v in (("milp_cuts", milp_cuts), ("branching_rule", branching_rule))
+        if v is not None
+    ]
+    if _tree_opts and _lpm_backend != "native":
         raise ValueError(
-            "milp_cuts is an option of discopt's native MILP tree; pass "
-            "milp_backend='native' with it (the HiGHS route runs its own cut loop)."
+            f"{', '.join(_tree_opts)} steer discopt's native MILP tree; pass "
+            "milp_backend='native' with them (the HiGHS route runs its own search)."
+        )
+    if branching_rule is not None and branching_rule not in _MILP_BRANCHING_RULES:
+        raise ValueError(
+            f"branching_rule={branching_rule!r}: expected one of {', '.join(_MILP_BRANCHING_RULES)}"
         )
     if milp_backend is not None:
         from discopt._relax.problem_classifier import ProblemClass as _PC
@@ -10659,18 +10679,29 @@ def solve_model(
                 "milp_backend='native' runs discopt's MILP tree; nlp_solver='simplex' "
                 "names the monolithic Rust MILP engine. Pass one or the other."
             )
-        if milp_cuts is not None and (
+        if _tree_opts and (
             _lpm_class != _PC.MILP
             or _feasibility_callback_names(lazy_constraints, incumbent_callback)
+            or cut_callback is not None
         ):
             raise ValueError(
-                "milp_cuts switches the root cut loop of discopt's MILP tree, which "
+                f"{', '.join(_tree_opts)} steer discopt's MILP tree, which "
                 + (
                     "does not run for an LP."
                     if _lpm_class != _PC.MILP
-                    else "lazy_constraints/incumbent_callback bypass (they route to "
-                    "spatial branch and bound, #748)."
+                    else "lazy_constraints/incumbent_callback/cut_callback bypass (they "
+                    "route to spatial branch and bound, #748)."
                 )
+            )
+        if (
+            _lpm_backend == "highs"
+            and _lpm_class == _PC.MILP
+            and (node_callback is not None or cut_callback is not None)
+        ):
+            raise ValueError(
+                "milp_backend='highs' runs HiGHS, which exposes no node or cut hook; "
+                "node_callback/cut_callback need discopt's own search (leave "
+                "milp_backend unset, or pass milp_backend='native')."
             )
     gurobi_options = kwargs.pop("gurobi_options", None) if _solver == "gurobi" else None
 
@@ -10697,6 +10728,15 @@ def solve_model(
             _feasibility_callbacks,
             "the decomposition engines solve their own master/subproblems and "
             "never screen candidate incumbents.",
+        )
+    if cut_callback is not None and nlp_bb is True:
+        # #1535: the NLP-BB loop has no cut hook; the callback would never be
+        # called while the solve reported as if it had been. The auto-select
+        # already steps aside for a cut callback; an explicit request is refused.
+        raise ValueError(
+            "cut_callback is not supported with nlp_bb=True: NLP-based branch and "
+            "bound has no hook that applies user cuts. Leave nlp_bb unset so the "
+            "spatial branch and bound, which does, solves the model."
         )
     if _feasibility_callbacks and gdp_method in ("oa", "loa"):
         _refuse_unenforced_callbacks(
@@ -11567,7 +11607,12 @@ def solve_model(
             nlp_bb=nlp_bb,
             nlp_solver=nlp_solver,
             lagrangian_bound=lagrangian_bound,
-            has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+            has_callbacks=(
+                lazy_constraints is not None
+                or incumbent_callback is not None
+                or node_callback is not None
+                or cut_callback is not None
+            ),
             backend=_lpm_backend,
         ):
             gp_result = solve_gp(
@@ -12573,7 +12618,12 @@ def solve_model(
         nlp_bb=nlp_bb,
         nlp_solver=nlp_solver,
         lagrangian_bound=lagrangian_bound,
-        has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+        has_callbacks=(
+            lazy_constraints is not None
+            or incumbent_callback is not None
+            or node_callback is not None
+            or cut_callback is not None
+        ),
         backend=_lpm_backend,
     ):
         logger.info("Root presolve skipped: the HiGHS LP/MILP route presolves internally")
@@ -13063,6 +13113,21 @@ def solve_model(
     _pure_continuous_force_spatial = _callbacks_force_bb and _pure_continuous
     if problem_class is not None:
         if problem_class == ProblemClass.LP and not _callbacks_force_bb:
+            _lp_unused = [
+                n
+                for n, cb in (("node_callback", node_callback), ("cut_callback", cut_callback))
+                if cb is not None
+            ]
+            if _lp_unused:
+                # #1535: an LP is solved without branch and bound -- there is no
+                # node to report and no relaxation to cut. Say so instead of
+                # returning as if the callback had been consulted.
+                warnings.warn(
+                    f"{' and '.join(_lp_unused)} not called: this model is an LP, "
+                    "solved by a single simplex run with no branch-and-bound tree.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             if _lpm_backend == "highs":
                 return _solve_lp_highs(model, t_start, time_limit)
             _lp_res = _solve_lp(model, t_start, time_limit)
@@ -13090,11 +13155,23 @@ def solve_model(
             # NLP-BB auto-select already take. Trades the specialized engine's
             # speed for correctness (CLAUDE.md §1). This mirrors the #740 fix on
             # the spatial path.
-            if lazy_constraints is None and incumbent_callback is None:
+            #
+            # #1535: ``cut_callback`` joins them. Neither MILP engine has a cut hook,
+            # so the callback was silently never called on a MILP (0 calls, on both
+            # the HiGHS and the native route); the spatial path separates it.
+            # ``node_callback`` needs a tree to observe: HiGHS and the monolithic
+            # Rust engine expose none, so it keeps the MILP on ``_solve_milp_bb``.
+            _observe_tree = node_callback is not None
+            if lazy_constraints is None and incumbent_callback is None and cut_callback is None:
                 # #1229 HiGHS route (default; DISCOPT_LP_MILP_BACKEND=rust opts out). An explicit
                 # ``nlp_solver="simplex"`` still names the Rust engine, and
                 # ``lagrangian_bound`` still needs the per-node Python path.
-                if _lpm_backend == "highs" and nlp_solver != "simplex" and not lagrangian_bound:
+                if (
+                    _lpm_backend == "highs"
+                    and nlp_solver != "simplex"
+                    and not lagrangian_bound
+                    and not _observe_tree
+                ):
                     _highs_res = _solve_milp_highs(
                         model,
                         time_limit,
@@ -13124,8 +13201,13 @@ def solve_model(
                 _deferred: dict = {}
                 # #1535: ``milp_backend="native"`` asks for the MILP tree below,
                 # the engine whose search the caller's options actually steer.
-                _want_engine = _lpm_backend != "native" and (
-                    nlp_solver == "simplex" or (_milp_engine_default_on() and not lagrangian_bound)
+                _want_engine = (
+                    _lpm_backend != "native"
+                    and not _observe_tree
+                    and (
+                        nlp_solver == "simplex"
+                        or (_milp_engine_default_on() and not lagrangian_bound)
+                    )
                 )
                 # #1243: the monolithic engine's RELATIVE arm is
                 # ``TreeManager::gap()``, whose denominator is FLOORED AT 1.0, so
@@ -13209,12 +13291,19 @@ def solve_model(
                     abs_gap_tol=abs_gap_tol,
                     node_callback=node_callback,
                     root_cuts=milp_cuts is not False,
+                    branching_rule=branching_rule or "pseudocost",
                 )
                 if _lpm_backend == "native" and _bb_res.algorithm_route is None:
                     _bb_res.algorithm_route = (
                         f"native-milp: discopt MILP branch and bound "
                         f"(milp_backend='native', strategy={strategy!r}, "
+                        f"branching_rule={branching_rule or 'pseudocost'!r}, "
                         f"root cuts {'off' if milp_cuts is False else 'on'})"
+                    )
+                elif _observe_tree and _bb_res.algorithm_route is None:
+                    _bb_res.algorithm_route = (
+                        "milp-tree: discopt MILP branch and bound (node_callback set; "
+                        "the HiGHS route has no tree to observe)"
                     )
                 return _merge_engine_stats(
                     _merge_engine_bound(_bb_res, _engine_bound, model),
@@ -13226,12 +13315,12 @@ def solve_model(
                 # Say so on the result rather than let it read as the MILP tree.
                 _ROUTE_FALLBACK_NOTE.append(
                     "native-spatial: discopt spatial branch and bound (milp_backend="
-                    "'native' with lazy_constraints/incumbent_callback, #748)"
+                    "'native' with lazy_constraints/incumbent_callback/cut_callback, #748)"
                 )
             logger.info(
-                "MILP with a lazy_constraints/incumbent_callback — routing to spatial "
-                "Branch-and-Bound (the specialized MILP engine cannot honor these "
-                "callbacks; #748)"
+                "MILP with a lazy_constraints/incumbent_callback/cut_callback — routing "
+                "to spatial Branch-and-Bound (the specialized MILP engines cannot honor "
+                "these callbacks; #748)"
             )
             # Fall through to the spatial/McCormick path below.
         elif problem_class == ProblemClass.MIQP:
@@ -13498,8 +13587,15 @@ def solve_model(
     # per-node cut application; its primal heuristics inject incumbents without
     # consulting the callback — INT-1, #413). Fall through to the spatial-B&B
     # loop, which enforces both correctly, rather than silently drop the
-    # rejection and accept the excluded point.
-    if nlp_bb is None and lazy_constraints is None and incumbent_callback is None:
+    # rejection and accept the excluded point. #1535: ``cut_callback`` too -- the
+    # NLP-BB loop has no cut hook, so a convex model (a MILP routed here by #748
+    # included) ran with the callback never called.
+    if (
+        nlp_bb is None
+        and lazy_constraints is None
+        and incumbent_callback is None
+        and cut_callback is None
+    ):
         if not _root_convexity_known:
             _root_convexity_known, _root_is_convex, _root_constraint_mask = (
                 _classify_model_convexity(
@@ -28215,6 +28311,92 @@ def _solve_milp_simplex(
     )
 
 
+#: Branching rules the native MILP tree accepts (#1535). ``"pseudocost"`` is the
+#: tree's own default (reliability pseudocosts, most-fractional until a column has
+#: observations); the others are chosen here and handed to the tree as branch hints.
+_MILP_BRANCHING_RULES = ("pseudocost", "most_fractional", "least_fractional", "strong")
+
+
+def _milp_branching_hints(
+    rule: str,
+    node_solve: Callable,
+    lp_data,
+    int_cols: np.ndarray,
+    batch_ids,
+    batch_lb,
+    batch_ub,
+    result_lbs: np.ndarray,
+    result_sols: np.ndarray,
+    cutoff: float,
+    n_vars: int,
+    n_orig: int,
+    t_start: float,
+    time_limit: float,
+) -> tuple[list[tuple[int, int]], int]:
+    """The ``(node_id, column)`` branch hints ``rule`` picks for one batch (#1535).
+
+    Only nodes the tree will branch -- a real bound below ``cutoff`` and at least one
+    fractional integer column -- get a hint. A hint changes WHICH column is branched
+    on, never a bound: ``process_evaluated`` still splits at ``floor``/``ceil`` of the
+    node's value, an exhaustive cover, so the rule cannot cut off a feasible point.
+
+    * ``"most_fractional"`` -- fractional part closest to 1/2.
+    * ``"least_fractional"`` -- fractional part closest to an integer.
+    * ``"strong"`` -- full strong branching: solve both child LPs for every
+      candidate and take the largest product of objective degradations, an
+      infeasible child counting as an infinite degradation. The probe LPs are not
+      tree nodes; their number is returned so the caller can report it.
+
+    ``"pseudocost"`` returns no hints: that is the tree's own rule.
+    """
+    hints: list[tuple[int, int]] = []
+    probes = 0
+    if rule == "pseudocost" or int_cols.size == 0:
+        return hints, probes
+    for i in range(len(batch_ids)):
+        lb_i = float(result_lbs[i])
+        if not lb_i < _SENTINEL_THRESHOLD or lb_i >= cutoff:
+            continue
+        vals = result_sols[i][int_cols]
+        frac = vals - np.floor(vals)
+        cand = np.flatnonzero((frac > 1e-5) & (frac < 1.0 - 1e-5))
+        if cand.size == 0:
+            continue
+        if rule == "most_fractional":
+            pick = cand[int(np.argmin(np.abs(frac[cand] - 0.5)))]
+        elif rule == "least_fractional":
+            pick = cand[int(np.argmin(np.minimum(frac[cand], 1.0 - frac[cand])))]
+        else:  # strong
+            node_lb = np.asarray(batch_lb[i], dtype=np.float64)
+            node_ub = np.asarray(batch_ub[i], dtype=np.float64)
+            best_score = -np.inf
+            pick = cand[0]
+            for k in cand:
+                col = int(int_cols[k])
+                v = float(result_sols[i][col])
+                deltas = []
+                for side in ("down", "up"):
+                    clb, cub = node_lb.copy(), node_ub.copy()
+                    if side == "down":
+                        cub[col] = np.floor(v)
+                    else:
+                        clb[col] = np.ceil(v)
+                    out = node_solve(lp_data, clb, cub, n_vars, n_orig, t_start, time_limit)
+                    probes += 1
+                    if out is None:  # stalled probe: no information, not a proof
+                        deltas.append(0.0)
+                    elif out[2] == "optimal" and out[0] < _SENTINEL_THRESHOLD:
+                        deltas.append(max(float(out[0]) - lb_i, 0.0))
+                    else:
+                        deltas.append(np.inf)
+                score = max(deltas[0], 1e-6) * max(deltas[1], 1e-6)
+                if score > best_score:
+                    best_score = score
+                    pick = k
+        hints.append((int(batch_ids[i]), int(int_cols[pick])))
+    return hints, probes
+
+
 def _fire_milp_node_callback(
     node_callback: Callable,
     model: Model,
@@ -28287,6 +28469,7 @@ def _solve_milp_bb(
     # spatial path) and switch the root cut loop off to show what it buys.
     node_callback: Optional[Callable] = None,
     root_cuts: bool = True,
+    branching_rule: str = "pseudocost",
 ) -> SolveResult:
     """Solve a MILP via B&B with LP relaxation solves at each node.
 
@@ -28432,6 +28615,12 @@ def _solve_milp_bb(
     t_rust_start = time.perf_counter()
     tree = PyTreeManager(n_vars, lb.tolist(), ub.tolist(), int_offsets, int_sizes, strategy)
     tree.initialize()
+    # #1535: integer columns and probe count for a caller-chosen branching rule.
+    _branch_int_cols = np.array(
+        [j for off, sz in zip(int_offsets, int_sizes) for j in range(off, off + int(sz))],
+        dtype=np.int64,
+    )
+    _strong_probes = 0
     # #933 part (a): install the root LP relaxation bound (proved just above by
     # the same structured-node engine that bounds every node on this path, over
     # exactly this [lb, ub] box) into the tree root, so ``global_lower_bound``
@@ -28872,6 +29061,33 @@ def _solve_milp_bb(
             _debug_quit = True
             break
 
+        if branching_rule != "pseudocost":
+            # #1535: set before the #1414 hints below, which must win for their
+            # nodes (a later hint for the same node replaces an earlier one).
+            _inc_now = tree.incumbent()
+            _rule_hints, _n_probes = _milp_branching_hints(
+                branching_rule,
+                _node_solve,
+                lp_data,
+                _branch_int_cols,
+                batch_ids,
+                batch_lb,
+                batch_ub,
+                result_lbs,
+                result_sols,
+                float(_inc_now[1]) if _inc_now is not None else np.inf,
+                n_vars,
+                n_orig,
+                t_start,
+                time_limit,
+            )
+            _strong_probes += _n_probes
+            if _rule_hints:
+                tree.set_branch_hints(
+                    np.array([nid for nid, _ in _rule_hints], dtype=np.int64),
+                    np.array([col for _, col in _rule_hints], dtype=np.int64),
+                )
+
         t_rust_start = time.perf_counter()
         if _unpromotable_hints:
             # #1414: name the column whose rounding broke a row, so step 3 of
@@ -29280,6 +29496,10 @@ def _solve_milp_bb(
     # than inferred from a wall-clock reading.
     if _incumbent_extension_taken > 0.0:
         _milp_solver_stats["budget/incumbent_extension_s"] = float(_incumbent_extension_taken)
+    # #1535: strong-branching probe LPs are solved outside the tree, so they are
+    # not in ``node_count``; report them so the rule's real cost is visible.
+    if _strong_probes:
+        _milp_solver_stats["branching/strong_probe_lps"] = float(_strong_probes)
 
     # #1383: the certificate must survive the FINAL (objective, bound) pair.
     # Everything above may still have moved `obj_val` after the tree computed

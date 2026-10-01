@@ -69,9 +69,14 @@ classify_problem(model)                                   [problem_classifier.py
   │        else ─────────────────► _solve_milp_bb         (Rust tree; node-LP = warm simplex | POUNCE-IPM)
   │        milp_backend="native" (#1535) ► _solve_milp_bb directly — skips HiGHS AND the monolithic
   │                                   engine; honours strategy, batch_size, max_nodes, node_callback,
-  │                                   milp_cuts=False (no root cut loop); route "native-milp".
-  │                                   lazy_constraints / incumbent_callback still → Subtree A (#748),
-  │                                   route "native-spatial".
+  │                                   branching_rule (pseudocost | most_fractional | least_fractional
+  │                                   | strong, via tree branch hints), milp_cuts=False (no root cut
+  │                                   loop); route "native-milp".
+  │        node_callback (no milp_backend) ► _solve_milp_bb (HiGHS has no tree); route "milp-tree".
+  │        lazy_constraints / incumbent_callback / cut_callback → Subtree A (#748; cut_callback
+  │                                   since #1535 — no MILP engine has a cut hook); with native,
+  │                                   route "native-spatial". The convex NLP-BB auto-select also
+  │                                   steps aside for cut_callback; nlp_bb=True + cut_callback raises.
   │
   ├─ MIQP  convexity check (eigenvalue):
   │          convex    ──► _solve_miqp_bb  (self-hosted B&B, POUNCE node QPs; HiGHS-free, #359)
