@@ -10661,10 +10661,12 @@ def solve_model(
             f"branching_rule={branching_rule!r}: expected one of {', '.join(_MILP_BRANCHING_RULES)}"
         )
     if milp_backend is not None:
+        # Imported under its own name: the #1456 pre-solve inventory records passes
+        # by name, and ``classify_problem`` is already there.
         from discopt._relax.problem_classifier import ProblemClass as _PC
-        from discopt._relax.problem_classifier import classify_problem as _classify
+        from discopt._relax.problem_classifier import classify_problem
 
-        _lpm_class = _classify(model)
+        _lpm_class = classify_problem(model)
         if _lpm_class not in (_PC.LP, _PC.MILP):
             raise ValueError(
                 f"milp_backend={milp_backend!r} selects the engine for an LP or MILP "
