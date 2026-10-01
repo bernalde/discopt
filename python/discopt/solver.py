@@ -20212,6 +20212,7 @@ def _solve_continuous(
             options=opts,
             block_structure=pounce_block_structure,
             warm_start=pounce_warm_start,
+            solve_report=True,
         )
     else:
         # "ipm"/"sparse_ipm" resolve to POUNCE upstream (the JAX IPM is retired);
@@ -20479,6 +20480,7 @@ def _solve_continuous(
         root_time=wall_time,
         gap_certified=_gap_certified,
         kkt=nlp_result.kkt,
+        solve_report=nlp_result.solve_report,
         error=_error_reason if status == "error" else None,
     )
 
@@ -23943,6 +23945,42 @@ class _DeferredUnbounded:
         self.engine = engine
 
 
+def _capture_solve_report(
+    solve_fn: Callable[..., Any],
+) -> tuple[Callable[..., Any], list[Optional[dict]]]:
+    """Wrap a POUNCE matrix-form ``solve_fn`` so it requests the solve report (#1534).
+
+    Returns ``(wrapped, reports)``; ``reports`` collects ``solve_report`` from every
+    call, in order. ``_solve_lp_matrix`` / ``_solve_qp_matrix`` build their
+    ``SolveResult`` in a dozen places from a backend result they do not return, so
+    the report is captured here, at the POUNCE-specific seam, rather than threaded
+    through every one of those constructors.
+    """
+    reports: list[Optional[dict]] = []
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        result = solve_fn(*args, solve_report=True, **kwargs)
+        reports.append(result.solve_report)
+        return result
+
+    return wrapped, reports
+
+
+def _attach_solve_report(
+    result: "SolveResult | _DeferredUnbounded | None", reports: list[Optional[dict]]
+) -> None:
+    """Set ``solve_report``, in place, on a matrix-route result from the single POUNCE call.
+
+    Only when there WAS a single call: a route that called the backend more than
+    once has no single solve whose trajectory this would be, the same rule
+    ``SolveResult.kkt`` follows for branch-and-bound.
+    """
+    if result is None or len(reports) != 1:
+        return
+    target = result.result if isinstance(result, _DeferredUnbounded) else result
+    target.solve_report = reports[0]
+
+
 def _solve_lp_simplex(
     model: Model,
     t_start: float,
@@ -23983,16 +24021,20 @@ def _solve_lp_pounce(
     # 1e-8 relaxation is what puts that point outside the declared box (#940).
     # Applied backend-wide it also reaches the Benders dual LP, where it costs
     # convergence (2 correctness-lane tests, 1.6s -> 79s) — see #945.
-    solve_fn = functools.partial(
-        _pounce_solve_lp,
-        certificate=True,
-        options={"bound_relax_factor": POUNCE_BOUND_RELAX_FACTOR},
+    solve_fn, reports = _capture_solve_report(
+        functools.partial(
+            _pounce_solve_lp,
+            certificate=True,
+            options={"bound_relax_factor": POUNCE_BOUND_RELAX_FACTOR},
+        )
     )
     # The IPM is the one backend that relaxes a declared [1e15, 1e20) bound to its
     # own infinity, so its UNBOUNDED is the verdict the #850 guard defers on.
-    return _solve_lp_matrix(
+    result = _solve_lp_matrix(
         model, t_start, time_limit, solve_fn, "POUNCE", relaxes_huge_bounds=True
     )
+    _attach_solve_report(result, reports)
+    return result
 
 
 def _solve_lp_gurobi(
@@ -24380,14 +24422,16 @@ def _solve_qp_pounce(
     if any(v.var_type in (VarType.BINARY, VarType.INTEGER) for v in model._variables):
         return None
     # Same reasoning as _solve_lp_pounce: the guard checks THIS call site's point.
-    solve_fn = functools.partial(
-        _pounce_solve_qp,
-        certificate=True,
-        options={"bound_relax_factor": POUNCE_BOUND_RELAX_FACTOR},
+    solve_fn, reports = _capture_solve_report(
+        functools.partial(
+            _pounce_solve_qp,
+            certificate=True,
+            options={"bound_relax_factor": POUNCE_BOUND_RELAX_FACTOR},
+        )
     )
     # The IPM is the one QP backend that relaxes a declared [1e15, 1e20) bound to
     # its own infinity, so its UNBOUNDED needs the #850/#1319 guard.
-    return _solve_qp_matrix(
+    result = _solve_qp_matrix(
         model,
         t_start,
         time_limit,
@@ -24396,6 +24440,8 @@ def _solve_qp_pounce(
         relaxes_huge_bounds=True,
         reject_reason=reject_reason,
     )
+    _attach_solve_report(result, reports)
+    return result
 
 
 def _solve_qp_gurobi(

@@ -4130,6 +4130,44 @@ class SolveResult:
         a certificate stated in problem units must be built from.
         ``barrier_parameter`` is the terminal interior-point ``mu``, forwarded by
         :meth:`solve`'s ``warm_start`` to seed the next solve.
+    solve_report : dict or None
+        POUNCE's structured solve report for the one POUNCE call that produced
+        this result -- the ``pounce.solve-report/v1`` document, the same data as
+        ``pounce --json-output <file> --json-detail full`` (#1534). Set on the
+        routes that make a single POUNCE call: the continuous single-NLP route
+        (convex fast path, and the local NLP on a convexity-unknown model), the
+        continuous QP route, and the LP route when POUNCE answered it. ``None``
+        elsewhere: every branch-and-bound route (no single NLP, as for ``kkt``),
+        an LP answered by the simplex or HiGHS, and the cyipopt backend.
+
+        Keys (the document's own; nothing is renamed):
+
+        * ``report["statistics"]`` -- ``iteration_count``, the ``final_*``
+          residuals, evaluation counts, ``total_wallclock_time_secs``, and the
+          restoration-phase counts ``restoration_calls``,
+          ``restoration_inner_iters``, ``restoration_outer_iters``,
+          ``restoration_wall_secs``.
+        * ``report["iterations"]`` -- the trajectory, one dict per main-phase
+          iteration with ``iter``, ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
+          ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
+          ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
+          ``"R"`` marks an entry into restoration) and ``ls_trials``. The final
+          barrier parameter is ``report["iterations"][-1]["mu"]``.
+        * ``report["solution"]``, ``report["problem"]``,
+          ``report["fair_metadata"]`` (solver version, timestamps).
+
+        The trajectory matches POUNCE's printed iteration table row for row on
+        the main phase, with two POUNCE-side exceptions: the inner
+        restoration-phase rows (printed as ``24r``, ``25r``, ...) are not in it --
+        restoration shows up as the ``"R"`` row and the ``restoration_*`` counts --
+        and ``inf_pr`` is POUNCE's internal primal infeasibility on its
+        slack-reformulated, scaled problem rather than the printed column's
+        violation of the original constraints, so the two differ wherever a slack
+        sits off its constraint value (typically the first iterations).
+
+        It describes the problem POUNCE was handed: for a maximization that is
+        the negated objective, and for an LP or QP the matrix form with slacks
+        eliminated. Diagnostic only; nothing in the solver reads it back.
     convex_fast_path : bool
         True if the problem was detected as convex and solved with a
         single NLP call (no Branch & Bound), guaranteeing global optimality.
@@ -4287,6 +4325,12 @@ class SolveResult:
     # Diagnostic, never load-bearing: nothing in the solver reads this field back,
     # so a backend that omits a key cannot change a verdict.
     kkt: Optional[dict[str, float]] = None
+
+    # POUNCE's ``pounce.solve-report/v1`` document for the single POUNCE call that
+    # produced this result (#1534): iteration trajectory, restoration statistics,
+    # timing. ``None`` on every route without exactly one POUNCE call. Diagnostic,
+    # never load-bearing, like ``kkt``.
+    solve_report: Optional[dict[str, Any]] = None
 
     # Witness for an infeasible result, when the backend computed one. An
     # ``InfeasibilityCertificate`` (per-row minimal constraint violations, in
