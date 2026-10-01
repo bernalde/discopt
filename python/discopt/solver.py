@@ -6263,6 +6263,49 @@ def _gap_criterion(ub: float, lb: float, gap_tolerance: float, abs_gap_tol: floa
     return None
 
 
+def _refuse_unclosed_published_pair(
+    result: SolveResult, gap_tolerance: float, abs_gap_tol: float
+) -> None:
+    """Withdraw a certificate whose own published pair does not close the gap (#1536).
+
+    ``gap_certified=True`` is a statement about the ``(objective, bound)`` the
+    caller is handed, judged by the tolerances the caller asked for. Routes decide
+    it inside their engines, on whatever objective the engine sees -- and that need
+    not be the published one: the HiGHS MILP route used to give HiGHS a
+    constant-free objective, so after ``x = y - 1e6`` HiGHS's relative gap was
+    measured against ~1e6 and a 35-unit gap was published as certified. This is
+    the one check every route passes through, so a route that gets its stopping
+    rule wrong in a new way still cannot publish a certificate its numbers refute.
+
+    It only ever withdraws: a closed pair, an uncertified result and a result with
+    no pair (an infeasibility proof, a pairless certificate) are left untouched.
+    The arithmetic is :func:`_gap_criterion`'s, so it agrees with the
+    ``gap_criterion`` stat and with :func:`_gap_values_converged`. A MAXIMIZE result
+    publishes its bound as an UPPER bound; ordering the pair covers both senses.
+    """
+    if not result.gap_certified or result.status != "optimal":
+        return
+    if result.objective is None or result.bound is None:
+        return
+    o, b = float(result.objective), float(result.bound)
+    hi, lo = (o, b) if o >= b else (b, o)
+    if _gap_criterion(hi, lo, gap_tolerance, abs_gap_tol) is not None:
+        return
+    logger.warning(
+        "Certificate withdrawn: the published objective %.12g and bound %.12g do not "
+        "close the requested gap (rel %g, abs %g); reporting status='feasible' (#1536).",
+        o,
+        b,
+        gap_tolerance,
+        abs_gap_tol,
+    )
+    result.gap_certified = False
+    result.status = "feasible"
+    if result.solver_stats is None:
+        result.solver_stats = {}
+    result.solver_stats["certificate/published_pair_refused"] = 1.0
+
+
 def _warn_abs_gap_ignored(route: str, abs_gap_tolerance: Optional[float]) -> None:
     """Say so when *route* cannot honour an ``abs_gap_tolerance`` the caller set.
 
@@ -9681,6 +9724,10 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # Everything that is not native Rust is interpreted Python.
         result.python_time = max(0.0, wall - native)
         result.jax_time = min(spent["jax"], result.python_time)
+        # #1536: the single point every route's result passes through, after the
+        # #1059 route/fallback merge -- so it judges the pair actually published.
+        if _gap_tols is not None:
+            _refuse_unclosed_published_pair(result, _gap_tols[0], _gap_tols[1])
         # #1243: say which of the two criteria stopped the search. Derived from
         # the returned (incumbent, bound) pair with the SAME arithmetic the
         # convergence test uses, so the two can never disagree; ``None`` -- the
@@ -11292,6 +11339,13 @@ def solve_model(
         # that reaches every route, so it must not be silently dropped here.
         if "abs_tol" not in amp_kwargs and abs_gap_tolerance is not None:
             amp_kwargs["abs_tol"] = abs_gap_tol
+        # #1536: AMP is asked to meet ``rel_gap`` / ``abs_tol``, not
+        # ``gap_tolerance``, so its certificate is judged by those. This solve's
+        # entry is the last one: a nested solve pops its own on exit.
+        _GAP_TOLERANCES[-1] = (
+            float(amp_kwargs["rel_gap"]),
+            float(amp_kwargs.get("abs_tol", abs_gap_tol)),
+        )
 
         from discopt.transformations import get as _get_transformation
 
