@@ -171,7 +171,7 @@ def solve_arm(arm, layers, d, form, tl):
         if arm == "omlt+discopt":
             import discopt.pyomo  # noqa: F401 -- registers SolverFactory("discopt")
 
-            res = pyo.SolverFactory("discopt").solve(om, time_limit=tl)
+            res = pyo.SolverFactory("discopt").solve(om, timelimit=tl)
             tc = str(res.solver.termination_condition)
             lb = getattr(res.problem, "lower_bound", None)
             return tc, pyo.value(om.obj), lb, tc == "optimal", size
