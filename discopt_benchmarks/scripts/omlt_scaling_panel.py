@@ -173,8 +173,25 @@ def solve_arm(arm, layers, d, form, tl):
 
             res = pyo.SolverFactory("discopt").solve(om, timelimit=tl)
             tc = str(res.solver.termination_condition)
-            lb = getattr(res.problem, "lower_bound", None)
-            return tc, pyo.value(om.obj), lb, tc == "optimal", size
+            # Read the published pair without trusting which field holds which: the
+            # plugin swaps incumbent and dual bound (#1560), and with no incumbent
+            # ``pyo.value(om.obj)`` is just the variables' initial value. For a
+            # minimize, the dual bound is the smaller finite field; an incumbent
+            # exists only when both are finite or the lone one equals om.obj.
+            vals = [res.problem.lower_bound, res.problem.upper_bound]
+            fin = [float(v) for v in vals if v is not None and np.isfinite(float(v))]
+            here = pyo.value(om.obj, exception=False)
+            if len(fin) == 2:
+                obj, bound = here, min(fin)
+                assert here is not None and abs(here - max(fin)) <= 1e-6 * (1 + abs(here)), (
+                    here,
+                    fin,
+                )
+            elif len(fin) == 1 and here is not None and abs(here - fin[0]) <= 1e-9:
+                obj, bound = here, None  # incumbent, no dual bound
+            else:
+                obj, bound = None, (fin[0] if fin else None)
+            return tc, obj, bound, tc == "optimal", size
         if form == "bigm":
             res = pyo.SolverFactory("highs").solve(om, timelimit=tl, load_solutions=False)
             tc = str(res.solver.termination_condition)
