@@ -25525,6 +25525,59 @@ def _matrix_solution_violations(x, A_ub, b_ub, A_eq, b_eq, bounds) -> str:
     return "no block shows a positive residual"
 
 
+def _qp_objective_at_point(
+    model: Model,
+    x: np.ndarray,
+    expanded: float,
+    Q: np.ndarray,  # noqa: N803
+    c: np.ndarray,
+    obj_const: float,
+) -> float:
+    """The model's objective at ``x``, evaluated in its declared form when the
+    expanded QP value is only a less accurate evaluation of the same number (#1537).
+
+    The QP route works on ``1/2 x'Qx + c'x + obj_const``: every affine argument is
+    multiplied out. Under ``x = y - c0`` that turns ``(y - c0)**2 - 3 (y - c0)`` into
+    ``y**2 - (2 c0 + 3) y + (c0**2 + 3 c0)`` and the value at the optimum is the
+    difference of terms of size ``c0**2``: at ``c0 = 1e6`` the published bound was
+    -2.2501220703125 against a true -2.25 (the ulp of 1e12), and at 7.7e6 the bound
+    was so far below the reconciled objective that the certificate was withdrawn --
+    a certificate that depends on where the box sits. This route publishes the
+    objective AS the bound (the convex / tree premise), so that number has to be
+    computed where it is accurate: the declared expression, which the tape
+    evaluates on the affine arguments themselves.
+
+    The declared value replaces the expanded one only when they agree to within the
+    expanded form's own rounding scale ``|obj_const| + |c|'|x| + |x|'|Q||x|``, i.e.
+    when they are two evaluations of one number at one point. A larger difference
+    is a reformulation mismatch, not rounding, and is left to
+    ``Model._reconcile_objective_with_model`` and its certificate re-test, exactly as
+    before.
+    """
+    from discopt._tape_nlp_evaluator import make_evaluator
+
+    try:
+        ev = make_evaluator(model)
+        f = float(ev.evaluate_objective(x))
+    except Exception as exc:  # noqa: BLE001 - evaluator robustness, mirrors reconciliation
+        logger.warning(
+            "QP objective re-evaluation in declared form failed (%s: %s); publishing "
+            "the expanded value %.17g (#1537).",
+            type(exc).__name__,
+            exc,
+            expanded,
+        )
+        return expanded
+    f_decl = -f if getattr(ev, "_negate", False) else f
+    if not np.isfinite(f_decl):
+        return expanded
+    ax = np.abs(x)
+    mag = abs(float(obj_const)) + float(np.abs(c) @ ax) + float(ax @ (np.abs(Q) @ ax))
+    if abs(f_decl - expanded) <= 64.0 * np.finfo(float).eps * (mag + abs(expanded)):
+        return f_decl
+    return expanded
+
+
 def _solve_qp_matrix(
     model: Model,
     t_start: float,
@@ -25675,6 +25728,16 @@ def _solve_qp_matrix(
             return None
         x_flat = result.x[:n_orig]
         assert objective is not None
+        # #1537: ``objective`` doubles as the published bound below, so evaluate it
+        # where it is accurate (see the helper).
+        objective = _qp_objective_at_point(
+            model,
+            np.asarray(x_flat, dtype=np.float64),
+            objective,
+            Q_orig,
+            c_orig,
+            qp_data.obj_const,
+        )
 
         n_eq_rows = A_eq.shape[0] if A_eq is not None else 0
         n_ub_rows = A_ub.shape[0] if A_ub is not None else 0
@@ -25941,6 +26004,225 @@ def _solve_milp_gurobi(
     return SolveResult(status="error", wall_time=wall_time, node_count=result.node_count)
 
 
+def _highs_lp_verifier_available() -> bool:
+    """Whether the HiGHS LP route (the verified Farkas / NS-bound arbiter) can run.
+
+    ``highspy`` is a core dependency, but the WASM build has none. There a POUNCE
+    ``primal_infeasible`` label is acted on only when the in-house simplex
+    corroborates it, and the multiplier-free node bound falls back to the
+    box-only bound (#1537).
+    """
+    try:
+        import highspy  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _convex_qp_node_lower_bound(
+    P,  # noqa: N803
+    c,
+    obj_const: float,
+    G,  # noqa: N803
+    h,
+    A,  # noqa: N803
+    b,
+    node_lb,
+    node_ub,
+    x,
+    y=None,
+    z=None,
+) -> float:
+    """A rigorous lower bound on ``min 1/2 x'Px + c'x + obj_const`` over the node
+    ``G x <= h, A x = b, node_lb <= x <= node_ub`` from an IPM point ``x`` (#1537).
+
+    Every POUNCE node path used the objective AT the returned point as the node's
+    lower bound. That is a lower bound only if the point is the exact minimiser;
+    the IPM's stopping test is relative, so how far ``f(x)`` may sit above the
+    minimum scales with the gradient. Under ``x = y - 1e6`` the expanded
+    objective's gradient is ~1e7 and ``st_miqp3``'s root came back "optimal" with
+    ``f = 25.8`` against a true node minimum of -6: the optimum was pruned and 15.0
+    published as a certified optimum.
+
+    With POUNCE's structured multipliers (``grad f + A'y + G'z - z_lb + z_ub = 0``,
+    ``z >= 0``) the Lagrangian ``L = f + z'(Gx - h) + y'(Ax - b)`` is convex, at most
+    ``f`` on the node, so ``L(x) + min_box grad L(x) . (u - x)`` bounds the node
+    minimum from below -- tight at a true KKT point (the reduced gradient then
+    vanishes or points into the box). Without multipliers, or when that closed form
+    is ``-inf`` (an open side with a residual gradient), the tangent plane of ``f``
+    at ``x`` is minimised over the node polyhedron by the verified HiGHS LP route;
+    that is rigorous by convexity alone. One rounding unit of the magnitudes that
+    were summed is subtracted, since the expanded objective cancels terms of size
+    ``obj_const``. ``-inf`` when neither applies: the node then stays open.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    lo = np.asarray(node_lb, dtype=np.float64)
+    hi = np.asarray(node_ub, dtype=np.float64)
+    lo = np.where(lo <= -_CONSTRAINT_INF, -np.inf, lo)
+    hi = np.where(hi >= _CONSTRAINT_INF, np.inf, hi)
+    if not np.all(np.isfinite(x)):
+        return -np.inf
+    Pm = np.zeros((n, n)) if P is None else np.asarray(P, dtype=np.float64)  # noqa: N806
+    cv = np.asarray(c, dtype=np.float64)
+    Px = Pm @ x  # noqa: N806
+    f = 0.5 * float(x @ Px) + float(cv @ x) + float(obj_const)
+    ax = np.abs(x)
+    mag = float(ax @ (np.abs(Pm) @ ax)) + float(np.abs(cv) @ ax) + abs(float(obj_const))
+    has_G = G is not None and np.asarray(G).size > 0  # noqa: N806
+    has_A = A is not None and np.asarray(A).size > 0  # noqa: N806
+    # One rounding unit of everything summed: the error that dominates here is the
+    # final cancellation of the expanded terms against ``obj_const`` (each term
+    # carries half an ulp), not the short inner products. Under ``x = y - 1e6`` the
+    # terms are ~3e13 and this is ~7e-3 -- the honest price of the expanded form.
+    eps = float(np.finfo(float).eps)
+
+    # Separable curvature that P dominates: P - diag(D) is diagonally dominant with
+    # a nonnegative diagonal, hence PSD, so
+    #   f(u) >= f(x) + g . d + 1/2 sum_j D_j d_j^2   (d = u - x)
+    # for every u (exact when P is diagonal, e.g. every (x_j - c_j)**2 term). The
+    # Lagrangian has the same Hessian. Minimised per coordinate over the box this
+    # is tight to ~g_j^2 / (2 D_j) at an IPM point and finite even on an open side
+    # -- a purely linear tangent pays |g_j| x (box width) instead.
+    absP = np.abs(Pm)  # noqa: N806
+    D = np.maximum(0.0, np.diag(Pm) - (absP.sum(axis=1) - np.abs(np.diag(Pm))))  # noqa: N806
+
+    def _box_term(g: np.ndarray) -> tuple[float, float]:
+        if not np.all(np.isfinite(g)):
+            return -np.inf, 0.0
+        dlo, dhi = lo - x, hi - x
+        total, size = 0.0, 0.0
+        for j in range(n):
+            gj, Dj = float(g[j]), float(D[j])
+            if Dj > 0.0:
+                d = min(max(-gj / Dj, dlo[j]), dhi[j])
+                total += gj * d + 0.5 * Dj * d * d
+                size += abs(gj * d) + 0.5 * Dj * d * d + Dj * (abs(x[j]) + abs(d)) * abs(d)
+            elif gj != 0.0:
+                d = dlo[j] if gj > 0.0 else dhi[j]
+                if not np.isfinite(d):
+                    return -np.inf, 0.0
+                total += gj * d
+                size += abs(gj) * (abs(d) + abs(x[j]))
+        return total, size
+
+    # lambda = 0 is a multiplier too: the box alone relaxes the node, so this is a
+    # valid bound, and the tight one whenever no row binds at the optimum (an IPM's
+    # inexact multipliers on an inactive big-M row otherwise leave a residual
+    # gradient of M x z on the binaries).
+    t0, s0 = _box_term(Px + cv)
+    box_only = f + t0 - eps * (mag + s0 + abs(f)) if np.isfinite(t0) else -np.inf
+    if box_only >= f - 1e-7 * (1.0 + abs(f)):
+        return box_only
+
+    if y is not None or z is not None:
+        val, g, m2 = f, Px + cv, mag
+        if has_G and z is not None and np.asarray(z).size:
+            Gm, hv = np.asarray(G, dtype=np.float64), np.asarray(h, dtype=np.float64)  # noqa: N806
+            zv = np.maximum(np.asarray(z, dtype=np.float64), 0.0)
+            val += float(zv @ (Gm @ x - hv))
+            g = g + Gm.T @ zv
+            m2 += float(zv @ (np.abs(Gm) @ ax + np.abs(hv)))
+        if has_A and y is not None and np.asarray(y).size:
+            Am, bv = np.asarray(A, dtype=np.float64), np.asarray(b, dtype=np.float64)  # noqa: N806
+            yv = np.asarray(y, dtype=np.float64)
+            val += float(yv @ (Am @ x - bv))
+            g = g + Am.T @ yv
+            m2 += float(np.abs(yv) @ (np.abs(Am) @ ax + np.abs(bv)))
+        t, m3 = _box_term(g)
+        closed = -np.inf
+        if np.isfinite(t) and np.isfinite(val):
+            closed = val + t - eps * (m2 + m3 + abs(val))
+        # Tight at a KKT point, which is the common case; but a residual reduced
+        # gradient of 1e-10 on a column with a 1e12-wide box costs 100 units. Then
+        # the polyhedral bound below is also computed, and the larger is kept (both
+        # are valid lower bounds).
+        if closed >= f - 1e-7 * (1.0 + abs(f)):
+            return closed
+        return max(
+            box_only,
+            closed,
+            _convex_qp_node_lower_bound(P, c, obj_const, G, h, A, b, node_lb, node_ub, x),
+        )
+
+    # Multiplier-free: f(x) + min over the node polyhedron of grad f(x) . (u - x).
+    if not _highs_lp_verifier_available():
+        return box_only
+    from discopt.solvers import SolveStatus
+    from discopt.solvers.lp_milp_highs import solve_lp as _highs_solve_lp
+
+    g0 = Px + cv
+    res = _highs_solve_lp(
+        g0,
+        A_ub=np.asarray(G, dtype=np.float64) if has_G else None,
+        b_ub=np.asarray(h, dtype=np.float64) if has_G else None,
+        A_eq=np.asarray(A, dtype=np.float64) if has_A else None,
+        b_eq=np.asarray(b, dtype=np.float64) if has_A else None,
+        bounds=list(zip(np.asarray(node_lb, float).tolist(), np.asarray(node_ub, float).tolist())),
+    )
+    if res.status != SolveStatus.OPTIMAL or res.objective is None or res.x is None:
+        return box_only
+    lin = float(res.objective) - float(g0 @ x)
+    m3 = float(np.abs(g0) @ (np.abs(np.asarray(res.x, dtype=np.float64)) + ax))
+    # The LP objective is HiGHS's, certified only to the route's own gap test.
+    from discopt.solvers.lp_milp_highs import CERT_ABS, CERT_REL
+
+    lp_slack = CERT_ABS + CERT_REL * abs(float(res.objective))
+    return max(box_only, f + lin - lp_slack - eps * (mag + m3 + abs(f)))
+
+
+def _linear_node_verified_empty(A_ub, b_ub, A_eq, b_eq, node_lb, node_ub) -> bool:
+    """Whether ``A_ub x <= b_ub, A_eq x = b_eq, node_lb <= x <= node_ub`` is PROVED empty.
+
+    #1537: every POUNCE node path pruned on POUNCE's own ``primal_infeasible`` label
+    as if it were a certificate. It is not one -- it is an IPM's floating-point
+    verdict -- and under ``x = y - 1e6`` it was measured false: on ``st_miqp1`` and
+    ``st_miqp2`` the root node of a feasible MIQP came back ``primal_infeasible`` and
+    the solve was published as certified ``infeasible``; on ``st_miqp3`` pruning a
+    feasible subtree certified 0.0 against a true -6. A node's feasible set is the
+    linear system alone (the objective, quadratic or not, plays no part), so the
+    label is now accepted only when the HiGHS LP route finds a Farkas ray for that
+    system and ``farkas_verified`` proves it against the node box in rounding-aware
+    arithmetic. Anything else leaves the node open, which is what every caller
+    already does with an unsettled node -- it costs a certificate, never soundness.
+    """
+    from discopt.solvers import SolveStatus
+
+    lb = np.asarray(node_lb, dtype=np.float64)
+    if not _highs_lp_verifier_available():
+        # No Farkas verifier on this platform (WASM). Corroborate instead: the
+        # exact-vertex in-house simplex must independently find the system
+        # infeasible. Strictly more conservative than the POUNCE label alone,
+        # which is what this platform trusted before #1537.
+        from discopt.solvers.lp_simplex import SIMPLEX_AVAILABLE
+        from discopt.solvers.lp_simplex import solve_lp as _simplex_solve_lp
+
+        if not SIMPLEX_AVAILABLE:
+            return False
+        ub0 = np.asarray(node_ub, dtype=np.float64)
+        res0 = _simplex_solve_lp(
+            np.zeros(lb.shape[0]),
+            A_ub=None if A_ub is None or np.asarray(A_ub).shape[0] == 0 else A_ub,
+            b_ub=None if A_ub is None or np.asarray(A_ub).shape[0] == 0 else b_ub,
+            A_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else A_eq,
+            b_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else b_eq,
+            bounds=list(zip(lb.tolist(), ub0.tolist())),
+        )
+        return bool(res0.status == SolveStatus.INFEASIBLE)
+    from discopt.solvers.lp_milp_highs import solve_lp as _highs_solve_lp
+
+    ub = np.asarray(node_ub, dtype=np.float64)
+    res = _highs_solve_lp(
+        np.zeros(lb.shape[0]),
+        A_ub=None if A_ub is None or np.asarray(A_ub).shape[0] == 0 else A_ub,
+        b_ub=None if A_ub is None or np.asarray(A_ub).shape[0] == 0 else b_ub,
+        A_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else A_eq,
+        b_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else b_eq,
+        bounds=list(zip(lb.tolist(), ub.tolist())),
+    )
+    return bool(res.status == SolveStatus.INFEASIBLE)
+
+
 def _structured_node_recovery(
     node_lb: np.ndarray,
     node_ub: np.ndarray,
@@ -26012,7 +26294,9 @@ def _structured_node_recovery(
         return None
 
     if res.status == "primal_infeasible":
-        return ("infeasible", None, None)
+        if _linear_node_verified_empty(A_ub_m, b_ub_m, A_eq_m, b_eq_m, lb_n, ub_n):
+            return ("infeasible", None, None)
+        return None  # #1537: an unverified label settles nothing
     if res.status != "optimal" or res.x is None or not np.isfinite(res.obj):
         return None
 
@@ -26034,7 +26318,21 @@ def _structured_node_recovery(
         if not bool(np.all(np.abs(A_eq_m @ x_sol - b_eq_m) <= tol * (1.0 + np.abs(b_eq_m)))):
             logger.debug("structured node recovery violates equality rows; rejecting")
             return None
-    return ("optimal", float(res.obj) + float(obj_const), x_sol)
+    bound = _convex_qp_node_lower_bound(
+        None if Q is None else np.asarray(Q, dtype=np.float64),
+        c,
+        obj_const,
+        A_ub_m,
+        b_ub_m,
+        A_eq_m,
+        b_eq_m,
+        lb_n,
+        ub_n,
+        x_sol,
+        y=getattr(res, "y", None),
+        z=getattr(res, "z", None),
+    )
+    return ("optimal", bound, x_sol)  # #1537: a rigorous bound, not f(x_sol)
 
 
 def _pounce_recover_node_bound(
@@ -26115,9 +26413,15 @@ def _pounce_recover_node_bound(
         and res.objective is not None
         and np.isfinite(res.objective)
     ):
-        return ("optimal", float(res.objective) + float(obj_const), np.asarray(res.x))
+        x_r = np.asarray(res.x, dtype=np.float64)
+        bound = _convex_qp_node_lower_bound(
+            Q, c, obj_const, A_ub, b_ub, A_eq, b_eq, node_lb, node_ub, x_r
+        )  # #1537: a rigorous bound, not f(x_r)
+        return ("optimal", bound, x_r)
     if res.status == SolveStatus.INFEASIBLE:
-        return ("infeasible", None, None)
+        if _linear_node_verified_empty(A_ub, b_ub, A_eq, b_eq, node_lb, node_ub):
+            return ("infeasible", None, None)
+        return None  # #1537: an unverified label settles nothing
     return None
 
 
@@ -26284,14 +26588,18 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
     convexity assumption the JAX QP IPM made), so:
 
     * ``OPTIMAL`` -> KKT-valid relaxation optimum -> a valid node lower bound,
-    * ``INFEASIBLE`` -> Phase-1-certified empty box -> a sound prune,
+    * ``INFEASIBLE`` -> a sound prune only once :func:`_linear_node_verified_empty`
+      proves the node's linear system empty (#1537: the label alone was measured
+      false under translation),
     * anything else -> untrusted; the caller keeps the node open (never a
       false-infeasible prune).
 
-    Returns numpy arrays ``(clean, infeasible, obj_vals, x_vals)`` indexed by
-    node: ``clean[i]`` marks a trustworthy OPTIMAL solve, ``infeasible[i]`` a
-    certified empty box, ``obj_vals[i]`` the augmented objective (without
-    ``obj_const``), and ``x_vals[i]`` the full primal iterate (with slacks).
+    Returns numpy arrays ``(clean, infeasible, obj_vals, lb_vals, x_vals)`` indexed
+    by node: ``clean[i]`` marks a trustworthy OPTIMAL solve, ``infeasible[i]`` a
+    certified empty box, ``obj_vals[i]`` the augmented objective at the returned
+    point (without ``obj_const``), ``lb_vals[i]`` the RIGOROUS node lower bound
+    (with ``obj_const``; :func:`_convex_qp_node_lower_bound`, #1537 -- the objective
+    at an IPM point is not one), and ``x_vals[i]`` the full primal iterate.
 
     Node waves are solved in one ``pounce.solve_qp_batch`` call (one parallel
     Rayon wave across nodes) over POUNCE's *structured convex* QP form, which —
@@ -26312,7 +26620,9 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
     clean = np.zeros(n_batch, dtype=bool)
     infeasible = np.zeros(n_batch, dtype=bool)
     obj_vals = np.full(n_batch, np.nan, dtype=np.float64)
+    lb_vals = np.full(n_batch, -np.inf, dtype=np.float64)
     x_vals = np.full((n_batch, n_total), np.nan, dtype=np.float64)
+    obj_const = float(qp_data.obj_const)
 
     # --- Batched structured-QP path (pounce-solver >= 0.5) ---
     solve_qp_batch = None
@@ -26414,9 +26724,27 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
                         clean[i] = True
                         obj_vals[i] = float(res.obj)
                         x_vals[i] = x_full
+                        lb_vals[i] = _convex_qp_node_lower_bound(
+                            P_s,
+                            c_s,
+                            obj_const,
+                            A_ub_m,
+                            b_ub_m,
+                            A_eq_m,
+                            b_eq_m,
+                            problems[i]["lb"],
+                            problems[i]["ub"],
+                            x_s,
+                            y=getattr(res, "y", None),
+                            z=getattr(res, "z", None),
+                        )
                 elif res.status == "primal_infeasible":
-                    infeasible[i] = True
-            return clean, infeasible, obj_vals, x_vals
+                    # #1537: a label, not a certificate; unverified -> left untrusted
+                    # (the caller's non-clean path keeps the node open).
+                    infeasible[i] = _linear_node_verified_empty(
+                        A_ub_m, b_ub_m, A_eq_m, b_eq_m, problems[i]["lb"], problems[i]["ub"]
+                    )
+            return clean, infeasible, obj_vals, lb_vals, x_vals
 
     # --- Serial callback fallback (older wheels / batch failure) ---
     from discopt.solvers.qp_pounce import solve_qp as _pounce_qp
@@ -26457,9 +26785,14 @@ def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, ti
                 clean[i] = True
                 obj_vals[i] = float(res.objective)
                 x_vals[i] = x_full
+                # No structured multipliers on this path: the LP tangent bound.
+                lb_vals[i] = _convex_qp_node_lower_bound(
+                    Q, c, obj_const, None, None, A_eq, b_eq, lb_full, ub_full, x_full
+                )
         elif res.status == SolveStatus.INFEASIBLE:
-            infeasible[i] = True
-    return clean, infeasible, obj_vals, x_vals
+            # #1537: verified on the slack form this path solved (slacks >= 0).
+            infeasible[i] = _linear_node_verified_empty(None, None, A_eq, b_eq, lb_full, ub_full)
+    return clean, infeasible, obj_vals, lb_vals, x_vals
 
 
 def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, time_limit):
@@ -26548,10 +26881,25 @@ def _solve_node_lp_pounce(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, ti
         if not feasible:
             logger.debug("POUNCE convex node solution violates its rows; rejecting")
             return None
-        bound = float(res.obj) + float(lp_data.obj_const)
+        bound = _convex_qp_node_lower_bound(
+            None,
+            np.asarray(lp_data.c[:n_orig], dtype=np.float64),
+            float(lp_data.obj_const),
+            A_ub_m,
+            b_ub_m,
+            A_eq_m,
+            b_eq_m,
+            lb_n,
+            ub_n,
+            x_sol,
+            y=getattr(res, "y", None),
+            z=getattr(res, "z", None),
+        )  # #1537: a rigorous bound, not c'x at the IPM point
         return (bound, x_sol[:n_vars], "optimal")
     if res.status == "primal_infeasible":
-        return (_INFEASIBILITY_SENTINEL, None, "infeasible")
+        if _linear_node_verified_empty(A_ub_m, b_ub_m, A_eq_m, b_eq_m, lb_n, ub_n):
+            return (_INFEASIBILITY_SENTINEL, None, "infeasible")
+        return None  # #1537: an unverified label settles nothing
     return None
 
 
@@ -30623,7 +30971,7 @@ def _solve_miqp_bb(
         # gives the same KKT-valid bound / Phase-1 infeasibility verdict per node.
         # #1543: solved in the shifted frame, mapped back to model coordinates
         # (structural columns only; the slacks are shift-invariant).
-        clean, infeasible, obj_vals, x_vals = _pounce_qp_relaxation_nodes(
+        clean, infeasible, obj_vals, lb_vals, x_vals = _pounce_qp_relaxation_nodes(
             _qp_q,
             [np.asarray(_bl, dtype=np.float64) - _s for _bl in batch_lb],
             [np.asarray(_bu, dtype=np.float64) - _s for _bu in batch_ub],
@@ -30654,8 +31002,11 @@ def _solve_miqp_bb(
                 result_excl[i] = True
                 result_sols[i] = 0.5 * (lb_c + ub_c)
             elif clean[i] and _node_point_feasible(x_vals[i], node_lb, node_ub):
-                # KKT-valid relaxation optimum -> a valid node lower bound.
-                result_lbs[i] = obj_vals[i] + _const_q
+                # #1537: the node's bound is the rigorous dual bound, not f at the
+                # IPM point (which sits above the minimum by up to gradient x error).
+                # #1543: computed in the shifted frame, whose obj_const absorbs the
+                # shift, so it bounds the model objective directly.
+                result_lbs[i] = lb_vals[i]
                 result_sols[i] = x_vals[i, :n_vars]
                 if result_lbs[i] < _SENTINEL_THRESHOLD:
                     _maybe_inject_snapped_or_rounded(result_sols[i], node_lb, node_ub)
