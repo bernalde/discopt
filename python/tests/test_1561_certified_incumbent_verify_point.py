@@ -167,6 +167,47 @@ def test_verify_point_judges_the_rows_of_the_evaluator_it_is_given():
     assert verify_point(m, x, evaluator=make_evaluator(looser)).ok
 
 
+# ── a deterministic witness on the real NLP-BB route ────────────────────────
+#
+# Found by the full-suite A/B for the PR (the ``mo1442`` lexicographic
+# epsilon-constraint sweep, ``test_1442``): an ε subproblem whose bound
+# ``v0^2 + v1^2 + s <= 32 - 8e-6`` excludes the integer point (4, 4) by 8e-6.
+# NLP-BB returned v = 3.9999995 -- inside INT_TOL of (4, 4), satisfying the
+# row as computed -- and ``origin/main`` certified ``optimal`` with objective
+# -8 on it, deterministically. The integral realisation (4, 4) violates the row
+# by 8.1e-6, and the true optimum is -7 (the point (4, 3)). So this is not only
+# an unverifiable certificate; the certified objective is wrong by 1.
+
+
+def _eps_witness():
+    m = dm.Model("eps1561")
+    v = m.integer("v", shape=(2,), lb=0, ub=4)
+    s = m.continuous("s", lb=0.0, ub=1e6)
+    m.subject_to(dm.sum(v) >= 2)
+    m.subject_to(v[0] ** 2 + v[1] ** 2 + s <= 32.0 - 8e-6)
+    m.minimize(-(v[0] + v[1]) - s / 30000.0)
+    return m
+
+
+def test_nlpbb_does_not_certify_a_point_whose_integral_realisation_fails():
+    m = _eps_witness()
+    res = m.solve(time_limit=60.0)
+    assert res.x, res.status
+    x = np.concatenate(
+        [np.atleast_1d(np.asarray(res.x[v.name], float)).ravel() for v in m._variables]
+    )
+    verdict = verify_point(m, x)
+    if res.gap_certified or res.status == "optimal":
+        # A certificate is only acceptable on a verified point, and then the
+        # objective must be the true optimum, -7 (minus the slack bonus).
+        assert verdict.ok, (res.status, res.objective, verdict.reason)
+        assert res.objective == pytest.approx(-7.0, abs=1e-3)
+    else:
+        # The probe fired: the route's own gate is what withdrew it.
+        assert not verdict.ok
+        assert (res.solver_stats or {}).get("nlpbb/integral_incumbent_unverified") == 1.0
+
+
 # ── a solve that EXTENDS the model (structure cuts) ─────────────────────────
 #
 # Structure cuts (``cut_recognizer``) append auxiliary columns and rows to the
