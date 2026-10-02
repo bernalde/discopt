@@ -163,3 +163,18 @@ def test_shifted_qp_is_the_same_function():
         assert abs(f_q - f_true) <= 1e-9 * (1 + abs(f_true))
         checks += 1
     assert checks == 20
+
+
+def test_overflowing_shift_declines_instead_of_raising():
+    """A shift whose exact products overflow returns ``None`` (the unshifted data
+    are then used, as before #1543)."""
+    qp = extract_qp_data(_sq(0.0))
+    for s in (1e300, -1e300):
+        assert solver_mod._miqp_origin_shift(qp, np.array([s]), np.array([s]), 1) is None
+
+
+def test_exact_sum_mixed_infinities_is_nan_not_valueerror():
+    """``math.fsum`` raises on +inf and -inf together; the helper must hand the
+    non-finite result to the caller's overflow check instead."""
+    assert np.isnan(solver_mod._exact_sum([np.inf], [-np.inf], [1.0]))
+    assert solver_mod._exact_sum([1e16], [1.0], [-1e16]) == 1.0

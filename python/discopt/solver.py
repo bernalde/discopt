@@ -25540,8 +25540,16 @@ def _two_product(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _exact_sum(*parts) -> float:
-    """Correctly rounded sum of every element of every part (``math.fsum``)."""
-    return math.fsum(np.concatenate([np.ravel(np.asarray(p, dtype=np.float64)) for p in parts]))
+    """Correctly rounded sum of every element of every part (``math.fsum``).
+
+    ``nan`` when any element is non-finite: ``math.fsum`` raises ``ValueError`` on
+    ``+inf`` and ``-inf`` together, and the caller's overflow check is the place
+    that decides what a non-finite product means.
+    """
+    terms = np.concatenate([np.ravel(np.asarray(p, dtype=np.float64)) for p in parts])
+    if not np.all(np.isfinite(terms)):
+        return math.nan
+    return math.fsum(terms)
 
 
 def _miqp_origin_shift(qp_data, lb: np.ndarray, ub: np.ndarray, n_orig: int, model=None):
