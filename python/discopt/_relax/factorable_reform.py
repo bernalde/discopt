@@ -65,6 +65,7 @@ from discopt.mpec import carry_complementarities
 
 from .gdp_reformulate import (
     _bound_expression,
+    _BoundMemo,
     _collect_variables,
     _is_linear,
     bound_expression_error,
@@ -1021,7 +1022,9 @@ def _lift_objective_atoms(expr: Expression, model: Model, lifter: "_Lifter") -> 
     return expr
 
 
-def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, float]:
+def _denominator_sign_slack(
+    denom: Expression, model: Model, memo: _BoundMemo | None = None
+) -> tuple[float, float]:
     """#1397: how much of each ``_bound_expression(denom)`` endpoint could be round-off.
 
     Returned as ``(lo_slack, hi_slack)`` in the denominator's own units so each adds
@@ -1042,28 +1045,48 @@ def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, flo
     feasibility tolerance sound: an over-stated ``dmin`` would under-scale that body
     and let a gross violation slip under the tolerance.
     """
-    err_lo, err_hi = bound_expression_error(denom, model)
+    err_lo, err_hi = bound_expression_error(denom, model, memo)
     return (
         float(err_lo) if np.isfinite(err_lo) else np.inf,
         float(err_hi) if np.isfinite(err_hi) else np.inf,
     )
 
 
-def _find_clearable_denominator(expr: Expression, model: Model):
+def _find_clearable_denominator(
+    expr: Expression,
+    model: Model,
+    memo: _BoundMemo | None = None,
+    visited: dict[int, Expression] | None = None,
+):
     """Return the denominator ``D`` of the first division term ``N/D`` in
     *expr*'s additive structure whose ``D`` is non-constant and sign-definite
     over the variable box, as ``(D, sign, dmin)`` where ``sign`` is +1/-1 and
-    ``dmin = min |D|`` over the box.  ``None`` if no such division exists."""
+    ``dmin = min |D|`` over the box.  ``None`` if no such division exists.
+
+    #1565: linear in DAG size. *memo* shares every interval and interval error
+    across the denominators examined (and, from :func:`_clear_divisions`, across
+    its passes over one box). *visited* records each node already searched: the
+    search returns at the first hit, so a node seen before is one whose search
+    already came back ``None`` and would again -- skipping it is exact. It maps
+    ``id`` to the node itself so an address cannot be recycled mid-search.
+    """
+    if memo is None:
+        memo = _BoundMemo()
+    if visited is None:
+        visited = {}
+    if id(expr) in visited:
+        return None
+    visited[id(expr)] = expr
     if isinstance(expr, BinaryOp):
         if expr.op in ("+", "-"):
-            found = _find_clearable_denominator(expr.left, model)
+            found = _find_clearable_denominator(expr.left, model, memo, visited)
             if found is not None:
                 return found
-            return _find_clearable_denominator(expr.right, model)
+            return _find_clearable_denominator(expr.right, model, memo, visited)
         if expr.op == "/":
             d = expr.right
             if not isinstance(d, Constant):
-                lo, hi = _bound_expression(d, model)
+                lo, hi = _bound_expression(d, model, memo)
                 # #1397: ``_ZERO_MARGIN`` alone assumes ``lo``/``hi`` are exact.
                 # They are not -- ``_bound_expression`` is plain float interval
                 # arithmetic with no outward rounding -- and clearing a denominator
@@ -1076,15 +1099,15 @@ def _find_clearable_denominator(expr: Expression, model: Model):
                 # 1e-9 margin, while its true infimum is ``-0.5``; the gate cleared
                 # it at every M from 1e16 to 1e18. An O(1) denominator is
                 # unaffected: its error is 0.0 (declared bounds are exact floats).
-                lo_slack, hi_slack = _denominator_sign_slack(d, model)
+                lo_slack, hi_slack = _denominator_sign_slack(d, model, memo)
                 if lo > _ZERO_MARGIN + lo_slack:
                     return d, 1, lo - lo_slack
                 if hi < -_ZERO_MARGIN - hi_slack:
                     return d, -1, -hi - hi_slack
             # Search the numerator for a nested division.
-            return _find_clearable_denominator(expr.left, model)
+            return _find_clearable_denominator(expr.left, model, memo, visited)
     if isinstance(expr, UnaryOp) and expr.op == "neg":
-        return _find_clearable_denominator(expr.operand, model)
+        return _find_clearable_denominator(expr.operand, model, memo, visited)
     return None
 
 
@@ -1129,8 +1152,12 @@ def _clear_divisions(body: Expression, sense: str, model: Model):
     ever makes the feasibility test stricter, never looser.
     """
     scale = 1.0
+    # #1565: one interval memo for every pass. The box is fixed for the whole
+    # call (clearing builds expressions; it never touches a variable bound), and
+    # the nodes a later pass bounds are the same objects an earlier pass did.
+    memo = _BoundMemo()
     for _ in range(8):  # bounded: each pass clears one denominator family
-        found = _find_clearable_denominator(body, model)
+        found = _find_clearable_denominator(body, model, memo)
         if found is None:
             break
         denom, sign, dmin = found

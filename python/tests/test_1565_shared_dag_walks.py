@@ -1,0 +1,266 @@
+"""#1565: presolve walks over a shared expression DAG must be linear in its size.
+
+A reduced-space NN embedding (OMLT ``ReducedSpaceSmoothNNFormulation``) is one
+expression in which every hidden activation is referenced by every unit of the
+next layer, so its *tree* is exponentially larger than its *DAG*: a width-20,
+depth-3 sigmoid net is 2,889 distinct nodes but 148,206 tree nodes. The
+bound/error walks in ``gdp_reformulate`` (reached from factorable denominator
+clearing), the clearable-denominator search and the structure-cut recognizer's
+SymPy translation all walked it as the tree, which is how ``solve(time_limit=30)``
+ran 66 s on a width-25 net and more than 10 minutes on a width-50 one.
+
+These tests pin the walks to the DAG -- by counting calls, not by timing -- and
+check the memoised results are exactly those of a walk over the same expression
+re-built *without* sharing (which is what the old tree walk computed).
+"""
+
+from __future__ import annotations
+
+import discopt.modeling as dm
+import numpy as np
+import pytest
+from discopt._relax import factorable_reform as fr
+from discopt._relax import gdp_reformulate as g
+from discopt.modeling.core import BinaryOp, FunctionCall, UnaryOp
+
+
+def _children(node):
+    if isinstance(node, BinaryOp):
+        return (node.left, node.right)
+    if isinstance(node, UnaryOp):
+        return (node.operand,)
+    if isinstance(node, FunctionCall):
+        return tuple(node.args)
+    return ()
+
+
+def _dag_and_tree_size(root) -> tuple[int, int]:
+    seen: dict[int, object] = {}
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen[id(n)] = n
+        stack.extend(_children(n))
+    tree: dict[int, int] = {}
+
+    def size(n):
+        k = id(n)
+        if k not in tree:
+            tree[k] = 1 + sum(size(c) for c in _children(n))
+        return tree[k]
+
+    return len(seen), size(root)
+
+
+def _unshare(node):
+    """Rebuild ``node`` as a tree: a fresh interior node per occurrence."""
+    if isinstance(node, BinaryOp):
+        return BinaryOp(node.op, _unshare(node.left), _unshare(node.right))
+    if isinstance(node, UnaryOp):
+        return UnaryOp(node.op, _unshare(node.operand))
+    if isinstance(node, FunctionCall):
+        return FunctionCall(node.func_name, *[_unshare(a) for a in node.args])
+    return node  # Variable / Constant leaves are shared in both forms
+
+
+def _reduced_space_net(
+    width: int, depth: int = 3, seed: int = 0, denom: bool = False, act: str = "sigmoid"
+):
+    """A reduced-space sigmoid network ``y == net(x)`` as one shared expression.
+
+    With ``denom`` the output also divides by a positive affine expression of the
+    last hidden layer, so the clearable-denominator search has real work. With
+    ``act="gauss"`` the activation ``exp(-z**2)`` has no division at all, so that
+    search finds nothing and must visit the whole expression to say so.
+    """
+    rng = np.random.default_rng(seed)
+    m = dm.Model("net")
+    x = [m.continuous(f"x{i}", lb=-1.0, ub=1.0) for i in range(2)]
+    y = m.continuous("y", lb=-50.0, ub=50.0)
+    h = list(x)
+    for _ in range(depth):
+        W = rng.normal(size=(width, len(h)))
+        b = rng.normal(size=width)
+        nxt = []
+        for j in range(width):
+            z = float(b[j])
+            for i, hi in enumerate(h):
+                z = z + float(W[j, i]) * hi
+            nxt.append(1.0 / (1.0 + dm.exp(-z)) if act == "sigmoid" else dm.exp(-(z**2)))
+        h = nxt
+    out = 0.0
+    for j, hj in enumerate(h):
+        out = out + float(rng.normal()) * hj
+    if denom:
+        d = 1.0
+        for hj in h:
+            d = d + 0.5 * hj  # sigmoid outputs in (0, 1): d in [1, 1 + width/2]
+        out = out / d
+    m.subject_to(y == out)
+    m.minimize(y)
+    return m, m._constraints[0].body
+
+
+def _count_calls(monkeypatch, module, name):
+    real = getattr(module, name)
+    calls = [0]
+
+    def counting(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, counting)
+    return calls
+
+
+def test_net_is_a_dag_much_smaller_than_its_tree():
+    _, body = _reduced_space_net(12)
+    dag, tree = _dag_and_tree_size(body)
+    assert tree > 10 * dag, (dag, tree)  # the premise every test below relies on
+
+
+@pytest.mark.parametrize("name", ["_bound_error", "_bound_expression"])
+def test_bound_walks_visit_each_shared_node_once(monkeypatch, name):
+    m, body = _reduced_space_net(12)
+    dag, tree = _dag_and_tree_size(body)
+    calls = _count_calls(monkeypatch, g, name)
+    if name == "_bound_error":
+        g.bound_expression_error(body, m)
+    else:
+        g._bound_expression(body, m)
+    # Each node is entered once per *parent edge* (a memo hit returns at once),
+    # so the count is bounded by a small multiple of the DAG -- never the tree.
+    assert 0 < calls[0] <= 4 * dag, (calls[0], dag, tree)
+
+
+def test_clearable_denominator_search_visits_each_shared_node_once(monkeypatch):
+    """The search descends the additive structure; share it and it must not
+    re-search a node it already found nothing in. ``s_{k+1} = s_k + s_k`` is
+    2**k additive leaves in 2k nodes, and none of its divisions is clearable
+    (the denominator changes sign), so the search is exhaustive."""
+    m = dm.Model("doubling")
+    x = m.continuous("x", lb=1.0, ub=2.0)
+    y = m.continuous("y", lb=-1.0, ub=1.0)
+    s = x / (y + 0.5)  # denominator spans [-0.5, 1.5]: not sign-definite
+    for _ in range(16):
+        s = s + s
+    dag, tree = _dag_and_tree_size(s)
+    assert tree > 1000 * dag, (dag, tree)
+    calls = _count_calls(monkeypatch, fr, "_find_clearable_denominator")
+    assert fr._find_clearable_denominator(s, m) is None
+    assert 0 < calls[0] <= 4 * dag, (calls[0], dag, tree)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("denom", [False, True])
+@pytest.mark.parametrize("act", ["sigmoid", "gauss"])
+def test_memoised_walks_equal_the_unshared_tree_walk(seed, denom, act):
+    """Bound-neutral: the shared walk returns exactly what the tree walk did."""
+    m, body = _reduced_space_net(4, seed=seed, denom=denom, act=act)
+    interior: dict[int, object] = {}
+    stack = [body]
+    while stack:
+        n = stack.pop()
+        if id(n) in interior or not isinstance(n, (BinaryOp, UnaryOp, FunctionCall)):
+            continue
+        interior[id(n)] = n
+        stack.extend(_children(n))
+    checks = 0
+    for b in interior.values():  # every shared subexpression, root included
+        tb = _unshare(b)
+        assert g._bound_expression(b, m) == g._bound_expression(tb, m)
+        assert g.bound_expression_error(b, m) == g.bound_expression_error(tb, m)
+        assert str(fr._find_clearable_denominator(b, m)) == str(
+            fr._find_clearable_denominator(tb, m)
+        )
+        checks += 3
+    assert checks >= 3 * 50, checks
+
+
+def test_denominator_clearing_still_fires_on_shared_net():
+    m, _ = _reduced_space_net(6, denom=True)
+    out = fr.factorable_reformulate(m, clear_only=True)
+    assert out is not m  # the positive denominator was found and cleared
+
+
+# --- structure-cut recognizer (SymPy) --------------------------------------------
+
+sympy = pytest.importorskip("sympy")
+
+
+def test_to_sympy_translates_each_shared_node_once(monkeypatch):
+    from discopt._relax.symbolic import cut_recognizer as cr
+
+    cr._ensure_sympy()
+    _, body = _reduced_space_net(12)
+    dag, tree = _dag_and_tree_size(body)
+    calls = _count_calls(monkeypatch, cr, "_to_sympy")
+    cr._to_sympy(body, {})
+    assert 0 < calls[0] <= 4 * dag, (calls[0], dag, tree)
+
+
+def test_to_sympy_equals_unshared_translation():
+    from discopt._relax.symbolic import cut_recognizer as cr
+
+    cr._ensure_sympy()
+    for seed in (0, 1):
+        _, body = _reduced_space_net(4, seed=seed, denom=True)
+        assert cr._to_sympy(body, {}) == cr._to_sympy(_unshare(body), {})
+
+
+def test_recognizer_skips_model_translation_without_objective_products(monkeypatch):
+    """The net has a nonlinear equality (so the cheap pre-check passes) but its
+    objective ``y`` has no ``x*(y**k - 1)`` term: no cut is derivable, and the
+    whole-model translation must not run to find that out."""
+    from discopt._relax.symbolic import cut_recognizer as cr
+
+    m, _ = _reduced_space_net(12)
+    assert cr.has_square_difference_candidate(m)
+
+    def must_not_run(*a, **k):
+        raise AssertionError("model_to_sympy ran for an objective with no product term")
+
+    monkeypatch.setattr(cr, "model_to_sympy", must_not_run)
+    assert cr.recognize_and_derive_cuts(m) == []
+
+
+def _gas_model():
+    from discopt.benchmarks.problems.gas_network_minlp import build_gas_network_minlp
+
+    return build_gas_network_minlp()
+
+
+def test_recognizer_deadline_aborts_before_injecting_anything():
+    from discopt._relax.symbolic import cut_recognizer as cr
+
+    m = _gas_model()
+    n_cons = len(m._constraints)
+    with pytest.raises(cr.RecognizerDeadline):
+        cr.recognize_and_inject(m, deadline=lambda: True)
+    assert len(m._constraints) == n_cons  # untouched
+    # and without a deadline the same model still yields its cuts
+    assert cr.recognize_and_inject(_gas_model(), deadline=lambda: False) == 2
+
+
+def test_solve_logs_structure_cut_abandonment(monkeypatch, caplog):
+    """The solver treats an expired recognizer as a loud, sound abstention."""
+    import logging
+
+    from discopt._relax.symbolic import cut_recognizer as cr
+
+    def expired(model, **kwargs):
+        raise cr.RecognizerDeadline("structure-cut recognizer: time limit spent during test")
+
+    monkeypatch.setattr(cr, "recognize_and_inject", expired)
+    m = dm.Model("tiny")
+    x = m.continuous("x", lb=0.5, ub=2.0)
+    y = m.continuous("y", lb=0.5, ub=2.0)
+    m.subject_to(x * y == 1.0)
+    m.minimize(x + y)
+    with caplog.at_level(logging.INFO, logger="discopt.solver"):
+        r = m.solve(time_limit=30)
+    assert r.status == "optimal"
+    assert r.objective == pytest.approx(2.0, abs=1e-5)
+    assert any("structure-cut presolve abandoned" in rec.getMessage() for rec in caplog.records)

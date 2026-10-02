@@ -10830,7 +10830,9 @@ def solve_model(
             try:
                 from discopt._relax.symbolic.cut_recognizer import recognize_and_inject
 
-                _n_struct_cuts = recognize_and_inject(model)
+                # #1565: bounded by the solve clock. On expiry the recognizer
+                # raises before injecting anything, so the model is unchanged.
+                _n_struct_cuts = recognize_and_inject(model, deadline=_deadline_exhausted)
                 if _n_struct_cuts:
                     logger.info(
                         "Structure-cut presolve: injected %d square-difference-network "
@@ -10840,14 +10842,26 @@ def solve_model(
             except ImportError:
                 pass  # optional [sympy] extra not installed -> skip silently
             except Exception as _sc_exc:
-                # #1514: narrowed. The recognizer's documented declines are a model
-                # outside its translator (``SymbolicTranslationError``), a chain it
-                # cannot solve symbolically (``CutDerivationError``) and SymPy's own
-                # "cannot solve/derive" (``NotImplementedError``, which
-                # ``EnvelopeDerivationError`` subclasses). Anything else is a defect.
-                if not _structure_cut_declined(_sc_exc):
-                    raise
-                logger.debug("structure-cut presolve declined: %s", _sc_exc)
+                from discopt._relax.symbolic.cut_recognizer import RecognizerDeadline
+
+                if isinstance(_sc_exc, RecognizerDeadline):
+                    # #1565: abstention for want of time is logged, not silent
+                    # (the #1456 convention): the relaxation below is built
+                    # without whatever cuts the recognizer might have derived.
+                    logger.info(
+                        "structure-cut presolve abandoned: %s; no cuts injected, the "
+                        "model is unchanged (#1565)",
+                        _sc_exc,
+                    )
+                elif _structure_cut_declined(_sc_exc):
+                    # #1514: narrowed. The recognizer's documented declines are a
+                    # model outside its translator (``SymbolicTranslationError``),
+                    # a chain it cannot solve symbolically (``CutDerivationError``)
+                    # and SymPy's own "cannot solve/derive" (``NotImplementedError``,
+                    # which ``EnvelopeDerivationError`` subclasses).
+                    logger.debug("structure-cut presolve declined: %s", _sc_exc)
+                else:
+                    raise  # anything else is a defect (#1514)
 
     # G-convexity transformation-cut presolve (#181, DISCOPT_G_CONVEX_CUTS,
     # default-OFF). A *bound-changing* capability (CLAUDE.md §5): recognizes
@@ -13798,6 +13812,25 @@ def solve_model(
         # The convex NLP may fail to certify for two reasons handled here.
         from discopt._relax.factorable_reform import has_clearable_denominator
 
+        # #1565: the denominator clear below is the same per-constraint rewrite
+        # as the presolve factorable pass and is bounded by the same clock. On
+        # expiry it returns the model untouched (its "nothing to clear" answer),
+        # so this branch is not taken; the abstention is logged here because the
+        # once-per-solve presolve summary has already been written.
+        _clear_hook = _presolve_deadline.abandon_hook("factorable-clear")
+        _clear_logged: set[str] = set()
+
+        def _clear_expired() -> bool:
+            if not _clear_hook():
+                return False
+            if "factorable-clear" not in _clear_logged:
+                _clear_logged.add("factorable-clear")
+                logger.info(
+                    "denominator clearing abandoned mid-traversal: time limit spent; "
+                    "the model is left unchanged (#1565)"
+                )
+            return True
+
         if _model_contains_nonsmooth_node(model):
             # (1) Non-smooth objective/constraints (abs/min/max): a smooth
             # gradient-based solver oscillates at the kink (e.g. min |x| over
@@ -13815,7 +13848,8 @@ def solve_model(
             _pure_continuous_force_spatial = True
             # Fall through to the spatial B&B below.
         elif has_clearable_denominator(model) and (
-            (cleared := factorable_reformulate(model, clear_only=True)) is not model
+            (cleared := factorable_reformulate(model, clear_only=True, deadline=_clear_expired))
+            is not model
         ):
             # (2) An ill-conditioned division whose denominator reaches toward
             # zero (like st_e17's 0.2458*x0**2/x1 with x1 down to 1e-5). If the
