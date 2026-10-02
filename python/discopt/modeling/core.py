@@ -8090,6 +8090,64 @@ class Model:
                 res, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
             )
 
+        def _withhold_unverified_certificate(res: "SolveResult", evaluator=None) -> None:
+            """#1561 certified-incumbent backstop: no certificate on a point
+            ``verify_point`` rejects.
+
+            Every route has its own exit gate, and they do not agree with
+            :func:`~discopt.validation.feasibility.verify_point`, the repo's single
+            definition of a feasible incumbent: NLP-BB's gate judged the point as
+            computed, with integer columns up to 1e-5 off, while ``verify_point``
+            judges its integral realisation (#1380). On tls2 with every row scaled
+            by 1e6 that disagreement published ``optimal``/``gap_certified=True``
+            on a point whose snapped row 18 is violated by 6.67 where 1.0 is
+            allowed. The route-level gate is fixed too; this is the class-level
+            check at the one place every route's result passes, so a gate that
+            drifts again cannot certify what ``verify_point`` refuses.
+
+            Only a CERTIFIED result is judged, and the point is not withheld: the
+            loose #772 screen above decides that. A rejected point is reported
+            ``feasible``, uncertified, with ``solver_stats
+            ["certificate/incumbent_unverified"]`` set. ``bound`` is untouched; it
+            is a dual bound and does not depend on the incumbent.
+            """
+            if not res.x or not (res.status == "optimal" or res.gap_certified):
+                return
+            import logging as _vlogging
+
+            import numpy as _np
+
+            from discopt.validation.feasibility import verify_point
+
+            try:
+                _flat = _np.concatenate(
+                    [
+                        _np.atleast_1d(_np.asarray(res.x[v.name], dtype=_np.float64)).ravel()
+                        for v in self._variables
+                    ]
+                )
+                _verdict = verify_point(self, _flat, evaluator=evaluator)
+                _ok, _reason = bool(_verdict.ok), _verdict.reason
+            except Exception as _vexc:
+                # A check that cannot run cannot vouch for a certificate (§7):
+                # decertify rather than publish an unchecked one.
+                _ok, _reason = False, f"verification raised {type(_vexc).__name__}: {_vexc}"
+            if _ok:
+                return
+            _vlogging.getLogger("discopt.solver").error(
+                "UNVERIFIED CERTIFICATE (#1561): the incumbent reported as %s "
+                "(objective=%s) fails verify_point on the declared model (%s). "
+                "Reporting it as 'feasible', uncertified.",
+                res.status,
+                res.objective,
+                _reason,
+            )
+            if res.status == "optimal":
+                res.status = "feasible"
+            res.gap_certified = False
+            res.solver_stats = dict(res.solver_stats or {})
+            res.solver_stats["certificate/incumbent_unverified"] = 1.0
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8166,6 +8224,7 @@ class Model:
                 # #1551: this return skips ``solve_model`` and everything below,
                 # so the evaluation-error guard has to run here too.
                 _guard_unresolved_objective(_ck_res)
+                _withhold_unverified_certificate(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -8914,6 +8973,11 @@ class Model:
         # and calls the same guard at its own return.
         if isinstance(result, SolveResult):
             _guard_unresolved_objective(result)
+            # #1561: after the #772 screen (which may already have withheld the
+            # point) and on the same pre-solve snapshot of the declared rows.
+            _withhold_unverified_certificate(
+                result, _verify_snap[0] if _verify_snap is not None else None
+            )
 
         if llm:
             try:

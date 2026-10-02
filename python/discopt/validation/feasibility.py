@@ -824,6 +824,7 @@ def verify_point(
     x_flat,
     *,
     with_objective: bool = False,
+    evaluator=None,
 ) -> VerifyResult:
     """Verify ``x_flat`` is feasible for ``model``; optionally return its objective.
 
@@ -833,6 +834,12 @@ def verify_point(
     evaluated every constraint row and every residual, bound and integrality
     condition is within tolerance. Any evaluator failure, shape mismatch or
     non-finite value yields ``ok=False`` — never an optimistic pass.
+
+    ``evaluator`` (#1561) supplies the rows instead of compiling them from
+    ``model`` now. ``Model.solve`` passes the evaluator it snapshotted BEFORE the
+    solve, because presolve may rewrite the constraint DAG in place and root cuts
+    may append rows; the rows judged are then the ones the caller declared. Bounds
+    and integrality are still read from ``model``.
     """
     from discopt.modeling.core import ObjectiveSense
 
@@ -859,9 +866,10 @@ def verify_point(
         # #75: via the dispatcher, so the selected backend is honoured and the
         # jax import stays inside its fallback. A direct `cached_evaluator`
         # import here put JAX on every solve that validates a point.
-        from discopt._tape_nlp_evaluator import make_evaluator
+        if evaluator is None:
+            from discopt._tape_nlp_evaluator import make_evaluator
 
-        evaluator = make_evaluator(model)
+            evaluator = make_evaluator(model)
         res = check_constraints(model, x_flat, evaluator=evaluator)
         if not res.ok:
             return res
