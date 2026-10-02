@@ -31,22 +31,36 @@ from discopt.modeling.core import from_nl
 CORPUS = os.path.expanduser("~/Dropbox/projects/discopt-minlp-benchmark/minlplib/nl")
 GAP_TOL = 1e-4
 
-# Convex big-M/GDP instances that do not close inside a short budget, so the
-# time-limited exit carries a valid bound AND an open gap -- the state that
-# produced the false certificate. Gate probes only (CLAUDE.md SS2): the
-# assertion is the general invariant, not a per-instance expectation.
-PROBES = ["syn40m", "rsyn0805m02m"]
+# Convex big-M/GDP instances exited with a valid bound AND an open gap -- the
+# state that produced the false certificate. Gate probes only (CLAUDE.md SS2):
+# the assertion is the general invariant, not a per-instance expectation.
+#
+# Each probe names the limit that forces the open-gap exit. ``rsyn0805m02m``
+# still leaves its gap open at the 20 s wall limit (the time-limited exit).
+# ``syn40m`` no longer does: since #1125 (83371f54, "probe the OA master at the
+# cheap cut budget") OA certifies it in ~1-2 s / 4 master MILPs, where before it
+# spent the whole 20 s on its third master and exited at a 15-39% gap (first-
+# parent bisect, 2026-10-02). A legitimate speed-up, so the probe precondition
+# went stale, not the invariant. It is kept on a deterministic
+# ``max_nodes=2`` cap (OA's iteration limit), which exits after 2 master MILPs
+# with a 39% open gap on any machine. Both exits run the same reason-independent
+# ``gap_certified`` finalizer in ``solvers/oa.py``; the precondition assertion
+# below still fails loudly if either stops leaving its gap open.
+PROBES = [
+    pytest.param("syn40m", {"max_nodes": 2}, id="syn40m"),
+    pytest.param("rsyn0805m02m", {}, id="rsyn0805m02m"),
+]
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("name", PROBES)
-def test_open_gap_is_never_reported_as_certified(name):
+@pytest.mark.parametrize("name,limit", PROBES)
+def test_open_gap_is_never_reported_as_certified(name, limit):
     path = os.path.join(CORPUS, name + ".nl")
     if not os.path.exists(path):
         pytest.skip("MINLPLib corpus not present")
 
     result = from_nl(path).solve(
-        solver="mip-nlp", mip_nlp_method="oa", time_limit=20, gap_tolerance=GAP_TOL
+        solver="mip-nlp", mip_nlp_method="oa", time_limit=20, gap_tolerance=GAP_TOL, **limit
     )
 
     # SS6: this probe is only meaningful on a run that actually left a gap open.

@@ -209,12 +209,24 @@ def test_reduction_separation_timers_present_and_bounded():
     # reaches this schema check on every spatial solve.
     # ``bound_provenance/`` (#1278 F) is also COUNTS -- certified nodes per bound
     # source -- emitted only when non-zero.
-    _NON_TIMER_FAMILIES = ("cuts/", "pool/", "row_filter/", "bound_provenance/")
+    # ``certificate/`` (#1551) holds the certificate guards' diagnostics: the
+    # objective's float evaluation error at the incumbent (a non-negative width,
+    # recorded on every certified solve the check applies to) and 0/1 flags.
+    _NON_TIMER_FAMILIES = ("cuts/", "pool/", "row_filter/", "bound_provenance/", "certificate/")
     _KNOWN = _TIMER_FAMILIES + _NON_TIMER_FAMILIES
     # ``gap_criterion`` (#1243) is the one documented non-numeric entry: which arm
     # of the convergence test the returned pair meets, present only when one does.
     crit = stats.pop("gap_criterion", None)
     assert crit in (None, "absolute", "relative"), f"gap_criterion={crit!r}"
+    # The #1551 guard's skip reason is the other string entry, present only when
+    # the evaluation-error check did not apply.
+    skipped = stats.pop("certificate/objective_eval_error_skipped", None)
+    assert skipped is None or isinstance(skipped, str), f"skip reason={skipped!r}"
+    # #1537 E's incumbent repair records why it did not run (``repair_skipped``)
+    # or why it declined (``repair_declined``) as strings, present only then.
+    for key in ("certificate/repair_skipped", "certificate/repair_declined"):
+        why = stats.pop(key, None)
+        assert why is None or isinstance(why, str), f"{key}={why!r}"
     # Every other entry is a non-negative float in a known instrumentation family.
     assert all(isinstance(v, float) and v >= 0.0 for v in stats.values())
     assert all(k.startswith(_KNOWN) for k in stats), (

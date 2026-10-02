@@ -9920,6 +9920,10 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # #1536: the single point every route's result passes through, after the
         # #1059 route/fallback merge -- so it judges the pair actually published.
         if _gap_tols is not None:
+            # #1537 E: the tolerances this certificate is judged at (AMP's
+            # ``rel_gap``/``abs_tol``, else the caller's), so ``Model.solve``'s
+            # post-solve incumbent repair re-judges the repaired pair at the same.
+            result._judged_gap_tolerances = (float(_gap_tols[0]), float(_gap_tols[1]))
             _refuse_unclosed_published_pair(result, _gap_tols[0], _gap_tols[1])
             # #1551: same choke point, for a pair finer than the objective's own
             # float resolution at the incumbent.
@@ -22668,6 +22672,7 @@ def _solve_nlp_bb(
     constraint_duals = None
     bound_duals_lower = None
     bound_duals_upper = None
+    _integral_unverified = False  # #1561: set by the integral-realisation gate below
 
     if incumbent is not None:
         sol_flat = np.array(sol_array)
@@ -22812,9 +22817,15 @@ def _solve_nlp_bb(
                 # when it would clear that gate, or when it is no further outside
                 # than the incumbent it replaces.
                 _ref_obj = float(nlp_refined.objective)
+                # #1561: the incumbent is judged at its INTEGRAL realisation, the
+                # point ``verify_point`` (and the exit gate below) judges. When
+                # the C-3 snap was rejected, ``sol_flat`` still carries integer
+                # columns up to 1e-5 off; its own rows look clean only because
+                # that sliver of integrality buys slack, which ``refined`` (whose
+                # integers are pinned exactly) is not allowed to buy.
                 _inc_exc, _, _ = _nonlinear_point_excess(
                     evaluator,
-                    sol_flat,
+                    _round_incumbent_integers(sol_flat, int_offsets, int_sizes)[0],
                     cl_list,
                     cu_list,
                     n_rows=_declared_rows,
@@ -22906,7 +22917,7 @@ def _solve_nlp_bb(
             # point that already clears it never reaches this branch.
             _cur_exc, _, _ = _nonlinear_point_excess(
                 evaluator,
-                sol_flat,
+                _round_incumbent_integers(sol_flat, int_offsets, int_sizes)[0],  # #1561
                 cl_list,
                 cu_list,
                 n_rows=_declared_rows,
@@ -23074,6 +23085,41 @@ def _solve_nlp_bb(
                 f"term-scaled tolerance (declared abs tol {_NLPBB_EXIT_ABS_TOL:.0e}, "
                 f"{_exit_cmp} comparisons over {_declared_rows} declared rows)"
             )
+
+        # #1561: the gate above judges the point AS RETURNED. When the C-3 snap
+        # was rejected (and no refine replaced the point), that point's integer
+        # columns are up to 1e-5 off an integer, and the rows it satisfies are
+        # satisfied with slack bought by that fractionality. Every consumer of a
+        # MINLP point -- ``verify_point`` (#1380), a user plugging the integers
+        # back in -- judges its INTEGRAL realisation instead. Measured on tls2
+        # with every row scaled by 1e6: x31 off by ~2.2e-6 on a row
+        # ``x2 - 3 x31 - 8 x32 - 15 x33 = 1`` passed this gate as returned and was
+        # certified ``optimal``; snapped, the row is violated by 6.67 where
+        # ``verify_point`` allows 1.0. So the integral realisation is held to the
+        # same gate. It is not a refusal (the returned point is within the
+        # integrality tolerance of the search), but nothing that fails it may be
+        # certified: the status is downgraded below, after every step that could
+        # re-earn a certificate.
+        _integral_point = _round_incumbent_integers(sol_flat, int_offsets, int_sizes)[0]
+        if not np.array_equal(_integral_point, sol_flat):
+            _int_exc, _int_where, _int_cmp = _nonlinear_point_excess(
+                evaluator,
+                _integral_point,
+                cl_list,
+                cu_list,
+                n_rows=_declared_rows,
+                box=_declared_box,
+            )
+            if _int_exc > _NLPBB_EXIT_ABS_TOL:
+                _integral_unverified = True
+                logger.warning(
+                    "NLP-BB (#1561): the incumbent's integral realisation fails the "
+                    "exit gate (%s violated by %.3e over %d comparisons); reporting it "
+                    "UNCERTIFIED.",
+                    _int_where,
+                    _int_exc,
+                    _int_cmp,
+                )
 
         # The reported objective must describe the reported POINT.
         #
@@ -23306,6 +23352,17 @@ def _solve_nlp_bb(
         abs_gap_tol,
         "NLP-BB",
     )
+
+    # #1561: an incumbent whose integral realisation fails the exit gate is never
+    # certified. Applied last, so neither the re-earn step nor the root-cut
+    # composition above can restore a certificate this point cannot carry. The
+    # bound is untouched: it is a valid dual bound regardless of the incumbent.
+    if _integral_unverified:
+        if status == "optimal":
+            status = "feasible"
+        _gap_certified = False
+        _ext_stats = dict(_ext_stats or {})
+        _ext_stats["nlpbb/integral_incumbent_unverified"] = 1.0
 
     return SolveResult(
         status=status,
