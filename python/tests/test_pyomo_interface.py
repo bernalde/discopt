@@ -454,5 +454,87 @@ def test_unvalidated_bound_is_not_reported_as_dual_bound(opt, monkeypatch):
     assert res.problem.upper_bound == math.inf
 
 
+# -- zero-variable models: optimal only when every constraint holds ------------
+
+
+def _constant_model(con_rule):
+    m = pyo.ConcreteModel()
+    m.p = pyo.Param(mutable=True, initialize=1.0)
+    m.c = pyo.Constraint(rule=con_rule)
+    m.o = pyo.Objective(expr=m.p)
+    return m
+
+
+def test_constant_model_infeasible_constraint_is_infeasible(opt):
+    """A zero-variable model whose constant constraint fails (1 >= 2) is infeasible.
+
+    Before the fix the trivial path reported `optimal` without looking at the
+    constraints, and (with the #1560 field fix) published 1.0 as a certified bound.
+    """
+    import math
+
+    res = opt.solve(_constant_model(lambda m: m.p >= 2))
+    assert res.solver.termination_condition == pyo.TerminationCondition.infeasible
+    assert res.problem.lower_bound == -math.inf
+    assert res.problem.upper_bound == math.inf
+
+
+def test_constant_model_feasible_constraint_is_optimal(opt):
+    res = opt.solve(_constant_model(lambda m: m.p >= 0))
+    assert res.solver.termination_condition == pyo.TerminationCondition.optimal
+    assert res.problem.lower_bound == 1.0
+    assert res.problem.upper_bound == 1.0
+
+
+def test_constant_model_exact_equality_is_optimal(opt):
+    res = opt.solve(_constant_model(lambda m: m.p == 1.0))
+    assert res.solver.termination_condition == pyo.TerminationCondition.optimal
+    assert res.problem.lower_bound == 1.0
+    assert res.problem.upper_bound == 1.0
+
+
+def test_constant_model_violated_equality_is_infeasible(opt):
+    res = opt.solve(_constant_model(lambda m: m.p == 1.5))
+    assert res.solver.termination_condition == pyo.TerminationCondition.infeasible
+
+
+def test_constant_model_fixed_var_infeasible(opt):
+    """A model whose only variable is fixed also takes the zero-column path."""
+    m = pyo.ConcreteModel()
+    m.x = pyo.Var(bounds=(0, 10))
+    m.x.fix(3.0)
+    m.c = pyo.Constraint(expr=m.x <= 2)
+    m.o = pyo.Objective(expr=m.x)
+    res = opt.solve(m)
+    assert res.solver.termination_condition == pyo.TerminationCondition.infeasible
+
+
+def test_constant_model_unevaluable_constraint_is_error(opt):
+    """A constant constraint whose body cannot be evaluated is an error, never optimal.
+
+    End to end, Pyomo's NL writer rejects `log(-1)` first; the helper test below
+    pins the trivial path's own refusal.
+    """
+    m = pyo.ConcreteModel()
+    m.p = pyo.Param(mutable=True, initialize=-1.0)
+    m.c = pyo.Constraint(expr=pyo.log(m.p) <= 5)
+    m.o = pyo.Objective(expr=m.p)
+    res = opt.solve(m)
+    assert res.solver.termination_condition == pyo.TerminationCondition.error
+
+
+@pytest.mark.parametrize("p0", [-1.0, float("nan")])
+def test_constant_constraint_check_refuses_unevaluable_body(p0):
+    """The zero-variable feasibility check raises rather than skipping a row it
+    cannot evaluate (a domain error, or a non-finite value)."""
+    from discopt.pyomo.solver import DiscoptSolver
+
+    m = pyo.ConcreteModel()
+    m.p = pyo.Param(mutable=True, initialize=p0)
+    m.c = pyo.Constraint(expr=pyo.log(m.p) <= 5 if p0 < 0 else m.p <= 5)
+    with pytest.raises(ValueError):
+        DiscoptSolver._violated_constant_constraints(m)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

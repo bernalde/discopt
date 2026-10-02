@@ -357,18 +357,55 @@ class DiscoptSolver(OptSolver):
         for vdata, val in zip(cols, flat):
             soln.variable[vdata.name] = {"Value": float(val)}
 
+    @staticmethod
+    def _violated_constant_constraints(model) -> list[str]:
+        """Names of the active constraints a zero-variable model violates.
+
+        With no free columns every constraint body is a constant, so feasibility is
+        decided here, not by a solve. The tolerance is the incumbent verifier's
+        bound-keyed form, ``ABS_TOL + BOUND_REL_TOL * |bound|``
+        (``discopt.validation.feasibility``): a constant row has no gradient, so the
+        bound is its only scale. A body that cannot be evaluated, or evaluates to a
+        non-finite number, raises; the caller turns that into an ``error`` result, so
+        an unchecked constraint can never be reported ``optimal``.
+        """
+        import math
+
+        from pyomo.core.base.constraint import Constraint
+        from pyomo.core.expr import value as pyo_value
+
+        from discopt.validation.feasibility import ABS_TOL, BOUND_REL_TOL
+
+        violated: list[str] = []
+        for con in model.component_data_objects(Constraint, active=True, descend_into=True):
+            body = float(pyo_value(con.body))
+            if not math.isfinite(body):
+                raise ValueError(f"constraint {con.name!r} body evaluates to {body}")
+            lb, ub = con.lb, con.ub
+            if lb is not None and body < float(lb) - (ABS_TOL + BOUND_REL_TOL * abs(float(lb))):
+                violated.append(con.name)
+            elif ub is not None and body > float(ub) + (ABS_TOL + BOUND_REL_TOL * abs(float(ub))):
+                violated.append(con.name)
+        return violated
+
     def _trivial_results(self, model) -> SolverResults:
         from pyomo.core.expr import value as pyo_value
 
+        violated = self._violated_constant_constraints(model)
+
         results = SolverResults()
         results.solver.name = "discopt"
-        tc, ss = _mapping.termination_for("optimal")
+        tc, ss = _mapping.termination_for("infeasible" if violated else "optimal")
         results.solver.termination_condition = tc
         results.solver.status = ss
         results.problem.number_of_variables = 0
         sense, incumbent_field, bound_field = self._objective_sense(model)
         if sense is not None:
             results.problem.sense = sense
+        if violated:
+            # Infeasible: no incumbent and no bound, so both fields stay at +-inf.
+            results.solver.message = f"constant constraint(s) violated: {violated}"
+            return results
         try:
             from pyomo.core.base.objective import Objective
 
