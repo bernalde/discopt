@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import builtins as _builtins
 import contextlib as _contextlib
+import contextvars as _contextvars
 import copy as _copy
+import functools as _functools
 import gc
 import math
 import re
@@ -5043,6 +5045,30 @@ def missing_validation_guards(src: "Model", dst: "Model") -> list[str]:
     return missing
 
 
+#: How many ``Model.solve`` calls are on the stack (#1537 C). A ContextVar, not a
+#: thread-local: ``_run_with_deep_recursion`` runs deep solves on a worker thread
+#: inside ``contextvars.copy_context()``, which carries this but not a
+#: ``threading.local``, so a sub-solve there still reads as nested.
+_SOLVE_DEPTH: _contextvars.ContextVar[int] = _contextvars.ContextVar(
+    "discopt_model_solve_depth", default=0
+)
+
+
+def _counts_solve_depth(fn):
+    """Track ``Model.solve`` nesting so a pass meant for the caller's own model
+    (recentring) can tell the user's top-level call from the solver's sub-solves."""
+
+    @_functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        token = _SOLVE_DEPTH.set(_SOLVE_DEPTH.get() + 1)
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            _SOLVE_DEPTH.reset(token)
+
+    return wrapper
+
+
 class Model:
     """
     A Mixed-Integer Nonlinear Program.
@@ -7504,6 +7530,7 @@ class Model:
 
     # ── Solve ──
 
+    @_counts_solve_depth
     def solve(
         self,
         time_limit: float = 3600,
@@ -7928,6 +7955,12 @@ class Model:
 
         if (
             _recentre.recentre_enabled()
+            # Only the caller's own top-level solve. A sub-solve the solver runs on
+            # a tightened model of its own (RENS, a relaxation probe...) is a nested
+            # ``Model.solve``; recentring those broke bound neutrality on unshifted
+            # models (graduation panel: 4stufen, hda, heatexch_gen* reported moved
+            # variables although the user's model has nothing to move).
+            and _SOLVE_DEPTH.get() == 1
             and not getattr(self, "_recentre_inner", False)
             and not stream
             and lazy_constraints is None
