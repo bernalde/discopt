@@ -26478,6 +26478,159 @@ def _pounce_recover_node_bound(
     return None
 
 
+def _two_product(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Error-free product: ``a * b == p + e`` exactly, elementwise (Dekker).
+
+    Veltkamp splitting; exact barring overflow/underflow, which the caller checks
+    for by testing the result for finiteness.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    p = a * b
+
+    def _split(v):
+        t = 134217729.0 * v  # 2**27 + 1
+        hi = t - (t - v)
+        return hi, v - hi
+
+    ah, al = _split(a)
+    bh, bl = _split(b)
+    e = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+    return p, e
+
+
+def _exact_sum(*parts) -> float:
+    """Correctly rounded sum of every element of every part (``math.fsum``).
+
+    ``nan`` when any element is non-finite: ``math.fsum`` raises ``ValueError`` on
+    ``+inf`` and ``-inf`` together, and the caller's overflow check is the place
+    that decides what a non-finite product means.
+    """
+    terms = np.concatenate([np.ravel(np.asarray(p, dtype=np.float64)) for p in parts])
+    if not np.all(np.isfinite(terms)):
+        return math.nan
+    return math.fsum(terms)
+
+
+def _miqp_origin_shift(qp_data, lb: np.ndarray, ub: np.ndarray, n_orig: int, model=None):
+    """Translate the QP's origin into the root box: ``x = s + d`` (issue #1543).
+
+    The node QP engine (POUNCE) solves in whatever coordinates it is handed. When
+    a variable's box sits far from the origin -- ``y in [1e5, 1e5 + 3]`` with an
+    objective ``6 (y - 1e5)^2 - 12 (y - 1e5)`` -- the extracted QP is the expanded
+    ``6 y^2 - 1200012 y + 6.00012e10``, and an IPM's relative tolerances on those
+    magnitudes are absolute errors of order one in the objective. Measured on the
+    issue's repro: the root node returned ``y = 100001.478`` (bound -4.63 against a
+    true -6), and the fixed leaf box ``[100001, 100001]`` -- which holds the
+    optimum -- came back ``primal_infeasible``, a false infeasibility proof that
+    pruned it. The solve certified 0.
+
+    The fix is the change of variables, not a tolerance: ``s_j`` is the integer
+    nearest to the point of ``[lb_j, ub_j]`` closest to 0, so integer columns stay
+    integral in ``d`` and every ``|d_j|`` is bounded by the box width. The shifted
+    problem is the same QP:
+
+    * ``c' = c + Q s`` (the gradient at ``s``),
+    * ``b' = b - A s``,
+    * ``const' = const + c's + 1/2 s'Qs`` (the objective at ``s``),
+
+    each computed with error-free products and a correctly rounded sum, so the
+    cancellation the expanded form invites (``6e10 - 1.2e11 + 6e10``) costs one
+    rounding of the *result*, not one ulp of the largest term.
+
+    That is exact arithmetic on the *extracted* coefficients, and the extracted
+    constant is itself a rounded ``6 c^2 + 12 c``: at ``c = 123456.7`` it is off by
+    ~1e-5, enough to put the certified bound 1.7e-6 *above* the optimum. So when
+    ``model`` is given and the POUNCE tape represents it, ``const'`` and ``c'`` are
+    taken from the model's objective and gradient evaluated at ``s`` on the
+    expression as written, where ``(y - c)`` is formed before it is squared. ``Q``
+    is unchanged (the Hessian of a quadratic is constant). The tape values must
+    agree with the exact expanded ones to ``1e-9`` relative to the magnitude of the
+    expanded terms; a larger disagreement means the extraction and the model
+    describe different functions, which is refused loudly rather than solved.
+
+    Returns ``(s, shifted_qp_data)``, or ``None`` when no column needs a shift
+    (every box contains 0, so the solve is bit-identical to the unshifted one) or
+    when an exact product overflows (logged; the unshifted data is then used, as
+    before this change). ``x_l``/``x_u`` are deliberately left unshifted: they
+    feed only the slack-form decomposition, which reads the slack columns, and the
+    node boxes are shifted by the caller.
+    """
+    lb_s = np.asarray(lb, dtype=np.float64)[:n_orig]
+    ub_s = np.asarray(ub, dtype=np.float64)[:n_orig]
+    s = np.round(np.clip(0.0, lb_s, ub_s))
+    s[~np.isfinite(s)] = 0.0
+    S = np.flatnonzero(s)
+    if S.size == 0:
+        return None
+    sS = s[S]
+
+    Q = _dense_Q(qp_data.Q)
+    c = np.asarray(qp_data.c, dtype=np.float64)
+    A = _dense_A(qp_data.A_eq)
+    b = np.asarray(qp_data.b_eq, dtype=np.float64)
+
+    c_new = c.copy()
+    QS = Q[:, S]
+    for i in np.flatnonzero(np.any(QS != 0.0, axis=1)):
+        p, e = _two_product(QS[i], sS)
+        c_new[i] = _exact_sum([c[i]], p, e)
+
+    b_new = b.copy()
+    if A.ndim == 2 and A.shape[0] > 0:
+        AS = A[:, S]
+        for i in np.flatnonzero(np.any(AS != 0.0, axis=1)):
+            p, e = _two_product(AS[i], sS)
+            b_new[i] = _exact_sum([b[i]], -p, -e)
+
+    pc, ec = _two_product(c[S], sS)
+    QSS = Q[np.ix_(S, S)]
+    ii, jj = np.nonzero(QSS)
+    p1, e1 = _two_product(0.5 * QSS[ii, jj], sS[ii])
+    p2, e2 = _two_product(p1, sS[jj])
+    p3, e3 = _two_product(e1, sS[jj])
+    const_new = _exact_sum([float(qp_data.obj_const)], pc, ec, p2, e2, p3, e3)
+
+    if not (
+        np.all(np.isfinite(c_new))
+        and np.all(np.isfinite(b_new))
+        and np.isfinite(const_new)
+        and np.all(np.isfinite(np.concatenate([pc, ec, p2, e2, p3, e3])))
+    ):
+        logger.debug("MIQP origin shift (#1543): exact products overflowed; not shifting")
+        return None
+
+    if model is not None:
+        from discopt._tape_nlp_evaluator import try_build
+
+        ev = try_build(model)
+        if ev is not None and ev.n_variables == n_orig:
+            # The tape minimises (a MAXIMIZE objective is negated), which is the
+            # sense ``qp_data`` is stored in, so its values compare directly.
+            f_s = float(ev.evaluate_objective(s))
+            g_s = np.asarray(ev.evaluate_gradient(s), dtype=np.float64)
+            const_scale = 1.0 + float(
+                abs(float(qp_data.obj_const)) + np.sum(np.abs(pc)) + np.sum(np.abs(p2))
+            )
+            g_scale = 1.0 + np.abs(c[:n_orig]) + np.abs(QS[:n_orig]) @ np.abs(sS)
+            if not (
+                np.isfinite(f_s)
+                and g_s.shape == (n_orig,)
+                and np.all(np.isfinite(g_s))
+                and abs(f_s - const_new) <= 1e-9 * const_scale
+                and np.all(np.abs(g_s - c_new[:n_orig]) <= 1e-9 * g_scale)
+            ):
+                raise RuntimeError(
+                    "MIQP origin shift (#1543): the model's objective evaluated at the "
+                    f"shift point ({f_s!r}) disagrees with the extracted QP's "
+                    f"({const_new!r}), or its gradient does; the extraction and the "
+                    "model describe different functions."
+                )
+            const_new = f_s
+            c_new[:n_orig] = g_s
+    return s, qp_data._replace(c=c_new, b_eq=b_new, obj_const=float(const_new))
+
+
 def _pounce_qp_relaxation_nodes(qp_data, batch_lb, batch_ub, n_orig, t_start, time_limit):
     """Solve a batch of MIQP B&B node QP relaxations with POUNCE (JAX-free).
 
@@ -30566,6 +30719,38 @@ def _solve_miqp_bb(
     _c_m = np.asarray(qp_data.c[:n_orig])
     _Q_m = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
 
+    # #1543: every node QP is SOLVED in coordinates ``d = x - _s`` whose origin
+    # lies in the root box (see ``_miqp_origin_shift``); the tree, the feasibility
+    # arbiters (``_A_ub_m`` ... above, ``_node_point_feasible``, the exit gates)
+    # and everything reported stay in the model's own coordinates. ``*_q`` is the
+    # solve frame. With no shift (every box contains 0) ``_s`` is zero and the
+    # ``*_q`` data are the unshifted data, so the path is bit-identical.
+    _s = np.zeros(n_vars, dtype=np.float64)
+    _qp_q = qp_data
+    _origin_shift = _miqp_origin_shift(qp_data, lb, ub, n_orig, model=model)
+    if _origin_shift is not None:
+        _s[:n_orig] = _origin_shift[0]
+        _qp_q = _origin_shift[1]
+        logger.debug(
+            "MIQP-BB: node QPs solved with the origin shifted into the root box on "
+            "%d of %d columns (#1543)",
+            int(np.count_nonzero(_s)),
+            n_orig,
+        )
+    _const_q = float(_qp_q.obj_const)
+    _c_q = np.asarray(_qp_q.c[:n_orig], dtype=np.float64)
+    if _origin_shift is None:
+        _A_ub_q, _b_ub_q, _A_eq_q, _b_eq_q = _A_ub_m, _b_ub_m, _A_eq_m, _b_eq_m
+    else:
+        _A_ub_q, _b_ub_q, _A_eq_q, _b_eq_q = _decompose_eq_slack_form(
+            _A_eq_dense,
+            np.asarray(_qp_q.b_eq),
+            n_orig,
+            _n_total0 - n_orig,
+            np.asarray(_qp_q.x_u, dtype=np.float64),
+            row_sense=_declared_row_senses(_qp_q, _A_eq_dense),
+        )
+
     def _node_point_feasible(x_full, node_lb_i, node_ub_i) -> bool:
         """Does a node point satisfy the model's rows and the node's own box?
 
@@ -30624,18 +30809,22 @@ def _solve_miqp_bb(
         :func:`_verify_and_inject_candidate` — so the guard cannot drift between
         them even though the funnels do.
         """
+        # #1543: purified in the solve frame; mapped back before verification.
+        x_row_q = np.asarray(x_row, dtype=np.float64) - _s
+        node_lb_q = np.asarray(node_lb_i, dtype=np.float64) - _s
+        node_ub_q = np.asarray(node_ub_i, dtype=np.float64) - _s
         inc = _pounce_snap_incumbent(
-            x_row,
+            x_row_q,
             int_offsets,
             int_sizes,
-            node_lb_i,
-            node_ub_i,
-            _c_m,
-            float(qp_data.obj_const),
-            _A_ub_m,
-            _b_ub_m,
-            _A_eq_m,
-            _b_eq_m,
+            node_lb_q,
+            node_ub_q,
+            _c_q,
+            _const_q,
+            _A_ub_q,
+            _b_ub_q,
+            _A_eq_q,
+            _b_eq_q,
             t_start,
             time_limit,
             Q=_Q_m,
@@ -30645,17 +30834,17 @@ def _solve_miqp_bb(
             # The snap path declined, i.e. this point is genuinely fractional.
             # The gate itself decides whether an attempt is affordable.
             inc = _round_fix_resolve_attempt(
-                x_row,
+                x_row_q,
                 int_offsets,
                 int_sizes,
-                node_lb_i,
-                node_ub_i,
-                _c_m,
-                float(qp_data.obj_const),
-                _A_ub_m,
-                _b_ub_m,
-                _A_eq_m,
-                _b_eq_m,
+                node_lb_q,
+                node_ub_q,
+                _c_q,
+                _const_q,
+                _A_ub_q,
+                _b_ub_q,
+                _A_eq_q,
+                _b_eq_q,
                 t_start,
                 time_limit,
                 _Q_m,
@@ -30669,7 +30858,7 @@ def _solve_miqp_bb(
             return
         _verify_and_inject_candidate(
             tree,
-            np.asarray(inc[1][:n_vars], dtype=np.float64).copy(),
+            np.asarray(inc[1][:n_vars], dtype=np.float64) + _s,
             inc[0],
             n_orig=n_orig,
             node_lb_i=node_lb_i,
@@ -30709,21 +30898,21 @@ def _solve_miqp_bb(
             # non-KKT objective as an (untrusted) bound and decertify — the
             # feasible iterate is still a valid incumbent either way.
             rec = _pounce_recover_node_bound(
-                node_lb_i,
-                node_ub_i,
-                _c_m,
-                float(qp_data.obj_const),
-                _A_ub_m,
-                _b_ub_m,
-                _A_eq_m,
-                _b_eq_m,
+                np.asarray(node_lb_i, dtype=np.float64) - _s,
+                np.asarray(node_ub_i, dtype=np.float64) - _s,
+                _c_q,
+                _const_q,
+                _A_ub_q,
+                _b_ub_q,
+                _A_eq_q,
+                _b_eq_q,
                 t_start,
                 time_limit,
                 Q=_Q_m,
             )
             if rec is not None and rec[0] == "optimal":
                 lbs[i] = rec[1]
-                sols[i] = np.asarray(rec[2][:n_vars], dtype=np.float64)
+                sols[i] = np.asarray(rec[2][:n_vars], dtype=np.float64) + _s
             else:
                 sols[i] = np.asarray(x_full[:n_vars], dtype=np.float64)
                 lbs[i] = float(obj_val)
@@ -30734,21 +30923,21 @@ def _solve_miqp_bb(
         lb_c, ub_c = _clip_start_box(node_lb_i, node_ub_i)
         sols[i] = 0.5 * (lb_c + ub_c)
         rec = _pounce_recover_node_bound(
-            node_lb_i,
-            node_ub_i,
-            _c_m,
-            float(qp_data.obj_const),
-            _A_ub_m,
-            _b_ub_m,
-            _A_eq_m,
-            _b_eq_m,
+            np.asarray(node_lb_i, dtype=np.float64) - _s,
+            np.asarray(node_ub_i, dtype=np.float64) - _s,
+            _c_q,
+            _const_q,
+            _A_ub_q,
+            _b_ub_q,
+            _A_eq_q,
+            _b_eq_q,
             t_start,
             time_limit,
             Q=_Q_m,
         )
         if rec is not None and rec[0] == "optimal":
             lbs[i] = rec[1]
-            sols[i] = np.asarray(rec[2][:n_vars], dtype=np.float64)
+            sols[i] = np.asarray(rec[2][:n_vars], dtype=np.float64) + _s
             if lbs[i] < _SENTINEL_THRESHOLD:
                 _maybe_inject_snapped_or_rounded(sols[i], node_lb_i, node_ub_i)
         elif rec is not None:  # Phase-1-certified infeasible: rigorous prune.
@@ -30832,9 +31021,18 @@ def _solve_miqp_bb(
         # Solve every node's convex QP relaxation with POUNCE (JAX-free). The
         # batched JAX QP IPM was the last JAX dependency on the MIQP path; POUNCE
         # gives the same KKT-valid bound / Phase-1 infeasibility verdict per node.
+        # #1543: solved in the shifted frame, mapped back to model coordinates
+        # (structural columns only; the slacks are shift-invariant).
         clean, infeasible, obj_vals, lb_vals, x_vals = _pounce_qp_relaxation_nodes(
-            qp_data, batch_lb, batch_ub, n_orig, t_start, time_limit
+            _qp_q,
+            [np.asarray(_bl, dtype=np.float64) - _s for _bl in batch_lb],
+            [np.asarray(_bu, dtype=np.float64) - _s for _bu in batch_ub],
+            n_orig,
+            t_start,
+            time_limit,
         )
+        if _origin_shift is not None:
+            x_vals[:, :n_orig] += _s[:n_orig]
         result_lbs = np.full(n_batch, _INFEASIBILITY_SENTINEL, dtype=np.float64)
         result_sols = np.empty((n_batch, n_vars), dtype=np.float64)
         result_feas = np.zeros(n_batch, dtype=bool)
@@ -30857,6 +31055,8 @@ def _solve_miqp_bb(
             elif clean[i] and _node_point_feasible(x_vals[i], node_lb, node_ub):
                 # #1537: the node's bound is the rigorous dual bound, not f at the
                 # IPM point (which sits above the minimum by up to gradient x error).
+                # #1543: computed in the shifted frame, whose obj_const absorbs the
+                # shift, so it bounds the model objective directly.
                 result_lbs[i] = lb_vals[i]
                 result_sols[i] = x_vals[i, :n_vars]
                 if result_lbs[i] < _SENTINEL_THRESHOLD:
@@ -30866,9 +31066,7 @@ def _solve_miqp_bb(
                 # an untrusted bound. Keep the node open (POUNCE recovery), never a
                 # false-infeasible prune (issue #127).
                 x_seed = x_vals[i] if np.all(np.isfinite(x_vals[i])) else None
-                obj_seed = (
-                    obj_vals[i] + float(qp_data.obj_const) if np.isfinite(obj_vals[i]) else np.nan
-                )
+                obj_seed = obj_vals[i] + _const_q if np.isfinite(obj_vals[i]) else np.nan
                 _handle_nonclean(
                     i, result_lbs, result_sols, x_seed, obj_seed, node_lb, node_ub, result_excl
                 )
@@ -31004,23 +31202,27 @@ def _solve_miqp_bb(
                     _declared_box,
                 )
 
+            # #1543: the re-solve runs in the shifted frame; the arbiter judges
+            # the point in model coordinates.
             _verdict, _point, _pobj = _integral_claim_recovery(
-                sol_flat,
-                _rounded_inc,
+                np.asarray(sol_flat, dtype=np.float64) - _s,
+                np.asarray(_rounded_inc, dtype=np.float64) - _s,
                 int_offsets=int_offsets,
                 int_sizes=int_sizes,
-                declared_box=_declared_box,
-                c=_c_m,
-                obj_const=float(qp_data.obj_const),
-                A_ub=_A_ub_m,
-                b_ub=_b_ub_m,
-                A_eq=_A_eq_m,
-                b_eq=_b_eq_m,
+                declared_box=_declared_box - _s[:n_orig, None],
+                c=_c_q,
+                obj_const=_const_q,
+                A_ub=_A_ub_q,
+                b_ub=_b_ub_q,
+                A_eq=_A_eq_q,
+                b_eq=_b_eq_q,
                 t_start=t_start,
                 time_limit=time_limit,
                 Q=_Q_m,
-                arbiter=_miqp_arbiter,
+                arbiter=lambda _p: _miqp_arbiter(np.asarray(_p, dtype=np.float64) + _s),
             )
+            if _point is not None:
+                _point = np.asarray(_point, dtype=np.float64) + _s
             if _verdict == "ok" and _miqp_arbiter(_point):
                 logger.info(
                     "MIQP-BB: re-derived the incumbent at its integral realisation "
@@ -31130,9 +31332,9 @@ def _solve_miqp_bb(
         # #1331: ``obj_val`` is the objective the NODE relaxation reported; the
         # snap above has since moved the point. Recompute from the point that is
         # actually returned -- ``objective`` claims that ``x`` achieves it.
-        _obj_at_point = _objective_at_reported_point(
-            _x_check, _c_m, float(qp_data.obj_const), Q=_Q_m
-        )
+        # #1543: evaluated in the shifted frame, where the expanded quadratic
+        # does not cancel catastrophically (same function, exactly re-centred).
+        _obj_at_point = _objective_at_reported_point(_x_check - _s[:n_orig], _c_q, _const_q, Q=_Q_m)
         # Worse (higher, in the internal minimisation sense) means the tree
         # fathomed and converged against a value no point attains, so its own
         # stopping test cannot be taken at face value; it is re-run below
