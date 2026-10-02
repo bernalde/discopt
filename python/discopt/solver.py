@@ -6397,6 +6397,12 @@ def _withhold_unresolved_objective_certificate(
         result.solver_stats = {}
     result.solver_stats["certificate/objective_eval_error"] = err
     hi, lo = (o, b) if o >= b else (b, o)
+    # Judge only the error's MARGINAL effect. A pair that does not close at these
+    # tolerances even with no error was certified at others -- ``solver="amp"``
+    # meets ``rel_gap``, not ``gap_tolerance`` -- and the ``Model.solve`` call site
+    # only knows the caller's ``gap_tolerance``; that pair is #1536's business.
+    if _gap_criterion(hi, lo, gap_tolerance, abs_gap_tol) is None:
+        return
     if _gap_criterion(hi + err, lo, gap_tolerance, abs_gap_tol) is not None:
         return
     logger.warning(
