@@ -1448,7 +1448,109 @@ def _fixed_integer_lp(sf: "StdForm", x: np.ndarray, time_limit: Optional[float])
     return solve_lp_std(dataclasses.replace(sf, xl=xl, xu=xu), time_limit=time_limit)
 
 
+def logical_column_scales(sf: StdForm, n_struct: Optional[int]) -> Optional[np.ndarray]:
+    """Power-of-two factors that equilibrate the route's own logical columns, or ``None``.
+
+    #1537: the standard form ends every inequality row with a unit logical
+    ``a x + s = b, s >= 0``. Multiply that row by 1e6 -- the same model -- and the
+    logical is 2.5e-7 of its row's largest entry, below :data:`UNSCALABLE_OPEN_RATIO`.
+    That is not a false alarm: on the #1295-class panel HiGHS then pruned the true
+    optimum on 3/9 such models (caught only by the #1509 refutation), and with the
+    logical's coefficient raised to its row's magnitude it certified all of them
+    correctly. Before this, ×1e6 rows on clean MILPs withdrew 12/12 correct
+    certificates.
+
+    So the logical is rescaled rather than excused: ``s = f s'`` with ``f`` a power of
+    two is exact in floating point, changes no other row and (``c_s = 0``) not the
+    objective, and puts the column's entry within a factor 2 below its row's largest. Only
+    columns at index ``>= n_struct`` (the route's own, never published), with one
+    nonzero, zero cost, continuous, and *below* the cap are touched, so a model this
+    route certifies today is handed to HiGHS unchanged. A user's own tiny-coefficient
+    column is not touched and still decertifies: that class was measured wrong
+    (#1295) and is the user's scaling, not the route's.
+    """
+    if n_struct is None or n_struct >= sf.n or sf.A.nnz == 0:
+        return None
+    A = sp.csc_matrix(sf.A)  # noqa: N806
+    absA = abs(A).tocoo()  # noqa: N806
+    row_max = np.zeros(sf.m)
+    np.maximum.at(row_max, absA.row, absA.data)
+    col_nnz = np.diff(A.indptr)
+    scales = np.ones(sf.n)
+    cand = np.zeros(sf.n, dtype=bool)
+    cand[n_struct:] = True
+    cand &= (col_nnz == 1) & (sf.c == 0.0)
+    cand[sf.int_idx] = False
+    lo_open, hi_open = sf.xl <= -INF, sf.xu >= INF
+    for j in np.flatnonzero(cand):
+        i, a = int(A.indices[A.indptr[j]]), abs(float(A.data[A.indptr[j]]))
+        if row_max[i] <= 0.0 or a / row_max[i] >= UNSCALABLE_OPEN_RATIO:
+            continue
+        # floor, not round: the rescaled entry lands in (row_max / 2, row_max], so it
+        # never becomes its row's new largest and lowers every other entry's ratio.
+        f = float(2.0 ** np.floor(np.log2(row_max[i] / a)))
+        if f * a > row_max[i]:
+            f /= 2.0
+        # A finite side must stay an ordinary finite side after ``/ f``; a sentinel
+        # side stays the sentinel. Anything else would change what "open" means.
+        new_lo, new_hi = sf.xl[j] / f, sf.xu[j] / f
+        if not lo_open[j] and (abs(sf.xl[j]) >= READBACK_LIMIT or new_lo * f != sf.xl[j]):
+            continue
+        if not hi_open[j] and (abs(sf.xu[j]) >= READBACK_LIMIT or new_hi * f != sf.xu[j]):
+            continue
+        scales[j] = f
+    return scales if np.any(scales != 1.0) else None
+
+
+def _scale_logicals(sf: StdForm, f: np.ndarray) -> StdForm:
+    """``sf`` in the variables ``x'_j = x_j / f_j`` (sentinel sides kept)."""
+    A = sp.csc_matrix(sf.A) @ sp.diags(f, format="csc")  # noqa: N806
+    xl = np.where(sf.xl <= -INF, sf.xl, sf.xl / f)
+    xu = np.where(sf.xu >= INF, sf.xu, sf.xu / f)
+    return StdForm.from_arrays(sf.c * f, A, sf.b, xl, xu, sf.obj_const, sf.int_idx)
+
+
 def solve_milp_std(
+    sf: StdForm,
+    *,
+    time_limit: Optional[float],
+    gap_tolerance: float,
+    abs_gap_tolerance: Optional[float] = None,
+    max_nodes: int,
+    initial_point: Optional[np.ndarray] = None,
+    n_struct: Optional[int] = None,
+    root_check: bool = True,
+) -> HighsOutcome:
+    """Solve the MILP ``sf`` under the §3.2 contract, with the route's own
+    under-scaled logical columns rescaled exactly first (#1537,
+    :func:`logical_column_scales`); see :func:`_solve_milp_std`."""
+    f = logical_column_scales(sf, n_struct)
+    kw: dict[str, Any] = dict(
+        time_limit=time_limit,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tolerance=abs_gap_tolerance,
+        max_nodes=max_nodes,
+        initial_point=initial_point,
+        n_struct=n_struct,
+        root_check=root_check,
+    )
+    if f is None:
+        return _solve_milp_std(sf, **kw)
+    out = _solve_milp_std(_scale_logicals(sf, f), **kw)
+    # Back to ``sf``'s variables: x = f x'; a reduced cost is per unit of the column,
+    # d = d' / f; a primal ray is a direction in column space. Row duals and a Farkas
+    # ray live in row space, and the rows were not touched.
+    if out.x is not None:
+        out.x = np.asarray(out.x, dtype=np.float64) * f
+    if out.col_dual is not None:
+        out.col_dual = np.asarray(out.col_dual, dtype=np.float64) / f
+    if out.ray is not None and out.status == "unbounded" and np.size(out.ray) == sf.n:
+        out.ray = np.asarray(out.ray, dtype=np.float64) * f
+    out.stats["milp/logicals_rescaled"] = float(np.count_nonzero(f != 1.0))
+    return out
+
+
+def _solve_milp_std(
     sf: StdForm,
     *,
     time_limit: Optional[float],

@@ -24922,6 +24922,59 @@ def _matrix_solution_violations(x, A_ub, b_ub, A_eq, b_eq, bounds) -> str:
     return "no block shows a positive residual"
 
 
+def _qp_objective_at_point(
+    model: Model,
+    x: np.ndarray,
+    expanded: float,
+    Q: np.ndarray,  # noqa: N803
+    c: np.ndarray,
+    obj_const: float,
+) -> float:
+    """The model's objective at ``x``, evaluated in its declared form when the
+    expanded QP value is only a less accurate evaluation of the same number (#1537).
+
+    The QP route works on ``1/2 x'Qx + c'x + obj_const``: every affine argument is
+    multiplied out. Under ``x = y - c0`` that turns ``(y - c0)**2 - 3 (y - c0)`` into
+    ``y**2 - (2 c0 + 3) y + (c0**2 + 3 c0)`` and the value at the optimum is the
+    difference of terms of size ``c0**2``: at ``c0 = 1e6`` the published bound was
+    -2.2501220703125 against a true -2.25 (the ulp of 1e12), and at 7.7e6 the bound
+    was so far below the reconciled objective that the certificate was withdrawn --
+    a certificate that depends on where the box sits. This route publishes the
+    objective AS the bound (the convex / tree premise), so that number has to be
+    computed where it is accurate: the declared expression, which the tape
+    evaluates on the affine arguments themselves.
+
+    The declared value replaces the expanded one only when they agree to within the
+    expanded form's own rounding scale ``|obj_const| + |c|'|x| + |x|'|Q||x|``, i.e.
+    when they are two evaluations of one number at one point. A larger difference
+    is a reformulation mismatch, not rounding, and is left to
+    ``Model._reconcile_objective_with_model`` and its certificate re-test, exactly as
+    before.
+    """
+    from discopt._tape_nlp_evaluator import make_evaluator
+
+    try:
+        ev = make_evaluator(model)
+        f = float(ev.evaluate_objective(x))
+    except Exception as exc:  # noqa: BLE001 - evaluator robustness, mirrors reconciliation
+        logger.warning(
+            "QP objective re-evaluation in declared form failed (%s: %s); publishing "
+            "the expanded value %.17g (#1537).",
+            type(exc).__name__,
+            exc,
+            expanded,
+        )
+        return expanded
+    f_decl = -f if getattr(ev, "_negate", False) else f
+    if not np.isfinite(f_decl):
+        return expanded
+    ax = np.abs(x)
+    mag = abs(float(obj_const)) + float(np.abs(c) @ ax) + float(ax @ (np.abs(Q) @ ax))
+    if abs(f_decl - expanded) <= 64.0 * np.finfo(float).eps * (mag + abs(expanded)):
+        return f_decl
+    return expanded
+
+
 def _solve_qp_matrix(
     model: Model,
     t_start: float,
@@ -25072,6 +25125,16 @@ def _solve_qp_matrix(
             return None
         x_flat = result.x[:n_orig]
         assert objective is not None
+        # #1537: ``objective`` doubles as the published bound below, so evaluate it
+        # where it is accurate (see the helper).
+        objective = _qp_objective_at_point(
+            model,
+            np.asarray(x_flat, dtype=np.float64),
+            objective,
+            Q_orig,
+            c_orig,
+            qp_data.obj_const,
+        )
 
         n_eq_rows = A_eq.shape[0] if A_eq is not None else 0
         n_ub_rows = A_ub.shape[0] if A_ub is not None else 0
