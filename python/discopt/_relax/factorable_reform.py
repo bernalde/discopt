@@ -374,8 +374,12 @@ def _structural_key(expr: Expression, pins: list) -> tuple:
             return ("nd", idx.dtype.str, idx.shape, idx.tobytes())
         if isinstance(idx, tuple):
             return ("t",) + tuple(index_key(i) for i in idx)
+        if isinstance(idx, list):  # elementwise: repr truncates large nested arrays
+            return ("l",) + tuple(index_key(i) for i in idx)
         if isinstance(idx, slice):
             return ("s", idx.start, idx.stop, idx.step)
+        if isinstance(idx, (bool, np.bool_)):  # before int: bool subclasses int
+            return ("b", bool(idx))
         if isinstance(idx, (int, np.integer)):
             return ("i", int(idx))
         return ("r", type(idx).__name__, repr(idx))  # Ellipsis / None: exact reprs

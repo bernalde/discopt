@@ -74,3 +74,25 @@ def test_key_is_lossless_where_repr_was_not():
     # and structurally equal expressions agree
     assert _structural_key(x + 1.0, pins) == _structural_key(x + 1.0, pins)
     assert not pins  # every node above has an exact rule: nothing fell back to id()
+
+
+def test_index_key_separates_bool_from_int_and_long_list_indices():
+    """``bool`` subclasses ``int``, and ``repr`` truncates a long nested array."""
+    from discopt._relax.factorable_reform import _structural_key
+    from discopt.modeling.core import IndexExpression
+
+    m = dm.Model("idx")
+    X = m.continuous("X", shape=(3, 4), lb=0.0, ub=1.0)
+    pins: list = []
+    # X[True] is the whole array (shape (1, 3, 4)); X[1] is one row
+    assert _structural_key(IndexExpression(X, True), pins) != _structural_key(
+        IndexExpression(X, 1), pins
+    )
+    a = np.zeros(2000, dtype=np.int64)
+    b = a.copy()
+    b[1000] = 1
+    assert repr([a]) == repr([b])  # the lossy display the old key relied on
+    assert _structural_key(IndexExpression(X, [a]), pins) != _structural_key(
+        IndexExpression(X, [b]), pins
+    )
+    assert not pins
