@@ -137,12 +137,50 @@ def _free_and_fixed():
     return m
 
 
+def _parameter_shape(form: str):
+    """Parameter coefficients and offsets, scalar and indexed (PR #1578 review).
+
+    The Rust arena sees a Parameter as a constant, so a product or sum with a
+    variable folds into a LINEAR row. The Python writer treated it as a
+    nonlinear term. That changed the body bytes, and since #1562 it also
+    changed the row's position, so `nl_row_order` mapped duals to the wrong
+    rows. Each form is placed after a linear row, so a misclassified row also
+    moves.
+    """
+
+    def build():
+        m = dm.Model(f"param_{form}")
+        x = m.continuous("x", lb=0.5, ub=2.0)
+        y = m.continuous("y", lb=0.5, ub=2.0)
+        p = m.parameter("p", value=2.0)
+        q = m.parameter("q", value=np.array([1.5, -3.0]))
+        m.subject_to(x + y <= 3.0, name="lin")
+        body = {
+            "p_x": lambda: p * x + y >= 1.0,
+            "x_p": lambda: x * p + y >= 1.0,
+            "rhs_p": lambda: x + y >= p,
+            "p_sum": lambda: p * (x + y) >= 1.0,
+            "q_index": lambda: q[1] * x + q[0] + y <= 4.0,
+            "p_nonlinear": lambda: p * x**2 + y >= 1.0,
+            "exp_p_x": lambda: dm.exp(p) * x + y >= 1.0,
+        }[form]()
+        m.subject_to(body, name="param_row")
+        m.subject_to(x**2 + y <= 9.0, name="nl")
+        m.minimize(p * x + y)
+        return m
+
+    return build
+
+
+_PARAMETER_FORMS = ("p_x", "x_p", "rhs_p", "p_sum", "q_index", "p_nonlinear", "exp_p_x")
+
 SHAPES = {
     "minlp": _minlp,
     "vectorised": _vectorised,
     "matmul": _matmul,
     "equality": _equality,
     "free_and_fixed": _free_and_fixed,
+    **{f"param_{f}": _parameter_shape(f) for f in _PARAMETER_FORMS},
 }
 
 

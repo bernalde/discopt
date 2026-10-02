@@ -97,11 +97,16 @@ def _assert_roundtrip_values(model, tmp_path, n_points=4, seed=0):
     ev1, ev2 = NLPEvaluator(model), NLPEvaluator(reloaded)
     rhs1 = np.array([c.rhs for c in model._constraints], dtype=float)
     rhs2 = np.array([c.rhs for c in reloaded._constraints], dtype=float)
-    assert [c.sense for c in model._constraints] == [c.sense for c in reloaded._constraints]
+    # The .nl writes nonlinear rows first (#1562): reloaded row i is model row
+    # `rows[i]`. Scalar constraints only here, so a row is a constraint.
+    rows = np.asarray(writer._row_order, dtype=int)
+    assert sorted(rows.tolist()) == list(range(len(model._constraints)))
+    senses = [model._constraints[i].sense for i in rows]
+    assert senses == [c.sense for c in reloaded._constraints]
     for x in _sample_points(model, n_points, seed):
         assert ev1.evaluate_objective(x) == pytest.approx(ev2.evaluate_objective(x[perm]), abs=1e-9)
         if model._constraints:
-            c1 = ev1.evaluate_constraints(x) - rhs1
+            c1 = (ev1.evaluate_constraints(x) - rhs1)[rows]
             c2 = ev2.evaluate_constraints(x[perm]) - rhs2
             np.testing.assert_allclose(c1, c2, atol=1e-9)
     return writer, reloaded, perm
@@ -176,7 +181,7 @@ class TestNLRoundTrip:
         for xv in _sample_points(m, n_points=2, seed=1):
             expected = np.concatenate(
                 [np.atleast_1d(compile_expression(c.body, m)(xv)).ravel() for c in m._constraints]
-            )
+            )[writer._row_order]  # .nl rows are nonlinear-first (#1562)
             got = ev2.evaluate_constraints(xv[perm]) - rhs2
             assert got.shape == expected.shape
             np.testing.assert_allclose(got, expected, atol=1e-9)

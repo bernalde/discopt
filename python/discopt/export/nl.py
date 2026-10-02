@@ -159,17 +159,20 @@ def _to_nl_with_block_structure(
     text = writer.write()
 
     var_labels = _block_labels_in_nl_order(writer, model, structure.var_blocks)
-    con_labels = [int(b) for b in structure.con_blocks]
-    if len(con_labels) != len(writer._con_linear):
+    model_row_labels = [int(b) for b in structure.con_blocks]
+    if len(model_row_labels) != len(writer._con_linear):
         # The evaluator and the writer expand array bodies and builder rows in
         # the same order (both row-major, both expression rows then builder
         # rows), so a disagreement in COUNT means one of them changed and the
         # labels would be written against rows they do not describe.
         raise ValueError(
-            f"the emitted NLP has {len(con_labels)} rows but the .nl writer emitted "
+            f"the emitted NLP has {len(model_row_labels)} rows but the .nl writer emitted "
             f"{len(writer._con_linear)}; refusing to write block labels that would name "
             "the wrong rows."
         )
+    # The `.nl` puts nonlinear rows first (#1562), so its rows are a permutation
+    # of the model's; label each `.nl` row with the block of the model row it is.
+    con_labels = [model_row_labels[r] for r in writer._row_order]
 
     lines = [f"{len(var_labels)} {len(con_labels)}"]
     lines.append(" ".join(str(b) for b in var_labels))
@@ -192,13 +195,56 @@ def _block_labels_in_nl_order(writer: "_NLWriter", model: Model, var_blocks: Any
     return labels
 
 
+def nl_row_order(model: Model) -> np.ndarray:
+    """The model scalar row behind each row of ``model.to_nl()``'s output.
+
+    ``.nl`` requires the nonlinear rows first (header ``nlc`` names rows
+    ``C0 .. C{nlc-1}``), so :func:`to_nl` writes ``[nonlinear | linear]``,
+    stable within each group (#1562), and its row order is generally a
+    permutation of the model's. ``order[i]`` is the model scalar row that
+    ``.nl`` row ``i`` came from, so a reader's per-row output (``.sol`` duals,
+    constraint activities) maps back with ``model_vals[order] = nl_vals``.
+
+    Model scalar rows are numbered the way the writer decomposes them: each
+    entry of ``model._constraints`` expanded row-major (an array body is several
+    rows), followed by the builder rows of ``add_linear_constraints``.
+
+    The map comes from the same writer :func:`to_nl` dispatches to: the Rust
+    writer, or the Python one when Rust declines or ``DISCOPT_RUST_NL=0``. The
+    writers are diffed byte for byte, but recomputing the map with the Python
+    writer was right only while the two agreed on which rows are nonlinear.
+    The PR #1578 review found Parameter rows where they did not
+    (``p*x + y >= 1`` was linear in Rust and nonlinear in Python), and there the
+    map silently pointed duals at the wrong rows.
+    """
+    refuse_non_algebraic_relations(model, ".nl")
+    model.validate(for_solve=False)
+    written = _rust_nl_write(model, None)
+    if written is not None:
+        return np.asarray(written[1], dtype=np.intp)
+    writer = _NLWriter(model)
+    writer.write()
+    return np.asarray(writer._row_order, dtype=np.intp)
+
+
 _RUST_NL_ENV = "DISCOPT_RUST_NL"
 
 _RUST_NL_LOG = logging.getLogger(__name__)
 
 
 def _rust_nl_text(model: Model, initial_point: Union[dict, None] = None) -> Optional[str]:
-    """``.nl`` text from the Rust writer, or ``None`` to use the Python writer.
+    """``.nl`` text from the Rust writer, or ``None`` to use the Python writer."""
+    written = _rust_nl_write(model, initial_point)
+    return None if written is None else written[0]
+
+
+def _rust_nl_write(
+    model: Model, initial_point: Union[dict, None] = None
+) -> Optional[tuple[str, list[int]]]:
+    """``(text, row_order)`` from the Rust writer, or ``None`` to use the Python writer.
+
+    ``row_order[i]`` is the model scalar row written as ``.nl`` row ``i``, as
+    :func:`nl_row_order` documents.
 
     Writing ``.nl`` was the entire remaining external-solver performance gap:
     the Python writer below costs **16.05 µs/row of a 16.21 µs/row**
@@ -228,9 +274,9 @@ def _rust_nl_text(model: Model, initial_point: Union[dict, None] = None) -> Opti
     # FASTEST construction path with the SLOWEST writer: a 20 000-row bulk model
     # built in 0.31 us/row and then exported at 22.83. `nl_writer::write_nl` now
     # takes the builder-row boundary from the repr and reorders to this order, so
-    # the two writers agree byte for byte and row order -- how a solver's `.sol`
-    # duals map back to constraints -- is unchanged from what discopt has always
-    # written.
+    # the two writers agree byte for byte. Both then put the nonlinear rows
+    # first, as the format requires (#1562); `nl_row_order` maps `.nl` rows --
+    # and so a solver's `.sol` duals -- back to the model's.
     # The starting point lives on the Model, keyed by `(name, element)`; the
     # writer wants repr COLUMNS. Resolving here rather than in Rust keeps the
     # `(name, element)` convention in the one layer that owns it. A key naming a
@@ -264,11 +310,13 @@ def _rust_nl_text(model: Model, initial_point: Union[dict, None] = None) -> Opti
             entries.append((offsets[id(var)] + elem, float(value)))
     try:
         repr_ = model_to_repr(model, getattr(model, "_builder", None))
-        # Through a typed local: `write_nl` comes from the PyO3 extension, whose
-        # bindings are untyped, so returning it directly returns `Any` from a
-        # function declared to return `str | None`.
-        text: str = repr_.write_nl(model.name, entries)
-        return text
+        # Through typed locals, because `write_nl_with_row_order` comes from the
+        # PyO3 extension and its bindings are untyped. Returning its result
+        # directly would return `Any` from a function with a declared return type.
+        text: str
+        order: list[int]
+        text, order = repr_.write_nl_with_row_order(model.name, entries)
+        return text, list(order)
     except Exception as exc:  # noqa: BLE001
         # "This model has no arena representation" arrives as several exception
         # types (`TypeError: Unknown expression type`, `ValueError: Unknown
@@ -421,6 +469,11 @@ class _NLWriter:
         self._con_nl_vars: list[set[int]] = []
         self._obj_nl_vars: set[int] = set()  # vars in the objective nonlinear body
         self._con_bounds: list[tuple[int, float, float]] = []  # (type, lb, ub)
+        # ``.nl`` row ``i`` is model scalar row ``_row_order[i]`` (#1562). Model
+        # scalar rows are numbered in this writer's decomposition order: every
+        # ``model._constraints`` body expanded row-major, then the builder rows.
+        # Filled by _order_rows_nonlinear_first.
+        self._row_order: list[int] = []
         # Header discrete/nonlinear counts, filled by _reorder_vars_canonical.
         self._nlvc_total = 0  # total nonlinear vars in constraints (incl. both)
         self._nlvo_total = 0  # total nonlinear vars in objectives (incl. both)
@@ -437,6 +490,7 @@ class _NLWriter:
         self._decompose_expressions()
         self._reorder_vars_canonical()
         self._compute_nl_vars()
+        self._order_rows_nonlinear_first()
         buf = io.StringIO()
         self._write_header(buf)
         self._write_C_sections(buf)
@@ -628,6 +682,47 @@ class _NLWriter:
         if objs_only:
             return len(nl_cons) + objs_only
         return len(nl_objs)
+
+    # ── Row order: nonlinear rows first (#1562) ──
+
+    def _order_rows_nonlinear_first(self):
+        """Permute rows to ``[nonlinear | linear]``, stable within each group.
+
+        The ``.nl`` format requires the ``nlc`` nonlinear constraints declared in
+        header line 3 to be rows ``C0 .. C{nlc-1}``; every row after them must
+        carry an ``n0`` body (Gay, "Writing .nl Files", 2005; Pyomo's
+        ``NLv2Writer`` orders rows the same way). This writer used to emit rows
+        in declaration order while still declaring ``nlc``, so a model with a
+        linear row declared ahead of a nonlinear one named the wrong rows as
+        nonlinear: SCIP's reader segfaulted (rc -11) on the issue's two-row
+        repro, and an ASL reader that does not crash takes its nonlinear-row
+        bookkeeping from the wrong rows -- the class of #1222. (POUNCE's reader
+        happens to read both layouts identically; measured, same constraint
+        values, Jacobian and solve.)
+
+        A row is nonlinear exactly when its body is not ``n0``, i.e. when
+        ``_con_nonlinear[i]`` is not ``None`` -- the predicate the ``C`` writer
+        uses to choose between an expression and ``n0``, the header uses to
+        count ``nlc``, and the Rust writer uses, so the count, the order and the
+        bodies cannot disagree. Network and complementarity rows, which the spec
+        orders between the two groups, are never emitted by this writer
+        (:func:`refuse_non_algebraic_relations` refuses them up front).
+
+        The permutation is kept in ``_row_order`` (``.nl`` row -> model scalar
+        row) so a reader's per-row output -- ``.sol`` duals, constraint values --
+        maps back to the model; :func:`nl_row_order` exposes it.
+        """
+        n = len(self._con_linear)
+        nonlinear = [i for i in range(n) if self._con_nonlinear[i] is not None]
+        linear = [i for i in range(n) if self._con_nonlinear[i] is None]
+        order = nonlinear + linear
+        self._row_order = order
+        if order == list(range(n)):
+            return
+        self._con_linear = [self._con_linear[i] for i in order]
+        self._con_nonlinear = [self._con_nonlinear[i] for i in order]
+        self._con_nl_vars = [self._con_nl_vars[i] for i in order]
+        self._con_bounds = [self._con_bounds[i] for i in order]
 
     # ── Jacobian sparsity (union of linear + nonlinear vars per constraint) ──
 
@@ -955,6 +1050,19 @@ class _NLWriter:
         while stack:
             node, c = stack.pop()
 
+            pval = self._param_const(node)
+            if pval is not None:
+                # A scalar Parameter (or an element of one) is a constant at
+                # export time, exactly as `_write_expr` emits it, and as the Rust
+                # writer's arena sees it (an `OP_CONST`). Treating it as
+                # nonlinear made `p*x + y >= 1` a nonlinear row here and a linear
+                # one in Rust. Each writer then put the row in a different place,
+                # and `nl_row_order` mapped `.sol` duals onto the wrong rows (PR
+                # #1578 review).
+                if pval != 0.0:
+                    const_acc[0] += pval * c
+                continue
+
             if isinstance(node, Constant):
                 val = float(node.value)
                 if val != 0.0:
@@ -1024,6 +1132,30 @@ class _NLWriter:
         # rather than raising in float().
         if isinstance(expr, Constant) and expr.value.ndim == 0:
             return float(expr.value)
+        # A scalar Parameter folds as a coefficient too, matching the Rust
+        # writer's `OP_MUL` fold over an `OP_CONST` operand.
+        return self._param_const(expr)
+
+    @staticmethod
+    def _param_const(expr: Expression) -> float | None:
+        """The export-time value of a scalar Parameter (or a scalar element of one).
+
+        Returns ``None`` for anything else, including a shaped Parameter used
+        without an index. `_write_expr` refuses that case loudly, and it must
+        not be folded here into a single number.
+        """
+        if isinstance(expr, Parameter):
+            val = np.asarray(expr.value)
+            if val.shape in ((), (1,)):
+                return float(val.reshape(-1)[0])
+            return None
+        if isinstance(expr, IndexExpression) and isinstance(expr.base, Parameter):
+            try:
+                elem = np.asarray(np.asarray(expr.base.value)[expr.index])
+            except (IndexError, TypeError):
+                return None
+            if elem.ndim == 0:
+                return float(elem)
         return None
 
     def _resolve_var_index(self, expr: IndexExpression) -> int | None:
@@ -1062,7 +1194,18 @@ class _NLWriter:
         # _con_nonlinear[i] is None (and _con_nl_vars[i] empty), so it is
         # correctly counted as linear (ASL requires nonlinear constraints to be
         # the first n_nl_cons rows and carry the only non-n0 bodies).
-        n_nl_cons = sum(1 for vs in self._con_nl_vars if vs)
+        #
+        # Rows were permuted nonlinear-first by _order_rows_nonlinear_first on
+        # this same ``is not None`` predicate, so these are exactly C0..C{nlc-1}.
+        n_nl_cons = sum(1 for nl in self._con_nonlinear if nl is not None)
+        # Header line 2 fields 4-5: range and equality row counts. ``neqns`` used
+        # to be a constant ``0`` (#1562); AMPL and Pyomo write the true counts,
+        # and a reader may size its equality bookkeeping from them.
+        # No path here builds a ``btype == 0`` row today, and the Rust writer
+        # hard-codes ``n_ranges = 0`` (``nl_writer.rs``, which has no range
+        # sense). Adding range rows means counting them in both writers.
+        n_ranges = sum(1 for btype, _lb, _ub in self._con_bounds if btype == 0)
+        n_eqns = sum(1 for btype, _lb, _ub in self._con_bounds if btype == 4)
         n_nl_objs = 1 if self._obj_nonlinear is not None else 0
 
         # Count Jacobian nonzeros from the SAME union sparsity the k and J
@@ -1078,7 +1221,10 @@ class _NLWriter:
         # Line 0: format marker
         buf.write(f"g3 1 1 0\t# problem {self.model.name}\n")
         # Line 1: core dimensions
-        buf.write(f" {n_vars} {n_cons} {n_objs} 0 0\t# vars, constraints, objectives\n")
+        buf.write(
+            f" {n_vars} {n_cons} {n_objs} {n_ranges} {n_eqns}"
+            "\t# vars, constraints, objectives, ranges, eqns\n"
+        )
         # Line 2: nonlinearity counts
         buf.write(f" {n_nl_cons} {n_nl_objs}\t# nonlinear constraints, objectives\n")
         # Line 3: network (unused)
