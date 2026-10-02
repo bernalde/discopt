@@ -25,6 +25,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Callable, Optional, Union
 
 import numpy as np
@@ -2688,14 +2689,194 @@ def _expand_integer_powers_for_relaxation(expr: Expression, model: Model) -> Exp
     return distribute_products(visit(expr))
 
 
+# Degree cap for the exact univariate-polynomial path (#1542). Beyond it a term is
+# left to the legacy distribute-and-match path; the cap only bounds the cost of the
+# rational arithmetic, it carries no soundness weight.
+_EXACT_POLY_MAX_DEGREE = 16
+
+_ExactPoly = tuple[Optional[int], dict[int, Fraction]]
+
+
+def _exact_poly_mul(a: dict[int, Fraction], b: dict[int, Fraction]) -> dict[int, Fraction]:
+    out: dict[int, Fraction] = {}
+    for pa, ca in a.items():
+        for pb, cb in b.items():
+            out[pa + pb] = out.get(pa + pb, Fraction(0)) + ca * cb
+    return {p: c for p, c in out.items() if c != 0}
+
+
+def _exact_poly_add(
+    a: dict[int, Fraction], b: dict[int, Fraction], sign: int = 1
+) -> dict[int, Fraction]:
+    out = dict(a)
+    for p, c in b.items():
+        out[p] = out.get(p, Fraction(0)) + sign * c
+    return {p: c for p, c in out.items() if c != 0}
+
+
+def _exact_univariate_polynomial(expr: Expression, model: Model) -> Optional[_ExactPoly]:
+    """Represent ``expr`` as an exact univariate polynomial, or return ``None``.
+
+    Returns ``(var_idx, {power: Fraction})`` (``var_idx`` is ``None`` for a
+    variable-free expression). Every literal is a binary float and therefore an
+    exact ``Fraction``, and ``+``/``-``/``*``/integer ``**``/division by a
+    constant are closed over the rationals, so the coefficients are the *exact*
+    coefficients of the polynomial the expression denotes — no rounding at all.
+
+    This is the #1542 fix's source of truth. Distributing a shifted power such as
+    ``0.2*(y - 1228561)**3`` in floating point produces monomial coefficients of
+    magnitude ``~c**3 = 1.9e18`` (one ulp ``= 256``) whose exact sum is ``O(1)``:
+    the rounded coefficients alone are wrong by more than the objective's range,
+    so no evaluation scheme downstream of float distribution can recover a valid
+    bound. Building the polynomial from the expression's own structure in exact
+    arithmetic removes that cancellation at its source rather than masking it.
+    """
+    if isinstance(expr, Constant):
+        value = _constant_value(expr)
+        if value is None or not math.isfinite(value):
+            return None
+        frac = Fraction(value)
+        return None, ({0: frac} if frac != 0 else {})
+    flat = _get_flat_index(expr, model)
+    if flat is not None:
+        return flat, {1: Fraction(1)}
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        inner = _exact_univariate_polynomial(expr.operand, model)
+        if inner is None:
+            return None
+        return inner[0], {p: -c for p, c in inner[1].items()}
+    if not isinstance(expr, BinaryOp) or expr.op not in ("+", "-", "*", "/", "**"):
+        return None
+    if expr.op == "**":
+        exp_val = _constant_value(expr.right)
+        if exp_val is None or not math.isfinite(exp_val) or exp_val != int(exp_val) or exp_val < 0:
+            return None
+        n = int(exp_val)
+        base = _exact_univariate_polynomial(expr.left, model)
+        if base is None:
+            return None
+        base_deg = max(base[1], default=0)
+        if base_deg * n > _EXACT_POLY_MAX_DEGREE:
+            return None
+        result: dict[int, Fraction] = {0: Fraction(1)}
+        for _ in range(n):
+            result = _exact_poly_mul(result, base[1])
+        return (base[0] if result.keys() - {0} else None), result
+    left = _exact_univariate_polynomial(expr.left, model)
+    if left is None:
+        return None
+    right = _exact_univariate_polynomial(expr.right, model)
+    if right is None:
+        return None
+    if left[0] is not None and right[0] is not None and left[0] != right[0]:
+        return None
+    var_idx = left[0] if left[0] is not None else right[0]
+    if expr.op == "/":
+        if right[1].keys() - {0} or not right[1]:
+            return None  # only division by a nonzero constant is polynomial
+        coeffs = {p: c / right[1][0] for p, c in left[1].items()}
+    elif expr.op == "*":
+        if max(left[1], default=0) + max(right[1], default=0) > _EXACT_POLY_MAX_DEGREE:
+            return None
+        coeffs = _exact_poly_mul(left[1], right[1])
+    else:
+        coeffs = _exact_poly_add(left[1], right[1], 1 if expr.op == "+" else -1)
+    return (var_idx if coeffs.keys() - {0} else None), coeffs
+
+
+def _fraction_to_float_down(value: Fraction) -> Optional[float]:
+    """Largest float ``<= value`` (``None`` if it would overflow)."""
+    if abs(value) > Fraction(1e300):
+        return None
+    out = float(value)
+    if Fraction(out) > value:
+        out = math.nextafter(out, -math.inf)
+    return out
+
+
+def _exact_polynomial_lower_bound(
+    coeffs: dict[int, Fraction], lb: float, ub: float
+) -> Optional[Fraction]:
+    """Lower bound of the exact polynomial ``sum c_k x**k`` over ``[lb, ub]``.
+
+    Replaces the raw-monomial-basis float evaluation of ``_polynomial_lower_bound``
+    (#1542): the polynomial is re-expanded exactly about an anchor ``a`` inside the
+    box (Taylor shift ``x = a + u``, exact over the rationals), so the local
+    coefficients carry the polynomial's true scale instead of ``|x|**k``; the
+    candidate minimizers (box ends and real roots of the local derivative) are
+    located in floating point on that well-scaled form, and the polynomial is
+    then evaluated at each candidate *exactly*. Coefficients are never dropped
+    for being small — only exact zeros vanish.
+    """
+    clean = {p: c for p, c in coeffs.items() if c != 0}
+    if not clean:
+        return Fraction(0)
+    max_power = max(clean)
+    if max_power == 0:
+        return clean[0]
+    leading = clean[max_power]
+    lo_unbounded = not _is_effectively_finite(lb)
+    hi_unbounded = not _is_effectively_finite(ub)
+    if hi_unbounded and leading < 0:
+        return None
+    if lo_unbounded:
+        if max_power % 2 == 0 and leading < 0:
+            return None
+        if max_power % 2 == 1 and leading > 0:
+            return None
+
+    if not lo_unbounded and not hi_unbounded:
+        anchor = Fraction(0.5 * float(lb) + 0.5 * float(ub))
+    elif not lo_unbounded:
+        anchor = Fraction(float(lb))
+    elif not hi_unbounded:
+        anchor = Fraction(float(ub))
+    else:
+        anchor = Fraction(0)
+    # Exact Taylor shift: q(u) = p(anchor + u).
+    local: list[Fraction] = [Fraction(0)] * (max_power + 1)
+    for p, c in clean.items():
+        for k in range(p + 1):
+            local[k] += c * math.comb(p, k) * anchor ** (p - k)
+
+    def q_exact(u: Fraction) -> Fraction:
+        value = Fraction(0)
+        for c in reversed(local):
+            value = value * u + c
+        return value
+
+    candidates: list[Fraction] = []
+    u_lo = None if lo_unbounded else Fraction(float(lb)) - anchor
+    u_hi = None if hi_unbounded else Fraction(float(ub)) - anchor
+    if u_lo is not None:
+        candidates.append(u_lo)
+    if u_hi is not None:
+        candidates.append(u_hi)
+    local_f = [float(c) if abs(c) < Fraction(1e300) else math.inf for c in local]
+    if not all(math.isfinite(c) for c in local_f):
+        return None
+    deriv = [k * local_f[k] for k in range(max_power, 0, -1)]
+    while deriv and deriv[0] == 0.0:
+        deriv.pop(0)
+    roots = np.roots(deriv) if len(deriv) > 1 else np.array([])
+    for root in roots:
+        if abs(float(np.imag(root))) > 1e-9:
+            continue
+        u = Fraction(float(np.real(root)))
+        if (u_lo is None or u >= u_lo) and (u_hi is None or u <= u_hi):
+            candidates.append(u)
+    if not candidates:
+        return None
+    return min(q_exact(u) for u in candidates)
+
+
 def _expression_lower_bound_for_lift(
     expr: Expression,
     model: Model,
     flat_lb: np.ndarray,
     flat_ub: np.ndarray,
 ) -> Optional[float]:
-    expanded = _expand_integer_powers_for_relaxation(expr, model)
-    lower = _separable_objective_lower_bound(expanded, model, flat_lb, flat_ub)
+    lower = _separable_objective_lower_bound(expr, model, flat_lb, flat_ub, expand_powers=True)
     return _finite_bound_or_none(lower)
 
 
@@ -2714,15 +2895,6 @@ def _expression_upper_bound_for_lift(
     if lower_of_negated is None:
         return None
     return -lower_of_negated
-
-
-def _sorted_unique_points(points: list[float]) -> list[float]:
-    """Return sorted points with near-duplicates removed."""
-    unique: list[float] = []
-    for point in sorted(float(p) for p in points):
-        if not unique or abs(point - unique[-1]) > 1e-12:
-            unique.append(point)
-    return unique
 
 
 def _flatten_additive_terms(
@@ -2959,62 +3131,22 @@ def _scaled_affine_lower_bound(
     return scale * bound
 
 
-def _evaluate_polynomial(coeffs: dict[int, float], x: float) -> Optional[float]:
-    max_power = max(coeffs)
-    value = 0.0
-    for power in range(max_power, -1, -1):
-        value = value * x + float(coeffs.get(power, 0.0))
-        if not np.isfinite(value):
-            return None
-    return float(value)
-
-
 def _polynomial_lower_bound(
     coeffs: dict[int, float],
     lb: float,
     ub: float,
 ) -> Optional[float]:
-    clean = {power: coeff for power, coeff in coeffs.items() if abs(coeff) > 1e-12}
-    if not clean:
-        return 0.0
-    max_power = max(clean)
-    if max_power == 0:
-        return float(clean[0])
+    """Float-coefficient front end to :func:`_exact_polynomial_lower_bound`.
 
-    leading = float(clean[max_power])
-    lo_unbounded = not _is_effectively_finite(lb)
-    hi_unbounded = not _is_effectively_finite(ub)
-    if hi_unbounded and leading < 0.0:
+    The coefficients are taken at their exact float values (no small-coefficient
+    dropping, #1542) and the result is rounded down.
+    """
+    if not all(math.isfinite(float(c)) for c in coeffs.values()):
         return None
-    if lo_unbounded:
-        if max_power % 2 == 0 and leading < 0.0:
-            return None
-        if max_power % 2 == 1 and leading > 0.0:
-            return None
-
-    candidates: list[float] = []
-    if not lo_unbounded:
-        candidates.append(float(lb))
-    if not hi_unbounded:
-        candidates.append(float(ub))
-
-    deriv_coeffs = [power * clean.get(power, 0.0) for power in range(max_power, 0, -1)]
-    roots = np.roots(deriv_coeffs) if deriv_coeffs else np.array([])
-    for root in roots:
-        if abs(float(np.imag(root))) > 1e-9:
-            continue
-        x = float(np.real(root))
-        if (lo_unbounded or x >= lb - 1e-9) and (hi_unbounded or x <= ub + 1e-9):
-            candidates.append(x)
-
-    values: list[float] = []
-    for x in _sorted_unique_points(candidates):
-        value = _evaluate_polynomial(clean, x)
-        if value is not None and np.isfinite(value):
-            values.append(value)
-    if not values:
-        return None
-    return min(values)
+    lower = _exact_polynomial_lower_bound(
+        {int(p): Fraction(float(c)) for p, c in coeffs.items()}, float(lb), float(ub)
+    )
+    return None if lower is None else _fraction_to_float_down(lower)
 
 
 def _reciprocal_term_lower_bound(
@@ -3181,6 +3313,7 @@ def _separable_objective_lower_bound(
     model: Model,
     flat_lb: np.ndarray,
     flat_ub: np.ndarray,
+    expand_powers: bool = False,
 ) -> Optional[float]:
     """Compute a conservative constant lower bound for simple separable objectives.
 
@@ -3190,9 +3323,41 @@ def _separable_objective_lower_bound(
     every other term is distributed individually before the polynomial / affine
     matchers run (the union over terms equals distributing the whole expression,
     so non-reciprocal behavior is unchanged).
+
+    Additive terms that are univariate polynomials (``0.2*(y - c)**3``,
+    ``3*(y - c)``, constants) are matched first, on the expression's *own*
+    structure, into exact rational coefficients per variable (#1542); every
+    other term takes the legacy path. With ``expand_powers`` the legacy terms
+    get ``_expand_integer_powers_for_relaxation`` applied — per term, *after*
+    the exact match, so a shifted power is never expanded in floating point
+    before the exact path sees it. The per-variable polynomial (exact terms plus
+    the legacy path's float monomial coefficients, taken at their exact float
+    values) is bounded by ``_exact_polynomial_lower_bound``.
     """
+    raw_terms: list[tuple[float, Expression]] = []
+    _flatten_additive_terms(expr, 1.0, raw_terms)
+
+    exact_terms: dict[int, dict[int, Fraction]] = {}
+    exact_const = Fraction(0)
     terms: list[tuple[float, Expression]] = []
-    _flatten_additive_terms(expr, 1.0, terms)
+    for scale, term in raw_terms:
+        exact = _exact_univariate_polynomial(term, model)
+        if exact is not None:
+            var_idx, coeffs = exact
+            frac_scale = Fraction(scale)
+            if var_idx is None:
+                exact_const += frac_scale * coeffs.get(0, Fraction(0))
+            else:
+                exact_terms[var_idx] = _exact_poly_add(
+                    exact_terms.get(var_idx, {}),
+                    {p: frac_scale * c for p, c in coeffs.items()},
+                )
+            continue
+        if expand_powers:
+            expanded = _expand_integer_powers_for_relaxation(term, model)
+            _flatten_additive_terms(expanded, scale, terms)
+        else:
+            terms.append((scale, term))
 
     total = 0.0
     polynomial_terms: dict[int, dict[int, float]] = {}
@@ -3296,12 +3461,32 @@ def _separable_objective_lower_bound(
             if not _accumulate_simple_term(sub_scale, sub_term):
                 return None
 
-    for var_idx, coeffs in polynomial_terms.items():
-        lower = _polynomial_lower_bound(coeffs, float(flat_lb[var_idx]), float(flat_ub[var_idx]))
+    exact_total = exact_const
+    for var_idx, float_coeffs in polynomial_terms.items():
+        exact_terms[var_idx] = _exact_poly_add(
+            exact_terms.get(var_idx, {}),
+            {p: Fraction(c) for p, c in float_coeffs.items() if math.isfinite(c)},
+        )
+        if not all(math.isfinite(c) for c in float_coeffs.values()):
+            return None
+    for var_idx, exact_coeffs in exact_terms.items():
+        if not 0 <= var_idx < len(flat_lb):
+            return None
+        lower = _exact_polynomial_lower_bound(
+            exact_coeffs, float(flat_lb[var_idx]), float(flat_ub[var_idx])
+        )
         if lower is None:
             return None
-        total += lower
+        exact_total += lower
 
+    exact_float = _fraction_to_float_down(exact_total)
+    if exact_float is None or not np.isfinite(total):
+        return None
+    total = total + exact_float
+    if total != 0.0 and terms:
+        # ``total`` mixes the legacy float terms with the exact part; one
+        # rounding of this final sum is moved outward.
+        total = math.nextafter(total, -math.inf)
     if not np.isfinite(total):
         return None
     return float(total)
