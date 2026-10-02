@@ -244,12 +244,8 @@ def _xfail(reason: str, raises):
 #: ``raises``: a fix flips the xfail to a failure, and a failure for any other
 #: reason is not absorbed.
 KNOWN_FALSE: dict = {
-    # Re-measured on main after #1548: still false (now -37 vs -45 rather than a
-    # false infeasible), and #1548 notes its own generator does not reproduce it.
-    ("polynomial", "shift1e6"): (
-        "#1542: a shifted cubic is certified at the wrong optimum",
-        KnownFalseCertificate,
-    ),
+    # ("polynomial", "shift1e6") was here until #1542 fixed the separable
+    # objective floor's float expansion of the shifted cubic.
 }
 
 

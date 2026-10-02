@@ -2867,7 +2867,84 @@ def _exact_polynomial_lower_bound(
             candidates.append(u)
     if not candidates:
         return None
-    return min(q_exact(u) for u in candidates)
+    incumbent = min(q_exact(u) for u in candidates)
+    if u_lo is None or u_hi is None:
+        # Unbounded side: the minimum is at the finite end or a critical point;
+        # np.roots locates those to working precision on the well-scaled local
+        # form. There is no box to certify over, so this branch keeps that
+        # (second-order) approximation.
+        return incumbent
+    return _bernstein_lower_bound(local, u_lo, u_hi, incumbent)
+
+
+#: Branch-and-bound limits for :func:`_bernstein_lower_bound`. The result is a
+#: rigorous lower bound whatever limit stops the search; the limits only decide
+#: how close to the true minimum it gets.
+_BERNSTEIN_MAX_PIECES = 256
+_BERNSTEIN_REL_GAP = Fraction(1, 10**9)
+
+
+def _bernstein_lower_bound(
+    local: list[Fraction], u_lo: Fraction, u_hi: Fraction, incumbent: Fraction
+) -> Fraction:
+    """Rigorous lower bound of ``q(u) = sum local[k] u**k`` over ``[u_lo, u_hi]``.
+
+    The minimum Bernstein coefficient of a polynomial on an interval bounds it
+    from below there, and de Casteljau subdivision at the midpoint is exact over
+    the rationals; branch-and-bound on the pieces, with ``incumbent`` (the exact
+    value at np.roots' approximate critical points, an *upper* bound on the
+    minimum) as the incumbent, closes the gap. This replaces trusting the
+    floating-point critical points themselves: a value at an approximate
+    minimizer over-estimates the minimum, which is the wrong side for a bound.
+    """
+    import heapq
+
+    n = len(local) - 1
+    width = u_hi - u_lo
+    if width <= 0:
+        return incumbent
+    # Coefficients of p(t) = q(u_lo + width * t), t in [0, 1] (exact).
+    shifted = [Fraction(0)] * (n + 1)
+    for p, c in enumerate(local):
+        if c == 0:
+            continue
+        for k in range(p + 1):
+            shifted[k] += c * math.comb(p, k) * u_lo ** (p - k)
+    mono = [shifted[k] * width**k for k in range(n + 1)]
+    bern = [
+        sum(
+            (Fraction(math.comb(i, k), math.comb(n, k)) * mono[k] for k in range(i + 1)),
+            Fraction(0),
+        )
+        for i in range(n + 1)
+    ]
+
+    def split(b: list[Fraction]) -> tuple[list[Fraction], list[Fraction]]:
+        left, right = [b[0]], [b[-1]]
+        row = list(b)
+        for _ in range(n):
+            row = [(row[j] + row[j + 1]) / 2 for j in range(len(row) - 1)]
+            left.append(row[0])
+            right.append(row[-1])
+        return left, right[::-1]
+
+    best = min(incumbent, bern[0], bern[-1])
+    gap = _BERNSTEIN_REL_GAP * max(Fraction(1), abs(best))
+    heap: list[tuple[Fraction, int, list[Fraction]]] = [(min(bern), 0, bern)]
+    counter = 1
+    pieces = 1
+    while heap:
+        low, _, b = heap[0]
+        if low >= best - gap or pieces >= _BERNSTEIN_MAX_PIECES:
+            return min(low, best)
+        heapq.heappop(heap)
+        for half in split(b):
+            pieces += 1
+            best = min(best, half[0], half[-1])  # piece ends are exact values
+            heapq.heappush(heap, (min(half), counter, half))
+            counter += 1
+        gap = _BERNSTEIN_REL_GAP * max(Fraction(1), abs(best))
+    return best
 
 
 def _expression_lower_bound_for_lift(

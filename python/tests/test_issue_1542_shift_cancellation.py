@@ -165,6 +165,48 @@ def test_exact_polynomial_is_exact():
     ) * Fraction(1e15)
 
 
+@pytest.mark.correctness
+def test_polynomial_floor_never_exceeds_true_minimum():
+    """The floor is a rigorous bound, not the value at a float critical point.
+
+    q evaluated exactly at np.roots' approximate minimizer over-estimates the
+    minimum (by ~1e-31 here, on 21 of these 300 cases before the Bernstein
+    branch-and-bound); compare against sympy's exact algebraic minimum.
+    """
+    sp = pytest.importorskip("sympy")
+    import random
+
+    u = sp.symbols("u")
+    rng = random.Random(0)
+    compared = 0
+    for _ in range(300):
+        deg = rng.choice([2, 3, 4, 5, 6])
+        coeffs = {k: Fraction(rng.randint(-9, 9), rng.randint(1, 7)) for k in range(deg + 1)}
+        if deg % 2 == 0:
+            coeffs[deg] = abs(coeffs[deg]) + 1
+        elif coeffs[deg] == 0:
+            coeffs[deg] = Fraction(1)
+        shift = rng.choice([0, 987, 1228561, -1314226])
+        lo, hi = sorted([rng.uniform(-3, 3), rng.uniform(-3, 3)])
+        lo, hi = lo + shift, hi + shift
+        bound = _exact_polynomial_lower_bound(coeffs, lo, hi)
+        q = sum(sp.Rational(c.numerator, c.denominator) * u**k for k, c in coeffs.items())
+        L, H = (
+            sp.Rational(*Fraction(lo).as_integer_ratio()),
+            sp.Rational(*Fraction(hi).as_integer_ratio()),
+        )
+        crit = [r for r in sp.real_roots(sp.Poly(sp.diff(q, u), u)) if L <= r <= H]
+        b = sp.Rational(bound.numerator, bound.denominator)
+        for r in [L, H, *crit]:
+            diff = q.subs(u, r) - b
+            ok = diff >= 0 if diff.is_Rational else sp.N(diff, 400) >= 0
+            assert ok, (coeffs, lo, hi, sp.N(diff, 30))
+        true_min = min(sp.N(q.subs(u, r), 60) for r in [L, H, *crit])
+        assert b >= true_min - sp.Rational(1, 10**6) * max(1, abs(true_min))
+        compared += 1
+    assert compared == 300
+
+
 # ── route B: affine folding ahead of distribution ────────────────────────────
 
 
