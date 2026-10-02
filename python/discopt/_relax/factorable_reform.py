@@ -51,7 +51,9 @@ from discopt.modeling.core import (
     Expression,
     FunctionCall,
     IndexExpression,
+    MatMulExpression,
     Model,
+    Parameter,
     SumExpression,
     SumOverExpression,
     UnaryOp,
@@ -349,6 +351,72 @@ def _needs_lift(powers: dict[int, list]) -> bool:
     return any(exp >= 2 for _leaf, exp in powers.values())
 
 
+def _structural_key(expr: Expression, pins: list) -> tuple:
+    """An exact, hashable structural key for *expr* (#1555).
+
+    Two expressions get the same key only if they are the same expression:
+
+    * constants by dtype, shape and raw bytes (``repr`` rounds to ``.6g`` and
+      prints arrays by shape, #1497);
+    * variables and parameters by identity -- the model keeps them alive, so
+      their ``id()`` cannot be recycled during the lift (the ex7_2_3 hazard);
+    * an ``IndexExpression``'s index exactly (an ndarray index by its bytes);
+    * any node type not listed below by ``id()``, with the node appended to
+      *pins* so its address stays reserved for as long as the cache lives.
+
+    Never contains an expression object itself: ``Expression.__eq__`` builds a
+    ``Constraint``, which would break dict lookup on a hash collision.
+    """
+    memo: dict[int, tuple] = {}
+
+    def index_key(idx) -> tuple:
+        if isinstance(idx, np.ndarray):
+            return ("nd", idx.dtype.str, idx.shape, idx.tobytes())
+        if isinstance(idx, tuple):
+            return ("t",) + tuple(index_key(i) for i in idx)
+        if isinstance(idx, list):  # elementwise: repr truncates large nested arrays
+            return ("l",) + tuple(index_key(i) for i in idx)
+        if isinstance(idx, slice):
+            return ("s", idx.start, idx.stop, idx.step)
+        if isinstance(idx, (bool, np.bool_)):  # before int: bool subclasses int
+            return ("b", bool(idx))
+        if isinstance(idx, (int, np.integer)):
+            return ("i", int(idx))
+        return ("r", type(idx).__name__, repr(idx))  # Ellipsis / None: exact reprs
+
+    def walk(node: Expression) -> tuple:
+        nid = id(node)
+        hit = memo.get(nid)
+        if hit is not None:
+            return hit
+        if isinstance(node, Constant):
+            v = np.asarray(node.value)
+            k: tuple = ("C", v.dtype.str, v.shape, v.tobytes())
+        elif isinstance(node, (Variable, Parameter)):
+            k = (type(node).__name__, id(node))
+        elif isinstance(node, IndexExpression):
+            k = ("I", walk(node.base), index_key(node.index))
+        elif isinstance(node, BinaryOp):
+            k = ("B", node.op, walk(node.left), walk(node.right))
+        elif isinstance(node, UnaryOp):
+            k = ("U", node.op, walk(node.operand))
+        elif type(node) is FunctionCall:
+            k = ("F", node.func_name) + tuple(walk(a) for a in node.args)
+        elif isinstance(node, SumOverExpression):
+            k = ("SO",) + tuple(walk(t) for t in node.terms)
+        elif isinstance(node, SumExpression):
+            k = ("S", node.axis, walk(node.operand))
+        elif isinstance(node, MatMulExpression):
+            k = ("M", walk(node.left), walk(node.right))
+        else:
+            pins.append(node)
+            k = ("id", type(node).__name__, nid)
+        memo[nid] = k
+        return k
+
+    return walk(expr)
+
+
 class _Lifter:
     """Allocates monomial auxiliary variables ``w == leaf**k`` on *model*,
     deduplicating by (flat_index, exponent)."""
@@ -356,16 +424,25 @@ class _Lifter:
     def __init__(self, model: Model):
         self.model = model
         self._cache: dict[tuple[int, int], Variable] = {}
-        # Keyed by a STRUCTURAL representation of the expression, never ``id()``:
-        # CPython recycles the ``id()`` of a garbage-collected object, so a later,
-        # structurally *different* expression can reuse a freed address and score a
-        # false cache hit — returning a stale aux for the wrong sub-expression.
-        # In ex7_2_3 that dropped a ``/x8`` denominator from a lifted ratio,
-        # producing a non-feasibility-preserving reformulation that certified an
-        # infeasible box corner as the global optimum (a false "optimal"). A
-        # structural key can only ever *fail* to dedup (harmless — an extra aux),
-        # never falsely merge two distinct expressions.
-        self._expr_cache: dict[tuple[str, float | None], Variable] = {}
+        # Keyed by an EXACT structural key (:func:`_structural_key`), never a bare
+        # ``id()`` of an expression node and never ``repr()``:
+        #
+        # * ``id()``: CPython recycles the ``id()`` of a garbage-collected object,
+        #   so a later, structurally *different* expression can reuse a freed
+        #   address and score a false cache hit. In ex7_2_3 that dropped a ``/x8``
+        #   denominator from a lifted ratio and certified an infeasible box corner
+        #   as the global optimum (a false "optimal").
+        # * ``repr()``: a DISPLAY string, and lossy -- ``SumOverExpression`` prints
+        #   as ``"Σ[n terms]"``, so ``dm.sum([x, 1])`` and ``dm.sum([y, 1])`` shared
+        #   one aux and ``(y+1)**1.7`` was silently rewritten as ``(x+1)**1.7``: a
+        #   certified 1.8095 against a true 4.0 (#1555).
+        #
+        # Only a LOSSLESS key can fail solely by not deduplicating (an extra aux,
+        # harmless) and never by merging two distinct expressions.
+        self._expr_cache: dict[tuple, Variable] = {}
+        # Nodes whose key falls back to ``id()`` are pinned here, so their address
+        # cannot be recycled while this lifter (and its cache) is alive.
+        self._key_pins: list[Expression] = []
         self.aux_constraints: list[Constraint] = []
         self._counter = 0
         # R4: names of lifted product-factor auxes whose interval spans 0. These
@@ -425,7 +502,7 @@ class _Lifter:
         (:func:`_is_integer_valued_affine`), so the type is exact, never a
         restriction. A cached aux is returned as it was created.
         """
-        key = (repr(expr), lb_floor)
+        key = (_structural_key(expr, self._key_pins), lb_floor)
         cached = self._expr_cache.get(key)
         if cached is not None:
             return cached
