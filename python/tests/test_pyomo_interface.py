@@ -287,5 +287,172 @@ def test_duals_graceful_for_integer_model(opt):
     assert d is None or math.isfinite(d)  # absent or finite — never fabricated/NaN
 
 
+# -- #1559: solve() kwargs are never silently dropped ---------------------------
+
+
+def _spy_solve(monkeypatch):
+    """Record the kwargs the plugin hands to ``Model.solve``."""
+    import discopt.modeling as dm
+
+    captured: dict = {}
+    orig = dm.Model.solve
+
+    def spy(self, *a, **k):
+        captured.update(k)
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(dm.Model, "solve", spy)
+    return captured
+
+
+def _box(sense=None):
+    m = pyo.ConcreteModel()
+    m.x = pyo.Var(bounds=(1, 4))
+    m.o = pyo.Objective(expr=m.x, sense=sense or pyo.minimize)
+    return m
+
+
+def test_unknown_kwarg_raises(opt):
+    """An unrecognised keyword is a TypeError, as in Pyomo's own HiGHS plugins (#1559).
+
+    Before the fix it was popped by nobody and the solve ran as if it were absent.
+    """
+    with pytest.raises(TypeError, match="bogus_option"):
+        opt.solve(_box(), bogus_option=3)
+
+
+def test_time_limit_alias_is_honoured(opt, monkeypatch):
+    """`time_limit=` (discopt's own spelling) reaches Model.solve (#1559).
+
+    Before the fix it was dropped and the solve ran at the 3600 s default.
+    """
+    captured = _spy_solve(monkeypatch)
+    opt.solve(_box(), time_limit=11)
+    assert captured.get("time_limit") == 11
+
+
+def test_timelimit_still_honoured(opt, monkeypatch):
+    captured = _spy_solve(monkeypatch)
+    opt.solve(_box(), timelimit=13)
+    assert captured.get("time_limit") == 13
+
+
+def test_time_limit_and_timelimit_agreeing_is_accepted(opt, monkeypatch):
+    captured = _spy_solve(monkeypatch)
+    opt.solve(_box(), timelimit=5, time_limit=5)
+    assert captured.get("time_limit") == 5
+
+
+def test_time_limit_and_timelimit_conflict_raises(opt):
+    with pytest.raises(ValueError, match="time limit"):
+        opt.solve(_box(), timelimit=5, time_limit=9)
+
+
+def test_timelimit_kwarg_conflicting_with_options_raises(opt):
+    """A kwarg time limit that differs from one in `options` must not be dropped."""
+    with pytest.raises(ValueError, match="time limit"):
+        opt.solve(_box(), timelimit=5, options={"time_limit": 9})
+
+
+def test_pyomo_standard_suffixes_kwarg_accepted(opt):
+    """`suffixes=['dual']` is part of the legacy solve() contract and stays accepted."""
+    res = opt.solve(_box(), suffixes=["dual"])
+    assert res.solver.termination_condition == pyo.TerminationCondition.optimal
+
+
+def test_unsupported_suffix_request_raises(opt):
+    with pytest.raises(ValueError, match="slack"):
+        opt.solve(_box(), suffixes=["slack"])
+
+
+# -- #1560: incumbent and dual bound land in Pyomo's fields --------------------
+
+
+@pytest.mark.parametrize("sense", [pyo.minimize, pyo.maximize])
+def test_bound_fields_at_optimality(opt, sense):
+    """Pyomo convention (HiGHS/appsi): minimize -> upper=incumbent, lower=dual bound;
+    maximize -> lower=incumbent, upper=dual bound. At optimality lower <= upper.
+
+    Before the fix the fields were swapped, visible here as lower > upper by ~1e-12.
+    """
+    res = opt.solve(_box(sense))
+    assert res.solver.termination_condition == pyo.TerminationCondition.optimal
+    lo, up = res.problem.lower_bound, res.problem.upper_bound
+    expected = 1.0 if sense == pyo.minimize else 4.0
+    assert lo == pytest.approx(expected, abs=1e-6)
+    assert up == pytest.approx(expected, abs=1e-6)
+    assert lo <= up
+
+
+@pytest.mark.parametrize("sense", [pyo.minimize, pyo.maximize])
+def test_bound_fields_match_solveresult(opt, monkeypatch, sense):
+    """The incumbent and the dual bound go to distinct, sense-dependent fields.
+
+    Uses a fabricated result with objective != bound so a swap cannot hide inside a
+    solver tolerance.
+    """
+    import discopt.modeling as dm
+
+    def fake_solve(self, **k):
+        if sense == pyo.minimize:
+            return dm.SolveResult(status="feasible", objective=3.0, bound=1.5, bound_valid=True)
+        return dm.SolveResult(status="feasible", objective=1.5, bound=3.0, bound_valid=True)
+
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    res = opt.solve(_box(sense))
+    assert res.problem.lower_bound == 1.5
+    assert res.problem.upper_bound == 3.0
+
+
+@pytest.mark.parametrize("sense", [pyo.minimize, pyo.maximize])
+def test_timeout_without_incumbent_leaves_incumbent_unset(opt, monkeypatch, sense):
+    """A time-limited exit with a valid dual bound but no incumbent (#1560).
+
+    Before the fix a minimize reported upper_bound = the dual bound, i.e. claimed a
+    feasible point that was never found, and left lower_bound at -inf.
+    """
+    import math
+
+    import discopt.modeling as dm
+
+    bound = -2.03 if sense == pyo.minimize else 7.5
+
+    def fake_solve(self, **k):
+        return dm.SolveResult(
+            status="time_limit",
+            objective=None,
+            bound=bound,
+            x=None,
+            bound_valid=True,
+            bound_source="bnb_tree",
+        )
+
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    res = opt.solve(_box(sense))
+    assert res.solver.termination_condition == pyo.TerminationCondition.maxTimeLimit
+    if sense == pyo.minimize:
+        assert res.problem.lower_bound == bound
+        assert res.problem.upper_bound == math.inf
+    else:
+        assert res.problem.upper_bound == bound
+        assert res.problem.lower_bound == -math.inf
+
+
+def test_unvalidated_bound_is_not_reported_as_dual_bound(opt, monkeypatch):
+    """A `bound` discopt does not assert valid (`bound_valid=False`, e.g. a local
+    solve) must not be published as Pyomo's dual bound."""
+    import math
+
+    import discopt.modeling as dm
+
+    def fake_solve(self, **k):
+        return dm.SolveResult(status="time_limit", objective=None, bound=-2.03, x=None)
+
+    monkeypatch.setattr(dm.Model, "solve", fake_solve)
+    res = opt.solve(_box(pyo.minimize))
+    assert res.problem.lower_bound == -math.inf
+    assert res.problem.upper_bound == math.inf
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
