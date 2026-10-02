@@ -114,16 +114,39 @@ class DiscoptSolver(OptSolver):
         load_solutions = bool(kwds.pop("load_solutions", True))
         keepfiles = bool(kwds.pop("keepfiles", False))
         warmstart = bool(kwds.pop("warmstart", False))
-        timelimit = kwds.pop("timelimit", None)
+        timelimit = self._resolve_time_limit(
+            kwds.pop("timelimit", None), kwds.pop("time_limit", None)
+        )
+        # Accepted for interface compatibility; neither changes what discopt computes.
         kwds.pop("symbolic_solver_labels", None)
         kwds.pop("report_timing", None)
+        self._check_suffixes(kwds.pop("suffixes", None))
+        call_options = dict(kwds.pop("options", {}) or {})
+        call_options.update(self._options_string_to_dict(kwds.pop("options_string", "") or ""))
+
+        # Anything left was not consumed above. Dropping it silently runs a different
+        # solve from the one the caller asked for (#1559: ``time_limit=`` used to run
+        # at the 3600 s default). Pyomo's own HiGHS plugins (``appsi_highs``,
+        # ``highs``) raise TypeError here, and legacy ``OptSolver._presolve`` raises
+        # ValueError("passed unrecognized keywords"), so refusing is the contract.
+        if kwds:
+            raise TypeError(
+                f"DiscoptSolver.solve() got unexpected keyword argument(s): {sorted(kwds)}. "
+                "Solver options go in options={...}."
+            )
 
         # Merge persistent options (self.options) with this call's options.
         options: dict[str, Any] = dict(self.options)
-        options.update(kwds.pop("options", {}) or {})
-        if timelimit is not None:
-            options.setdefault("time_limit", timelimit)
+        options.update(call_options)
         solve_kwargs = _mapping.translate_options(options)
+        if timelimit is not None:
+            existing = solve_kwargs.get("time_limit")
+            if existing is not None and existing != timelimit:
+                raise ValueError(
+                    f"conflicting time limit: solve(timelimit/time_limit={timelimit!r}) "
+                    f"but options give {existing!r}; pass it once"
+                )
+            solve_kwargs["time_limit"] = timelimit
 
         return self._solve_via_nl(
             model,
@@ -232,14 +255,18 @@ class DiscoptSolver(OptSolver):
         results.problem.name = getattr(model, "name", "unknown")
         results.problem.number_of_variables = len(cols)
         results.problem.number_of_constraints = len(rows)
-        sense, obj_bound_field = self._objective_sense(model)
+        sense, incumbent_field, bound_field = self._objective_sense(model)
         if sense is not None:
             results.problem.sense = sense
+        # An absent incumbent leaves its field at Pyomo's default (+inf for a
+        # minimize, -inf for a maximize): "no feasible point known" (#1560).
         if result.objective is not None:
-            setattr(results.problem, obj_bound_field, result.objective)
-        if result.bound is not None:
-            other = "upper_bound" if obj_bound_field == "lower_bound" else "lower_bound"
-            setattr(results.problem, other, result.bound)
+            setattr(results.problem, incumbent_field, result.objective)
+        # Pyomo consumers read the dual-bound field as a certificate (a gap is computed
+        # from it), so only a bound discopt itself asserts to be a valid global dual
+        # bound is published there; ``bound_valid`` fails closed (#1244).
+        if result.bound is not None and getattr(result, "bound_valid", False):
+            setattr(results.problem, bound_field, result.bound)
 
         has_primal = getattr(result, "x", None) is not None
         if has_primal:
@@ -254,16 +281,50 @@ class DiscoptSolver(OptSolver):
 
     # -- Helpers ---------------------------------------------------------------
     @staticmethod
+    def _resolve_time_limit(timelimit: Any, time_limit: Any) -> Any:
+        """Merge Pyomo's ``timelimit`` with discopt's ``time_limit`` spelling (#1559)."""
+        if timelimit is not None and time_limit is not None and timelimit != time_limit:
+            raise ValueError(
+                f"conflicting time limit: timelimit={timelimit!r} and "
+                f"time_limit={time_limit!r}; pass one"
+            )
+        return timelimit if timelimit is not None else time_limit
+
+    @staticmethod
+    def _check_suffixes(suffixes: Any) -> None:
+        """Validate the legacy ``suffixes=`` request.
+
+        discopt loads ``dual`` and ``rc`` into the model's import Suffixes of those
+        names (``_mapping.load_duals``); any other suffix it cannot produce, and
+        accepting the request would hand back a model silently missing it.
+        """
+        if not suffixes:
+            return
+        if isinstance(suffixes, str):
+            suffixes = [suffixes]
+        unsupported = sorted(set(map(str, suffixes)) - {"dual", "rc"})
+        if unsupported:
+            raise ValueError(
+                f"DiscoptSolver cannot return suffix(es) {unsupported}; supported: ['dual', 'rc']"
+            )
+
+    @staticmethod
     def _objective_sense(model):
-        """Return ``(pyomo sense, bound-field)`` for the model's active objective."""
+        """Return ``(pyomo sense, incumbent field, dual-bound field)``.
+
+        Pyomo's convention, as written by its own HiGHS plugins
+        (``contrib/solver/common/base.py``, ``contrib/appsi/base.py``): for a
+        minimize the incumbent objective is ``upper_bound`` and the dual bound is
+        ``lower_bound``; for a maximize the two swap (#1560).
+        """
         from pyomo.core.base.objective import Objective
         from pyomo.opt import ProblemSense
 
         for obj in model.component_data_objects(Objective, active=True):
             if obj.sense == 1:  # minimize
-                return ProblemSense.minimize, "lower_bound"
-            return ProblemSense.maximize, "upper_bound"
-        return None, "lower_bound"
+                return ProblemSense.minimize, "upper_bound", "lower_bound"
+            return ProblemSense.maximize, "lower_bound", "upper_bound"
+        return None, "upper_bound", "lower_bound"
 
     @staticmethod
     def _warmstart_seed(discopt_model, cols) -> dict[str, Any]:
@@ -296,23 +357,63 @@ class DiscoptSolver(OptSolver):
         for vdata, val in zip(cols, flat):
             soln.variable[vdata.name] = {"Value": float(val)}
 
+    @staticmethod
+    def _violated_constant_constraints(model) -> list[str]:
+        """Names of the active constraints a zero-variable model violates.
+
+        With no free columns every constraint body is a constant, so feasibility is
+        decided here, not by a solve. The tolerance is the incumbent verifier's
+        bound-keyed form, ``ABS_TOL + BOUND_REL_TOL * |bound|``
+        (``discopt.validation.feasibility``): a constant row has no gradient, so the
+        bound is its only scale. A body that cannot be evaluated, or evaluates to a
+        non-finite number, raises; the caller turns that into an ``error`` result, so
+        an unchecked constraint can never be reported ``optimal``.
+        """
+        import math
+
+        from pyomo.core.base.constraint import Constraint
+        from pyomo.core.expr import value as pyo_value
+
+        from discopt.validation.feasibility import ABS_TOL, BOUND_REL_TOL
+
+        violated: list[str] = []
+        for con in model.component_data_objects(Constraint, active=True, descend_into=True):
+            body = float(pyo_value(con.body))
+            if not math.isfinite(body):
+                raise ValueError(f"constraint {con.name!r} body evaluates to {body}")
+            lb, ub = con.lb, con.ub
+            if lb is not None and body < float(lb) - (ABS_TOL + BOUND_REL_TOL * abs(float(lb))):
+                violated.append(con.name)
+            elif ub is not None and body > float(ub) + (ABS_TOL + BOUND_REL_TOL * abs(float(ub))):
+                violated.append(con.name)
+        return violated
+
     def _trivial_results(self, model) -> SolverResults:
         from pyomo.core.expr import value as pyo_value
 
+        violated = self._violated_constant_constraints(model)
+
         results = SolverResults()
         results.solver.name = "discopt"
-        tc, ss = _mapping.termination_for("optimal")
+        tc, ss = _mapping.termination_for("infeasible" if violated else "optimal")
         results.solver.termination_condition = tc
         results.solver.status = ss
         results.problem.number_of_variables = 0
-        sense, field = self._objective_sense(model)
+        sense, incumbent_field, bound_field = self._objective_sense(model)
         if sense is not None:
             results.problem.sense = sense
+        if violated:
+            # Infeasible: no incumbent and no bound, so both fields stay at +-inf.
+            results.solver.message = f"constant constraint(s) violated: {violated}"
+            return results
         try:
             from pyomo.core.base.objective import Objective
 
             for obj in model.component_data_objects(Objective, active=True):
-                setattr(results.problem, field, pyo_value(obj.expr))
+                # A constant objective is exact: it is both incumbent and bound.
+                val = pyo_value(obj.expr)
+                setattr(results.problem, incumbent_field, val)
+                setattr(results.problem, bound_field, val)
                 break
         except Exception as exc:  # noqa: BLE001 - a constant objective is reported unset
             logger.debug(
