@@ -4163,7 +4163,7 @@ class SolveResult:
           ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
           ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
           ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
-          ``"R"`` marks an entry into restoration) and ``ls_trials``. The final
+          ``"R"`` marks restoration; see below) and ``ls_trials``. The final
           barrier parameter is ``report["iterations"][-1]["mu"]``.
         * ``report["solution"]``, ``report["problem"]``,
           ``report["fair_metadata"]`` (solver version, timestamps).
@@ -4174,7 +4174,11 @@ class SolveResult:
         ``"restoration"``), the inner restoration rows (printed as ``24r``,
         ``25r``, ...) are included in printed order, and the slack-form residual
         is ``inf_pr_internal``. Select ``phase == "main"`` for the outer
-        trajectory. On pounce-solver 0.12.0 rows carry no ``phase``, only the
+        trajectory. As in the printed table, one restoration call puts ``"R"``
+        on two rows -- the entry (a ``"restoration"`` row) and the return to the
+        main phase -- so count calls with ``statistics["restoration_calls"]`` or
+        the ``"main"`` -> ``"restoration"`` transitions, not the ``"R"`` rows.
+        On pounce-solver 0.12.0 rows carry no ``phase``, only the
         main-phase rows are present -- restoration shows up as the ``"R"`` row and
         the ``restoration_*`` counts -- and ``inf_pr`` is POUNCE's internal primal
         infeasibility on its slack-reformulated, scaled problem rather than the
