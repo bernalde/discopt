@@ -251,3 +251,75 @@ def test_qp_declared_form_does_not_hide_a_reformulation_mismatch():
     Q, c, k = np.array([[2.0]]), np.array([-2.0]), 1.0  # noqa: N806
     assert _qp_objective_at_point(m, x, 4.0 + 1e-15, Q, c, k) == 4.0
     assert _qp_objective_at_point(m, x, 4.5, Q, c, k) == 4.5
+
+
+# ── MIQP-BB: POUNCE node labels and node bounds are not certificates ───────────
+
+_MIQP_OPTIMA = {"st_miqp1": 281.0, "st_miqp2": 2.0, "st_miqp3": -6.0}  # minlplib.solu
+
+
+@pytest.mark.parametrize("name", sorted(_MIQP_OPTIMA))
+def test_translated_miqp_is_never_falsely_certified(tmp_path, name):
+    """Found by the corpus invariance panel under ``x = y + 1e6``: ``st_miqp1`` and
+    ``st_miqp2`` came back certified ``infeasible`` (POUNCE labelled the feasible
+    root ``primal_infeasible`` and the label was pruned on), ``st_miqp3`` certified
+    0.0 against -6 (a root bound of f(x) = 25.8 at a drifted IPM point pruned the
+    optimum). Every answer must now be honest: no infeasibility claim, a bound on
+    the right side of the optimum, and a certified objective only if it is right."""
+    from pathlib import Path
+
+    from discopt.modeling.core import from_nl
+    from discopt.validation.nl_invariance import translate_nl
+
+    src = Path(__file__).parent / "data" / "minlplib_nl" / f"{name}.nl"
+    out = tmp_path / f"{name}_shift.nl"
+    out.write_text(translate_nl(src.read_text(encoding="latin-1"), 1e6), encoding="latin-1")
+    truth = _MIQP_OPTIMA[name]
+    r = from_nl(str(out)).solve(time_limit=30)
+    assert r.status != "infeasible", "a feasible model was certified infeasible"
+    tol = 1e-6 + 1e-4 * abs(truth)
+    if r.bound is not None:
+        assert r.bound <= truth + tol, f"bound {r.bound} above the optimum {truth}"
+    if r.gap_certified:
+        assert r.objective == pytest.approx(truth, abs=tol)
+    if r.objective is not None:
+        assert r.objective >= truth - tol, f"incumbent {r.objective} below the optimum"
+
+
+def test_linear_node_verified_empty_needs_a_proof():
+    from discopt.solver import _linear_node_verified_empty
+
+    G, h = np.array([[1.0, 1.0]]), np.array([-5.0])  # noqa: N806
+    assert _linear_node_verified_empty(G, h, None, None, np.zeros(2), np.ones(2))
+    # Feasible, and feasible far from the origin (the st_miqp1 shape): never "empty".
+    assert not _linear_node_verified_empty(G, np.array([5.0]), None, None, np.zeros(2), np.ones(2))
+    G2 = np.array([[-20.0, -12.0]])  # noqa: N806
+    lo = np.full(2, 1e6)
+    assert not _linear_node_verified_empty(G2, np.array([-30.0 - 32e6]), None, None, lo, lo + 1.0)
+
+
+def test_convex_qp_node_lower_bound_is_rigorous_at_a_drifted_point():
+    """At the true minimiser the bound is tight; at a drifted 'optimal' point it is
+    still at or below the true minimum (f there is not)."""
+    from discopt.solver import _convex_qp_node_lower_bound
+
+    # min 6 (u - c)^2 - 3 (v - c)  s.t. -4 (u - c) + (v - c) <= 0, box [c, c+3] x [c, c+12]
+    c0 = 1e6
+    P = np.diag([12.0, 0.0])  # noqa: N806
+    q = np.array([-12.0 * c0, -3.0])
+    k = 6.0 * c0 * c0 + 3.0 * c0
+    G, h = np.array([[-4.0, 1.0]]), np.array([-3.0 * c0])  # noqa: N806
+    lo, hi = np.array([c0, c0]), np.array([c0 + 3.0, c0 + 12.0])
+    true_min = -6.0
+    exact = np.array([c0 + 1.0, c0 + 4.0])
+    b_exact = _convex_qp_node_lower_bound(P, q, k, G, h, None, None, lo, hi, exact, z=[3.0])
+    assert b_exact <= true_min + 1e-6
+    # Tight up to the rounding margin of the expanded form, whose terms are ~3e13
+    # here (the reason workstream D wants affine-argument bounds instead).
+    assert b_exact == pytest.approx(true_min, abs=0.1)
+    drifted = np.array([c0 + 2.4388538761, c0 + 3.296923424])  # st_miqp3's root point
+    f_drift = 0.5 * drifted @ P @ drifted + q @ drifted + k
+    assert f_drift > true_min + 10.0, "the drifted point must be visibly non-optimal"
+    for z in (None, [0.0], [1e-9]):
+        b = _convex_qp_node_lower_bound(P, q, k, G, h, None, None, lo, hi, drifted, z=z)
+        assert b <= true_min + 1e-6, (z, b)
