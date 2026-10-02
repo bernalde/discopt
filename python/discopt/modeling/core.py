@@ -8090,6 +8090,113 @@ class Model:
                 res, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
             )
 
+        # #1561: the declared model, captured before any route can extend it.
+        # Structure cuts (``cut_recognizer``) append auxiliary columns and rows to
+        # ``self._variables``/``self._constraints`` during the solve, and presolve
+        # may tighten bounds in place; the backstop below judges the point the
+        # caller asked about, on the variables and bounds the caller declared.
+        from discopt.validation.feasibility import declared_variables as _declared_variables
+
+        _declared_vars_entry = _declared_variables(self)
+        _declared_cons_entry = list(self._constraints)
+        _declared_builder_rows_entry = self._num_builder_constraint_rows()
+
+        def _model_unchanged_since_entry() -> bool:
+            if len(self._variables) != len(_declared_vars_entry) or any(
+                v.name != d.name or int(getattr(v, "size", 1)) != d.size
+                for v, d in zip(self._variables, _declared_vars_entry)
+            ):
+                return False
+            if self._num_builder_constraint_rows() != _declared_builder_rows_entry:
+                return False
+            return len(self._constraints) == len(_declared_cons_entry) and all(
+                a is b for a, b in zip(self._constraints, _declared_cons_entry)
+            )
+
+        def _withhold_unverified_certificate(
+            res: "SolveResult", evaluator=None, declared=None
+        ) -> None:
+            """#1561 certified-incumbent backstop: no certificate on a point
+            ``verify_point`` rejects.
+
+            Every route has its own exit gate, and they do not agree with
+            :func:`~discopt.validation.feasibility.verify_point`, the repo's single
+            definition of a feasible incumbent: NLP-BB's gate judged the point as
+            computed, with integer columns up to 1e-5 off, while ``verify_point``
+            judges its integral realisation (#1380). On tls2 with every row scaled
+            by 1e6 that disagreement published ``optimal``/``gap_certified=True``
+            on a point whose snapped row 18 is violated by 6.67 where 1.0 is
+            allowed. The route-level gate is fixed too; this is the class-level
+            check at the one place every route's result passes, so a gate that
+            drifts again cannot certify what ``verify_point`` refuses.
+
+            The point is judged on the DECLARED model: ``evaluator`` and
+            ``declared`` (a ``declared_variables`` snapshot) are the pre-solve rows
+            and columns, and ``x`` is laid out over the declared names only.
+            Without a pre-solve evaluator the rows are compiled now, which is the
+            declared model only if the solve left ``_variables``/``_constraints``
+            untouched; when it did not, there is no declared evaluator to judge
+            against, and the post-solve model (declared rows plus the solver's
+            own additions, columns included) is judged instead -- stricter, never
+            looser.
+
+            Only a CERTIFIED result is judged, and the point is not withheld: the
+            loose #772 screen above decides that. A rejected point is reported
+            ``feasible``, uncertified, with ``solver_stats
+            ["certificate/incumbent_unverified"]`` set. ``bound`` is untouched; it
+            is a dual bound and does not depend on the incumbent.
+            """
+            if not res.x or not (res.status == "optimal" or res.gap_certified):
+                return
+            import logging as _vlogging
+
+            import numpy as _np
+
+            from discopt.validation.feasibility import verify_point
+
+            try:
+                if evaluator is None and _model_unchanged_since_entry():
+                    from discopt._tape_nlp_evaluator import make_evaluator
+
+                    evaluator = make_evaluator(self)
+                    declared = _declared_vars_entry
+                if evaluator is not None:
+                    if declared is None:
+                        raise ValueError("a pre-solve evaluator needs its declared variables")
+                    _cols = [d.name for d in declared]
+                else:
+                    _cols = [v.name for v in self._variables]
+                _flat = _np.concatenate(
+                    [
+                        _np.atleast_1d(_np.asarray(res.x[_n], dtype=_np.float64)).ravel()
+                        for _n in _cols
+                    ]
+                )
+                if evaluator is not None:
+                    _verdict = verify_point(self, _flat, evaluator=evaluator, variables=declared)
+                else:
+                    _verdict = verify_point(self, _flat)
+                _ok, _reason = bool(_verdict.ok), _verdict.reason
+            except Exception as _vexc:
+                # A check that cannot run cannot vouch for a certificate (§7):
+                # decertify rather than publish an unchecked one.
+                _ok, _reason = False, f"verification raised {type(_vexc).__name__}: {_vexc}"
+            if _ok:
+                return
+            _vlogging.getLogger("discopt.solver").error(
+                "UNVERIFIED CERTIFICATE (#1561): the incumbent reported as %s "
+                "(objective=%s) fails verify_point on the declared model (%s). "
+                "Reporting it as 'feasible', uncertified.",
+                res.status,
+                res.objective,
+                _reason,
+            )
+            if res.status == "optimal":
+                res.status = "feasible"
+            res.gap_certified = False
+            res.solver_stats = dict(res.solver_stats or {})
+            res.solver_stats["certificate/incumbent_unverified"] = 1.0
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8166,6 +8273,7 @@ class Model:
                 # #1551: this return skips ``solve_model`` and everything below,
                 # so the evaluation-error guard has to run here too.
                 _guard_unresolved_objective(_ck_res)
+                _withhold_unverified_certificate(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -8208,6 +8316,7 @@ class Model:
         # verification is effectively free and now always runs. ``verify_incumbent``
         # is retained for API compatibility but no longer suppresses the withhold.
         _verify_snap = None
+        _verify_snap_vars = None
         if self._constraints and not _is_fast_linear_quadratic_family(self):
             # #840: this model is genuinely nonlinear (an expression constraint plus a
             # nonlinear objective or constraint), so it routes to spatial B&B, which
@@ -8237,6 +8346,12 @@ class Model:
                 _verify_snap = (
                     build_evaluator(self, _jax_evaluator),
                     [v.name for v in self._variables],
+                )
+                # #1561: the same columns, frozen, for the certificate backstop.
+                _verify_snap_vars = (
+                    _declared_vars_entry
+                    if _model_unchanged_since_entry()
+                    else _declared_variables(self)
                 )
             except Exception as _snap_exc:
                 # Same §7 point as the verification handler below: without the
@@ -8914,6 +9029,12 @@ class Model:
         # and calls the same guard at its own return.
         if isinstance(result, SolveResult):
             _guard_unresolved_objective(result)
+            # #1561: after the #772 screen (which may already have withheld the
+            # point) and on the same pre-solve snapshot of the declared rows.
+            if _verify_snap is not None and _verify_snap_vars is not None:
+                _withhold_unverified_certificate(result, _verify_snap[0], _verify_snap_vars)
+            else:
+                _withhold_unverified_certificate(result)
 
         if llm:
             try:

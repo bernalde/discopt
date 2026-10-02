@@ -313,14 +313,6 @@ KNOWN_CORPUS: dict = {
         "#1537 E: row tolerance depends on the coordinates' magnitudes",
         KnownFalseCertificate,
     ),
-    # NOT #1537 E: after rows x1e6 the published incumbent violates row 18 by
-    # 6.669e-6, and fails verify_point on the SCALED model too (6.669 vs 1.0
-    # allowed) -- a real false certificate. The base certifies in ~15 s unloaded,
-    # so a loaded run skipped this cell and missed it (#1546 review).
-    ("tls2.nl", "rows"): (
-        "#1561: rows x1e6 certifies an incumbent infeasible in the scaled model",
-        KnownFalseCertificate,
-    ),
 }
 
 

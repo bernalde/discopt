@@ -819,11 +819,57 @@ def max_constraint_violation(model, x_flat, evaluator=None) -> float:
     return worst
 
 
+class DeclaredVariable:
+    """A frozen record of one declared variable: name, size, bounds and type.
+
+    What :func:`declared_variables` captures before a solve, so a later
+    :func:`verify_point` judges bounds and integrality on the variables the
+    caller declared -- not on whatever the solve has since appended (structure
+    cuts add auxiliary columns to ``model._variables``, #1561) or tightened in
+    place.
+    """
+
+    __slots__ = ("name", "size", "shape", "lb", "ub", "var_type")
+
+    def __init__(self, v):
+        self.name = v.name
+        self.size = int(getattr(v, "size", 1))
+        self.shape = tuple(getattr(v, "shape", ()))
+        self.lb = np.array(v.lb, dtype=np.float64, copy=True)
+        self.ub = np.array(v.ub, dtype=np.float64, copy=True)
+        self.var_type = v.var_type
+
+
+def declared_variables(model) -> tuple:
+    """Snapshot ``model._variables`` as :class:`DeclaredVariable` records."""
+    return tuple(DeclaredVariable(v) for v in model._variables)
+
+
+class _DeclaredModelView:
+    """``model`` with ``_variables`` replaced by a declared snapshot.
+
+    Every helper in this module reads columns, bounds and integrality from
+    ``model._variables``; this view points them at the declared set while every
+    other attribute resolves on the real model. It is never handed to an
+    evaluator factory: :func:`verify_point` requires an explicit evaluator
+    whenever ``variables`` is given.
+    """
+
+    def __init__(self, model, variables):
+        self._model = model
+        self._variables = list(variables)
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
 def verify_point(
     model,
     x_flat,
     *,
     with_objective: bool = False,
+    evaluator=None,
+    variables=None,
 ) -> VerifyResult:
     """Verify ``x_flat`` is feasible for ``model``; optionally return its objective.
 
@@ -833,12 +879,36 @@ def verify_point(
     evaluated every constraint row and every residual, bound and integrality
     condition is within tolerance. Any evaluator failure, shape mismatch or
     non-finite value yields ``ok=False`` — never an optimistic pass.
+
+    ``evaluator`` (#1561) supplies the rows instead of compiling them from
+    ``model`` now. ``Model.solve`` passes the evaluator it snapshotted BEFORE the
+    solve, because presolve may rewrite the constraint DAG in place and root cuts
+    may append rows; the rows judged are then the ones the caller declared. Bounds
+    and integrality are read from ``model`` unless ``variables`` is given.
+
+    ``variables`` (#1561) is the declared variable set -- a
+    :func:`declared_variables` snapshot -- that ``x_flat`` is laid out over and
+    that bounds and integrality are judged on. A solve can append auxiliary
+    columns to ``model._variables``; judging the declared point against the
+    extended list is a length mismatch, not a verdict. It requires ``evaluator``
+    (built on the same declared model), since the rows must match the columns.
     """
     from discopt.modeling.core import ObjectiveSense
+
+    if variables is not None:
+        if evaluator is None:
+            raise ValueError("verify_point(variables=...) requires an explicit evaluator")
+        model = _DeclaredModelView(model, variables)
 
     x_flat = np.asarray(x_flat, dtype=np.float64)
     if x_flat.ndim != 1 or not np.all(np.isfinite(x_flat)):
         return VerifyResult(False, None, "point is not a finite 1-D vector")
+    if variables is not None:
+        n_declared = sum(int(v.size) for v in model._variables)
+        if x_flat.shape[0] != n_declared:
+            return VerifyResult(
+                False, None, f"point has {x_flat.shape[0]} columns, declared {n_declared}"
+            )
 
     res = check_variable_bounds(model, x_flat)
     if not res.ok:
@@ -859,9 +929,10 @@ def verify_point(
         # #75: via the dispatcher, so the selected backend is honoured and the
         # jax import stays inside its fallback. A direct `cached_evaluator`
         # import here put JAX on every solve that validates a point.
-        from discopt._tape_nlp_evaluator import make_evaluator
+        if evaluator is None:
+            from discopt._tape_nlp_evaluator import make_evaluator
 
-        evaluator = make_evaluator(model)
+            evaluator = make_evaluator(model)
         res = check_constraints(model, x_flat, evaluator=evaluator)
         if not res.ok:
             return res
