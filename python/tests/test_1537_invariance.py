@@ -303,6 +303,16 @@ KNOWN_CORPUS: dict = {
         "#1537 E: row tolerance depends on the coordinates' magnitudes",
         KnownFalseCertificate,
     ),
+    # #1537 E again: after the 1e6 shift the B&B tree accepts an incumbent that
+    # slides along equality row 5 (x1 = 1.00000104, objective 30.9999959 vs 31),
+    # within the shifted row's scale-aware tolerance (|J||x| ~ 1.3e6) and 1.04e-6
+    # over the original's 1e-6. Pre-existing on main: sweeping translate()'s seed
+    # 0..11 at 1e6, main fails seed 8 (row 5, 1.295e-6) and #1542's exact affine
+    # folding, which changes the float path, also fails seed 2 -- the harness's.
+    ("ex1225.nl", "shift"): (
+        "#1537 E: row tolerance depends on the coordinates' magnitudes",
+        KnownFalseCertificate,
+    ),
     # NOT #1537 E: after rows x1e6 the published incumbent violates row 18 by
     # 6.669e-6, and fails verify_point on the SCALED model too (6.669 vs 1.0
     # allowed) -- a real false certificate. The base certifies in ~15 s unloaded,
