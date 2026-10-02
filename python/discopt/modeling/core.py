@@ -4136,9 +4136,20 @@ class SolveResult:
         ``pounce --json-output <file> --json-detail full`` (#1534). Set on the
         routes that make a single POUNCE call: the continuous single-NLP route
         (convex fast path, and the local NLP on a convexity-unknown model), the
-        continuous QP route, and the LP route when POUNCE answered it. ``None``
-        elsewhere: every branch-and-bound route (no single NLP, as for ``kkt``),
-        an LP answered by the simplex or HiGHS, and the cyipopt backend.
+        continuous QP route, the LP route when POUNCE answered it, and all three
+        arms of ``solver="pounce"`` (``pounce:lp-ipm``, ``pounce:qp-ipm``,
+        ``pounce:nlp``), on every status they return. ``None`` elsewhere: every
+        branch-and-bound route (no single NLP, as for ``kkt``), an LP answered by
+        the simplex or HiGHS, and the cyipopt backend.
+
+        On ``pounce:lp-ipm`` / ``pounce:qp-ipm`` the document is built by discopt
+        from POUNCE's ``QpResult`` (its Python convex entry point writes none),
+        with the same field mapping POUNCE's CLI uses for that engine
+        (:func:`discopt.solvers._pounce_report.convex_report`;
+        ``report["fair_metadata"]["generated_by"]`` says so). That engine has no
+        line search, regularization or restoration phase, so those columns are
+        zero there and its rows match the table printed at ``print_level > 0``
+        exactly.
 
         Keys (the document's own; nothing is renamed):
 

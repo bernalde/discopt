@@ -207,3 +207,103 @@ def test_missing_report_warns_and_is_none(monkeypatch, caplog):
     assert res.status == "optimal"
     assert res.solve_report is None
     assert "[pounce-solve-report-missing]" in caplog.text
+
+
+# --- solver="pounce" (#1533): every arm attaches the report ------------------------
+#
+# The LP and QP arms run POUNCE's convex IPM through ``pounce.qp.solve_qp``, which
+# writes no report; discopt builds the document from its ``QpResult``
+# (``_pounce_report.convex_report``). Reopened #1534: those two arms returned
+# ``solve_report=None``.
+
+# One row of ``convex_ipm_pounce._print_trace``: iter objective inf_pr inf_du mu a_pr a_du
+_CONVEX_ROW = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+
+
+def _pounce_lp():
+    m = dm.Model("lp")
+    x = m.continuous("x", shape=(2,), lb=0.0, ub=10.0)
+    m.minimize(-x[0] - 2.0 * x[1])
+    m.subject_to(x[0] + x[1] <= 4.0)
+    return m
+
+
+def _pounce_qp():
+    m = dm.Model("qp")
+    x = m.continuous("x", shape=(2,), lb=0.0, ub=1.0)
+    m.minimize(x[0] ** 2 + x[1] ** 2 - 3.0 * x[0] - 4.0 * x[1])
+    m.subject_to(x[0] + x[1] <= 1.0)
+    return m
+
+
+def _check_convex_report(res, route):
+    assert res.algorithm_route == route
+    rep = res.solve_report
+    assert rep is not None and rep["schema"] == _SCHEMA
+    assert rep["solution"]["engine"] == "cvx-qp"
+    assert rep["fair_metadata"]["generated_by"].endswith("convex_report")
+    stats = rep["statistics"]
+    assert stats["iteration_count"] == res.solver_stats["pounce/iterations"]
+    assert stats["iteration_count"] >= 1
+    assert stats["restoration_calls"] == 0
+    its = rep["iterations"]
+    assert [it["iter"] for it in its] == list(range(len(its)))
+    for key in ("objective", "inf_pr", "inf_du", "mu", "alpha_primal", "alpha_dual"):
+        assert all(math.isfinite(it[key]) for it in its), key
+    return rep
+
+
+@pytest.mark.parametrize(
+    ("build", "route", "optimum"),
+    [(_pounce_lp, "pounce:lp-ipm", -8.0), (_pounce_qp, "pounce:qp-ipm", -3.5)],
+)
+def test_pounce_solver_convex_arms_attach_report(build, route, optimum):
+    res = build().solve(solver="pounce")
+    assert res.status == "optimal"
+    assert res.objective == pytest.approx(optimum, abs=1e-6)
+    rep = _check_convex_report(res, route)
+    assert rep["solution"]["status_upstream"] == "Solve_Succeeded"
+    assert rep["solution"]["x"] == pytest.approx(list(res.x["x"]), abs=1e-6)
+
+
+def test_pounce_solver_nlp_arm_attaches_report():
+    res = _convex_nlp().solve(solver="pounce")
+    assert res.algorithm_route == "pounce:nlp"
+    assert res.solve_report is not None and res.solve_report["schema"] == _SCHEMA
+    assert len(res.solve_report["iterations"]) >= 1
+
+
+@pytest.mark.parametrize("build", [_pounce_lp, _pounce_qp])
+def test_pounce_solver_convex_trajectory_matches_printed_table(build, capsys):
+    res = build().solve(solver="pounce", pounce_options={"print_level": 1})
+    out = capsys.readouterr().out
+    printed = [m.groups() for line in out.splitlines() if (m := _CONVEX_ROW.match(line))]
+    its = res.solve_report["iterations"]
+    assert len(printed) == len(its) >= 1
+    for row, it in zip(printed, its):
+        it_no, obj, inf_pr, inf_du, mu, a_pr, a_du = row
+        assert int(it_no) == it["iter"]
+        assert f"{it['objective']:.7e}" == obj
+        assert f"{it['inf_pr']:.2e}" == inf_pr
+        assert f"{it['inf_du']:.2e}" == inf_du
+        assert f"{it['mu']:.2e}" == mu
+        assert f"{it['alpha_primal']:.2e}" == a_pr
+        assert f"{it['alpha_dual']:.2e}" == a_du
+
+
+def test_pounce_solver_convex_report_on_a_limit():
+    """The report is attached on a non-optimal outcome too, where it is most needed."""
+    res = _pounce_qp().solve(solver="pounce", pounce_options={"max_iter": 1})
+    assert res.status == "iteration_limit"
+    rep = _check_convex_report(res, "pounce:qp-ipm")
+    assert rep["solution"]["status_upstream"] == "Maximum_Iterations_Exceeded"
+
+
+def test_convex_backend_report_is_opt_in():
+    from discopt.solvers import convex_ipm_pounce as cvx
+
+    kw = dict(c=np.array([-1.0, -2.0]), A_ub=np.array([[1.0, 1.0]]), b_ub=np.array([4.0]))
+    assert cvx.solve_lp(**kw).solve_report is None
+    rep = cvx.solve_lp(**kw, solve_report=True).solve_report
+    assert rep is not None and rep["schema"] == _SCHEMA
+    assert rep["problem"]["n_constraints"] == 1

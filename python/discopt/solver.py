@@ -21031,13 +21031,17 @@ def _solve_pounce_route(
             return call
 
         reject_reason: list[str] = []
+        # #1534: the route's one convex-IPM call carries the solve report.
+        solve_fn, reports = _capture_solve_report(
+            _recorded(_cvx.solve_lp if is_lp else _cvx.solve_qp)
+        )
         try:
             if is_lp:
                 outcome = _solve_lp_matrix(
                     model,
                     t_start,
                     _remaining(),
-                    _recorded(_cvx.solve_lp),
+                    solve_fn,
                     "POUNCE lp-ipm",
                     strict=True,
                     relaxes_huge_bounds=True,
@@ -21047,7 +21051,7 @@ def _solve_pounce_route(
                     model,
                     t_start,
                     _remaining(),
-                    _recorded(_cvx.solve_qp),
+                    solve_fn,
                     "POUNCE qp-ipm",
                     strict=True,
                     relaxes_huge_bounds=True,
@@ -21088,6 +21092,9 @@ def _solve_pounce_route(
                     )
             else:
                 result = outcome
+            # On every outcome, a refused or limited one included: the trajectory
+            # is most useful exactly when the solve did not certify.
+            _attach_solve_report(result, reports)
             if result.status not in _POUNCE_ROUTE_CERTIFIED:
                 _strip_local_claims(result)
             result.algorithm_route = route
