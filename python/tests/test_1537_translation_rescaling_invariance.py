@@ -368,3 +368,45 @@ def test_translated_hda_is_not_certified_infeasible(tmp_path):
     # which scales with the time limit; 5 s stops short of it (measured).
     r = from_nl(str(out)).solve(time_limit=30)
     assert r.status != "infeasible", "a feasible model was certified infeasible"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("shift", [1e3, 1e6])
+def test_translated_nvs09_is_honest(tmp_path, shift):
+    """The corpus panel's nvs09 cells raised ``RecursionError`` before #1549 (a product
+    of ten shifted factors distributed into 1024 monomials). With #1549 the shifted
+    model must answer honestly: never certify a wrong value, never a bound past the
+    optimum (minlplib.solu: -43.134336918)."""
+    from pathlib import Path
+
+    from discopt.modeling.core import from_nl
+    from discopt.validation.nl_invariance import translate_nl
+
+    truth = -43.134336918
+    src = Path(__file__).parent / "data" / "minlplib_nl" / "nvs09.nl"
+    out = tmp_path / "nvs09_shift.nl"
+    out.write_text(translate_nl(src.read_text(encoding="latin-1"), shift), encoding="latin-1")
+    r = from_nl(str(out)).solve(time_limit=30)
+    tol = 1e-6 + 1e-4 * abs(truth)
+    assert r.status != "infeasible"
+    if r.bound is not None:
+        assert r.bound <= truth + tol
+    if r.gap_certified:
+        assert r.objective == pytest.approx(truth, abs=tol)
+
+
+def test_rescaled_logical_point_is_reverified_on_the_callers_form():
+    """#1414's class through the rescaling: ``min -x + 3 z, x <= M z`` with M = 1e8.
+    The unit slack is rescaled by ~2**26, so x = 10, z = 0 (a 10-unit violation) is
+    1.5e-7 in the scaled slack and passes its ``>= -tol`` bound. The mapped point
+    must be re-verified on the original form and the rescaled answer discarded."""
+    m = dm.Model("bigm")
+    x = m.continuous("x", lb=0, ub=10)
+    z = m.binary("z")
+    m.subject_to(x - 1e8 * z <= 0)
+    m.minimize(-x + 3 * z)
+    r = m.solve(time_limit=30)
+    st = r.solver_stats or {}
+    assert st.get("route/lp_milp_backend") == 1.0
+    assert st.get("milp/logicals_rescale_refused") == 1.0, st
+    assert r.objective is None or r.objective >= -7.0 - 1e-6, (r.status, r.objective)
