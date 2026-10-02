@@ -9920,6 +9920,10 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # #1536: the single point every route's result passes through, after the
         # #1059 route/fallback merge -- so it judges the pair actually published.
         if _gap_tols is not None:
+            # #1537 E: the tolerances this certificate is judged at (AMP's
+            # ``rel_gap``/``abs_tol``, else the caller's), so ``Model.solve``'s
+            # post-solve incumbent repair re-judges the repaired pair at the same.
+            result._judged_gap_tolerances = (float(_gap_tols[0]), float(_gap_tols[1]))
             _refuse_unclosed_published_pair(result, _gap_tols[0], _gap_tols[1])
             # #1551: same choke point, for a pair finer than the objective's own
             # float resolution at the incumbent.

@@ -8197,6 +8197,190 @@ class Model:
             res.solver_stats = dict(res.solver_stats or {})
             res.solver_stats["certificate/incumbent_unverified"] = 1.0
 
+        def _repair_published_incumbent(res: "SolveResult", evaluator=None, declared=None) -> None:
+            """#1537 E: publish the incumbent repaired to float noise, and re-judge
+            the certificate on the repaired objective.
+
+            :func:`~discopt.validation.feasibility.repair_point` has the measurement.
+            In short: ``verify_point``'s row allowance depends on the units a row is
+            written in, so a solver's working-accuracy residual (1e-9..7e-6 on the
+            three corpus cells) passes it in one set of coordinates and fails it in an
+            identical model in another, and the objective the solver reports is bought
+            with that residual -- ``ex14_1_9`` with rows x1e-3 certified ``-9.98e-6``
+            against a true minimum of ~0. Repairing the point removes the dependence
+            on the units: the result is feasible to float noise in every coordinate
+            system, and its objective is the honest one.
+
+            The repaired point is adopted only if ``verify_point`` accepts it on the
+            declared model. If its objective then crosses the published bound, the
+            bound is refuted (a verified point past it): the certificate is withdrawn
+            and the bound cleared with its validity flag (#1244's rule), loudly.
+            Otherwise the bound is never touched. The certificate is re-asked
+            of the new ``(objective, bound)`` pair by the same arbiter that grants it
+            (``_withhold_stale_certificate``): downgrade-only, so a solve whose
+            certified objective was bought with a residual loses the certificate,
+            and a solve whose was not keeps it.
+
+            Nested internal solves (the root-relaxation fallback in ``solver.py``,
+            ``solve_mpec``, ``estimate``, ``infeasibility``) run this too, by design
+            and harmlessly: those callers read ``x``/``objective``, or ``bound``
+            only behind ``status == "optimal"``. The repair is downgrade-only on
+            status/certificate and clears a bound only when a verified point refutes
+            it, so a nested caller can lose a bound that was invalid, never gain one.
+
+            Known staleness (diagnostic only, never a certificate input):
+            ``gap_criterion``, ``kkt`` and the duals still describe the solver's
+            pre-repair point; the repaired point is within the solver's own
+            feasibility tolerance of it.
+            """
+            from discopt.validation.feasibility import incumbent_repair_enabled
+
+            if not incumbent_repair_enabled() or not res.x or res.objective is None:
+                return
+            import logging as _rlogging
+
+            import numpy as _np
+
+            from discopt.validation.feasibility import repair_point, verify_point
+
+            _log = _rlogging.getLogger("discopt.solver")
+            stats = res.solver_stats = dict(res.solver_stats or {})
+            if evaluator is None:
+                if not _model_unchanged_since_entry():
+                    stats["certificate/repair_skipped"] = "model changed during the solve"
+                    return
+                from discopt._tape_nlp_evaluator import make_evaluator
+
+                evaluator = make_evaluator(self)
+                declared = _declared_vars_entry
+            if declared is None:
+                raise ValueError("a pre-solve evaluator needs its declared variables")
+            _names = [d.name for d in declared]
+            if not set(_names) <= set(res.x):
+                stats["certificate/repair_skipped"] = "result lacks a declared column"
+                return
+            if any(type(c) is not Constraint for c in _declared_cons_entry):
+                # A disjunction / indicator / SOS / logical row is not in the declared
+                # evaluator's rows, so a move judged on those rows alone could break it.
+                stats["certificate/repair_skipped"] = "non-algebraic rows"
+                return
+            # Any EXTRA column in ``res.x`` (a factorable-lift ``_fr_aux_*``, a
+            # structure-cut aux) is the solver's internal column, not part of the
+            # declared model; it is reported as the solver left it (see
+            # ``SolveResult.declared_x``). Only declared columns are the claim.
+            _shapes = [_np.shape(res.x[n]) for n in _names]
+            _flat = _np.concatenate(
+                [_np.atleast_1d(_np.asarray(res.x[n], dtype=_np.float64)).ravel() for n in _names]
+            )
+            rep = repair_point(self, _flat, evaluator=evaluator, variables=declared)
+            if rep.x is None:
+                if rep.excess_before > 0.0:
+                    stats["certificate/repair_declined"] = rep.reason
+                return
+            verdict = verify_point(
+                self, rep.x, with_objective=True, evaluator=evaluator, variables=declared
+            )
+            if not verdict.ok or verdict.objective is None:
+                stats["certificate/repair_declined"] = f"repaired point: {verdict.reason}"
+                return
+            from discopt.solver import (
+                _bound_crosses_objective,
+                _recertify_gap_closed,
+                _resolve_abs_gap_tolerance,
+                _withhold_stale_certificate,
+            )
+
+            is_max = self._objective is not None and (
+                self._objective.sense == ObjectiveSense.MAXIMIZE
+            )
+            old_obj, new_obj = float(res.objective), float(verdict.objective)
+            bnd = res.bound
+            has_bound = bnd is not None and _np.isfinite(float(bnd))
+            # A verified point past the published bound refutes the bound (CLAUDE.md
+            # §1): ``bound <= incumbent`` (min) is the certificate invariant. Decided
+            # here, before anything is written, and acted on after the write-back.
+            bound_refuted = has_bound and _bound_crosses_objective(float(bnd), new_obj, is_max)
+            off = 0
+            for n, shp in zip(_names, _shapes):
+                size = int(_np.prod(shp)) if shp else 1
+                vals = rep.x[off : off + size]
+                res.x[n] = vals.reshape(shp) if shp else _np.asarray(vals[0])
+                off += size
+            res.objective = new_obj
+            stats["certificate/incumbent_repaired"] = 1.0
+            stats["certificate/repair_excess_before"] = float(rep.excess_before)
+            # Magnitude only: the ``certificate/`` family is non-negative floats.
+            stats["certificate/repair_objective_shift"] = float(abs(new_obj - old_obj))
+            if bound_refuted:
+                # #1244's rule, as in ``_withhold_stale_certificate``'s crossing arm:
+                # the incumbent is verified and the bound is not, so the bound is the
+                # weaker claim -- clear it with its validity flag and its gap, and
+                # withdraw the certificate it supported. Never publish either.
+                _log.error(
+                    "incumbent repair (#1537 E): the repaired, verified point has objective "
+                    "%.12g beyond the published bound %.12g (%s sense) -- the bound is "
+                    "invalid. Withdrawing the certificate and the bound.",
+                    new_obj,
+                    float(bnd),
+                    "max" if is_max else "min",
+                )
+                if res.gap_certified:
+                    stats["certificate/repair_decertified"] = 1.0
+                res.gap_certified = False
+                if res.status == "optimal":
+                    res.status = "feasible"
+                res._set_bound(None, valid=False)
+                res.gap = None
+                stats["certificate/repair_bound_refuted"] = 1.0
+                return
+            if not has_bound:
+                return
+            from discopt.solvers._gap import optimality_gap as _optimality_gap
+
+            _s = -1.0 if is_max else 1.0
+            # Re-judge at the tolerances the certificate was granted at: the solver
+            # wrapper records them (AMP meets ``rel_gap``, not ``gap_tolerance``).
+            _judged = getattr(res, "_judged_gap_tolerances", None)
+            if _judged is not None:
+                gtol, atol = float(_judged[0]), float(_judged[1])
+            else:
+                gtol = float(gap_tolerance)
+                atol = _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            was_certified = bool(res.gap_certified)
+            res.gap = _optimality_gap(_s * float(bnd), _s * new_obj)
+            if not was_certified:
+                return
+            if _recertify_gap_closed(old_obj, float(bnd), is_max, gtol, atol):
+                res.status, res.gap, res.gap_certified, _ = _withhold_stale_certificate(
+                    res.status,
+                    new_obj,
+                    float(bnd),
+                    res.gap,
+                    True,
+                    is_max,
+                    gtol,
+                    atol,
+                    "incumbent repair (#1537 E)",
+                )
+            elif abs(new_obj - float(bnd)) > abs(old_obj - float(bnd)):
+                # A certificate whose pair did not close even at the tolerances it
+                # was judged at (no recorded tolerances, or a pairless proof): only
+                # the repair's MARGINAL effect is judged -- a pair the repair moved
+                # further apart no longer supports the certificate.
+                _log.warning(
+                    "incumbent repair (#1537 E): the repaired objective %.12g is further "
+                    "from the bound %.12g than the certified %.12g; withdrawing the "
+                    "certificate.",
+                    new_obj,
+                    float(bnd),
+                    old_obj,
+                )
+                res.gap_certified = False
+                if res.status == "optimal":
+                    res.status = "feasible"
+            if was_certified and not res.gap_certified:
+                stats["certificate/repair_decertified"] = 1.0
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8272,8 +8456,11 @@ class Model:
             if _ck_res is not None:
                 # #1551: this return skips ``solve_model`` and everything below,
                 # so the evaluation-error guard has to run here too.
-                _guard_unresolved_objective(_ck_res)
+                # #1561 judges the route's own point; the #1537 E repair then
+                # improves what is published (downgrade-only), and #1551 judges that.
                 _withhold_unverified_certificate(_ck_res)
+                _repair_published_incumbent(_ck_res)
+                _guard_unresolved_objective(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -9028,13 +9215,22 @@ class Model:
         # certificate is not re-tested. The convex-kernel fast path returns early
         # and calls the same guard at its own return.
         if isinstance(result, SolveResult):
-            _guard_unresolved_objective(result)
             # #1561: after the #772 screen (which may already have withheld the
-            # point) and on the same pre-solve snapshot of the declared rows.
+            # point) and on the same pre-solve snapshot of the declared rows. It
+            # judges the point the ROUTE certified: a route whose gate accepted a
+            # point verify_point rejects loses its certificate whatever the repair
+            # below makes of the point.
             if _verify_snap is not None and _verify_snap_vars is not None:
                 _withhold_unverified_certificate(result, _verify_snap[0], _verify_snap_vars)
             else:
                 _withhold_unverified_certificate(result)
+            # #1537 E: publish the incumbent repaired to float noise and re-judge its
+            # certificate on the repaired objective (downgrade-only; bound untouched).
+            if _verify_snap is not None and _verify_snap_vars is not None:
+                _repair_published_incumbent(result, _verify_snap[0], _verify_snap_vars)
+            else:
+                _repair_published_incumbent(result)
+            _guard_unresolved_objective(result)
 
         if llm:
             try:

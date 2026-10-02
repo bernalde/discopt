@@ -222,6 +222,11 @@ def test_reduction_separation_timers_present_and_bounded():
     # the evaluation-error check did not apply.
     skipped = stats.pop("certificate/objective_eval_error_skipped", None)
     assert skipped is None or isinstance(skipped, str), f"skip reason={skipped!r}"
+    # #1537 E's incumbent repair records why it did not run (``repair_skipped``)
+    # or why it declined (``repair_declined``) as strings, present only then.
+    for key in ("certificate/repair_skipped", "certificate/repair_declined"):
+        why = stats.pop(key, None)
+        assert why is None or isinstance(why, str), f"{key}={why!r}"
     # Every other entry is a non-negative float in a known instrumentation family.
     assert all(isinstance(v, float) and v >= 0.0 for v in stats.values())
     assert all(k.startswith(_KNOWN) for k in stats), (
