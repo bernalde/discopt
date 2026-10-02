@@ -89,20 +89,25 @@ def test_parameters_are_not_folded_and_stay_live(flag_on):
     assert float(np.asarray(r2.x["y"])) == pytest.approx(1e6 + 7, abs=1e-5)
 
 
-def test_unsupported_structure_refuses_and_solve_falls_back(flag_on):
+def test_unsupported_structure_refuses_and_solve_falls_back(flag_on, caplog):
     m = dm.Model("gdp")
     x = m.continuous("x", lb=1e6, ub=1e6 + 10)
     m.either_or([[x <= 1e6 + 1], [x >= 1e6 + 9]])
     m.minimize((x - 1e6 - 5) ** 2)
     with pytest.raises(RecentreUnsupported):
         recentre(m)
-    r = m.solve(time_limit=20)  # unrecentred, still solved
+    with caplog.at_level("WARNING", logger="discopt"):
+        r = m.solve(time_limit=20)  # unrecentred, still solved
     assert _moved(r) is None and r.status in ("optimal", "feasible")
+    # The skip is visible: a WARNING and the reason in solver_stats (N2).
+    assert "recentring was skipped" in caplog.text
+    assert isinstance(r.solver_stats.get("recentre/skipped"), str)
 
 
 def test_mapped_point_is_reverified_against_the_original(flag_on, monkeypatch):
-    """A mapping defect cannot publish a certificate: corrupt ``to_outer`` and the
-    point the user receives fails their model, so the certificate is withdrawn."""
+    """A mapping defect cannot publish a point the user's model rejects: corrupt
+    ``to_outer`` and the mapped point is withheld exactly as main's #772
+    false-primal guard withholds one -- whatever the inner status was."""
     import discopt.modeling._recentre as rmod
 
     real = rmod.Recentring.to_outer
@@ -116,7 +121,8 @@ def test_mapped_point_is_reverified_against_the_original(flag_on, monkeypatch):
     m.subject_to(y <= 1e6 + 2.5)
     m.minimize(-(y - 1e6))  # optimum at the row: y = 1e6 + 2.5
     r = m.solve(time_limit=20)
-    assert not r.gap_certified and r.status == "feasible"
+    assert r.status == "error" and r.x is None and r.objective is None
+    assert r.incumbent_verification_failed and not r.gap_certified
     assert r.solver_stats.get("recentre/mapped_point_refused") == 1.0
 
 
@@ -130,15 +136,41 @@ def test_initial_solution_and_warm_start_are_mapped(flag_on):
     assert r2.gap_certified and float(np.asarray(r2.x["y"])) == pytest.approx(1e6 + 1.7, abs=1e-5)
 
 
-def test_flag_off_is_untouched(monkeypatch):
-    monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
+def _shifted_qp():
     m = dm.Model("off")
     y = m.continuous("y", lb=1e6, ub=1e6 + 3)
-    m.minimize((y - 1e6 - 1.7) ** 2)
-    assert _moved(m.solve(time_limit=20)) is None
+    i = m.integer("i", lb=-2e6, ub=-2e6 + 5)
+    m.subject_to((y - 1e6) + (i + 2e6) >= 3.5)
+    m.minimize((y - 1e6 - 1.2) ** 2 + (i + 2e6 - 2.6) ** 2)
+    return m
 
 
-# ── the fixes (flag ON): each was a false certificate or a crash with it OFF ──
+def test_flag_off_is_untouched(monkeypatch):
+    """Flag OFF the pass is never entered and the solve is bound-neutral: unset
+    and ``=0`` give identical node count, objective and bound, and a ``recentre``
+    that raises if called changes nothing either."""
+    import discopt.modeling._recentre as rmod
+
+    def unreachable(*a, **k):
+        raise AssertionError("recentre() was called with the flag OFF")
+
+    monkeypatch.setattr(rmod, "recentre", unreachable)
+    runs = []
+    for value in (None, "0"):
+        if value is None:
+            monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
+        else:
+            monkeypatch.setenv("DISCOPT_RECENTRE", value)
+        r = _shifted_qp().solve(time_limit=20, deterministic=True)
+        assert _moved(r) is None and "recentre/skipped" not in r.solver_stats
+        runs.append((r.status, r.objective, r.bound, r.node_count, r.gap_certified))
+    assert runs[0] == runs[1]
+
+
+# ── the fixes (flag ON). Each was a false certificate or a crash on the main of
+# the time; several pass with the flag OFF on today's main too (other #1537
+# workstreams fixed them), so each asserts the pass actually ran (``_moved``) --
+# they pin that recentring keeps them right, not that only recentring does. ──
 
 
 @pytest.mark.parametrize("c", [1e5, 1e6])
@@ -148,6 +180,7 @@ def test_1543_one_variable_integer_qp(flag_on, c):
     u = y - c
     m.minimize(6 * u * u - 12 * u)
     r = m.solve(time_limit=20)
+    assert _moved(r) == 1.0
     assert r.gap_certified and r.objective == pytest.approx(-6.0, abs=1e-6)
     assert float(np.asarray(r.x["y"])) == pytest.approx(c + 1.0, abs=1e-6)
 
@@ -167,6 +200,7 @@ def test_1542_shifted_cubic(flag_on):
         m.subject_to(sum(A[r_, j] * x[j] for j in range(5)) <= b[r_])
     m.minimize(sum(cc[j] * x[j] for j in range(5)) + 0.2 * x[3] ** 3)
     r = m.solve(time_limit=20)
+    assert _moved(r) == 5.0
     assert r.gap_certified and r.objective == pytest.approx(-36.0, abs=1e-5)
 
 
@@ -181,6 +215,7 @@ def test_corpus_shift_false_certificates_recover(flag_on, name):
     base = m.solve(time_limit=20)
     assert base.gap_certified
     r = translate(m, 1e6, seed=2).solve(time_limit=20)
+    assert _moved(r)
     assert r.gap_certified and r.status == "optimal"
     assert r.objective == pytest.approx(base.objective, abs=1e-6, rel=1e-4)
 
@@ -193,6 +228,7 @@ def test_corpus_nvs09_shift_no_longer_crashes(flag_on):
     m = dm.from_nl(os.path.join(CORPUS, "nvs09.nl"))
     base = m.solve(time_limit=20)
     r = translate(m, 1e6, seed=2).solve(time_limit=20)
+    assert _moved(r)
     if r.gap_certified:
         assert r.objective == pytest.approx(base.objective, abs=1e-6, rel=1e-4)
 
@@ -207,3 +243,143 @@ def test_one_sided_offsets_are_moved():
     plan = plan_shifts(m, 100.0)
     assert set(plan) == {id(a), id(b), id(d)}
     assert float(plan[id(d)]) == -5e5
+
+
+# ── builder-resident state (fast API): translated exactly, or refused ─────────
+# Before the fix every one of these was dropped from the recentred model: the
+# rows vanished (a looser problem) and a builder objective became the zero
+# placeholder, certifying 0 as optimal. Each optimum is at a vertex the dropped
+# state decides.
+
+C6 = 1e6
+_FAST_OPT = 3e6 + 20  # min x0 + 2 x1, x0 + x1 >= 2e6 + 15, x in [1e6, 1e6 + 10]^2
+
+
+def _fast_box(m):
+    return m.continuous("x", shape=(2,), lb=[C6, C6], ub=[C6 + 10, C6 + 10])
+
+
+def _assert_fast_optimum(r, opt):
+    assert _moved(r) == 1.0
+    assert r.status == "optimal" and r.gap_certified
+    assert r.objective == pytest.approx(opt, abs=1e-6)
+    assert r.bound <= opt + 1e-6
+    x = np.asarray(r.x["x"], dtype=float)
+    assert x[0] + x[1] >= 2e6 + 15 - 1e-6
+
+
+def test_builder_add_linear_constraints_is_translated(flag_on):
+    m = dm.Model("fast_rows")
+    x = _fast_box(m)
+    m.add_linear_constraints(np.array([[1.0, 1.0]]), x, ">=", np.array([2e6 + 15]))
+    m.minimize(x[0] + 2 * x[1])
+    _assert_fast_optimum(m.solve(time_limit=20), _FAST_OPT)
+
+
+def test_builder_add_linear_objective_is_translated(flag_on):
+    m = dm.Model("fast_lin_obj")
+    x = _fast_box(m)
+    m.subject_to(x[0] + x[1] >= 2e6 + 15)
+    m.add_linear_objective(np.array([1.0, 2.0]), x, 0.5, "minimize")
+    _assert_fast_optimum(m.solve(time_limit=20), _FAST_OPT + 0.5)
+
+
+def test_builder_add_quadratic_objective_is_translated(flag_on):
+    # 0.5 x'Qx + q'x + k with an off-diagonal Q: in z-space it gains the linear
+    # term S c and the constant q'c + 0.5 c'Sc, all exact here.
+    m = dm.Model("fast_quad_obj")
+    x = _fast_box(m)
+    m.add_linear_constraints(np.array([[1.0, 1.0]]), x, ">=", np.array([2e6 + 15]))
+    Q = np.array([[2.0, 1.0], [1.0, 2.0]])
+    q = np.array([-4e6 - 20.0, -2e6 - 10.0])  # shifts the minimiser into the box
+    m.add_quadratic_objective(Q, q, x, 7.0, "minimize")
+
+    def f(v):
+        return 0.5 * v @ Q @ v + q @ v + 7.0
+
+    grid = [np.array([C6 + a, C6 + b]) for a in range(11) for b in range(11) if a + b >= 15]
+    # convex: the continuous optimum is no worse than the best lattice point
+    best = min(f(v) for v in grid)
+    r = m.solve(time_limit=20)
+    assert _moved(r) == 1.0 and r.status == "optimal" and r.gap_certified
+    tol = 1e-9 * abs(best)  # |f| ~ 4e12 here
+    assert r.objective <= best + tol
+    assert r.objective == pytest.approx(f(np.asarray(r.x["x"], dtype=float)), abs=tol)
+    assert r.bound <= r.objective + tol
+
+
+def test_builder_model_constraint_fast_family_is_translated(flag_on):
+    m = dm.Model("fam")
+    x = m.continuous("x", shape=(3,), lb=C6, ub=C6 + 10)
+    idx = m.set("I", [0, 1, 2])
+    m.constraint(idx, lambda i: x[i] >= C6 + 2.0 + i, name="lo", fast=True)
+    m.minimize(dm.sum((x - C6) ** 2))
+    r = m.solve(time_limit=20)
+    assert _moved(r) == 1.0 and r.status == "optimal" and r.gap_certified  # one (3,) variable
+    assert r.objective == pytest.approx(4 + 9 + 16, abs=1e-6)
+
+
+def test_builder_row_with_inexact_translation_refuses(flag_on, caplog):
+    """``b - A c`` that is not a double cannot be translated exactly: refuse
+    (and solve unrecentred) rather than round a row."""
+    m = dm.Model("fast_inexact")
+    x = m.continuous("x", shape=(2,), lb=[C6 + 0.1, C6], ub=[C6 + 10, C6 + 10])
+    A = np.array([[0.7, 1.0]])  # 1.3e6 + 7 - 0.7 * 1e6 - 1e6 is not a double
+    m.add_linear_constraints(A, x, ">=", np.array([1.3e6 + 7]))
+    m.minimize(x[0] + x[1])
+    with pytest.raises(RecentreUnsupported, match="not exactly representable"):
+        recentre(m)
+    with caplog.at_level("WARNING", logger="discopt"):
+        r = m.solve(time_limit=20)
+    assert _moved(r) is None and "recentre/skipped" in r.solver_stats
+    assert "recentring was skipped" in caplog.text
+
+
+# ── N1, N3, N6 ────────────────────────────────────────────────────────────────
+
+
+def test_deep_sum_does_not_recurse_out(flag_on):
+    m = dm.Model("deep")
+    x = m.continuous("x", lb=C6, ub=C6 + 5)
+    y = m.continuous("y", shape=(2000,), lb=0, ub=1)
+    expr = x - C6
+    for k in range(2000):
+        expr = expr + y[k]
+    m.subject_to(expr <= 50)
+    m.minimize((x - C6 - 2) ** 2 + y[0])
+    rc = recentre(m)  # raised RecursionError before the fix
+    assert rc is not None and len(rc.shifts) == 1
+
+
+def test_shift_bounds_rounds_outward():
+    from fractions import Fraction
+
+    import discopt.modeling._recentre as rmod
+
+    lb = np.array([140.25, 0.1, -np.inf, 3.0])
+    ub = np.array([1e17, 7.3, -5e5 + 0.1, np.inf])
+    c = np.array([140.0, 3.0, -5e5, 1.0])
+    lo, hi = rmod.shift_bounds(lb, ub, c)
+    checked = 0
+    for k in range(len(lb)):
+        if np.isfinite(lb[k]):
+            assert Fraction(float(lo[k])) <= Fraction(float(lb[k])) - Fraction(float(c[k]))
+            checked += 1
+        else:
+            assert lo[k] == -np.inf
+        if np.isfinite(ub[k]):
+            assert Fraction(float(hi[k])) >= Fraction(float(ub[k])) - Fraction(float(c[k]))
+            checked += 1
+        else:
+            assert hi[k] == np.inf
+    assert checked == 6
+    # the motivating case: 1e17 - 140 rounds to nearest INSIDE the box
+    assert Fraction(1e17 - 140.0) < Fraction(1e17) - 140
+    assert hi[0] > 1e17 - 140.0
+
+
+def test_inner_only_columns_are_not_returned(flag_on):
+    m = _shifted_qp()
+    r = m.solve(time_limit=20)
+    assert _moved(r) == 2.0
+    assert set(r.x) == {v.name for v in m._variables}

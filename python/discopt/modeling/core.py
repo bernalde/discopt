@@ -5045,6 +5045,38 @@ def missing_validation_guards(src: "Model", dst: "Model") -> list[str]:
     return missing
 
 
+_FALSE_PRIMAL_ERROR = (
+    "the incumbent the solver returned is infeasible in the original "
+    "model (false-primal guard, #772); it was withheld"
+)
+
+
+def _withhold_false_primal(result: "SolveResult", error: str = _FALSE_PRIMAL_ERROR) -> None:
+    """The #772 false-primal response: withhold an incumbent the original model rejects.
+
+    Shared by ``Model.solve``'s final-incumbent guard and the #1537 C recentring
+    path, which re-verifies a point mapped back from the recentred model, so the
+    two cannot drift.
+    """
+    result.incumbent_verification_failed = True
+    result.gap_certified = False
+    result.x = None
+    result.objective = None
+    result.gap = None
+    # The status must stop asserting what the guard just withdrew. Clearing
+    # ``x``/``objective`` while leaving ``status="optimal"`` reports a PROVEN
+    # OPTIMUM WITH NO SOLUTION -- a caller that keys on the status (every gate and
+    # panel in this repo does) reads a certificate that the guard has already
+    # refused to stand behind. Observed under
+    # ``DISCOPT_PRESOLVE_BOUND_PROPAGATION=1`` on nvs05: ``status='optimal'``,
+    # ``objective=None``, 3/3 reps. This is not a limit termination -- an unsound
+    # result was detected -- so it reports as an error and refuses loudly
+    # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was shown to be
+    # invalid, and the dual bound remains rigorous.
+    result.status = "error"
+    result.error = error
+
+
 #: How many ``Model.solve`` calls are on the stack (#1537 C). A ContextVar, not a
 #: thread-local: ``_run_with_deep_recursion`` runs deep solves on a worker thread
 #: inside ``contextvars.copy_context()``, which carries this but not a
@@ -7968,42 +8000,56 @@ class Model:
             and node_callback is None
             and cut_callback is None
         ):
+            _solve_args = dict(
+                time_limit=time_limit,
+                gap_tolerance=gap_tolerance,
+                abs_gap_tolerance=abs_gap_tolerance,
+                threads=threads,
+                llm=llm,
+                sensitivity=sensitivity,
+                deterministic=deterministic,
+                partitions=partitions,
+                initial_solution=initial_solution,
+                warm_start=warm_start,
+                skip_convex_check=skip_convex_check,
+                nlp_bb=nlp_bb,
+                solver=solver,
+                validate=validate,
+                verify_incumbent=verify_incumbent,
+                gauss_newton=gauss_newton,
+                tuning=tuning,
+                debug=debug,
+                **kwargs,
+            )
             try:
                 _rc = _recentre.recentre(self)
             except _recentre.RecentreUnsupported as exc:
                 import logging as _logging
 
-                _logging.getLogger(__name__).info("recentring skipped: %s", exc)
-                _rc = None
-            if _rc is not None:
-                result = _recentre.solve_recentred(
-                    self,
-                    _rc,
-                    dict(
-                        time_limit=time_limit,
-                        gap_tolerance=gap_tolerance,
-                        abs_gap_tolerance=abs_gap_tolerance,
-                        threads=threads,
-                        llm=llm,
-                        sensitivity=sensitivity,
-                        deterministic=deterministic,
-                        partitions=partitions,
-                        initial_solution=initial_solution,
-                        warm_start=warm_start,
-                        skip_convex_check=skip_convex_check,
-                        nlp_bb=nlp_bb,
-                        solver=solver,
-                        validate=validate,
-                        verify_incumbent=verify_incumbent,
-                        gauss_newton=gauss_newton,
-                        tuning=tuning,
-                        debug=debug,
-                        **kwargs,
-                    ),
+                # WARNING, not INFO: the user set the flag and it did nothing. The
+                # model is solved unrecentred -- as a nested solve, so the pass
+                # does not retry -- and the reason is stamped on the result.
+                _logging.getLogger(__name__).warning(
+                    "%s is set but recentring was skipped (%s); solving %r unrecentred",
+                    _recentre.FLAG,
+                    exc,
+                    self.name,
                 )
+                _unrecentred = cast(
+                    Union[SolveResult, Iterator[SolveUpdate]], self.solve(**_solve_args)
+                )
+                if isinstance(_unrecentred, SolveResult):
+                    if _unrecentred.solver_stats is None:
+                        _unrecentred.solver_stats = {}
+                    _unrecentred.solver_stats["recentre/skipped"] = str(exc)
+                return _unrecentred
+            if _rc is not None:
+                result = _recentre.solve_recentred(self, _rc, _solve_args)
                 # The same tail the unrecentred path runs, on THIS model: the
                 # objective recomputed from the mapped point in the original
-                # coordinates, then the #1313/#1322 solved-point stamp.
+                # coordinates, the #1313/#1322 solved-point stamp, and the derived
+                # reports (switched off for the inner solve, so none of them can
+                # describe the recentred model).
                 if result.objective is not None and result.x is not None:
                     self._reconcile_objective_with_model(result)
                 if result.x is not None:
@@ -8011,6 +8057,35 @@ class Model:
 
                     setattr(result, "_problem_fingerprint", solution_state_fingerprint(self))
                     self._last_solve_result = result
+                if llm:
+                    try:
+                        result._explanation = result._explain_with_llm()
+                    except Exception as _exp_exc:  # noqa: BLE001 - advisory, as below
+                        import logging as _logging
+
+                        _logging.getLogger("discopt.llm").debug(
+                            "post-solve LLM explanation skipped: %s: %s",
+                            type(_exp_exc).__name__,
+                            _exp_exc,
+                        )
+                if sensitivity:
+                    result._ensure_sensitivity()
+                if validate and result.x:
+                    from discopt.validation.examiner import examine
+
+                    try:
+                        result.validation_report = examine(result, self)
+                    except Exception as _val_exc:
+                        # Same outcome as the unrecentred path (report None), but
+                        # said out loud rather than silently.
+                        import logging as _logging
+
+                        _logging.getLogger(__name__).warning(
+                            "validation report not produced: %s: %s",
+                            type(_val_exc).__name__,
+                            _val_exc,
+                        )
+                        result.validation_report = None
                 return result
 
         # Reject misspelled / unknown solve() keyword arguments loudly (M6).
@@ -9262,27 +9337,7 @@ class Model:
                         "— the result is NOT a valid solution.",
                         result.objective,
                     )
-                    result.incumbent_verification_failed = True
-                    result.gap_certified = False
-                    result.x = None
-                    result.objective = None
-                    result.gap = None
-                    # The status must stop asserting what the guard just withdrew.
-                    # Clearing ``x``/``objective`` while leaving ``status="optimal"``
-                    # reports a PROVEN OPTIMUM WITH NO SOLUTION -- a caller that keys
-                    # on the status (every gate and panel in this repo does) reads a
-                    # certificate that the guard has already refused to stand behind.
-                    # Observed under ``DISCOPT_PRESOLVE_BOUND_PROPAGATION=1`` on
-                    # nvs05: ``status='optimal'``, ``objective=None``, 3/3 reps.
-                    # This is not a limit termination -- an unsound mutation was
-                    # detected -- so it reports as an error and refuses loudly
-                    # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was
-                    # shown to be invalid, and the dual bound remains rigorous.
-                    result.status = "error"
-                    result.error = (
-                        "the incumbent the solver returned is infeasible in the original "
-                        "model (false-primal guard, #772); it was withheld"
-                    )
+                    _withhold_false_primal(result)
             except Exception as _ver_exc:
                 # A swallowed exception here does not "skip verification" -- it
                 # DELETES the soundness guard while leaving every caller believing

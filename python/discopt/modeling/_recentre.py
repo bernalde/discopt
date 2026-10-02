@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Optional
 
 import numpy as np
@@ -50,6 +51,7 @@ from discopt.modeling.core import (
     Model,
     Objective,
     Parameter,
+    SolveResult,
     SumExpression,
     SumOverExpression,
     UnaryOp,
@@ -104,6 +106,16 @@ def recentre_ratio() -> float:
 
 #: A bound at or beyond this magnitude is "effectively open" for the one-sided
 #: rule: ``[1e6, 1e15]`` and ``[1e6, inf)`` are both "x >= 1e6".
+#:
+#: **Limit (documented, not an oversight):** the anchor itself must be below this
+#: magnitude, so a variable whose box sits entirely at ``|x| >= 1e10`` --
+#: ``[1e15, 1e15 + 64]``, ``[2**52, 2**52 + 10]`` -- is never moved: both its
+#: bounds read as open. Such a box is solved
+#: exactly as with the flag OFF. Moving it would be exact (the shift is an
+#: integer and the narrow rule's subtraction is Sterbenz-exact), but at that
+#: magnitude the user's own constants are already below the box's ulp, so the
+#: model as written is not the model they meant; nothing in the panel measured
+#: it, and lowering the cutoff changes which one-sided boxes move.
 _OPEN = 1e10
 
 
@@ -126,6 +138,15 @@ def plan_shifts(model: Model, ratio: float) -> dict[int, np.ndarray]:
 
     The shift is the anchor rounded to an integer, so integer and binary domains
     stay integral.
+
+    **The one-sided rule moves modest offsets too.** Its threshold is the
+    absolute ``|lb| >= ratio``, not a ratio to a width it does not have, so a
+    plain ``x >= 150`` with no upper bound IS moved (to ``z >= 0.25`` for
+    ``lb = 150.25``) while ``x in [150, 200]`` is not (150 < 100 * 50). That is
+    deliberate -- an open box has no width to compare against, and the #1543
+    failures were exactly such boxes -- but it means the flag is not a no-op on a
+    model with only moderately offset one-sided bounds. Bounds at or beyond
+    :data:`_OPEN` count as open; see there for the large-magnitude limit.
     """
     plan: dict[int, np.ndarray] = {}
     for v in model._variables:
@@ -330,22 +351,207 @@ class Recentring:
         return out
 
 
+def _two_sum_error(a: np.ndarray, b: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Knuth's TwoSum: the exact rounding error ``(a + b) - s`` of ``s = fl(a + b)``.
+
+    Zero exactly when ``s`` is the exact sum. Only meaningful for finite inputs.
+    """
+    bp = s - a
+    ap = s - bp
+    err: np.ndarray = (a - ap) + (b - bp)
+    return err
+
+
+def shift_bounds(lb: np.ndarray, ub: np.ndarray, c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(lb - c, ub - c)`` rounded OUTWARD wherever the subtraction is inexact.
+
+    The narrow rule's ``lb - c`` is exact (Sterbenz: ``c`` is ``lb`` rounded, so
+    within a factor of 2), as is any shift of an integer bound below 2**53. The
+    one-sided rule is not: ``x in [140.25, 1e17]`` moves by ``c = 140``, and
+    ``1e17 - 140`` is not a double (ulp 16); round-to-nearest takes it to
+    ``...856``, *inside* the original box. The inner box must contain the outer
+    one, so an inexact lower bound steps down one ulp and an inexact upper bound
+    steps up one ulp. Infinite bounds stay infinite.
+    """
+    lo = lb - c
+    hi = ub - c
+    with np.errstate(invalid="ignore"):
+        err_lo = np.where(np.isfinite(lb), _two_sum_error(lb, -c, lo), 0.0)
+        err_hi = np.where(np.isfinite(ub), _two_sum_error(ub, -c, hi), 0.0)
+    # err = exact - rounded: an exact value below the rounded lower bound -> step down.
+    lo = np.where(err_lo < 0.0, np.nextafter(lo, -np.inf), lo)
+    hi = np.where(err_hi > 0.0, np.nextafter(hi, np.inf), hi)
+    return lo, hi
+
+
+def _exact(value: Fraction, what: str) -> float:
+    """``value`` as a float, or :class:`RecentreUnsupported` if it is not one."""
+    f = float(value)
+    if Fraction(f) != value:
+        raise RecentreUnsupported(
+            f"{what} is not exactly representable after the shift (nearest double {f!r})"
+        )
+    return f
+
+
+def _translate_rows(A, b: np.ndarray, c: np.ndarray, what: str) -> np.ndarray:
+    """``b - A @ c`` row by row, exactly, or :class:`RecentreUnsupported`.
+
+    ``A x <sense> b`` with ``x = z + c`` is ``A z <sense> b - A c``. The new rhs is
+    accumulated in exact rational arithmetic over the nonzeros that touch a moved
+    column, and refused when the exact value is not a double -- a rounded rhs
+    would be a different row, which is the approximation this pass exists to
+    avoid. Integer coefficients times integer shifts below 2**53 are always exact.
+    """
+    A = A.tocsr()
+    c_flat = np.ravel(c)
+    out = np.array(b, dtype=np.float64, copy=True)
+    indptr, indices, data = A.indptr, A.indices, A.data
+    for i in range(A.shape[0]):
+        acc = Fraction(float(b[i]))
+        touched = False
+        for k in range(int(indptr[i]), int(indptr[i + 1])):
+            cj = float(c_flat[int(indices[k])])
+            if cj != 0.0 and data[k] != 0.0:
+                acc -= Fraction(float(data[k])) * Fraction(cj)
+                touched = True
+        if touched:
+            out[i] = _exact(acc, f"{what} row {i} rhs")
+    return out
+
+
+def _translate_builder_objective(model: Model, var_map, shifts_by_id, new: Model) -> None:
+    """Move ``add_linear_objective`` / ``add_quadratic_objective`` into ``new``.
+
+    Linear ``q'x + k`` becomes ``q'z + (k + q'c)``. Quadratic ``0.5 x'Qx + q'x + k``
+    is first put in the builder's own convention -- the Rust builder optimises
+    ``0.5 x'Sx`` with ``S = triu(Q) + striu(Q)'`` (``export/_common.py``) -- and
+    then becomes ``0.5 z'Sz + (q + S c)'z + (k + q'c + 0.5 c'Sc)``. Every new
+    coefficient is computed exactly or the pass refuses.
+    """
+    import scipy.sparse as sp
+
+    lin_obj = model._builder_linear_objective
+    quad_obj = model._builder_quadratic_objective
+    if lin_obj is not None:
+        q, x, k, sense = lin_obj
+        z = var_map[id(x)]
+        c = shifts_by_id.get(id(x))
+        if c is None:
+            new.add_linear_objective(q, z, constant=k, sense=sense)
+            return
+        q = np.asarray(q, dtype=np.float64).ravel()
+        c_flat = np.ravel(c)
+        acc = Fraction(float(k))
+        for jj in np.nonzero((q != 0.0) & (c_flat != 0.0))[0]:
+            acc += Fraction(float(q[jj])) * Fraction(float(c_flat[jj]))
+        const = _exact(acc, "linear objective constant")
+        new.add_linear_objective(q, z, constant=const, sense=sense)
+        return
+    if quad_obj is not None:
+        Q, q, x, k, sense = quad_obj
+        z = var_map[id(x)]
+        c = shifts_by_id.get(id(x))
+        if c is None:
+            new.add_quadratic_objective(Q, q, z, constant=k, sense=sense)
+            return
+        S = (sp.triu(Q, 0) + sp.triu(Q, 1).T).tocsr()
+        q = np.asarray(q, dtype=np.float64).ravel()
+        c_flat = np.ravel(c)
+        cF = [Fraction(float(v)) for v in c_flat]
+        q_new = q.copy()
+        acc = Fraction(float(k))
+        for jj in np.nonzero((q != 0.0) & (c_flat != 0.0))[0]:
+            acc += Fraction(float(q[jj])) * cF[jj]
+        cSc = Fraction(0)
+        for i in range(S.shape[0]):
+            sc_i = Fraction(0)
+            touched = False
+            for kk in range(int(S.indptr[i]), int(S.indptr[i + 1])):
+                j = int(S.indices[kk])
+                if c_flat[j] != 0.0 and S.data[kk] != 0.0:
+                    sc_i += Fraction(float(S.data[kk])) * cF[j]
+                    touched = True
+            if touched:
+                q_new[i] = _exact(Fraction(float(q[i])) + sc_i, f"quadratic objective c[{i}]")
+                cSc += cF[i] * sc_i
+        const = _exact(acc + cSc / 2, "quadratic objective constant")
+        new.add_quadratic_objective(S, q_new, z, constant=const, sense=sense)
+        return
+    raise RecentreUnsupported("the objective is a builder placeholder with no recorded block")
+
+
+#: Model-resident state this pass does not translate. Each is refused when
+#: non-empty rather than silently dropped from the inner model (CLAUDE.md §3):
+#: piecewise domains and complementarities change the feasible set, and the
+#: decomposition / block labels key solver structure by constraint identity.
+_REFUSED_FIELDS = (
+    "_piecewise_domains",
+    "_complementarities",
+    "_lowered_complementarities",
+    "_decomp_stages",
+    "_decomp_blocks",
+    "_coupling_keys",
+    "_block_labels_var",
+    "_block_labels_con",
+)
+
+
 def recentre(model: Model, ratio: Optional[float] = None) -> Optional[Recentring]:
     """The recentred twin of ``model``, or ``None`` when no variable qualifies.
 
-    Raises :class:`RecentreUnsupported` for structure it does not rebuild
-    (indicator / disjunctive / SOS / logical rows, piecewise domains,
-    complementarities, a missing objective); the caller then solves unrecentred.
+    Every piece of model state that reaches a solve is either translated exactly
+    or refused with :class:`RecentreUnsupported` (the caller then solves the model
+    unrecentred and says so at WARNING):
+
+    * variables -- bounds shifted, rounded outward when inexact (:func:`shift_bounds`);
+    * expression rows and objective -- rewritten with constant folding;
+    * builder-resident rows (``add_linear_constraints``, ``Model.constraint(...,
+      fast=True)``) -- ``b - A c``, exactly (:func:`_translate_rows`);
+    * builder-resident objective (``add_linear_objective`` /
+      ``add_quadratic_objective``) -- linear and constant terms picked up exactly;
+    * parameters -- shared objects (values stay live, never folded);
+    * ``_initial_point`` and ``_gams_initial_values`` -- shifted per element;
+    * refused: indicator / disjunctive / SOS / logical rows (any ``Constraint``
+      subclass), a missing objective, an expression objective coexisting with a
+      builder objective, and the fields in :data:`_REFUSED_FIELDS`.
+
+    Not carried and not needed: ``_atan2_preconditions`` (re-checked on the
+    original by ``validate()`` before this runs, and the rewritten expressions are
+    the same functions), ``_gdp_factory_*`` (``validate()`` refuses unattached
+    blocks), ``_simplex_lowerings`` / ``_sets`` (bookkeeping no solve reads), and
+    ``_source_nl_path`` / ``_nl_repr`` (deliberately absent: the inner model is
+    not the ``.nl`` file).
+
+    The rewrite recurses once per expression level, so a deep model runs on the
+    large-stack worker the solver uses for deep expressions (#266).
     """
     plan = plan_shifts(model, recentre_ratio() if ratio is None else ratio)
     if not plan:
         return None
-    if model._objective is None:
+    from discopt._relax.convexity.rules import _run_with_deep_recursion
+    from discopt._relax.factorable_reform import _max_expr_node_count
+
+    depth = _max_expr_node_count(model)
+    need = 0 if depth <= 700 else min(4000 + 8 * depth, 1_000_000)
+    return _run_with_deep_recursion(lambda: _build(model, plan), depth_need=need)
+
+
+def _build(model: Model, plan: dict[int, np.ndarray]) -> Recentring:
+    obj = model._objective
+    if obj is None:
         raise RecentreUnsupported("model has no objective")
+    placeholder = bool(getattr(obj, "_is_placeholder", False))
+    has_builder_obj = (
+        model._builder_linear_objective is not None
+        or model._builder_quadratic_objective is not None
+    )
+    if has_builder_obj and not placeholder:
+        raise RecentreUnsupported("an expression objective and a builder objective are both set")
     for con in model._constraints:
         if type(con) is not Constraint:
             raise RecentreUnsupported(f"a {type(con).__name__} row")
-    for attr in ("_piecewise_domains", "_complementarities", "_lowered_complementarities"):
+    for attr in _REFUSED_FIELDS:
         if getattr(model, attr, None):
             raise RecentreUnsupported(f"model carries {attr}")
 
@@ -358,7 +564,7 @@ def recentre(model: Model, ratio: Optional[float] = None) -> Optional[Recentring
         lb, ub = np.asarray(v.lb, dtype=np.float64), np.asarray(v.ub, dtype=np.float64)
         if c is not None:
             c = np.broadcast_to(c, lb.shape).astype(np.float64)
-            lb, ub = lb - c, ub - c
+            lb, ub = shift_bounds(lb, ub, c)
             shifts_by_id[id(v)] = c if v.shape else np.asarray(float(c))
             shifts_by_name[v.name] = shifts_by_id[id(v)]
         shape = v.shape if v.shape else ()
@@ -378,9 +584,15 @@ def recentre(model: Model, ratio: Optional[float] = None) -> Optional[Recentring
         new._constraints.append(
             Constraint(body=rw(con.body), sense=con.sense, rhs=0.0, name=con.name)
         )
-    new._objective = Objective(
-        expression=rw(model._objective.expression), sense=model._objective.sense
-    )
+    for A, x, sense, b, name in model._builder_linear_blocks:
+        c = shifts_by_id.get(id(x))
+        b_new = b if c is None else _translate_rows(A, b, c, f"builder block {name!r}")
+        new.add_linear_constraints(A, var_map[id(x)], sense, b_new, name=name)
+    if placeholder:
+        _translate_builder_objective(model, var_map, shifts_by_id, new)
+    else:
+        new._objective = Objective(expression=rw(obj.expression), sense=obj.sense)
+
     # ``_initial_point`` is keyed ``(var name, flat element) -> value`` (set by
     # ``set_initial_point`` / ``from_nl``); move each entry into the new coordinates.
     new._initial_point = {
@@ -389,22 +601,47 @@ def recentre(model: Model, ratio: Optional[float] = None) -> Optional[Recentring
         else val
         for (name, elem), val in getattr(model, "_initial_point", {}).items()
     }
+    # ``from_gams`` start: ``name -> float`` (whole variable) or ``{flat: float}``.
+    gams_iv = getattr(model, "_gams_initial_values", None)
+    if gams_iv:
+        moved: dict[str, Any] = {}
+        for name, entry in gams_iv.items():
+            c = shifts_by_name.get(name)
+            if c is None:
+                moved[name] = entry
+                continue
+            c_flat = np.ravel(c)
+            if isinstance(entry, dict):
+                moved[name] = {i: float(v) - float(c_flat[int(i)]) for i, v in entry.items()}
+            elif c_flat.size == 1:
+                moved[name] = float(entry) - float(c_flat[0])
+            else:
+                moved[name] = {i: float(entry) - float(c_flat[i]) for i in range(c_flat.size)}
+        new._gams_initial_values = moved  # type: ignore[attr-defined]
     return Recentring(model=new, shifts=shifts_by_name)
 
 
-def solve_recentred(outer: Model, rc: Recentring, solve_args: dict[str, Any]):
+def solve_recentred(outer: Model, rc: Recentring, solve_args: dict[str, Any]) -> SolveResult:
     """Solve ``rc.model`` with ``outer.solve``'s arguments; map the result back.
 
     The inner solve runs the whole ``Model.solve`` pipeline (every route, the
-    convex kernel included). The mapped point is then re-verified against the
-    ORIGINAL model: a certificate is only kept for a point the user's model
-    accepts, so a mapping defect can never publish one.
+    convex kernel included). Whatever its status, a mapped point is then
+    re-verified against the ORIGINAL model with :func:`verify_point`; a point the
+    user's model rejects is withheld exactly as the #772 false-primal guard
+    withholds one (``x=None``, ``objective=None``, ``status="error"``,
+    ``incumbent_verification_failed=True``; the bound is untouched). The derived
+    reports -- ``sensitivity``, the ``validate`` examiner and the LLM explanation
+    -- are switched off for the inner solve; the caller computes them on the
+    ORIGINAL model.
     """
     import dataclasses
 
+    from discopt.modeling.core import _withhold_false_primal
     from discopt.validation.feasibility import verify_point
 
     args = dict(solve_args)
+    for derived in ("llm", "sensitivity", "validate"):
+        args[derived] = False
     init = args.get("initial_solution")
     if init:
         by_name = {getattr(k, "name", k): v for k, v in init.items()}
@@ -414,11 +651,16 @@ def solve_recentred(outer: Model, rc: Recentring, solve_args: dict[str, Any]):
     if ws is not None and ws.x is not None:
         args["warm_start"] = dataclasses.replace(ws, x=rc.to_inner(ws.x))
 
-    rc.model._recentre_inner = True
+    rc.model._recentre_inner = True  # type: ignore[attr-defined]
     result = rc.model.solve(**args)
+    if not isinstance(result, SolveResult):  # the call site excludes streaming solves
+        raise TypeError(f"recentring expected a SolveResult, got {type(result).__name__}")
 
-    if result.x is not None:
-        result.x = rc.to_outer(result.x)
+    outer_names = [v.name for v in outer._variables]
+    if result.x:
+        # Inner-only columns (``_fr_aux_*`` and the like) describe the inner model,
+        # not the user's; only the declared names are mapped back.
+        result.x = rc.to_outer({n: result.x[n] for n in outer_names if n in result.x})
     result._model = outer
     if result.infeasibility_certificate is not None:
         # A row-violation witness of the recentred LP; its rows are the same, but it
@@ -428,18 +670,27 @@ def solve_recentred(outer: Model, rc: Recentring, solve_args: dict[str, Any]):
     result.solver_stats = stats
     stats["recentre/variables_moved"] = float(len(rc.shifts))
 
-    if result.x is not None and result.gap_certified and result.status == "optimal":
-        flat = np.concatenate(
-            [np.ravel(np.asarray(result.x[v.name], dtype=np.float64)) for v in outer._variables]
-        )
-        check = verify_point(outer, flat)
-        if not check.ok:
-            logger.warning(
-                "recentring: the mapped incumbent fails the original model (%s); "
-                "certificate withdrawn",
-                check.reason,
+    if result.x:
+        missing = [n for n in outer_names if n not in result.x]
+        reason: Optional[str]
+        if missing:
+            reason = f"the inner result carries no value for {missing[:3]}"
+        else:
+            flat = np.concatenate(
+                [np.ravel(np.asarray(result.x[n], dtype=np.float64)) for n in outer_names]
             )
-            result.gap_certified = False
-            result.status = "feasible"
+            check = verify_point(outer, flat)
+            reason = None if check.ok else str(check.reason)
+        if reason is not None:
+            logger.error(
+                "recentring: the mapped incumbent fails the original model (%s); "
+                "withholding it (false-primal guard, #772)",
+                reason,
+            )
+            _withhold_false_primal(
+                result,
+                "the incumbent mapped back from the recentred model is infeasible in "
+                f"the original model ({reason}); it was withheld (false-primal guard, #772)",
+            )
             stats["recentre/mapped_point_refused"] = 1.0
     return result
