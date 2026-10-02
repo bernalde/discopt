@@ -264,3 +264,98 @@ def test_solve_logs_structure_cut_abandonment(monkeypatch, caplog):
     assert r.status == "optimal"
     assert r.objective == pytest.approx(2.0, abs=1e-5)
     assert any("structure-cut presolve abandoned" in rec.getMessage() for rec in caplog.records)
+
+
+# --- the factorable lift (one huge constraint) -------------------------------------
+
+
+def _model_snapshot(m) -> tuple:
+    return (
+        [v.name for v in m._variables],
+        [id(c) for c in m._constraints],
+        id(m._objective),
+    )
+
+
+def test_lift_deadline_fires_inside_one_constraint_and_leaves_model_untouched(monkeypatch):
+    """The net is ONE constraint, so the #1456 per-constraint check passes before
+    the lift starts and is never reached again. The clock is made to expire as
+    the lift starts walking the constraint: the reform must notice inside the
+    walk, drop everything built, and hand back the very model it was given."""
+    m, _ = _reduced_space_net(8)
+    before = _model_snapshot(m)
+    armed = [False]
+    consulted_after_arming = [0]
+
+    def deadline():
+        if armed[0]:
+            consulted_after_arming[0] += 1
+        return armed[0]
+
+    real = fr._lift_expr
+
+    def expiring(expr, model, lifter):
+        armed[0] = True  # the clock runs out mid-lift (after the per-constraint check)
+        return real(expr, model, lifter)
+
+    monkeypatch.setattr(fr, "_lift_expr", expiring)
+    out = fr.factorable_reformulate(m, deadline=deadline)
+    assert armed[0], "the lift never started -- the probe fired nothing"
+    assert consulted_after_arming[0] >= 1, "deadline never consulted inside the lift"
+    assert out is m
+    assert _model_snapshot(m) == before
+
+
+def test_lift_with_unexpired_deadline_equals_lift_without_one():
+    """Consulting the clock must not change what the lift builds."""
+    m1, _ = _reduced_space_net(6, seed=1)
+    m2, _ = _reduced_space_net(6, seed=1)
+    a = fr.factorable_reformulate(m1)
+    b = fr.factorable_reformulate(m2, deadline=lambda: False)
+    assert a is not m1 and b is not m2
+    assert [(v.name, float(v.lb), float(v.ub)) for v in a._variables] == [
+        (v.name, float(v.lb), float(v.ub)) for v in b._variables
+    ]
+    assert [str(c.body) for c in a._constraints] == [str(c.body) for c in b._constraints]
+
+
+def test_lift_convexity_gate_runs_once_per_shared_call(monkeypatch):
+    m, body = _reduced_space_net(10)
+    distinct_calls: dict[int, object] = {}
+    stack = [body]
+    while stack:
+        n = stack.pop()
+        if id(n) in distinct_calls:
+            continue
+        distinct_calls[id(n)] = n
+        stack.extend(_children(n))
+    n_calls = sum(1 for n in distinct_calls.values() if isinstance(n, FunctionCall))
+    calls = _count_calls(monkeypatch, fr, "_should_lift_call_arg")
+    out = fr.factorable_reformulate(m)
+    assert out is not m
+    # Aux defining equalities add a few call nodes of their own; the tree has
+    # orders of magnitude more call occurrences than the DAG.
+    assert 0 < calls[0] <= 2 * n_calls, (calls[0], n_calls)
+
+
+def test_call_power_scan_visits_each_shared_node_once(monkeypatch):
+    m, body = _reduced_space_net(12)
+    dag, tree = _dag_and_tree_size(body)
+    calls = _count_calls(monkeypatch, fr, "_scan_for_liftable_call_power")
+    assert fr._scan_for_liftable_call_power(body, m) is False
+    assert 0 < calls[0] <= 4 * dag, (calls[0], dag, tree)
+
+
+def test_expr_node_count_is_the_tree_size_computed_on_the_dag():
+    _, body = _reduced_space_net(12)
+    dag, tree = _dag_and_tree_size(body)
+    assert tree > 10 * dag
+    assert fr._expr_node_count(body) == tree
+
+
+def test_collect_variables_on_shared_dag_equals_unshared():
+    for seed in (0, 1):
+        m, body = _reduced_space_net(5, seed=seed, denom=True)
+        a = g._collect_variables(body)
+        b = g._collect_variables(_unshare(body))
+        assert list(a) == list(b) and [id(v) for v in a.values()] == [id(v) for v in b.values()]

@@ -1905,8 +1905,16 @@ def _collect_variables(expr: Expression) -> dict[str, Variable]:
     ``__eq__`` returning a Constraint).
     """
     found: dict[str, Variable] = {}
+    # #1565: a shared subexpression is walked once. Re-walking it can only
+    # re-assign names already in ``found`` (same name, same Variable), which
+    # changes neither the contents nor the insertion order, so skipping it is
+    # exact. Holding the node keeps its ``id`` from being recycled mid-walk.
+    seen: dict[int, Expression] = {}
 
     def _walk(e: Expression) -> None:
+        if id(e) in seen:
+            return
+        seen[id(e)] = e
         if isinstance(e, Variable):
             found[e.name] = e
         elif isinstance(e, IndexExpression):
