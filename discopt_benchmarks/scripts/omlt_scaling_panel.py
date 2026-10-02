@@ -234,6 +234,16 @@ def main() -> int:
     ap.add_argument("--d", type=int, default=2)
     ap.add_argument("--max-load", type=float, default=1.5)
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--forms",
+        default="relu:bigm,sigmoid:full,sigmoid:reduced",
+        help="comma-separated act:form pairs to run (chunk a long sweep)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="append to --out, skipping (instance, arm) rows it already holds",
+    )
     args = ap.parse_args()
 
     load = os.getloadavg()[0]
@@ -245,6 +255,15 @@ def main() -> int:
 
     rows, disagree, compared = [], 0, 0
 
+    done: set[tuple] = set()
+    if args.resume and args.out and os.path.exists(args.out):
+        with open(args.out) as fh:
+            for row in fh.read().splitlines()[1:]:
+                f = row.split("\t")
+                if len(f) >= 6:
+                    done.add(tuple(f[:6]))
+        print(f"resume: {len(done)} rows already in {args.out}", flush=True)
+
     def emit(line: str, *, first: bool = False) -> None:
         print(line, flush=True)
         if args.out:  # appended line by line so a long run leaves a usable partial file
@@ -253,15 +272,22 @@ def main() -> int:
 
     hdr = (
         "act\tform\twidth\tdepth\tseed\tarm\tstatus\tcert\tobjective\tbound\twall\tvars\tcons\tbins"
+        "\tload"
     )
-    emit(hdr, first=True)
-    for act, form in (("relu", "bigm"), ("sigmoid", "full"), ("sigmoid", "reduced")):
+    if not (args.resume and done):
+        emit(hdr, first=True)
+    pairs = [tuple(p.split(":")) for p in args.forms.split(",")]
+    for act, form in pairs:
         for depth in map(int, args.depths.split(",")):
             for width in map(int, args.widths.split(",")):
                 for seed in range(args.seeds):
                     layers = make_net(args.d, width, depth, act, seed)
                     certs = {}
                     for arm in ARMS:  # interleaved: all arms of one instance back to back
+                        key = (act, form, str(width), str(depth), str(seed), arm)
+                        if key in done:
+                            continue
+                        load = os.getloadavg()[0]  # per row: separates quiet from loaded timings
                         t0 = time.perf_counter()
                         st, obj, bnd, cert, size = solve_arm(
                             arm, layers, args.d, form, args.time_limit
@@ -274,7 +300,7 @@ def main() -> int:
                             f"{act}\t{form}\t{width}\t{depth}\t{seed}\t{arm}\t{st}\t{int(cert)}\t"
                             f"{'' if obj is None else f'{obj:.8g}'}\t"
                             f"{'' if bnd is None else f'{float(bnd):.8g}'}\t{wall:.2f}\t"
-                            f"{nv}\t{nc}\t{nb}"
+                            f"{nv}\t{nc}\t{nb}\t{load:.2f}"
                         )
                         emit(line)
                         rows.append(line)
