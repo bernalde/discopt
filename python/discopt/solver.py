@@ -55,7 +55,7 @@ from discopt.constants import CONSTRAINT_INF as _CONSTRAINT_INF
 from discopt.constants import DEFAULT_VARIABLE_BOUND
 from discopt.constants import INFEASIBILITY_SENTINEL as _INFEASIBILITY_SENTINEL
 from discopt.constants import SENTINEL_THRESHOLD as _SENTINEL_THRESHOLD
-from discopt.constants import STARTING_POINT_CLIP as _SPC
+from discopt.constants import clip_start_box as _clip_start_box
 from discopt.debug import outermost_solve as _debug_outermost_solve
 from discopt.modeling.core import (
     Constant,
@@ -1404,8 +1404,7 @@ def _native_kernel_seed_candidates(model, lb, ub, n_orig, deadline):
 
     lb = np.asarray(lb, dtype=np.float64)
     ub = np.asarray(ub, dtype=np.float64)
-    lb_c = np.clip(lb, -_SPC, _SPC)
-    ub_c = np.clip(ub, -_SPC, _SPC)
+    lb_c, ub_c = _clip_start_box(lb, ub)
     midpoint = 0.5 * (lb_c + ub_c)
 
     # Flat integer positions (scalar-variable covered subset: flat index == var index).
@@ -3675,6 +3674,28 @@ _REFINE_DEGRADE_EPS = 1e-12
 _NLPBB_EXIT_RTOL = 1e-9
 
 
+def _project_onto_declared_box(x, box, int_offsets=(), int_sizes=()):
+    """The nearest point to ``x`` inside the declared ``box`` (#1542), or ``None``.
+
+    Continuous columns are clipped to ``[lb, ub]``. Integer columns are clipped to
+    ``[ceil(lb), floor(ub)]``, the integers the declared box actually admits: a
+    bare clip onto a non-integral bound (``ub = 4.5``) would trade a bound
+    violation for an integrality one. Returns ``None`` when an integer column's
+    box contains no integer -- there is no projection to make then, and the
+    caller's gate decides as before.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    lo = np.array(box[:, 0], dtype=np.float64)
+    hi = np.array(box[:, 1], dtype=np.float64)
+    for off, sz in zip(int_offsets, int_sizes):
+        sl = slice(int(off), int(off) + int(sz))
+        lo[sl] = np.ceil(lo[sl])
+        hi[sl] = np.floor(hi[sl])
+        if np.any(lo[sl] > hi[sl]):
+            return None
+    return np.clip(x, lo, hi)
+
+
 def _nonlinear_point_excess(
     evaluator,
     x,
@@ -3782,10 +3803,18 @@ def _nonlinear_point_excess(
         excess = float(net.max())
         where = f"constraint row {int(net.argmax())}"
     if box_viol.size:
-        net_box = box_viol - rtol * np.abs(x[: box_viol.size])
-        if float(net_box.max()) > excess:
-            excess = float(net_box.max())
-            where = f"bound on x[{int(net_box.argmax())}]"
+        # #1542: a box entry gets NO term-scaled forgiveness. ``x_j - ub_j`` is one
+        # subtraction of two stored doubles -- there is no sum of terms to cancel,
+        # so ``rtol*|x_j|`` forgave noise that does not exist. It forgave real
+        # violations instead, and only on large-magnitude boxes, which made the
+        # gate depend on where the origin sits: at ``|x_j| = 1e6`` it admitted
+        # 1e-3 outside a declared bound, and a RENS incumbent ``9.95e-5`` below
+        # ``c4 >= 1e6`` (POUNCE's default ``bound_relax_factor`` admits
+        # ``1e-8*(1+|b|)`` = 1e-2 there) was certified ``optimal`` 3.95e-4 BELOW
+        # the true optimum of a model that solves exactly in unshifted coordinates.
+        if float(box_viol.max()) > excess:
+            excess = float(box_viol.max())
+            where = f"bound on x[{int(box_viol.argmax())}]"
     return float(excess), where, n_compared
 
 
@@ -4267,8 +4296,7 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
     # feasible regions, causing false infeasibility (issue #6).
     #
     # Clip first: unbounded vars give inf-(-inf)=NaN under unclipped subtract.
-    lb_c = np.clip(lb, -_SPC, _SPC)
-    ub_c = np.clip(ub, -_SPC, _SPC)
+    lb_c, ub_c = _clip_start_box(lb, ub)
     pt_a = lb_c + 0.25 * (ub_c - lb_c)
     pt_b = lb_c + 0.75 * (ub_c - lb_c)
     try:
@@ -4317,8 +4345,8 @@ def _tighten_node_bounds_with_status(evaluator, node_lb, node_ub, cl_list, cu_li
             changed = True
 
         # Evaluate Jacobian at midpoint of current bounds
-        mid = np.clip(lb, -_SPC, _SPC)
-        span = np.clip(ub, -_SPC, _SPC) - mid
+        mid, _mid_hi = _clip_start_box(lb, ub)
+        span = _mid_hi - mid
         mid = mid + 0.5 * span
         try:
             J = evaluator.evaluate_jacobian(mid)  # (m, n)
@@ -4464,8 +4492,7 @@ def _gams_initial_seed(model, node_lb, node_ub):
     iv = getattr(model, "_gams_initial_values", None)
     if not iv:
         return None
-    lb_c = np.clip(node_lb, -_SPC, _SPC)
-    ub_c = np.clip(node_ub, -_SPC, _SPC)
+    lb_c, ub_c = _clip_start_box(node_lb, node_ub)
     x0 = 0.5 * (lb_c + ub_c)
     offset = 0
     found = False
@@ -4515,8 +4542,7 @@ def _generate_starting_points(node_lb, node_ub, n_random=2):
     """
     if n_random is None:
         n_random = _adaptive_root_random_starts(int(np.size(node_lb)))
-    lb_clipped = np.clip(node_lb, -_SPC, _SPC)
-    ub_clipped = np.clip(node_ub, -_SPC, _SPC)
+    lb_clipped, ub_clipped = _clip_start_box(node_lb, node_ub)
     span = ub_clipped - lb_clipped
 
     points = [
@@ -4526,7 +4552,7 @@ def _generate_starting_points(node_lb, node_ub, n_random=2):
     ]
 
     # Near-lower-bound start (small *absolute* offset, not a span fraction).
-    # Half-bounded variables (finite lb, +inf ub) get clipped to ``[lb, _SPC]``,
+    # Half-bounded variables (finite lb, +inf ub) get clipped to ``[lb, STARTING_POINT_CLIP]``,
     # so every span-fraction start (midpoint, quarters, randoms) lands tens of
     # units above the lower bound -- a poor interior-point seed for flows /
     # areas / temperatures whose natural feasible scale is O(1) near their lower
@@ -13209,8 +13235,7 @@ def solve_model(
             # separate, still-JAX dependency of this block — see the module note.
             _tp_ev = _make_evaluator(model)
             _tp_lb, _tp_ub = (np.asarray(b, dtype=np.float64) for b in _tp_ev.variable_bounds)
-            _tp_lo = np.clip(_tp_lb, -_SPC, _SPC)
-            _tp_hi = np.clip(_tp_ub, -_SPC, _SPC)
+            _tp_lo, _tp_hi = _clip_start_box(_tp_lb, _tp_ub)
             _tp_best = None
             for _tp_x in (
                 np.clip(np.zeros_like(_tp_lb), _tp_lb, _tp_ub),  # origin into the box
@@ -16703,8 +16728,7 @@ def solve_model(
                 if _node_remaining <= 0.0:
                     result_ids[i] = int(batch_ids[i])
                     result_lbs[i] = -np.inf
-                    lb_clipped = np.clip(node_lb, -_SPC, _SPC)
-                    ub_clipped = np.clip(node_ub, -_SPC, _SPC)
+                    lb_clipped, ub_clipped = _clip_start_box(node_lb, node_ub)
                     result_sols[i] = 0.5 * (lb_clipped + ub_clipped)
                     result_feas[i] = False
                     # The node stays OPEN at -inf and is floored at its inherited
@@ -16750,8 +16774,7 @@ def solve_model(
                         # Clip parent solution into child's bounds
                         x0 = np.clip(psol_i, node_lb, node_ub)
                     else:
-                        lb_clipped = np.clip(node_lb, -_SPC, _SPC)
-                        ub_clipped = np.clip(node_ub, -_SPC, _SPC)
+                        lb_clipped, ub_clipped = _clip_start_box(node_lb, node_ub)
                         x0 = 0.5 * (lb_clipped + ub_clipped)
                     nlp_result = _solve_node_nlp(
                         _active_evaluator,
@@ -16901,8 +16924,7 @@ def solve_model(
                     result_feas[i] = False
                 else:
                     result_lbs[i] = _INFEASIBILITY_SENTINEL
-                    lb_clipped = np.clip(node_lb, -_SPC, _SPC)
-                    ub_clipped = np.clip(node_ub, -_SPC, _SPC)
+                    lb_clipped, ub_clipped = _clip_start_box(node_lb, node_ub)
                     result_sols[i] = 0.5 * (lb_clipped + ub_clipped)
                     result_feas[i] = False
 
@@ -17175,8 +17197,10 @@ def solve_model(
                 if _narrow_box_branch and _nbb_is_branchable(batch_lb[i], batch_ub[i]):
                     result_lbs[i] = -np.inf
                     result_feas[i] = False
-                    _lbc = np.clip(np.asarray(batch_lb[i], dtype=np.float64), -_SPC, _SPC)
-                    _ubc = np.clip(np.asarray(batch_ub[i], dtype=np.float64), -_SPC, _SPC)
+                    _lbc, _ubc = _clip_start_box(
+                        np.asarray(batch_lb[i], dtype=np.float64),
+                        np.asarray(batch_ub[i], dtype=np.float64),
+                    )
                     result_sols[i] = 0.5 * (_lbc + _ubc)
                     continue
                 _nonrigorous_fathom = True
@@ -17728,8 +17752,7 @@ def solve_model(
             # nominal budget on the expensive-Hessian models. Skipping is sound
             # (primal heuristic).
             if not _cands_sn and iteration == 0 and _root_heur_nlp_entry_ok(evaluator):
-                _lb_c = np.clip(lb, -_SPC, _SPC)
-                _ub_c = np.clip(ub, -_SPC, _SPC)
+                _lb_c, _ub_c = _clip_start_box(lb, ub)
                 _x_seed = 0.5 * (_lb_c + _ub_c)
                 _subnlp_calls += 1
                 _t_sn_mid = time.perf_counter()
@@ -17854,7 +17877,7 @@ def solve_model(
             if _enum_cands:
                 _enum_seed = result_sols[_enum_cands[0][0]]
             else:
-                _enum_seed = 0.5 * (np.clip(lb, -_SPC, _SPC) + np.clip(ub, -_SPC, _SPC))
+                _enum_seed = 0.5 * np.add(*_clip_start_box(lb, ub))
             _enum_stats: dict = {}
             try:
                 _enum_results = enumerate_binary_seeds_subnlp(
@@ -17912,7 +17935,7 @@ def solve_model(
             _cfg_seed = (
                 result_sols[_cfg_cands[0][0]]
                 if _cfg_cands
-                else 0.5 * (np.clip(lb, -_SPC, _SPC) + np.clip(ub, -_SPC, _SPC))
+                else 0.5 * np.add(*_clip_start_box(lb, ub))
             )
             _cfg_stats: dict = {}
             try:
@@ -20469,8 +20492,7 @@ def _solve_continuous(
             python_time=wall_time - jax_time,
         )
     lb, ub = tightened_lb, tightened_ub
-    lb_clipped = np.clip(lb, -_SPC, _SPC)
-    ub_clipped = np.clip(ub, -_SPC, _SPC)
+    lb_clipped, ub_clipped = _clip_start_box(lb, ub)
     if initial_point is not None:
         x0 = np.clip(initial_point, lb, ub)
         logger.info("Using warm-start point for continuous NLP")
@@ -20484,7 +20506,7 @@ def _solve_continuous(
         fully_unbounded = (raw_lb <= -_BOUND_WARN_THRESHOLD) & (raw_ub >= _BOUND_WARN_THRESHOLD)
         x0 = np.where(fully_unbounded, 0.5, x0)
         # On problems with one-sided large bounds (e.g. x >= 1e-5 with no
-        # upper bound), the midpoint of the clipped [-_SPC, _SPC] range
+        # upper bound), the midpoint of the clipped STARTING_POINT_CLIP range
         # lands at ~50, which sends exp/log NLPs into overflow territory
         # and crashes ipopt. Tighten the starting-point range to keep
         # initial iterates in a numerically safe zone while still
@@ -21803,8 +21825,7 @@ def _solve_nlp_bb(
                     if not np.any(np.isnan(psol_i)):
                         x0 = np.clip(psol_i, node_lb, node_ub)
                     else:
-                        lb_c = np.clip(node_lb, -_SPC, _SPC)
-                        ub_c = np.clip(node_ub, -_SPC, _SPC)
+                        lb_c, ub_c = _clip_start_box(node_lb, node_ub)
                         x0 = 0.5 * (lb_c + ub_c)
                     nlp_result = _solve_node_nlp(
                         evaluator,
@@ -21921,8 +21942,7 @@ def _solve_nlp_bb(
                         )
                     ):
                         result_excl[i] = True
-                    lb_c = np.clip(node_lb, -_SPC, _SPC)
-                    ub_c = np.clip(node_ub, -_SPC, _SPC)
+                    lb_c, ub_c = _clip_start_box(node_lb, node_ub)
                     result_sols[i] = 0.5 * (lb_c + ub_c)
                     result_feas[i] = False
 
@@ -22838,6 +22858,18 @@ def _solve_nlp_bb(
         # the declared feasible set has no honest status here — reporting it as
         # ``feasible`` would still publish its objective, and on this path that
         # same number is also the dual bound.
+        #
+        # #1542: one repair IS exact -- projecting onto the declared box. A box
+        # violation is a sub-solver artefact (POUNCE's ``bound_relax_factor``
+        # admits ``1e-8*(1+|b|)``), the projection is the nearest point satisfying
+        # every bound, and integer columns project onto the integers their box
+        # admits (``_project_onto_declared_box``), so it cannot break
+        # integrality. It is attempted ONLY when the point as returned would be
+        # refused -- an incumbent the gate already accepts leaves untouched, so no
+        # solve the gate passed before reports a different point -- and adopted
+        # only when the projected point clears this same gate, rows included. The
+        # objective below is re-evaluated at whichever point leaves, and the
+        # certificate is re-tested downstream.
         _exit_excess, _exit_where, _exit_cmp = _nonlinear_point_excess(
             evaluator,
             sol_flat,
@@ -22846,6 +22878,21 @@ def _solve_nlp_bb(
             n_rows=_declared_rows,
             box=_declared_box,
         )
+        if _exit_excess > _NLPBB_EXIT_ABS_TOL:
+            _box_proj = _project_onto_declared_box(sol_flat, _declared_box, int_offsets, int_sizes)
+            if _box_proj is not None and not np.array_equal(_box_proj, sol_flat):
+                _proj = _nonlinear_point_excess(
+                    evaluator,
+                    _box_proj,
+                    cl_list,
+                    cu_list,
+                    n_rows=_declared_rows,
+                    box=_declared_box,
+                )
+                if _proj[0] <= _NLPBB_EXIT_ABS_TOL:
+                    sol_flat = _box_proj
+                    x_dict = _unpack_solution(model, sol_flat)
+                    _exit_excess, _exit_where, _exit_cmp = _proj
         if _exit_excess > _NLPBB_EXIT_ABS_TOL:
             raise RuntimeError(
                 "NLP-BB returned an infeasible point labeled feasible/optimal: "
@@ -23134,44 +23181,41 @@ def _solve_node_nlp(
     We override variable bounds to use the node-specific bounds
     rather than the global bounds.
     """
-    # Pre-screen: detect trivially infeasible nodes by evaluating constraints
-    # at the midpoint. When the feasible region is very narrow (most variables
-    # pinned) and constraints are violated, NLP solvers like POUNCE can stall
-    # for thousands of iterations instead of quickly returning infeasible.
+    # Pre-screen: a node whose box is a single point needs no NLP -- the point is
+    # the whole box, so evaluating the rows there IS the feasibility question.
+    # NLP solvers like POUNCE can stall for thousands of iterations on such a box
+    # instead of returning infeasible quickly.
+    #
+    # #1542 (review of #1550): this used to fire when all but ONE variable was
+    # "pinned", judged on bounds clipped to ``+-STARTING_POINT_CLIP``, and certified
+    # INFEASIBLE after sampling two points. Two samples of a box with a free
+    # variable are not a proof: with ``(x-5)**2 >= 9`` on ``x in [0, 10]`` both
+    # samples sat at ``x = 5`` and the node was declared empty although ``x = 0``
+    # is feasible. And a clipped box only looks pinned -- ``[-105, -100]`` clips
+    # to the single point ``-100`` -- which is how a feasible shifted MINLP came
+    # back certified ``infeasible``. So it now certifies only when every RAW bound
+    # pair is equal and finite, and judges that point with the NLP-BB exit gate's
+    # own arbiter (``_nonlinear_point_excess``: abs 1e-6 net of term-scaled
+    # noise), so it cannot call a point infeasible that the gate would accept.
     if constraint_bounds is not None and evaluator.n_constraints > 0:
         from discopt.solvers import NLPResult
 
-        x_mid = np.clip(x0, node_lb, node_ub)
-        # Clip first: unbounded vars produce inf-(-inf)=NaN under raw subtract,
-        # which then disables this pre-screen on every node with free vars.
-        lb_c = np.clip(node_lb, -_SPC, _SPC)
-        ub_c = np.clip(node_ub, -_SPC, _SPC)
-        span = ub_c - lb_c
-        n_pinned = np.sum(span < 1e-10)
-        if n_pinned >= len(span) - 1:
-            # Nearly all variables pinned: evaluate constraints at midpoint
+        _pt_lb = np.asarray(node_lb, dtype=np.float64)
+        _pt_ub = np.asarray(node_ub, dtype=np.float64)
+        if _pt_lb.size > 0 and np.all(np.isfinite(_pt_lb)) and np.array_equal(_pt_lb, _pt_ub):
             try:
-                g = evaluator.evaluate_constraints(x_mid)
-                infeasible = False
-                for k, (cl, cu) in enumerate(constraint_bounds):
-                    if g[k] < cl - 1e-6 or g[k] > cu + 1e-6:
-                        infeasible = True
-                        break
-                if infeasible:
-                    # Verify at the bounds midpoint too
-                    x_check = 0.5 * (lb_c + ub_c)
-                    g2 = evaluator.evaluate_constraints(x_check)
-                    still_infeasible = False
-                    for k, (cl, cu) in enumerate(constraint_bounds):
-                        if g2[k] < cl - 1e-6 or g2[k] > cu + 1e-6:
-                            still_infeasible = True
-                            break
-                    if still_infeasible:
-                        return NLPResult(
-                            status=SolveStatus.INFEASIBLE,
-                            x=x_mid,
-                            objective=_INFEASIBILITY_SENTINEL,
-                        )
+                _pt_excess, _, _pt_cmp = _nonlinear_point_excess(
+                    evaluator,
+                    _pt_lb,
+                    [cl for cl, _ in constraint_bounds],
+                    [cu for _, cu in constraint_bounds],
+                )
+                if _pt_cmp > 0 and _pt_excess > _NLPBB_EXIT_ABS_TOL:
+                    return NLPResult(
+                        status=SolveStatus.INFEASIBLE,
+                        x=_pt_lb.copy(),
+                        objective=_INFEASIBILITY_SENTINEL,
+                    )
             except Exception as exc:  # noqa: BLE001 - falls through to the NLP solver
                 # #1520: kept as a sound fallback (the probe only ever declares a
                 # node infeasible; skipping it leaves the NLP to decide).
@@ -23281,8 +23325,9 @@ def _solve_node_nlp_pounce(
             _warn_fallback_once("node NLP (POUNCE)", e, "reporting the node NLP as ERROR")
             return NLPResult(status=SolveStatus.ERROR, x=start, objective=_INFEASIBILITY_SENTINEL)
 
-    lb_c = np.clip(np.asarray(node_lb, dtype=np.float64), -_SPC, _SPC)
-    ub_c = np.clip(np.asarray(node_ub, dtype=np.float64), -_SPC, _SPC)
+    lb_c, ub_c = _clip_start_box(
+        np.asarray(node_lb, dtype=np.float64), np.asarray(node_ub, dtype=np.float64)
+    )
     midpoint = 0.5 * (lb_c + ub_c)
     # Deterministic off-center fallback start (no RNG: determinism by default).
     off_center = lb_c + 0.382 * (ub_c - lb_c)
@@ -23464,8 +23509,10 @@ def _solve_batch_pounce(
             result_lbs = np.full(n_batch, _INFEASIBILITY_SENTINEL, dtype=np.float64)
             result_sols = np.empty((n_batch, n_vars), dtype=np.float64)
             for i in range(n_batch):
-                _lbc = np.clip(np.asarray(batch_lb[i], dtype=np.float64), -_SPC, _SPC)
-                _ubc = np.clip(np.asarray(batch_ub[i], dtype=np.float64), -_SPC, _SPC)
+                _lbc, _ubc = _clip_start_box(
+                    np.asarray(batch_lb[i], dtype=np.float64),
+                    np.asarray(batch_ub[i], dtype=np.float64),
+                )
                 result_sols[i] = 0.5 * (_lbc + _ubc)
             result_feas = np.zeros(n_batch, dtype=bool)
             return result_ids, result_lbs, result_sols, result_feas, np.ones(n_batch, dtype=bool)
@@ -23480,8 +23527,7 @@ def _solve_batch_pounce(
         node_ub = np.asarray(batch_ub[i], dtype=np.float64)
         node_bounds.append((node_lb, node_ub))
 
-        lb_c = np.clip(node_lb, -_SPC, _SPC)
-        ub_c = np.clip(node_ub, -_SPC, _SPC)
+        lb_c, ub_c = _clip_start_box(node_lb, node_ub)
         midpoint = 0.5 * (lb_c + ub_c)
 
         # Warm start: parent solution clipped into child bounds, else midpoint.
@@ -29863,7 +29909,7 @@ def _solve_milp_bb(
             for i in range(n_batch):
                 node_lb = np.array(batch_lb[i])
                 node_ub = np.array(batch_ub[i])
-                _mid = 0.5 * (np.clip(node_lb, -_SPC, _SPC) + np.clip(node_ub, -_SPC, _SPC))
+                _mid = 0.5 * np.add(*_clip_start_box(node_lb, node_ub))
                 out = _node_solve(lp_data, node_lb, node_ub, n_vars, n_orig, t_start, time_limit)
                 if out is not None and out[2] == "optimal":
                     result_lbs[i] = out[0]
@@ -30685,8 +30731,7 @@ def _solve_miqp_bb(
             if lbs[i] < _SENTINEL_THRESHOLD:
                 _maybe_inject_snapped_or_rounded(sols[i], node_lb_i, node_ub_i)
             return
-        lb_c = np.clip(node_lb_i, -_SPC, _SPC)
-        ub_c = np.clip(node_ub_i, -_SPC, _SPC)
+        lb_c, ub_c = _clip_start_box(node_lb_i, node_ub_i)
         sols[i] = 0.5 * (lb_c + ub_c)
         rec = _pounce_recover_node_bound(
             node_lb_i,
@@ -30803,8 +30848,7 @@ def _solve_miqp_bb(
         for i in range(n_batch):
             node_lb = np.array(batch_lb[i])
             node_ub = np.array(batch_ub[i])
-            lb_c = np.clip(node_lb, -_SPC, _SPC)
-            ub_c = np.clip(node_ub, -_SPC, _SPC)
+            lb_c, ub_c = _clip_start_box(node_lb, node_ub)
 
             if infeasible[i]:
                 # POUNCE Phase-1-certified empty box: a sound infeasibility prune.
