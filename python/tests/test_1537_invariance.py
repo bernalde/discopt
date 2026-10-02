@@ -288,31 +288,12 @@ TRANSFORM_GROUPS = {
 #: passes keeps guarding the instance: ``(reason, the exception the failure raises)``.
 #: Re-measured on main after #1548 / #1549 -- see the PR for the run.
 KNOWN_CORPUS: dict = {
-    # #1537 E: the feasibility tolerance is not invariant under the transform. The
-    # published incumbent satisfies the transformed rows within the solver's
-    # tolerance but violates the ORIGINAL row by more than 1e-6: ex14_1_9 by
-    # 9.98e-6 after rows x1e-3 (1e-8 in the solver's units), syn05hfsg row 38 by
-    # 6.73e-6 after a 1e6 shift (identical residual in both coordinates, accepted
-    # by verify_point's scale-aware tolerance there, rejected here). Both results
-    # are otherwise honest; #1548 already lists ex14_1_9 under E.
-    ("ex14_1_9.nl", "rows"): (
-        "#1537 E: absolute row tolerance not scale-invariant",
-        KnownFalseCertificate,
-    ),
-    ("syn05hfsg.nl", "shift"): (
-        "#1537 E: row tolerance depends on the coordinates' magnitudes",
-        KnownFalseCertificate,
-    ),
-    # #1537 E again: after the 1e6 shift the B&B tree accepts an incumbent that
-    # slides along equality row 5 (x1 = 1.00000104, objective 30.9999959 vs 31),
-    # within the shifted row's scale-aware tolerance (|J||x| ~ 1.3e6) and 1.04e-6
-    # over the original's 1e-6. Pre-existing on main: sweeping translate()'s seed
-    # 0..11 at 1e6, main fails seed 8 (row 5, 1.295e-6) and #1542's exact affine
-    # folding, which changes the float path, also fails seed 2 -- the harness's.
-    ("ex1225.nl", "shift"): (
-        "#1537 E: row tolerance depends on the coordinates' magnitudes",
-        KnownFalseCertificate,
-    ),
+    # The three #1537 E cells -- ("ex14_1_9.nl", "rows"), ("syn05hfsg.nl", "shift"),
+    # ("ex1225.nl", "shift") -- were here: each published an incumbent whose row
+    # residual (the solver's working accuracy) passed verify_point's allowance in
+    # the transformed units and failed it in the original's. Fixed by repairing the
+    # published incumbent to float noise (feasibility.repair_point) and re-judging
+    # its certificate on the repaired objective.
 }
 
 

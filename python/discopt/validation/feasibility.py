@@ -949,3 +949,189 @@ def verify_point(
     # that so the returned value is the objective in model units.
     model_obj = -obj_min if model._objective.sense == ObjectiveSense.MAXIMIZE else obj_min
     return VerifyResult(True, float(model_obj))
+
+
+# ── incumbent repair (#1537 E) ────────────────────────────────────────────────
+
+#: Most Newton steps :func:`repair_point` takes. Measured on the three #1537 E
+#: cells: one step takes each residual from 1e-9..7e-6 to float noise.
+REPAIR_MAX_ITER = 8
+#: Per-term round-off coefficient of the noise floor a repaired row is driven to:
+#: 16 ulps of the row's summed term magnitude, the allowance
+#: :func:`improving_gradient_norms` already uses for the same arithmetic.
+REPAIR_NOISE_ULPS = 16.0
+#: Largest dense ``|active rows| x |free columns|`` system the repair will factor.
+#: Above it the repair declines (and says so) rather than stall a solve's exit.
+REPAIR_MAX_DENSE = 4_000_000
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    """What :func:`repair_point` did. ``x`` is ``None`` when it declined, and
+    ``reason`` then says why (for logs and ``solver_stats``, never control flow)."""
+
+    x: Optional[np.ndarray]
+    excess_before: float
+    excess_after: float
+    iterations: int
+    reason: str = ""
+
+
+def _row_senses_and_rhs(evaluator):
+    """``(sense, rhs)`` per flat row, from the evaluator's own row map."""
+    senses: list[str] = []
+    rhs: list[float] = []
+    for start, stop, con in evaluator.constraint_row_map():
+        s = _sense_str(con)
+        if s is None:
+            raise ValueError(f"unknown constraint sense {con.sense!r}")
+        r = float(getattr(con, "rhs", 0.0) or 0.0)
+        senses.extend([s] * (stop - start))
+        rhs.extend([r] * (stop - start))
+    return np.array(senses, dtype=object), np.array(rhs, dtype=np.float64)
+
+
+def _signed_rows(evaluator, x, senses, rhs):
+    """``(residual, violation)``: ``body - rhs`` and the per-row violation (> 0 = violated)."""
+    g = np.asarray(evaluator.evaluate_constraints(x), dtype=np.float64)
+    if g.shape[0] != rhs.shape[0]:
+        raise ValueError(f"evaluator produced {g.shape[0]} rows, map wants {rhs.shape[0]}")
+    r = g - rhs
+    viol = np.where(senses == "<=", r, np.where(senses == ">=", -r, np.abs(r)))
+    return r, viol
+
+
+def _dense_jacobian(evaluator, x):
+    sparse_fn = getattr(evaluator, "evaluate_sparse_jacobian", None)
+    if sparse_fn is not None:
+        return sparse.csr_matrix(sparse_fn(x), dtype=np.float64)
+    return sparse.csr_matrix(np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64))
+
+
+def _noise_floor(J, x, r, rhs):
+    """Per-row float-evaluation noise: ``16 ulp * (sum_j |J_ij x_j| + |body| + |rhs|)``.
+
+    The residual a row can be driven to in float64 at this point, whatever units it
+    is written in: it is covariant with a row rescaling (every term scales) and, under
+    a translation, grows only with the magnitude the arithmetic really carries.
+    """
+    term = np.asarray(abs(J) @ np.abs(x), dtype=np.float64).ravel()
+    return REPAIR_NOISE_ULPS * _EPS * (term + np.abs(r + rhs) + np.abs(rhs))
+
+
+def repair_point(model, x_flat, *, evaluator, variables=None) -> RepairResult:
+    """Project ``x_flat`` onto its own rows, in the units the model is written in (#1537 E).
+
+    Why. :func:`verify_point` allows a row ``ABS_TOL * max(1, |rhs|, max_j |J_ij x_j|)``,
+    and that allowance is not invariant under a change of variables that leaves the
+    model identical: the floor ``1`` does not scale with the row, and ``|x_j|``
+    grows with the distance of the origin. A solver's own iterates carry residuals
+    at its working accuracy (LP feasibility, NLP convergence), and the allowance lets
+    them through as the published incumbent. Measured on the in-repo corpus
+    (``test_1537_invariance.py``): ``ex14_1_9`` with rows x1e-3 certified ``x1 =
+    -9.98e-6`` against a true minimum of ~0 (row violated 9.98e-9 in the solver's
+    units = 9.98e-6 in the original's, allowed 1e-6 in each); ``ex1225`` shifted by
+    ~1e6 certified 30.9999959 against 31 on an equality residual of 2.1e-6 the
+    shifted row's term scale allowed ~1; ``syn05hfsg`` likewise, 6.7e-6. Each is a
+    point the solver's tolerance exploits, and the objective it reports is bought
+    with that exploitation.
+
+    The fix is not a different tolerance -- no fixed absolute allowance can be
+    invariant under row scaling -- but a cleaner point. Newton steps on the rows
+    that are violated beyond float noise (plus every equality row, so a repair
+    cannot break one) move the continuous columns by the minimum-norm correction,
+    with integer columns snapped and frozen and every column clipped into its box.
+    The minimum-norm step is itself invariant under both transforms: a row rescale
+    scales both sides of ``J dx = -r``, a translation changes neither. The result
+    is feasible to float noise in ANY units, so the caller's verdict no longer
+    depends on which coordinates the model was written in.
+
+    Accepted only if no row ends more violated than it began (beyond noise) and the
+    largest violation-beyond-noise strictly falls. The caller must still run
+    :func:`verify_point` on the result and re-evaluate the objective there: this
+    function moves the point, it does not vouch for it.
+
+    ``variables`` is a :func:`declared_variables` snapshot, as in
+    :func:`verify_point`; the evaluator must be built on the same declared model.
+    """
+    if variables is not None:
+        model = _DeclaredModelView(model, variables)
+    x0 = np.asarray(x_flat, dtype=np.float64)
+    if x0.ndim != 1 or not np.all(np.isfinite(x0)):
+        return RepairResult(None, math.inf, math.inf, 0, "point is not a finite 1-D vector")
+    lb = np.concatenate([np.ravel(np.asarray(v.lb, dtype=np.float64)) for v in model._variables])
+    ub = np.concatenate([np.ravel(np.asarray(v.ub, dtype=np.float64)) for v in model._variables])
+    if lb.size != x0.size:
+        return RepairResult(None, math.inf, math.inf, 0, "point does not match the columns")
+    if evaluator.n_constraints <= 0:
+        return RepairResult(None, 0.0, 0.0, 0, "no rows")
+
+    senses, rhs = _row_senses_and_rhs(evaluator)
+    frozen = model_integer_mask(model) | (lb == ub)
+    # E's repair, first half: the point the solver CLAIMS -- integers snapped
+    # (#1380) and every column inside its declared box.
+    x = np.clip(snap_integers(model, x0), lb, ub)
+    r, viol = _signed_rows(evaluator, x, senses, rhs)
+    if not np.all(np.isfinite(r)):
+        return RepairResult(None, math.inf, math.inf, 0, "non-finite residual")
+    J = _dense_jacobian(evaluator, x)
+    noise0 = _noise_floor(J, x, r, rhs)
+    viol0 = viol.copy()
+    excess0 = float(np.max(np.maximum(viol0 - noise0, 0.0), initial=0.0))
+    if excess0 <= 0.0:
+        return RepairResult(None, 0.0, 0.0, 0, "already feasible to float noise")
+
+    active = (senses == "==") | (viol > noise0)
+    best_x, best_excess, it = None, excess0, 0
+    for it in range(1, REPAIR_MAX_ITER + 1):
+        rows = np.nonzero(active)[0]
+        cols = np.nonzero(~frozen)[0]
+        if rows.size == 0 or cols.size == 0:
+            break
+        if rows.size * cols.size > REPAIR_MAX_DENSE:
+            return RepairResult(
+                None, excess0, excess0, it, f"system {rows.size}x{cols.size} too large"
+            )
+        A = J[rows][:, cols].toarray()
+        if not np.all(np.isfinite(A)):
+            break
+        step, *_ = np.linalg.lstsq(A, -r[rows], rcond=None)
+        xn = x.copy()
+        xn[cols] += step
+        hit = (xn < lb) | (xn > ub)
+        xn = np.clip(xn, lb, ub)
+        rn, vn = _signed_rows(evaluator, xn, senses, rhs)
+        if not np.all(np.isfinite(rn)):
+            break
+        Jn = _dense_jacobian(evaluator, xn)
+        noise_n = _noise_floor(Jn, xn, rn, rhs)
+        x, r, viol, J = xn, rn, vn, Jn
+        frozen = frozen | hit
+        active = active | (viol > noise_n)
+        excess = float(np.max(np.maximum(viol - noise_n, 0.0), initial=0.0))
+        # No row may end more violated than it began, beyond either noise floor.
+        no_row_worse = bool(np.all(viol <= np.maximum(viol0, np.maximum(noise0, noise_n))))
+        if no_row_worse and excess < best_excess:
+            best_x, best_excess = x.copy(), excess
+        if excess <= 0.0:
+            break
+    if best_x is None:
+        return RepairResult(None, excess0, excess0, it, "no step reduced the violation")
+    return RepairResult(best_x, excess0, best_excess, it)
+
+
+def incumbent_repair_enabled() -> bool:
+    """``DISCOPT_INCUMBENT_REPAIR`` (#1537 E): repair the published incumbent.
+
+    See :func:`repair_point`. ``=0`` publishes the solver's point unrepaired.
+
+    Default ON from introduction. The §5 panel (2026-10-02, the 66 in-repo
+    MINLPLib instances, 20 s, arms interleaved) was cert-clean: incorrect 0 in
+    both arms, certified 49 -> 49, no certificate lost or gained, 16 incumbents
+    repaired with an objective shift of at most 2.4e-7. ``=0`` is kept as an
+    opt-out for A/B-ing the published point against the solver's raw one, not
+    as a parked graduation.
+    """
+    import os
+
+    return os.environ.get("DISCOPT_INCUMBENT_REPAIR", "1") != "0"
