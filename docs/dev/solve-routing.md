@@ -30,6 +30,14 @@ solve_model(...)                                          [solver.py:2017]
   ├─ stream=True ───────────────────────────► _solve_streaming  (NotImplementedError:
   │                                             no backend yields SolveUpdate yet)
   │
+  ├─ solver="pounce" ──► _solve_pounce_route  (#1533; before ALL presolve/reformulation)
+  │     refuses int/bin vars, GDP/logical constraints, feasibility callbacks
+  │     LP  ──► convex_ipm_pounce.solve_lp  (POUNCE lp-ipm)  → "optimal"
+  │     QP  ──► certify_psd (exact rational LDLᵀ) ──► convex_ipm_pounce.solve_qp
+  │           (POUNCE qp-ipm) → "optimal";  not proved PSD ──► NLP arm
+  │     else──► _solve_continuous(tighten_bounds=False)  (filter line-search IPM, once)
+  │           → "local_optimal" / "local_limit" / "local_infeasible", never a bound
+  │
   ├─ EXPLICIT SOLVER SELECTOR
   │     solver="amp"      ──► solve_amp      (Adaptive Multivariate Partitioning)
   │     solver="gp"       ──► GP detect → log-space convex reformulation → solve
@@ -96,7 +104,7 @@ classify_problem(model)                                   [problem_classifier.py
 
 | Decision | Criterion | Options |
 |---|---|---|
-| solver selector | explicit `solver=` | amp / gp / gp-minlp / bb / auto |
+| solver selector | explicit `solver=` | amp / gp / gp-minlp / bb / pounce / auto |
 | GDP intercept | disjunctions + `gdp_method` | oa / loa / big-m / hull |
 | reformulations | structural detectors | factorable clear/lift; integer-bilinear→MILP (only if *pure*) |
 | classify_problem | obj degree × all-cons-linear × has-int | LP / QP / MILP / MIQP / NLP / MINLP |

@@ -7744,6 +7744,32 @@ class Model:
                 r.bound           # None -- no dual information
                 r.gap_certified   # False -- by design
 
+            Use ``solver="pounce"`` for exactly one POUNCE interior-point solve of
+            the model as written, with no convexity classification, presolve,
+            spatial branch-and-bound or HiGHS fallback (#1533). An LP goes to
+            POUNCE's convex LP IPM (``lp-ipm``) and a QP whose Hessian discopt
+            proves positive semidefinite (an exact rational test) to its
+            ``qp-ipm``; both are convex, so they report ``"optimal"``. Every other
+            continuous model -- a QP not so proved, a QCQP, an NLP -- goes to the
+            filter line-search NLP IPM once and reports ``"local_optimal"`` with
+            no bound and ``gap_certified=False``, since nothing global was
+            proved. ``result.algorithm_route`` names the arm
+            (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``, ``"pounce:nlp"``) and
+            ``result.solver_stats["pounce/iterations"]`` the convex engine's
+            iteration count. A local infeasibility is ``"local_infeasible"``.
+            Integer/binary variables, and an ``nlp_solver`` other than
+            ``"pounce"``, raise ``ValueError``; any other option left at a
+            non-default value is ignored with a warning naming it.
+            Options go in ``pounce_options`` (an alias of ``ipopt_options``)::
+
+                r = m.solve(solver="pounce",
+                            pounce_options={"print_level": 5, "tol": 1e-9})
+
+            The convex LP/QP engine accepts ``tol``, ``max_iter``,
+            ``max_wall_time``, ``print_level`` (any positive value prints its
+            iteration trace), ``tau`` and ``tau_max``; an NLP-engine option such
+            as ``mu_strategy`` on an LP raises rather than being ignored.
+
             Use ``solver="amp"`` to select
             Adaptive Multivariate Partitioning. AMP-specific keyword
             arguments include ``rel_gap``, ``abs_tol``, ``max_iter``,
@@ -8905,6 +8931,13 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
+        # #1533: solver="pounce" never builds a relaxation, so "the relaxation layer
+        # could not bound this objective" would misdescribe it; its missing bound is
+        # the route's contract. Scoped to that route only: every other route keeps
+        # both diagnostics below exactly as before.
+        _no_bound_by_design = isinstance(result, SolveResult) and (
+            result.algorithm_route or ""
+        ).startswith("pounce:")
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a
@@ -8920,6 +8953,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
             and (_poles := _objective_poles_or_none(self))
         ):
             # #1493: a POLE, not a missing envelope. ``min 1/x`` on ``[-5, 5]``
@@ -8948,6 +8982,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
         ):
             _logging.getLogger("discopt.solver").warning(
                 "No valid dual bound was produced for model %r: the relaxation "
