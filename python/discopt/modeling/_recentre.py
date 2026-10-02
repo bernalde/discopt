@@ -71,16 +71,18 @@ class RecentreUnsupported(ValueError):
 
 
 def recentre_enabled() -> bool:
-    """``DISCOPT_RECENTRE`` -- default OFF: a documented opt-out (CLAUDE.md §5).
+    """``DISCOPT_RECENTRE`` -- default OFF; graduation blocked (CLAUDE.md §5).
 
     Graduation panel (``discopt_benchmarks/scripts/recentre_graduation_panel.py``,
     run 2026-10-02 on ``main`` after #1546/#1555, 20 s, 204 comparisons: the corpus
     as written, the corpus under ``x = y - c`` with c ~ 1e3 / 1e6, and the #1537
     generated families): ON vs OFF, false certificates **0 vs 2** (the #1542
     ``polynomial`` 1e6 shift), certified **176 vs 162**, total wall **856 s vs
-    1157 s**, bound-neutral drift 0 of 48 untouched instances. It is NOT the
-    default because it loses three certificates the OFF arm keeps, which §5's
-    no-certification-regression bar forbids:
+    1157 s**, bound-neutral drift 0 of 48 untouched instances. These numbers
+    predate the #1577 review fixes (exact builder-state translation, mapped-point
+    verification); the panel has not been re-run since. BAR 2 (net-positive)
+    passes. BAR 1 fails only on the no-certification-regression clause: ON loses
+    three certificates the OFF arm keeps, so graduation is blocked:
 
     * ``nvs09`` (both shifts): the recentred box is ``[0, 6]``, and the solver is
       translation-sensitive there with this flag OFF too -- the unshifted model
