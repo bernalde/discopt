@@ -18,8 +18,6 @@ left fold is kept, so every node that already reconstructed is byte-identical.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import discopt.modeling as dm
 import numpy as np
 import pytest
@@ -30,8 +28,6 @@ from discopt._relax.canonical_expr import (
 )
 from discopt._relax.dag_compiler import compile_expression
 from discopt.modeling.core import BinaryOp, FunctionCall, UnaryOp
-
-_NL_DIR = Path(__file__).parent / "data" / "minlplib_nl"
 
 
 def _depth(expr) -> int:
@@ -118,26 +114,5 @@ def test_shallow_model_with_wide_sum_certifies():
     assert abs(r.objective) <= 1e-6  # y(1 + sin(s/100)) >= 0, attained at y = 0
 
 
-@pytest.mark.slow
-def test_nvs09_translated_does_not_recurse():
-    """The issue's repro: nvs09 under ``x = y - c`` (seed-1 shifts, c ~ 1e3)."""
-    m = dm.from_nl(str(_NL_DIR / "nvs09.nl"))
-    rng = np.random.default_rng(1)
-    shifts = np.round(rng.choice([-1.0, 1.0], size=10) * 1e3 * rng.uniform(0.5, 1.5, size=10))
-    t = dm.Model("nvs09_shift")
-    ys = [
-        t.integer(f"y{i}", lb=float(v.lb) + s, ub=float(v.ub) + s)
-        for i, (v, s) in enumerate(zip(m._variables, shifts))
-    ]
-    xs = [y - s for y, s in zip(ys, shifts)]
-    obj = 0.0
-    for x in xs:
-        obj = obj + dm.log(x - 2.0) ** 2 + dm.log(10.0 - x) ** 2
-    prod = xs[0]
-    for x in xs[1:]:
-        prod = prod * x
-    t.minimize(obj - prod**0.2)
-    # Must not raise RecursionError. The certificate itself is held back by the
-    # cancellation in the distributed polynomial (#1542/#1543), not by this issue.
-    r = t.solve(time_limit=20)
-    assert r.status in ("optimal", "feasible", "time_limit", "unknown")
+# The issue's own instance (shifted nvs09) is covered end to end, certificate
+# included, by ``test_1544_cancellation_lift.py::test_nvs09_translated_certifies``.
