@@ -1,0 +1,147 @@
+"""Graduation panel for ``DISCOPT_RECENTRE`` (#1537 workstream C; CLAUDE.md §5).
+
+Flag OFF vs ON, interleaved per instance, over:
+
+* **A** the in-repo MINLPLib corpus as written -- the pass must be *bound-neutral*
+  wherever it moves nothing (identical status / objective / bound / node_count);
+* **B** the same corpus under ``x = y - c`` (c ~ 1e3, 1e6) via the invariance
+  harness;
+* **C** the harness's generated families under the same shifts.
+
+Every certificate is compared with the unshifted, flag-OFF certified base, and
+every published incumbent is independently re-verified with ``verify_point`` on
+the model that was solved. Reports, per arm: false certificates, incumbents that
+fail verification, certificates lost relative to the other arm, and total wall.
+Exits non-zero when it compared nothing (CLAUDE.md §6).
+
+    python -u discopt_benchmarks/scripts/recentre_graduation_panel.py [--time-limit 20]
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+import time
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS = os.path.join(HERE, "..", "..", "python", "tests")
+sys.path.insert(0, TESTS)
+
+import discopt  # noqa: E402
+import discopt.modeling as dm  # noqa: E402
+from _invariance import certified_answer_changed, translate  # noqa: E402
+from discopt.validation.feasibility import verify_point  # noqa: E402
+from test_1537_invariance import FAMILIES  # noqa: E402
+
+
+def _solve(model, flag: str, tl: float):
+    os.environ["DISCOPT_RECENTRE"] = flag
+    t0 = time.perf_counter()
+    try:
+        r = model.solve(time_limit=tl)
+        err = None
+    except Exception as exc:  # recorded as an outcome, never hidden
+        r, err = None, f"{type(exc).__name__}: {str(exc)[:80]}"
+    wall = time.perf_counter() - t0
+    bad_point = False
+    if r is not None and r.x is not None and r.status in ("optimal", "feasible"):
+        flat = np.concatenate(
+            [np.ravel(np.asarray(r.x[v.name], dtype=np.float64)) for v in model._variables]
+        )
+        bad_point = not verify_point(model, flat).ok
+    return r, err, wall, bad_point
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--time-limit", type=float, default=20.0)
+    args = ap.parse_args()
+    tl = args.time_limit
+    assert discopt.__file__.startswith(os.path.abspath(os.path.join(HERE, "..", "..", "python")))
+    print(f"discopt from {discopt.__file__}; load {os.getloadavg()}", flush=True)
+
+    corpus = sorted(glob.glob(os.path.join(TESTS, "data", "minlplib_nl", "*.nl")))
+    tally = {
+        arm: {"false": 0, "bad_point": 0, "raised": 0, "cert": 0, "wall": 0.0}
+        for arm in ("0", "1")
+    }
+    lost = {"0": 0, "1": 0}  # certified in the OTHER arm but not this one
+    neutral_checked = neutral_diff = compared = 0
+
+    def record(label, base, model, neutral: bool):
+        nonlocal compared, neutral_checked, neutral_diff
+        out = {}
+        for flag in ("0", "1"):  # interleaved: same instance, back to back
+            r, err, wall, bad = _solve(model, flag, tl)
+            t = tally[flag]
+            t["wall"] += wall
+            if err:
+                t["raised"] += 1
+            if bad:
+                t["bad_point"] += 1
+            if r is not None and r.gap_certified:
+                t["cert"] += 1
+            if r is not None and certified_answer_changed(base, r):
+                t["false"] += 1
+            out[flag] = (r, err)
+        compared += 1
+        r0, r1 = out["0"][0], out["1"][0]
+        c0 = bool(r0 is not None and r0.gap_certified)
+        c1 = bool(r1 is not None and r1.gap_certified)
+        if c0 and not c1:
+            lost["1"] += 1
+        if c1 and not c0:
+            lost["0"] += 1
+        moved = r1 is not None and (r1.solver_stats or {}).get("recentre/variables_moved")
+        note = ""
+        if neutral and not moved and r0 is not None and r1 is not None:
+            neutral_checked += 1
+            same = (r0.status, r0.node_count, r0.objective, r0.bound) == (
+                r1.status, r1.node_count, r1.objective, r1.bound
+            )
+            if not same:
+                neutral_diff += 1
+                note = "  NEUTRALITY DRIFT"
+        def fmt(r, err):
+            return err if err else f"{r.status}/{'C' if r.gap_certified else '-'} n={r.node_count}"
+        print(f"{label:34s} OFF {fmt(*out['0']):28s} ON {fmt(*out['1']):28s}"
+              f"{' moved=' + str(int(moved)) if moved else ''}{note}", flush=True)
+
+    for path in corpus:  # A + B
+        name = os.path.basename(path)
+        m = dm.from_nl(path)
+        os.environ["DISCOPT_RECENTRE"] = "0"
+        try:
+            base = m.solve(time_limit=tl)
+        except Exception as exc:
+            print(f"{name}: base raised {type(exc).__name__}", flush=True)
+            continue
+        record(f"A {name}", base, m, neutral=True)
+        if not base.gap_certified:
+            continue
+        for off, seed in ((1e3, 1), (1e6, 2)):
+            record(f"B {name} shift{off:g}", base, translate(m, off, seed=seed), neutral=False)
+
+    for fam, build in FAMILIES.items():  # C
+        for s in range(4):
+            m = build(s)
+            os.environ["DISCOPT_RECENTRE"] = "0"
+            base = m.solve(time_limit=tl)
+            if not base.gap_certified:
+                continue
+            for off, seed in ((1e3, 1), (1e6, 2)):
+                record(f"C {fam}[{s}] shift{off:g}", base, translate(m, off, seed=seed), False)
+
+    print(f"\nCOMPARED {compared}; bound-neutral checked {neutral_checked}, drifted {neutral_diff}")
+    for flag, t in tally.items():
+        print(f"flag={flag}: false={t['false']} bad_point={t['bad_point']} raised={t['raised']} "
+              f"certified={t['cert']} lost_vs_other={lost[flag]} wall={t['wall']:.0f}s")
+    return 0 if compared else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

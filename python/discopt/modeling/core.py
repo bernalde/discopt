@@ -7916,6 +7916,70 @@ class Model:
         """
         self.validate()
 
+        # --- #1537 C: exact recentring of large-offset variables (default OFF) ---
+        # A box far from the origin is the same model in coordinates ``x = z + c``
+        # but not the same numerics (23/69 certificates lost and 4 false ones under
+        # a 1e6 shift, measured by the invariance harness). The recentred twin is
+        # solved through this same method -- every route, the convex kernel
+        # included -- and the result is mapped back and re-verified against THIS
+        # model. Callbacks see solver coordinates, so a solve with any callback, or
+        # a streaming one, is left unrecentred.
+        from discopt.modeling import _recentre
+
+        if (
+            _recentre.recentre_enabled()
+            and not getattr(self, "_recentre_inner", False)
+            and not stream
+            and lazy_constraints is None
+            and incumbent_callback is None
+            and node_callback is None
+            and cut_callback is None
+        ):
+            try:
+                _rc = _recentre.recentre(self)
+            except _recentre.RecentreUnsupported as exc:
+                import logging as _logging
+
+                _logging.getLogger(__name__).info("recentring skipped: %s", exc)
+                _rc = None
+            if _rc is not None:
+                result = _recentre.solve_recentred(
+                    self,
+                    _rc,
+                    dict(
+                        time_limit=time_limit,
+                        gap_tolerance=gap_tolerance,
+                        abs_gap_tolerance=abs_gap_tolerance,
+                        threads=threads,
+                        llm=llm,
+                        sensitivity=sensitivity,
+                        deterministic=deterministic,
+                        partitions=partitions,
+                        initial_solution=initial_solution,
+                        warm_start=warm_start,
+                        skip_convex_check=skip_convex_check,
+                        nlp_bb=nlp_bb,
+                        solver=solver,
+                        validate=validate,
+                        verify_incumbent=verify_incumbent,
+                        gauss_newton=gauss_newton,
+                        tuning=tuning,
+                        debug=debug,
+                        **kwargs,
+                    ),
+                )
+                # The same tail the unrecentred path runs, on THIS model: the
+                # objective recomputed from the mapped point in the original
+                # coordinates, then the #1313/#1322 solved-point stamp.
+                if result.objective is not None and result.x is not None:
+                    self._reconcile_objective_with_model(result)
+                if result.x is not None:
+                    from discopt._evaluator_cache import solution_state_fingerprint
+
+                    setattr(result, "_problem_fingerprint", solution_state_fingerprint(self))
+                    self._last_solve_result = result
+                return result
+
         # Reject misspelled / unknown solve() keyword arguments loudly (M6).
         # ``**kwargs`` is forwarded verbatim to ``solve_model`` and its backends,
         # which historically only *warned* (or silently swallowed) unknown keys —
