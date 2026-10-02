@@ -276,6 +276,17 @@ fn split(prog: &mut ScalarProgram, root: i64) -> Split {
     }
 }
 
+/// Row permutation `[nonlinear | linear]`, stable within each group: entry `i`
+/// is the index of the row that becomes `.nl` row `i`. A row is nonlinear
+/// exactly when its body is not `n0` (`nonlinear.is_some()`).
+fn nonlinear_first_order(rows: &[Split]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len())
+        .filter(|&r| rows[r].nonlinear.is_some())
+        .collect();
+    order.extend((0..rows.len()).filter(|&r| rows[r].nonlinear.is_none()));
+    order
+}
+
 /// Flat variable slots referenced anywhere under `root`.
 fn vars_under(prog: &ScalarProgram, root: i64, out: &mut BTreeSet<usize>) {
     let mut stack = vec![root];
@@ -444,6 +455,10 @@ fn write_expr(
 ///
 /// Pass `0` for a model with no builder rows (every arena constraint is then an
 /// expression row and the permutation is the identity).
+///
+/// That order is then partitioned `[nonlinear | linear]` (stable), because the
+/// `.nl` header's `nlc` names rows `C0 .. C{nlc-1}` (#1562). The resulting
+/// `.nl` row -> model row map is `export/nl.py::nl_row_order`.
 pub fn write_nl(
     repr: &ModelRepr,
     model_name: &str,
@@ -581,6 +596,24 @@ pub fn write_nl(
         row_source = permuted_source;
     }
 
+    // ── nonlinear rows first (#1562). `rows` is now in the Python writers'
+    //    order; `.nl` additionally requires the `nlc` rows the header declares
+    //    nonlinear to be `C0 .. C{nlc-1}`, with every later row an `n0` body.
+    //    Emitting declaration order while declaring `nlc` named the wrong rows
+    //    as nonlinear whenever a linear row was declared first, and SCIP's
+    //    reader segfaulted on it. Stable
+    //    within each group, on the same `nonlinear.is_some()` predicate the
+    //    header count and the `C` writer use, and identical to
+    //    `export/nl.py::_order_rows_nonlinear_first` (the writers are diffed
+    //    byte for byte).
+    let row_order = nonlinear_first_order(&rows);
+    if row_order.iter().enumerate().any(|(i, &r)| i != r) {
+        let permuted_rows: Vec<Split> = row_order.iter().map(|&r| rows[r].clone()).collect();
+        let permuted_source: Vec<usize> = row_order.iter().map(|&r| row_source[r]).collect();
+        rows = permuted_rows;
+        row_source = permuted_source;
+    }
+
     // ── canonical variable order (see the module docs; issue #210)
     let mut nl_cons: BTreeSet<usize> = BTreeSet::new();
     for row in &rows {
@@ -673,10 +706,17 @@ pub fn write_nl(
     // ── header
     let n_cons = rows.len();
     let n_objs = 1;
-    let n_nl_cons = jac_cols
+    let n_nl_cons = rows.iter().filter(|r| r.nonlinear.is_some()).count();
+    // The rows were ordered nonlinear-first above; a violation here would make
+    // the header name the wrong rows, which is the #1562 defect itself.
+    debug_assert!(rows[..n_nl_cons].iter().all(|r| r.nonlinear.is_some()));
+    // Header line 2 fields 4-5. `ConstraintSense` has no range variant, so
+    // `nranges` is 0; `neqns` used to be a constant 0 as well (#1562), where
+    // AMPL and Pyomo write the true equality count.
+    let n_ranges = 0usize;
+    let n_eqns = row_source
         .iter()
-        .zip(&rows)
-        .filter(|(_, r)| r.nonlinear.is_some())
+        .filter(|&&ci| matches!(repr.constraints[ci].sense, ConstraintSense::Eq))
         .count();
     let n_nl_objs = usize::from(obj_split.nonlinear.is_some());
     let n_jac_nz: usize = jac_cols.iter().map(|c| c.len()).sum();
@@ -685,7 +725,7 @@ pub fn write_nl(
     let mut out = String::with_capacity(64 * (n_cons + n_total) + 256);
     out.push_str(&format!("g3 1 1 0\t# problem {model_name}\n"));
     out.push_str(&format!(
-        " {n_total} {n_cons} {n_objs} 0 0\t# vars, constraints, objectives\n"
+        " {n_total} {n_cons} {n_objs} {n_ranges} {n_eqns}\t# vars, constraints, objectives, ranges, eqns\n"
     ));
     out.push_str(&format!(
         " {n_nl_cons} {n_nl_objs}\t# nonlinear constraints, objectives\n"
@@ -852,6 +892,66 @@ pub fn write_nl(
 
     prog.seal();
     Ok(out)
+}
+
+#[cfg(test)]
+mod row_order_tests {
+    use super::*;
+    use crate::nl_parser::parse_nl;
+
+    /// The pre-#1562 writer's output for "linear row declared first": header
+    /// `nlc = 1`, but `C0` is `n0` and the nonlinear body is `C1`. The parser
+    /// takes rows in file order, so this yields a repr whose FIRST constraint
+    /// is linear -- exactly the arena a user-built model produces.
+    const LIN_FIRST: &str = "g3 1 1 0\n 2 3 1 0 0\n 1 0\n 0 0\n 1 0 0\n 0 0 0 1 0\n \
+0 0 0 0 0\n 6 2\n 0 0\n 0 0 0 0 0\nC0\nn0\nC1\no2\nn-1.0\no2\nv0\nv0\nC2\nn0\n\
+O0 0\nn0\nr\n1 3.0\n1 -2.0\n4 1.0\nb\n0 0.0 4.0\n0 0.0 4.0\nk1\n3\n\
+J0 2\n0 1.0\n1 1.0\nJ1 2\n0 0.0\n1 -1.0\nJ2 2\n0 1.0\n1 -1.0\nG0 2\n0 1.0\n1 2.0\n";
+
+    fn section(text: &str, tag: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.iter().position(|l| *l == tag).expect("section") + 1;
+        lines[start..]
+            .iter()
+            .take_while(|l| !l.starts_with('C') && !l.starts_with('O') && !l.starts_with('b'))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn nonlinear_rows_are_written_first() {
+        let repr = parse_nl(LIN_FIRST).expect("parse");
+        let out = write_nl(&repr, "lin_first", 0, &[]).expect("write");
+        let header: Vec<&str> = out.lines().take(3).collect();
+        // nlc = 1, and the one equality row is counted in `neqns`.
+        assert!(header[1].starts_with(" 2 3 1 0 1\t"), "{}", header[1]);
+        assert!(header[2].starts_with(" 1 0\t"), "{}", header[2]);
+        // C0 is the nonlinear body; C1 and C2 are the linear rows in their
+        // original relative order.
+        assert_eq!(section(&out, "C0")[0], "o2");
+        assert_eq!(section(&out, "C1"), vec!["n0"]);
+        assert_eq!(section(&out, "C2"), vec!["n0"]);
+        // The r section moved with the rows: nonlinear `<= -2`, then `<= 3`,
+        // then `== 1`.
+        let r = section(&out, "r");
+        assert_eq!(&r[..3], &["1 -2.0", "1 3.0", "4 1.0"]);
+        // ...and so did the Jacobian blocks.
+        assert!(
+            out.contains("J0 2\n0 0.0\n1 -1.0\nJ1 2\n0 1.0\n1 1.0\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn order_is_identity_when_already_nonlinear_first() {
+        let repr = parse_nl(LIN_FIRST).expect("parse");
+        let once = write_nl(&repr, "p", 0, &[]).expect("write");
+        let again = write_nl(&parse_nl(&once).expect("reparse"), "p", 0, &[]).expect("write");
+        assert_eq!(
+            once, again,
+            "a nonlinear-first file must round-trip unchanged"
+        );
+    }
 }
 
 #[cfg(test)]
