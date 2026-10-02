@@ -4156,8 +4156,12 @@ class SolveResult:
         * ``report["solution"]``, ``report["problem"]``,
           ``report["fair_metadata"]`` (solver version, timestamps).
 
-        The trajectory matches POUNCE's printed iteration table row for row on
-        the main phase, with two POUNCE-side exceptions (jkitchin/pounce#979): the inner
+        On pounce-solver 0.12.x the trajectory matches POUNCE's printed
+        iteration table row for row on the main phase, with two POUNCE-side
+        exceptions (jkitchin/pounce#979, fixed upstream after 0.12.0, where every
+        row carries ``phase`` -- ``"main"`` or ``"restoration"`` -- the ``r`` rows
+        are included and ``inf_pr`` is the printed column; filter on ``phase``
+        before reading ``"R"`` rows as restoration entries): the inner
         restoration-phase rows (printed as ``24r``, ``25r``, ...) are not in it --
         restoration shows up as the ``"R"`` row and the ``restoration_*`` counts --
         and ``inf_pr`` is POUNCE's internal primal infeasibility on its
