@@ -672,6 +672,24 @@ impl PyModelRepr {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("cannot write .nl: {e}")))
     }
 
+    /// `write_nl`, plus the file's row map: `order[i]` is the model scalar row
+    /// written as `.nl` row `i` (#1562). `export/nl.py::nl_row_order` takes the
+    /// map from here so it describes the file this writer actually produced.
+    #[pyo3(signature = (model_name, initial_point=Vec::new()))]
+    fn write_nl_with_row_order(
+        &self,
+        model_name: &str,
+        initial_point: Vec<(usize, f64)>,
+    ) -> PyResult<(String, Vec<usize>)> {
+        discopt_core::nl_writer::write_nl_with_row_order(
+            &self.inner,
+            model_name,
+            self.n_builder_constraints,
+            &initial_point,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("cannot write .nl: {e}")))
+    }
+
     /// How many leading constraints came from the Rust model builder.
     ///
     /// Exposed so a test can assert the boundary the `.nl` writer reorders on,

@@ -468,6 +468,27 @@ pub fn write_nl(
     // which is what every model that did not come from a `.nl` file wants.
     initial_point: &[(usize, f64)],
 ) -> Result<String, ExpandError> {
+    write_nl_with_row_order(repr, model_name, n_builder_constraints, initial_point)
+        .map(|(text, _)| text)
+}
+
+/// [`write_nl`], also returning the row map of the file it wrote: entry `i` is
+/// the model scalar row written as `.nl` row `i`. Model scalar rows are
+/// numbered in the Python writers' order: the expression rows of
+/// `model._constraints`, row-major, then the builder rows.
+///
+/// `export/nl.py::nl_row_order` returns this for the default writer. The map
+/// has to come from the writer that produced the file. Recomputing it with the
+/// Python writer is only right while both writers classify every row as linear
+/// or nonlinear identically, and they once did not: the PR #1578 review found
+/// Parameter rows classified differently, which silently swapped `.sol` duals
+/// between rows.
+pub fn write_nl_with_row_order(
+    repr: &ModelRepr,
+    model_name: &str,
+    n_builder_constraints: usize,
+    initial_point: &[(usize, f64)],
+) -> Result<(String, Vec<usize>), ExpandError> {
     let mut prog = expand(repr)?;
     prog.unseal();
 
@@ -713,6 +734,11 @@ pub fn write_nl(
     // Header line 2 fields 4-5. `ConstraintSense` has no range variant, so
     // `nranges` is 0; `neqns` used to be a constant 0 as well (#1562), where
     // AMPL and Pyomo write the true equality count.
+    // `export/nl.py::_write_header` counts `btype == 0` rows instead. It never
+    // builds one either, because its bounds come from the same three senses, so
+    // both writers write 0. A range sense added to `ConstraintSense` must be
+    // counted in both places. The byte-diff suite (`test_nl_writer_rust.py`) and
+    // the r-section check in `test_1562_nl_row_order.py` catch a mismatch.
     let n_ranges = 0usize;
     let n_eqns = row_source
         .iter()
@@ -891,7 +917,7 @@ pub fn write_nl(
     }
 
     prog.seal();
-    Ok(out)
+    Ok((out, row_order))
 }
 
 #[cfg(test)]

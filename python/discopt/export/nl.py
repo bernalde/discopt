@@ -207,12 +207,21 @@ def nl_row_order(model: Model) -> np.ndarray:
 
     Model scalar rows are numbered the way the writer decomposes them: each
     entry of ``model._constraints`` expanded row-major (an array body is several
-    rows), followed by the builder rows of ``add_linear_constraints``. Both
-    writers produce this same order -- they are diffed byte for byte -- so the
-    map holds whichever one :func:`to_nl` used.
+    rows), followed by the builder rows of ``add_linear_constraints``.
+
+    The map comes from the same writer :func:`to_nl` dispatches to: the Rust
+    writer, or the Python one when Rust declines or ``DISCOPT_RUST_NL=0``. The
+    writers are diffed byte for byte, but recomputing the map with the Python
+    writer was right only while the two agreed on which rows are nonlinear.
+    The PR #1578 review found Parameter rows where they did not
+    (``p*x + y >= 1`` was linear in Rust and nonlinear in Python), and there the
+    map silently pointed duals at the wrong rows.
     """
     refuse_non_algebraic_relations(model, ".nl")
     model.validate(for_solve=False)
+    written = _rust_nl_write(model, None)
+    if written is not None:
+        return np.asarray(written[1], dtype=np.intp)
     writer = _NLWriter(model)
     writer.write()
     return np.asarray(writer._row_order, dtype=np.intp)
@@ -224,7 +233,18 @@ _RUST_NL_LOG = logging.getLogger(__name__)
 
 
 def _rust_nl_text(model: Model, initial_point: Union[dict, None] = None) -> Optional[str]:
-    """``.nl`` text from the Rust writer, or ``None`` to use the Python writer.
+    """``.nl`` text from the Rust writer, or ``None`` to use the Python writer."""
+    written = _rust_nl_write(model, initial_point)
+    return None if written is None else written[0]
+
+
+def _rust_nl_write(
+    model: Model, initial_point: Union[dict, None] = None
+) -> Optional[tuple[str, list[int]]]:
+    """``(text, row_order)`` from the Rust writer, or ``None`` to use the Python writer.
+
+    ``row_order[i]`` is the model scalar row written as ``.nl`` row ``i``, as
+    :func:`nl_row_order` documents.
 
     Writing ``.nl`` was the entire remaining external-solver performance gap:
     the Python writer below costs **16.05 µs/row of a 16.21 µs/row**
@@ -290,11 +310,13 @@ def _rust_nl_text(model: Model, initial_point: Union[dict, None] = None) -> Opti
             entries.append((offsets[id(var)] + elem, float(value)))
     try:
         repr_ = model_to_repr(model, getattr(model, "_builder", None))
-        # Through a typed local: `write_nl` comes from the PyO3 extension, whose
-        # bindings are untyped, so returning it directly returns `Any` from a
-        # function declared to return `str | None`.
-        text: str = repr_.write_nl(model.name, entries)
-        return text
+        # Through typed locals, because `write_nl_with_row_order` comes from the
+        # PyO3 extension and its bindings are untyped. Returning its result
+        # directly would return `Any` from a function with a declared return type.
+        text: str
+        order: list[int]
+        text, order = repr_.write_nl_with_row_order(model.name, entries)
+        return text, list(order)
     except Exception as exc:  # noqa: BLE001
         # "This model has no arena representation" arrives as several exception
         # types (`TypeError: Unknown expression type`, `ValueError: Unknown
@@ -1028,6 +1050,19 @@ class _NLWriter:
         while stack:
             node, c = stack.pop()
 
+            pval = self._param_const(node)
+            if pval is not None:
+                # A scalar Parameter (or an element of one) is a constant at
+                # export time, exactly as `_write_expr` emits it, and as the Rust
+                # writer's arena sees it (an `OP_CONST`). Treating it as
+                # nonlinear made `p*x + y >= 1` a nonlinear row here and a linear
+                # one in Rust. Each writer then put the row in a different place,
+                # and `nl_row_order` mapped `.sol` duals onto the wrong rows (PR
+                # #1578 review).
+                if pval != 0.0:
+                    const_acc[0] += pval * c
+                continue
+
             if isinstance(node, Constant):
                 val = float(node.value)
                 if val != 0.0:
@@ -1097,6 +1132,30 @@ class _NLWriter:
         # rather than raising in float().
         if isinstance(expr, Constant) and expr.value.ndim == 0:
             return float(expr.value)
+        # A scalar Parameter folds as a coefficient too, matching the Rust
+        # writer's `OP_MUL` fold over an `OP_CONST` operand.
+        return self._param_const(expr)
+
+    @staticmethod
+    def _param_const(expr: Expression) -> float | None:
+        """The export-time value of a scalar Parameter (or a scalar element of one).
+
+        Returns ``None`` for anything else, including a shaped Parameter used
+        without an index. `_write_expr` refuses that case loudly, and it must
+        not be folded here into a single number.
+        """
+        if isinstance(expr, Parameter):
+            val = np.asarray(expr.value)
+            if val.shape in ((), (1,)):
+                return float(val.reshape(-1)[0])
+            return None
+        if isinstance(expr, IndexExpression) and isinstance(expr.base, Parameter):
+            try:
+                elem = np.asarray(np.asarray(expr.base.value)[expr.index])
+            except (IndexError, TypeError):
+                return None
+            if elem.ndim == 0:
+                return float(elem)
         return None
 
     def _resolve_var_index(self, expr: IndexExpression) -> int | None:
@@ -1142,6 +1201,9 @@ class _NLWriter:
         # Header line 2 fields 4-5: range and equality row counts. ``neqns`` used
         # to be a constant ``0`` (#1562); AMPL and Pyomo write the true counts,
         # and a reader may size its equality bookkeeping from them.
+        # No path here builds a ``btype == 0`` row today, and the Rust writer
+        # hard-codes ``n_ranges = 0`` (``nl_writer.rs``, which has no range
+        # sense). Adding range rows means counting them in both writers.
         n_ranges = sum(1 for btype, _lb, _ub in self._con_bounds if btype == 0)
         n_eqns = sum(1 for btype, _lb, _ub in self._con_bounds if btype == 4)
         n_nl_objs = 1 if self._obj_nonlinear is not None else 0

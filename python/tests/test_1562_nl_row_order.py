@@ -77,10 +77,35 @@ def _mixed_with_builder_rows() -> dm.Model:
     return m
 
 
+def _parameter_rows() -> dm.Model:
+    """Parameter rows that are LINEAR at export time (PR #1578 review).
+
+    A Parameter is a constant in the file, so ``p*x + y >= 1`` and
+    ``x + y >= p`` are ``n0`` rows. The Python writer used to call them
+    nonlinear while Rust (the default) called them linear. Since the
+    nonlinear-first reorder, that gave the two writers different row orders,
+    and ``nl_row_order`` (computed by Python) mapped the default file's rows,
+    and so its duals, onto the wrong constraints.
+    """
+    m = dm.Model("parameter_rows")
+    x = m.continuous("x", lb=0.5, ub=2)
+    y = m.continuous("y", lb=0.5, ub=2)
+    p = m.parameter("p", value=2.0)
+    q = m.parameter("q", value=np.array([1.5, -3.0]))
+    m.subject_to(x + y <= 3, name="lin")
+    m.subject_to(p * x + y >= 1, name="param_coeff")
+    m.subject_to(x * x + y >= 1, name="nl")
+    m.subject_to(x + y >= p, name="param_rhs")
+    m.subject_to(q[0] * (x + y) + q[1] <= 4, name="param_index")
+    m.minimize(x + y)
+    return m
+
+
 MODELS = {
     "lin_first": _lin_first,
     "sigmoid_layer": _sigmoid_layer,
     "mixed_builder": _mixed_with_builder_rows,
+    "parameter_rows": _parameter_rows,
 }
 
 
@@ -336,3 +361,55 @@ def test_block_structure_rows_follow_the_nl_row_order(tmp_path):
     assert bodies[0] != ["n0"] and bodies[1] == ["n0"]  # .nl row 0 is the nonlinear one
     # .nl row 0 is `r_nl_block0`, row 1 is `r_lin_block1`.
     assert con_labels == [0, 1]
+
+
+# ── 6. nl_row_order describes the file the DEFAULT writer wrote (#1578 review) ─
+
+
+def test_review_repro_parameter_row_is_linear_and_unmoved(tmp_path, monkeypatch):
+    """The reviewer's exact repro: on main this returned ``[1, 0]`` for a file
+    the Rust writer had written in identity order, swapping the two rows' duals.
+    """
+    monkeypatch.delenv("DISCOPT_RUST_NL", raising=False)
+    m = dm.Model("pl")
+    x = m.continuous("x", lb=0.5, ub=2)
+    y = m.continuous("y", lb=0.5, ub=2)
+    m.subject_to(x + y <= 3, name="lin")
+    p = m.parameter("p", value=2.0)
+    m.subject_to(p * x + y >= 1, name="param_row")
+    m.minimize(x + y)
+    path = tmp_path / "pl.nl"
+    m.to_nl(str(path))
+    text = path.read_text()
+    (nlc, *_rest), bodies, r_lines = _parse(text)
+    assert nlc == 0 and bodies == [["n0"], ["n0"]]
+    assert nl_row_order(m).tolist() == [0, 1]
+    # .nl row 0 is `x + y <= 3`. Row 1 is `p*x + y >= 1`, which discopt stores
+    # as `1 - (p*x + y) <= 0`, so its bound is -1.
+    assert r_lines == ["1 3.0", "1 -1.0"]
+    # The forced Python writer writes the same file, so the same map holds.
+    monkeypatch.setenv("DISCOPT_RUST_NL", "0")
+    assert m.to_nl() == text
+    assert nl_row_order(m).tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("name", sorted(MODELS))
+def test_nl_row_order_is_the_running_writers_own_map(name, monkeypatch):
+    """Default route -> the Rust writer's map; ``DISCOPT_RUST_NL=0`` -> Python's.
+
+    Both must also be the same map, because the two files are byte-identical.
+    """
+    from discopt.export.nl import _rust_nl_write
+
+    model = MODELS[name]()
+    monkeypatch.delenv("DISCOPT_RUST_NL", raising=False)
+    written = _rust_nl_write(model, None)
+    assert written is not None, "the Rust writer declined -- this case proves nothing"
+    default = nl_row_order(model).tolist()
+    assert default == written[1]
+    monkeypatch.setenv("DISCOPT_RUST_NL", "0")
+    forced = nl_row_order(model).tolist()
+    writer = _NLWriter(model)
+    writer.write()
+    assert forced == writer._row_order
+    assert default == forced

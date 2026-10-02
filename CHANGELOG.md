@@ -114,6 +114,11 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **`to_nl` writes the nonlinear rows first, as the `.nl` format requires** (`fix`, #1562).
+  - **The bug.** The header's `nlc` names rows `C0 .. C{nlc-1}` as nonlinear, but both writers emitted rows in declaration order. A linear row declared before a nonlinear one therefore produced a file whose header named the wrong rows, and pyscipopt's reader segfaulted on it. Both writers now write `[nonlinear | linear]`, stable within each group, as Pyomo does.
+  - **Header.** Line 2 now carries the true `neqns` count; it was always written as `0`.
+  - **New `discopt.export.nl_row_order(model)`.** **Behaviour change:** `.nl` row `i` is no longer model row `i`. Use this function to map a reader's per-row output (`.sol` duals, constraint activities) back to the model. The map comes from the writer `to_nl` actually used.
+  - **Parameters.** The Python writer now folds a scalar Parameter (or an element of one) as a constant, as the Rust writer always did. A row such as `p*x + y >= 1` is therefore linear in both writers, and the two stay byte-identical.
 - **Source residual reports now evaluate active indicator constraints** (`fix`, #1529). A Boolean-active implication reports its wrapped-row violation, an inactive implication reports zero, and fractional selectors remain a separate integrality failure; GDP/MPEC reports no longer become unmeasurable merely because their source model contains explicit one-way indicator rows. Non-binary indicator selectors are refused because the separate binary-integrality check does not cover them.
 - **Exact MPEC warm starts now lift generated operand auxiliaries** (`fix`, #1528). `solve_mpec(..., method="sos1"|"gdp", initial_solution=...)` evaluates every generated continuous operand auxiliary at the source point before handing the model to the exact solve, instead of midpoint-filling those columns and silently discarding a source-feasible incumbent. Failed lifts retain caller values and successful auxiliary lifts, and clamping/rounding warnings are emitted only once.
 
