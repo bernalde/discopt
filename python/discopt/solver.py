@@ -10082,8 +10082,9 @@ def solve_model(
     solver : str or None, default None
         Optional global-solver selector. Use ``"pounce"`` for exactly one POUNCE
         interior-point solve of the model as written (#1533): an LP goes to
-        POUNCE's convex LP IPM (``lp-ipm``), a QP with a positive-semidefinite
-        Hessian to its ``qp-ipm``, and every other continuous model to the filter
+        POUNCE's convex LP IPM (``lp-ipm``), a QP whose Hessian discopt proves
+        positive semidefinite (an exact rational test) to its ``qp-ipm``, and every
+        other continuous model -- including a QP not so proved -- to the filter
         line-search NLP IPM. No convexity classification, presolve, bound
         tightening, spatial B&B or HiGHS fallback runs. An LP or convex QP is
         reported ``"optimal"``; the NLP arm makes no global claim and reports
@@ -10091,7 +10092,9 @@ def solve_model(
         bound, even for a model that happens to be convex. The arm taken is in
         ``SolveResult.algorithm_route`` (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``,
         ``"pounce:nlp"``). Integer or binary variables, and logical/disjunctive
-        constraints, raise ``ValueError``. Use ``"amp"`` to dispatch to
+        constraints, raise ``ValueError``, as does an ``nlp_solver`` other than
+        ``"pounce"``; any other option left at a non-default value is ignored
+        with a warning naming it. Use ``"amp"`` to dispatch to
         Adaptive Multivariate Partitioning instead of branch-and-bound.
         Use ``"gurobi"`` to dispatch LP, MILP, QP, MIQP, QCP, QCQP, MIQCP,
         and MIQCQP models to the optional Gurobi backend. General NLP/MINLP
@@ -10355,28 +10358,7 @@ def solve_model(
                 f"solver='pounce' got unsupported options {sorted(kwargs)}; pass "
                 "POUNCE settings through pounce_options."
             )
-        _pounce_ignored = [
-            name
-            for name, differs in (
-                ("threads", threads != 1),
-                ("batch_size", batch_size != 16),
-                ("strategy", strategy != "best_first"),
-                ("max_nodes", max_nodes != 100_000),
-                ("partitions", partitions != 0),
-                ("cutting_planes", cutting_planes is not False),
-                ("psd_cuts", psd_cuts is not False),
-                ("rlt_cuts", rlt_cuts is not False),
-                ("mccormick_bounds", mccormick_bounds != "auto"),
-                ("decomposition", decomposition is not None),
-                ("lagrangian_bound", lagrangian_bound is not False),
-                ("nlp_bb", nlp_bb is not None),
-                ("node_callback", node_callback is not None),
-                ("cut_callback", cut_callback is not None),
-                ("gap_tolerance", gap_tolerance != 1e-4),
-                ("abs_gap_tolerance", abs_gap_tolerance is not None),
-            )
-            if differs
-        ]
+        _pounce_ignored = _pounce_route_ignored(locals())
         return _solve_pounce_route(
             model,
             time_limit=time_limit,
@@ -20149,6 +20131,7 @@ def _solve_continuous(
     gap_tolerance: float = 1e-6,
     certify_convex: bool = False,
     tighten_bounds: bool = True,
+    raw_status_out: Optional[list] = None,
 ) -> SolveResult:
     """Solve a purely continuous model directly with NLP solver (no B&B).
 
@@ -20156,7 +20139,8 @@ def _solve_continuous(
     nonlinear bound tightening (and the infeasibility proof it can return). Only
     ``solver="pounce"`` passes it (#1533): that route promises one interior-point
     solve of the model as written, and a box the solver tightened first changes
-    the iterates a reader of the log is studying.
+    the iterates a reader of the log is studying. ``raw_status_out``, when a list
+    is passed, receives the NLP backend's own return code (Ipopt numbering).
 
     ``warm_start`` is the dual half of ``Model.solve(warm_start=...)`` (#1247):
     ``{"x", "constraint_duals", "bound_duals_lower", "bound_duals_upper",
@@ -20300,6 +20284,8 @@ def _solve_continuous(
             backend_evaluator, x0, constraint_bounds=constraint_bounds, options=opts
         )
     jax_time += time.perf_counter() - t_jax_start
+    if raw_status_out is not None:
+        raw_status_out.append(nlp_result.raw_status)
 
     wall_time = time.perf_counter() - t_start
     python_time = wall_time - jax_time
@@ -20566,6 +20552,50 @@ POUNCE_ROUTE_LP = "pounce:lp-ipm"
 POUNCE_ROUTE_QP = "pounce:qp-ipm"
 POUNCE_ROUTE_NLP = "pounce:nlp"
 
+#: Ipopt's ``Infeasible_Problem_Detected``: the NLP converged to a point of
+#: locally minimal infeasibility.
+_IPOPT_INFEASIBLE_PROBLEM = 2
+
+#: ``solve_model`` parameters ``solver="pounce"`` honours (#1533). Every other
+#: parameter left at a non-default value is reported as ignored, so the list of
+#: ignored options cannot fall behind the signature.
+_POUNCE_ROUTE_HONOURED = frozenset(
+    {
+        "model",
+        "time_limit",
+        "ipopt_options",
+        "pounce_options",
+        "nlp_solver",
+        "initial_point",
+        "warm_start",
+        "lazy_constraints",
+        "incumbent_callback",
+        "solver",
+        "kwargs",
+    }
+)
+
+
+def _pounce_route_ignored(values: Mapping[str, Any]) -> list[str]:
+    """The ``solve_model`` parameters set to non-default values that the route ignores."""
+    import inspect
+
+    ignored = []
+    for name, param in inspect.signature(solve_model).parameters.items():
+        if name in _POUNCE_ROUTE_HONOURED or name not in values:
+            continue
+        val, default = values[name], param.default
+        if val is default:
+            continue
+        try:
+            same = type(val) is type(default) and bool(val == default)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            ignored.append(name)
+    return ignored
+
+
 #: The statuses a ``solver="pounce"`` result may carry a dual bound under.
 _POUNCE_ROUTE_CERTIFIED = frozenset({"optimal", "infeasible", "unbounded"})
 
@@ -20619,9 +20649,15 @@ def _solve_pounce_route(
 
     * **LP** -> POUNCE's convex LP interior-point method (``lp-ipm``,
       :mod:`discopt.solvers.convex_ipm_pounce`);
-    * **QP** with a PSD Hessian -> the same engine's ``qp-ipm``;
-    * everything else continuous -- a QP POUNCE finds indefinite, a QCQP, an NLP
-      -> the filter line-search NLP interior-point method, once.
+    * **QP** whose Hessian :func:`convex_ipm_pounce.certify_psd` proves PSD ->
+      the same engine's ``qp-ipm``;
+    * everything else continuous -- a QP not proved PSD, a QCQP, an NLP -> the
+      filter line-search NLP interior-point method, once.
+
+    Convexity of a QP is proved by discopt, not taken from POUNCE's own PSD check:
+    that check scales its tolerance by ``max|Q_ij|`` and ignores the box, so it
+    admits ``-1e-9 x**2 + y**2`` on ``x in [-1e4, 1e4]``, where the convex IPM stops
+    at a saddle that the route would then certify (#1533 review).
 
     No convexity classification, presolve, bound tightening, spatial B&B, or
     HiGHS/simplex fallback. An LP or PSD QP is convex, so its KKT point is a
@@ -20647,11 +20683,13 @@ def _solve_pounce_route(
         _feasibility_callback_names(lazy_constraints, incumbent_callback),
         "it is a single local interior-point solve with no hook that screens candidate points.",
     )
-    if nlp_solver not in ("pounce", "ipm", "sparse_ipm"):
+    if nlp_solver != "pounce":
+        # #1533 review: ``"ipm"``/``"sparse_ipm"`` were accepted and then replaced by
+        # ``"pounce"`` -- an accepted value with no effect. Only one value is honoured.
         raise ValueError(
-            f"solver='pounce' runs POUNCE's interior-point methods, but "
-            f"nlp_solver={nlp_solver!r} names a different engine. Drop nlp_solver, "
-            f"or drop solver='pounce'."
+            f"solver='pounce' always runs POUNCE's interior-point methods, but "
+            f"nlp_solver={nlp_solver!r} was passed. Drop nlp_solver, or drop "
+            f"solver='pounce'."
         )
     discrete = [v.name for v in model._variables if v.var_type in (VarType.BINARY, VarType.INTEGER)]
     if discrete:
@@ -20771,6 +20809,7 @@ def _solve_pounce_route(
             return result
 
     # NLP arm: the filter line-search IPM, once, over the declared box.
+    raw_status: list = []
     result = _solve_continuous(
         model,
         _remaining(),
@@ -20780,14 +20819,19 @@ def _solve_pounce_route(
         initial_point=initial_point,
         warm_start=warm_start,
         tighten_bounds=False,
+        raw_status_out=raw_status,
     )
     result.wall_time = time.perf_counter() - t_start
     if result.status == "optimal":
         result.status = "local_optimal"
-    elif result.status == "infeasible":
-        # The NLP engine converged to a point of locally minimal infeasibility.
-        # On a nonconvex model that is not a proof.
+    elif result.status == "infeasible" or (
+        result.status == "error" and raw_status and raw_status[0] == _IPOPT_INFEASIBLE_PROBLEM
+    ):
+        # The NLP engine converged to a point of locally minimal infeasibility
+        # (Ipopt code 2, which the backend reports as ``error``). On a nonconvex
+        # model that is not a proof, so the claim is the local one.
         result.status = "local_infeasible"
+        result.error = None
     elif result.status == "iteration_limit" and result.x:
         result.status = "local_limit"
     elif result.status == "unbounded":

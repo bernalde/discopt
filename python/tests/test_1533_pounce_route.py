@@ -257,3 +257,92 @@ def test_unbounded_over_the_default_box_is_not_certified():
     res = m.solve(solver="pounce")
     assert res.status == "error"
     assert "9.999e19" in res.error
+
+
+# ── #1539 review ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.smoke
+def test_slightly_indefinite_qp_is_not_certified():
+    """Review blocker: POUNCE's PSD tolerance (1e-8 * max|P|) admits this Hessian,
+    and the convex IPM stops at the saddle x=0, which used to be certified optimal
+    (objective 0) on a problem whose optimum is -0.1."""
+    m = dm.Model("saddle")
+    x = m.continuous("x", lb=-1e4, ub=1e4)
+    y = m.continuous("y", lb=-1, ub=1)
+    m.minimize(-1e-9 * x**2 + y**2)
+    res = m.solve(solver="pounce")
+    assert res.algorithm_route == "pounce:nlp"
+    assert res.status != "optimal"
+    assert res.bound is None and not res.gap_certified
+
+
+def test_certify_psd_is_exact_on_small_matrices():
+    from discopt.solvers.convex_ipm_pounce import certify_psd
+
+    cases = [
+        (np.diag([-2e-9, 2.0]), False),  # the review's Hessian
+        (np.diag([0.0, 2.0]), True),  # a variable that appears only linearly
+        (np.array([[1.0, -1.0], [-1.0, 1.0]]), True),  # (x - y)**2, singular PSD
+        (np.array([[1.0, 1.0], [1.0, 1.0 - 1e-15]]), False),  # det < 0 by 1e-15
+        (np.array([[0.0, 1.0], [1.0, 0.0]]), False),  # x*y
+        (np.array([[1.0, 0.0], [0.0, np.nan]]), False),
+    ]
+    for Q, expected in cases:
+        assert certify_psd(Q) is expected, Q
+    assert len(cases) == 6
+
+
+def test_certify_psd_eigen_fallback_above_the_exact_cap():
+    from discopt.solvers import convex_ipm_pounce as cvx
+
+    n = cvx._EXACT_PSD_MAX_N + 10
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((n, n))
+    pd = A.T @ A + np.eye(n)
+    assert cvx.certify_psd(pd) is True
+    bad = pd.copy()
+    bad[0, 0] = -1e-6  # a tiny negative diagonal makes it indefinite
+    assert cvx.certify_psd(bad) is False
+
+
+def test_local_infeasibility_is_local_infeasible_not_error():
+    m = dm.Model("noroom")
+    x = m.continuous("x", lb=-1, ub=1)
+    m.minimize(x)
+    m.subject_to(x**2 >= 4)
+    res = m.solve(solver="pounce")
+    assert res.status == "local_infeasible"
+    assert res.bound is None and not res.gap_certified
+
+
+@pytest.mark.parametrize("nlp_solver", ["ipm", "sparse_ipm", "ipopt"])
+def test_other_nlp_solver_values_are_refused(nlp_solver):
+    with pytest.raises(ValueError, match="nlp_solver"):
+        _lp().solve(solver="pounce", nlp_solver=nlp_solver)
+
+
+def test_every_ignored_option_is_named():
+    with pytest.warns(UserWarning, match="ignores.*skip_convex_check") as rec:
+        _lp().solve(solver="pounce", skip_convex_check=True, presolve=False)
+    msg = " ".join(str(w.message) for w in rec)
+    assert "presolve" in msg
+
+
+def test_a_plain_call_warns_about_nothing():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        _lp().solve(solver="pounce")
+    assert not [w for w in rec if "solver='pounce' ignores" in str(w.message)]
+
+
+def test_ignored_option_table_tracks_the_signature():
+    import inspect
+
+    from discopt.solver import _POUNCE_ROUTE_HONOURED, solve_model
+
+    params = set(inspect.signature(solve_model).parameters)
+    assert _POUNCE_ROUTE_HONOURED <= params
+    assert len(params - _POUNCE_ROUTE_HONOURED) >= 40

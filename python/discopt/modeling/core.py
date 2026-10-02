@@ -7656,15 +7656,19 @@ class Model:
             Use ``solver="pounce"`` for exactly one POUNCE interior-point solve of
             the model as written, with no convexity classification, presolve,
             spatial branch-and-bound or HiGHS fallback (#1533). An LP goes to
-            POUNCE's convex LP IPM (``lp-ipm``) and a QP with a PSD Hessian to its
+            POUNCE's convex LP IPM (``lp-ipm``) and a QP whose Hessian discopt
+            proves positive semidefinite (an exact rational test) to its
             ``qp-ipm``; both are convex, so they report ``"optimal"``. Every other
-            continuous model -- an indefinite QP, a QCQP, an NLP -- goes to the
+            continuous model -- a QP not so proved, a QCQP, an NLP -- goes to the
             filter line-search NLP IPM once and reports ``"local_optimal"`` with
             no bound and ``gap_certified=False``, since nothing global was
             proved. ``result.algorithm_route`` names the arm
             (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``, ``"pounce:nlp"``) and
             ``result.solver_stats["pounce/iterations"]`` the convex engine's
-            iteration count. Integer/binary variables raise ``ValueError``.
+            iteration count. A local infeasibility is ``"local_infeasible"``.
+            Integer/binary variables, and an ``nlp_solver`` other than
+            ``"pounce"``, raise ``ValueError``; any other option left at a
+            non-default value is ignored with a warning naming it.
             Options go in ``pounce_options`` (an alias of ``ipopt_options``)::
 
                 r = m.solve(solver="pounce",
@@ -8836,14 +8840,13 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
-        # #1533: a local status never carries a bound, and solver="pounce" never
-        # builds a relaxation, so "the relaxation layer could not bound this
-        # objective" would misdescribe both. Their missing bound is the contract.
-        from discopt.status import is_local_status as _is_local_status
-
+        # #1533: solver="pounce" never builds a relaxation, so "the relaxation layer
+        # could not bound this objective" would misdescribe it; its missing bound is
+        # the route's contract. Scoped to that route only: every other route keeps
+        # both diagnostics below exactly as before.
         _no_bound_by_design = isinstance(result, SolveResult) and (
-            _is_local_status(result.status) or (result.algorithm_route or "").startswith("pounce:")
-        )
+            result.algorithm_route or ""
+        ).startswith("pounce:")
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a

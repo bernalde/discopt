@@ -73,12 +73,88 @@ CONVEX_OPTION_KEYS: frozenset[str] = frozenset(
 
 
 class IndefiniteQPError(ValueError):
-    """The QP's Hessian is not positive semidefinite, so the convex IPM refuses it.
+    """The QP's Hessian was not PROVED positive semidefinite.
 
-    POUNCE's own PSD check decides this, before any iteration runs. The
-    ``solver="pounce"`` route catches it and solves the QP with the NLP engine
-    instead, reporting a local result.
+    Raised by :func:`solve_qp` when :func:`certify_psd` cannot prove ``Q`` PSD, and
+    when POUNCE's own PSD check refuses it. The ``solver="pounce"`` route catches it
+    and solves the QP with the NLP engine instead, reporting a local result.
     """
+
+
+#: Largest number of quadratically-active variables decided by the exact
+#: rational test in :func:`certify_psd`. Rational entries grow during elimination,
+#: so the cost is steep: measured on dense random ``A'A``, 0.16 s at n=30, 3.3 s at
+#: 60, 228 s at 150. Above it the eigenvalue test with a roundoff margin decides,
+#: which may decline a singular PSD matrix (sound: the QP then gets a local answer,
+#: never a false ``optimal``).
+_EXACT_PSD_MAX_N = 30
+
+#: Above this many quadratically-active variables the dense eigenvalue test is not
+#: run at all and the Hessian counts as unproved (the QP goes to the NLP arm).
+_EIG_PSD_MAX_N = 4000
+
+
+def _exact_psd(Q: np.ndarray) -> bool:
+    """Decide ``Q`` PSD exactly, by symmetric elimination over the rationals.
+
+    Every float is a dyadic rational, so ``Fraction`` represents ``Q`` exactly and
+    the verdict carries no tolerance. A symmetric matrix is PSD iff elimination on a
+    positive pivot leaves a PSD Schur complement; a negative diagonal, or a zero
+    diagonal whose row is not zero, refutes it.
+    """
+    from fractions import Fraction
+
+    A = [[Fraction(float(v)) for v in row] for row in Q]
+    while A:
+        n = len(A)
+        if any(A[i][i] < 0 for i in range(n)):
+            return False
+        for i in range(n):
+            if A[i][i] == 0 and any(A[i][j] != 0 for j in range(n)):
+                return False
+        keep = [i for i in range(n) if A[i][i] != 0]
+        if not keep:
+            return True
+        A = [[A[i][j] for j in keep] for i in keep]
+        p = A[0][0]
+        row = A[0]
+        A = [[A[i][j] - row[i] * row[j] / p for j in range(1, len(A))] for i in range(1, len(A))]
+    return True
+
+
+def certify_psd(Q: np.ndarray) -> bool:
+    """True only when ``Q`` (symmetrized) is PROVED positive semidefinite (#1533 review).
+
+    POUNCE's own check accepts ``lam_min >= -1e-8 * max|Q_ij|``, which admits an
+    indefinite Hessian whose negative curvature is small against its largest entry
+    but not against the box (``-1e-9 x**2 + y**2`` on ``x in [-1e4, 1e4]``): the
+    convex IPM then stops at a saddle and the route would certify it ``optimal``.
+    So convexity is decided here, before the QP arm can label anything optimal.
+
+    Rows and columns that are identically zero (variables appearing only linearly)
+    are dropped first. Up to :data:`_EXACT_PSD_MAX_N` remaining variables the test
+    is exact (:func:`_exact_psd`). Beyond that, the computed minimum eigenvalue must
+    clear the scale-carrying roundoff margin ``K * eps * ||Q||_2`` the repo already
+    uses for this purpose (``solver._CONVEX_OBJ_PSD_EIG_ROUNDOFF_K``, #1397); a
+    matrix that does not is treated as unproved, never as PSD.
+    """
+    Q = np.asarray(Q, dtype=np.float64)
+    if not np.all(np.isfinite(Q)):
+        return False
+    S = 0.5 * (Q + Q.T)
+    active = np.flatnonzero(np.any(S != 0.0, axis=1))
+    S = S[np.ix_(active, active)]
+    if S.size == 0:
+        return True
+    if S.shape[0] <= _EXACT_PSD_MAX_N:
+        return _exact_psd(S)
+    if S.shape[0] > _EIG_PSD_MAX_N:
+        return False
+    from discopt.solver import _CONVEX_OBJ_PSD_EIG_ROUNDOFF_K
+
+    eigs = np.linalg.eigvalsh(S)
+    margin = _CONVEX_OBJ_PSD_EIG_ROUNDOFF_K * np.finfo(np.float64).eps * float(np.max(np.abs(eigs)))
+    return bool(eigs.min() >= margin)
 
 
 def convex_engine_options(options: Optional[dict]) -> dict:
@@ -334,6 +410,11 @@ def solve_qp(
     n = len(c_arr)
     if Q_arr.shape != (n, n):
         raise ValueError(f"Q has shape {Q_arr.shape} but c has {n} elements")
+    if not certify_psd(Q_arr):
+        raise IndefiniteQPError(
+            "discopt could not prove the QP Hessian positive semidefinite, so the "
+            "convex QP IPM may not certify its answer."
+        )
     lb, ub = _engine_box(bounds, n, default_lb=-np.inf)
     raw, res, wall, A, cl, cu = _solve(
         Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options

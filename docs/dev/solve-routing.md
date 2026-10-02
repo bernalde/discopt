@@ -33,8 +33,8 @@ solve_model(...)                                          [solver.py:2017]
   ├─ solver="pounce" ──► _solve_pounce_route  (#1533; before ALL presolve/reformulation)
   │     refuses int/bin vars, GDP/logical constraints, feasibility callbacks
   │     LP  ──► convex_ipm_pounce.solve_lp  (POUNCE lp-ipm)  → "optimal"
-  │     QP  ──► convex_ipm_pounce.solve_qp  (POUNCE qp-ipm)  → "optimal"
-  │           indefinite (POUNCE's PSD check) ──► NLP arm
+  │     QP  ──► certify_psd (exact rational LDLᵀ) ──► convex_ipm_pounce.solve_qp
+  │           (POUNCE qp-ipm) → "optimal";  not proved PSD ──► NLP arm
   │     else──► _solve_continuous(tighten_bounds=False)  (filter line-search IPM, once)
   │           → "local_optimal" / "local_limit" / "local_infeasible", never a bound
   │
