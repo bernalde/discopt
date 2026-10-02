@@ -24,13 +24,25 @@
 //!   and (guarded, monotone) reverse;
 //! * integer rounding.
 //!
-//! Soundness: every tightening step is a valid interval deduction, applied with a
-//! small **outward relaxation** (`EPS`-scaled) so f64 roundoff can never cut a true
-//! feasible point; infeasibility is declared only when a violation exceeds a
-//! conservative tolerance. Skipping any step is always sound (the box just stays
-//! looser), so all guarded cases degrade gracefully.
+//! Soundness: every tightening step is a valid interval deduction whose endpoint
+//! arithmetic is **directed** (outward-rounded, `presolve::directed`, #1504 /
+//! #1537 D), then additionally relaxed by a small `EPS`-scaled margin;
+//! infeasibility is declared only when a violation exceeds a conservative
+//! tolerance. Skipping any step is always sound (the box just stays looser), so all
+//! guarded cases degrade gracefully.
+//!
+//! #1537 D: the `EPS * (1 + |cap|)` margin alone is NOT an enclosure. It is relative
+//! to the *result*, while the rounding error of an activity sum is relative to the
+//! largest *term*: a row whose ~1e14-magnitude products cancel to a ~3e9 bound lost
+//! ~10 units, and an exact-rational audit of 200,000 random rows found 3,125
+//! feasible points cut. Every endpoint below is now computed in directed rounding,
+//! so the margin is extra slack rather than the only guard.
 
 use crate::bnb::spatial_kernel::{BlfTerm, EnvTerm, SpatialKernelSpec};
+use crate::presolve::directed::{
+    add_down, add_up, div_down, div_up, mul_down, mul_up, powi_down, powi_up, root_down, root_up,
+    sqrt_down, sqrt_up, sub_down, sub_up,
+};
 
 /// Relative tolerance below which a bound crossing counts as real infeasibility.
 const INFEAS_TOL: f64 = 1e-7;
@@ -80,11 +92,18 @@ fn tighten_le(
     lo: &mut [f64],
     hi: &mut [f64],
 ) -> Option<bool> {
-    // Minimum activity.
+    // Minimum activity, rounded DOWN (#1537 D): a lower bound on the exact minimum
+    // activity, so neither the infeasibility test nor a residual built from it can
+    // exceed what exact arithmetic gives.
     let mut tot = 0.0f64;
     for (k, &c) in coeffs.iter().enumerate() {
         let j = cols[k];
-        tot += if c > 0.0 { c * lo[j] } else { c * hi[j] };
+        let m = if c > 0.0 {
+            mul_down(c, lo[j])
+        } else {
+            mul_down(c, hi[j])
+        };
+        tot = add_down(tot, m);
     }
     if !tot.is_finite() {
         return Some(false); // an unbounded term: no deduction possible, not a proof
@@ -98,29 +117,37 @@ fn tighten_le(
             continue;
         }
         let j = cols[k];
-        let mk = if c > 0.0 { c * lo[j] } else { c * hi[j] };
-        let cap = (rhs - (tot - mk)) / c;
-        if c > 0.0 {
-            changed |= cap_hi(hi, j, cap);
+        // Lower bound on the OTHER terms' min activity: tot_down - (this term, up).
+        let mk_up = if c > 0.0 {
+            mul_up(c, lo[j])
         } else {
-            changed |= raise_lo(lo, j, cap);
+            mul_up(c, hi[j])
+        };
+        let others = sub_down(tot, mk_up);
+        // Upper bound on the residual `rhs - others`, then divide outward.
+        let resid = sub_up(rhs, others);
+        if c > 0.0 {
+            changed |= cap_hi(hi, j, div_up(resid, c));
+        } else {
+            // c < 0: x_j >= resid / c, which falls as resid grows.
+            changed |= raise_lo(lo, j, div_down(resid, c));
         }
     }
     Some(changed)
 }
 
-/// Interval enclosure of `cst + Σ coeffs·x[cols]`.
+/// Interval enclosure of `cst + Σ coeffs·x[cols]` (directed rounding, #1537 D).
 fn form_interval(cols: &[usize], coeffs: &[f64], cst: f64, lo: &[f64], hi: &[f64]) -> (f64, f64) {
     let mut l = cst;
     let mut h = cst;
     for (k, &c) in coeffs.iter().enumerate() {
         let j = cols[k];
         if c >= 0.0 {
-            l += c * lo[j];
-            h += c * hi[j];
+            l = add_down(l, mul_down(c, lo[j]));
+            h = add_up(h, mul_up(c, hi[j]));
         } else {
-            l += c * hi[j];
-            h += c * lo[j];
+            l = add_down(l, mul_down(c, hi[j]));
+            h = add_up(h, mul_up(c, lo[j]));
         }
     }
     (l, h)
@@ -137,12 +164,13 @@ fn tighten_form_to(
     hi: &mut [f64],
 ) -> Option<bool> {
     let mut changed = false;
+    // Each rhs is rounded OUTWARD (#1537 D): `thi - cst` up, `tlo - cst` down.
     if thi.is_finite() {
-        changed |= tighten_le(cols, coeffs, thi - cst, lo, hi)?;
+        changed |= tighten_le(cols, coeffs, sub_up(thi, cst), lo, hi)?;
     }
     if tlo.is_finite() {
         let neg: Vec<f64> = coeffs.iter().map(|c| -c).collect();
-        changed |= tighten_le(cols, &neg, -(tlo - cst), lo, hi)?;
+        changed |= tighten_le(cols, &neg, -sub_down(tlo, cst), lo, hi)?;
     }
     Some(changed)
 }
@@ -154,38 +182,41 @@ fn tighten_form_to(
 /// touches zero (the entry experiment's load-bearing ingredient): e.g.
 /// `G ∈ [0, g_hi]`, `w_lo > 0` ⇒ `G > 0` and `F >= w_lo / g_hi` (no finite upper —
 /// `G → 0⁺`); mirrored for the other sign combinations.
+///
+/// #1537 D: the sign tests are exact (`0.0`), not a `1e-12` band. The band treated
+/// `G ∈ [-5e-13, 1]` as `[0, 1]` and deduced `F >= w_lo / g_hi`, cutting the
+/// feasible `F = -4e12, G = -3e-13`. Quotients are rounded outward.
 fn reverse_div(w_lo: f64, w_hi: f64, g_lo: f64, g_hi: f64) -> Option<(f64, f64)> {
-    let e = 1e-12;
-    if g_lo > e || g_hi < -e {
+    if g_lo > 0.0 || g_hi < 0.0 {
         // 0 not in [g_lo, g_hi]: full interval division.
-        let qs = [w_lo / g_lo, w_lo / g_hi, w_hi / g_lo, w_hi / g_hi];
         let mut lo = f64::INFINITY;
         let mut hi = f64::NEG_INFINITY;
-        for q in qs {
-            if q.is_nan() {
+        for (a, b) in [(w_lo, g_lo), (w_lo, g_hi), (w_hi, g_lo), (w_hi, g_hi)] {
+            let (ql, qh) = (div_down(a, b), div_up(a, b));
+            if ql.is_nan() || qh.is_nan() {
                 return None;
             }
-            lo = lo.min(q);
-            hi = hi.max(q);
+            lo = lo.min(ql);
+            hi = hi.max(qh);
         }
         return Some((lo, hi));
     }
-    if g_lo >= -e && g_hi > e {
+    if g_lo == 0.0 && g_hi > 0.0 {
         // G in [0, g_hi] (touching zero from above).
-        if w_lo > e {
-            return Some((w_lo / g_hi, f64::INFINITY)); // F > 0, F >= w_lo/g_hi
+        if w_lo > 0.0 {
+            return Some((div_down(w_lo, g_hi), f64::INFINITY)); // F > 0, F >= w_lo/g_hi
         }
-        if w_hi < -e {
-            return Some((f64::NEG_INFINITY, w_hi / g_hi)); // F < 0, F <= w_hi/g_hi
+        if w_hi < 0.0 {
+            return Some((f64::NEG_INFINITY, div_up(w_hi, g_hi))); // F < 0, F <= w_hi/g_hi
         }
     }
-    if g_hi <= e && g_lo < -e {
+    if g_hi == 0.0 && g_lo < 0.0 {
         // G in [g_lo, 0] (touching zero from below).
-        if w_lo > e {
-            return Some((f64::NEG_INFINITY, w_lo / g_lo)); // F < 0
+        if w_lo > 0.0 {
+            return Some((f64::NEG_INFINITY, div_up(w_lo, g_lo))); // F < 0
         }
-        if w_hi < -e {
-            return Some((w_hi / g_lo, f64::INFINITY)); // F > 0
+        if w_hi < 0.0 {
+            return Some((div_down(w_hi, g_lo), f64::INFINITY)); // F > 0
         }
     }
     None
@@ -209,12 +240,12 @@ fn propagate_product(
     let mut changed = false;
     // Forward: w ∈ [A]·[B].
     if a_lo.is_finite() && a_hi.is_finite() && b_lo.is_finite() && b_hi.is_finite() {
-        let ps = [a_lo * b_lo, a_lo * b_hi, a_hi * b_lo, a_hi * b_hi];
         let (mut plo, mut phi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for p in ps {
-            if !p.is_nan() {
-                plo = plo.min(p);
-                phi = phi.max(p);
+        for (x, y) in [(a_lo, b_lo), (a_lo, b_hi), (a_hi, b_lo), (a_hi, b_hi)] {
+            let (pl, ph) = (mul_down(x, y), mul_up(x, y));
+            if !pl.is_nan() && !ph.is_nan() {
+                plo = plo.min(pl);
+                phi = phi.max(ph);
             }
         }
         if plo <= phi {
@@ -236,17 +267,6 @@ fn propagate_product(
     Some(changed)
 }
 
-/// Signed real p-th root (odd p handles negatives; even p requires `t >= 0`).
-fn signed_root(t: f64, p: i32) -> f64 {
-    if p % 2 == 1 {
-        t.signum() * t.abs().powf(1.0 / p as f64)
-    } else if t >= 0.0 {
-        t.powf(1.0 / p as f64)
-    } else {
-        f64::NAN
-    }
-}
-
 /// One fixed-width term: forward + guarded reverse. `None` = infeasible.
 fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<bool> {
     let mut changed = false;
@@ -257,37 +277,43 @@ fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<boo
         EnvTerm::Monomial { i, s, p } => {
             // Sign-definite boxes only (the engine's registration precondition;
             // branching only shrinks boxes so it is preserved). Straddling: skip.
-            if lo[i] >= 0.0 || hi[i] <= 0.0 {
-                // Forward: monotone on a sign-definite box (matches monomial_aux_bounds).
-                let a = lo[i].powi(p);
-                let b = hi[i].powi(p);
-                let (flo, fhi) = if a <= b { (a, b) } else { (b, a) };
+            // `p >= 2` is the registration contract; anything else is skipped (sound).
+            if p >= 2 && (lo[i] >= 0.0 || hi[i] <= 0.0) {
+                let pu = p as u64;
+                // Forward: monotone on a sign-definite box (matches
+                // monomial_aux_bounds), endpoints in directed rounding (#1537 D).
+                let (flo, fhi) = if lo[i] >= 0.0 || p % 2 == 1 {
+                    // x^p nondecreasing on this box.
+                    (powi_down(lo[i], pu), powi_up(hi[i], pu))
+                } else {
+                    // hi[i] <= 0 and even p: nonincreasing.
+                    (powi_down(hi[i], pu), powi_up(lo[i], pu))
+                };
                 changed |= raise_lo(lo, s, flo);
                 changed |= cap_hi(hi, s, fhi);
                 if lo[s] > hi[s] + INFEAS_TOL * rel(hi[s]) {
                     return None;
                 }
-                // Reverse: x = s^(1/p), monotone per regime.
+                // Reverse: x = s^(1/p), monotone per regime. Verified directed
+                // roots (`root_down`/`root_up`, #1504) replace a bare `powf(1/p)`.
                 if p % 2 == 1 {
-                    let rlo = signed_root(lo[s], p);
-                    let rhi = signed_root(hi[s], p);
-                    changed |= raise_lo(lo, i, rlo);
-                    changed |= cap_hi(hi, i, rhi);
+                    changed |= raise_lo(lo, i, root_down(lo[s], pu));
+                    changed |= cap_hi(hi, i, root_up(hi[s], pu));
                 } else if lo[i] >= 0.0 {
                     let s_lo = lo[s].max(0.0);
                     if hi[s] < -INFEAS_TOL {
                         return None;
                     }
-                    changed |= raise_lo(lo, i, s_lo.powf(1.0 / p as f64));
-                    changed |= cap_hi(hi, i, hi[s].max(0.0).powf(1.0 / p as f64));
+                    changed |= raise_lo(lo, i, root_down(s_lo, pu));
+                    changed |= cap_hi(hi, i, root_up(hi[s].max(0.0), pu));
                 } else {
                     // hi[i] <= 0, even p: x in [-s_hi^(1/p), -s_lo^(1/p)].
                     let s_lo = lo[s].max(0.0);
                     if hi[s] < -INFEAS_TOL {
                         return None;
                     }
-                    changed |= raise_lo(lo, i, -(hi[s].max(0.0).powf(1.0 / p as f64)));
-                    changed |= cap_hi(hi, i, -(s_lo.powf(1.0 / p as f64)));
+                    changed |= raise_lo(lo, i, -root_up(hi[s].max(0.0), pu));
+                    changed |= cap_hi(hi, i, -root_down(s_lo, pu));
                 }
             }
         }
@@ -296,11 +322,11 @@ fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<boo
             let (t_lo, t_hi) = form_interval(&[j], &[coeff], cst, lo, hi);
             // Forward (exact square range).
             let (flo, fhi) = if t_lo >= 0.0 {
-                (t_lo * t_lo, t_hi * t_hi)
+                (mul_down(t_lo, t_lo), mul_up(t_hi, t_hi))
             } else if t_hi <= 0.0 {
-                (t_hi * t_hi, t_lo * t_lo)
+                (mul_down(t_hi, t_hi), mul_up(t_lo, t_lo))
             } else {
-                (0.0, (t_lo * t_lo).max(t_hi * t_hi))
+                (0.0, mul_up(t_lo, t_lo).max(mul_up(t_hi, t_hi)))
             };
             changed |= raise_lo(lo, w, flo);
             changed |= cap_hi(hi, w, fhi);
@@ -311,9 +337,9 @@ fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<boo
                 return None;
             }
             // Reverse: |t| <= sqrt(w_hi); sign-definite t also gets the lower root.
-            let r = hi[w].max(0.0).sqrt();
+            let r = sqrt_up(hi[w].max(0.0));
             let (mut nlo, mut nhi) = (-r, r);
-            let rl = lo[w].max(0.0).sqrt();
+            let rl = sqrt_down(lo[w].max(0.0));
             if t_lo >= 0.0 {
                 nlo = nlo.max(rl);
             } else if t_hi <= 0.0 {
@@ -329,15 +355,16 @@ fn propagate_env_term(t: &EnvTerm, lo: &mut [f64], hi: &mut [f64]) -> Option<boo
             }
             let alo = arg_lo.max(0.0);
             let ahi = arg_hi.max(0.0);
-            changed |= raise_lo(lo, w, alo.sqrt());
-            changed |= cap_hi(hi, w, ahi.sqrt());
+            changed |= raise_lo(lo, w, sqrt_down(alo));
+            changed |= cap_hi(hi, w, sqrt_up(ahi));
             if lo[w] > hi[w] + INFEAS_TOL * rel(hi[w]) {
                 return None;
             }
             // Reverse: arg ∈ [w_lo^2, w_hi^2] (w >= 0, monotone) and arg >= 0.
             let wl = lo[w].max(0.0);
             let wh = hi[w].max(0.0);
-            changed |= tighten_form_to(&[x], &[coeff], cst, wl * wl, wh * wh, lo, hi)?;
+            let (al, ah) = (mul_down(wl, wl), mul_up(wh, wh));
+            changed |= tighten_form_to(&[x], &[coeff], cst, al, ah, lo, hi)?;
         }
     }
     Some(changed)
@@ -633,6 +660,91 @@ mod tests {
         // The true point (1, 1, 1) must survive (w = x*y feasible).
         assert!(lo[0] <= 1.0 && hi[0] >= 1.0);
         assert!(lo[2] <= 1.0 + 1e-9 && hi[2] >= 1.0 - 1e-9);
+    }
+
+    /// #1537 D witness (exact-arithmetic audit, `probe_sp.py`, 3,125 of 200,000
+    /// random rows cut a feasible point). The row's min activity is a sum of
+    /// ~1e14-magnitude products; computing it in round-to-nearest and then taking
+    /// `tot - mk` loses up to ~10 units, far past the `EPS * (1 + |cap|)` guard. The
+    /// point below is feasible in exact rational arithmetic over the float data
+    /// (all other columns at their min-activity bound, `x1 = 3415692969.048031…`,
+    /// which makes the row hold with equality) yet the round-to-nearest code raised
+    /// `lo[1]` to 3415692979.69 -- above `hi[1]`, so the box was declared EMPTY.
+    #[test]
+    fn issue_1537_linear_row_cancellation_never_cuts_a_feasible_point() {
+        let mut spec = empty_spec(5);
+        spec.fixed_rows = vec![FixedRow {
+            cols: vec![0, 1, 2, 3, 4],
+            coeffs: vec![
+                0.01135996348320167,
+                -0.0022948358799420505,
+                -341.5045393785568,
+                -0.029260775192544688,
+                0.17995108280856198,
+            ],
+            rhs: -198764520876410.22,
+        }];
+        let lo0 = vec![
+            132255245420.08032,
+            3415688466.6468506,
+            582286247020.8639,
+            -305079229649.1662,
+            435975525363.2826,
+        ];
+        let hi0 = vec![
+            132255245500.33266,
+            3415692969.404494,
+            582286247020.8845,
+            -305079229649.02423,
+            435975525404.30225,
+        ];
+        let mut lo = lo0.clone();
+        let mut hi = hi0.clone();
+        // Exact x1 of the feasible point is 3415692969.048031...; this float is
+        // below it, so a valid box must keep lo[1] <= it.
+        let x1_feasible_floor = 3415692969.04803_f64;
+        assert!(
+            propagate_spec_fixpoint(&spec, &mut lo, &mut hi, None, 10),
+            "box with an exactly feasible point declared empty (lo1={}, hi1={})",
+            lo[1],
+            hi[1]
+        );
+        assert!(
+            lo[1] <= x1_feasible_floor,
+            "lo[1] = {} cuts the feasible x1 = 3415692969.048031",
+            lo[1]
+        );
+    }
+
+    /// #1537 D witness: `reverse_div` treated a factor in `[-5e-13, 1]` as if it
+    /// were `[0, 1]` (a hard-coded 1e-12 "touching zero" band), deducing `x >= 1`
+    /// from `w = x*y >= 1`. The point `x = -4e12, y = -3e-13, w = x*y ~ 1.2` is
+    /// feasible and was cut.
+    #[test]
+    fn issue_1537_reverse_division_respects_a_slightly_negative_factor() {
+        let mut spec = empty_spec(3);
+        spec.blf_terms = vec![BlfTerm {
+            a_cols: vec![0],
+            a_coeffs: vec![1.0],
+            a_const: 0.0,
+            b_cols: vec![1],
+            b_coeffs: vec![1.0],
+            b_const: 0.0,
+            w: 2,
+        }];
+        let (x, y) = (-4e12_f64, -3e-13_f64);
+        let w = x * y; // ~1.2, inside [1, 2]
+        let mut lo = vec![-1e13, -5e-13, 1.0];
+        let mut hi = vec![10.0, 1.0, 2.0];
+        assert!(propagate_spec_fixpoint(&spec, &mut lo, &mut hi, None, 10));
+        for (j, v) in [x, y, w].into_iter().enumerate() {
+            assert!(
+                lo[j] <= v && v <= hi[j],
+                "feasible point coordinate {j} = {v} cut by [{}, {}]",
+                lo[j],
+                hi[j]
+            );
+        }
     }
 
     #[test]
