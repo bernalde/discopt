@@ -8935,9 +8935,13 @@ class Model:
         # could not bound this objective" would misdescribe it; its missing bound is
         # the route's contract. Scoped to that route only: every other route keeps
         # both diagnostics below exactly as before.
+        # #1551: a bound withdrawn because the objective is unresolvable at the
+        # incumbent was produced and then refused, with its own WARNING; "could not
+        # bound this objective" would misdescribe that too.
         _no_bound_by_design = isinstance(result, SolveResult) and (
-            result.algorithm_route or ""
-        ).startswith("pounce:")
+            (result.algorithm_route or "").startswith("pounce:")
+            or bool((result.solver_stats or {}).get("certificate/objective_unresolved"))
+        )
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a
@@ -9039,6 +9043,21 @@ class Model:
             and result.x is not None
         ):
             self._reconcile_objective_with_model(result)
+
+        # --- #1551: a certificate finer than the objective's float resolution ---
+        # ``solve_model``'s wrapper runs the same check; repeated here because the
+        # convex-kernel fast path above returns without passing through it, and
+        # after the reconciliation so it judges the objective actually published.
+        # Idempotent: a withdrawn certificate is not re-tested.
+        if isinstance(result, SolveResult):
+            from discopt.solver import (
+                _resolve_abs_gap_tolerance,
+                _withhold_unresolved_objective_certificate,
+            )
+
+            _withhold_unresolved_objective_certificate(
+                result, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            )
 
         # --- #1313: remember the point this model was solved to ---------------- #
         # ``Model.sensitivity()`` runs its own local NLP, whose starting point

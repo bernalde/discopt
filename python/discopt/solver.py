@@ -6306,6 +6306,121 @@ def _refuse_unclosed_published_pair(
     result.solver_stats["certificate/published_pair_refused"] = 1.0
 
 
+def _objective_evaluation_error(model: Model, x: Mapping[str, Any]) -> Optional[float]:
+    """Rigorous bound on the rounding error of evaluating the objective at ``x``.
+
+    The width of an outward-rounded interval enclosure of ``model``'s objective
+    expression, evaluated at the degenerate box ``x``. The exact value of the
+    objective *as written* (float coefficients taken at face value) lies inside
+    that enclosure, and so does any float64 evaluation of it, so the width bounds
+    how far apart the two can be.
+
+    ``None`` when the question cannot be asked: no resident objective (absent, or
+    held by the Rust builder behind a placeholder), a variable the point carries
+    no value for, or an atom the interval evaluator cannot enclose (an unbounded
+    enclosure). Callers treat ``None`` as "not measured", never as "measured 0".
+    """
+    objective = getattr(model, "_objective", None)
+    if objective is None or getattr(objective, "_is_placeholder", False):
+        return None
+    from discopt._relax.convexity.interval import Interval
+    from discopt._relax.convexity.interval_eval import evaluate_interval
+
+    box: dict = {}
+    for v in model._variables:
+        if v.name not in x:
+            return None
+        val = np.asarray(x[v.name], dtype=np.float64)
+        if val.size != int(np.prod(v.shape)) or not np.all(np.isfinite(val)):
+            return None
+        box[v] = Interval.point(val.reshape(v.shape))
+    enc = evaluate_interval(objective.expression, model, box)
+    width = float(np.max(np.asarray(enc.hi, dtype=np.float64) - enc.lo))
+    if not np.isfinite(width):
+        return None
+    return width
+
+
+def _withhold_unresolved_objective_certificate(
+    result: SolveResult, model: Model, gap_tolerance: float, abs_gap_tol: float
+) -> None:
+    """Withdraw a certificate finer than the objective's own float resolution (#1551).
+
+    Every certificate is computed from float64 evaluations of the objective. When
+    the objective cannot be evaluated at the incumbent more accurately than the
+    gap tolerance -- catastrophic cancellation between large terms -- the solver
+    cannot tell the values it is comparing apart, and the gap it closed is noise.
+
+    Measured on ``min 6y^2 + By + C`` (``y`` integer in ``[c, c+3]``,
+    ``B = -(12c+12)``, ``C = 6c^2+12c``) at ``c = 2345678.9``: each term is
+    ~3.3e13, whose ulp is ~4e-3, and the OA auto-route returned
+    ``objective = bound = -5.9375`` with ``gap_certified=True`` while the exact
+    optimum of that function is ``-5.93832`` -- a lower bound 8.2e-4 ABOVE the
+    optimum, past the 5.9e-4 tolerance the certificate was granted at. The
+    interval enclosure of the objective at the incumbent is 0.039 wide.
+
+    The test: widen the published gap by the enclosure width and re-ask
+    :func:`_gap_criterion` -- the same arbiter that grants and retains every
+    other certificate. A pair that still closes is left alone, so a well-scaled
+    objective (width at the ulp of its value) is never touched.
+
+    On a withdrawal the bound goes with the certificate. It was computed from the
+    same unresolvable evaluations, it is the number that crossed the optimum in
+    the measurement above, and the #1244 rule is to clear a claim together with
+    its number rather than publish a bound this guard has just declined to stand
+    behind. Downgrade-only otherwise: never raises a certificate or a status.
+    """
+    if not result.gap_certified or result.status != "optimal":
+        return
+    if result.objective is None or result.bound is None or result.x is None:
+        return
+    o, b = float(result.objective), float(result.bound)
+    if not (np.isfinite(o) and np.isfinite(b)):
+        return
+    try:
+        err = _objective_evaluation_error(model, result.x)
+    except Exception as exc:  # noqa: BLE001 - the solve already succeeded
+        # Same contract as the objective reconciliation in ``Model.solve``: a check
+        # that cannot run leaves the result as it was and says so loudly, rather
+        # than turning a finished solve into an exception.
+        logger.warning(
+            "Objective evaluation-error check skipped (%s: %s); the certificate is "
+            "left as the solver reported it (#1551).",
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if err is None:
+        logger.debug("Objective evaluation-error check not applicable to this model (#1551).")
+        return
+    if result.solver_stats is None:
+        result.solver_stats = {}
+    result.solver_stats["certificate/objective_eval_error"] = err
+    hi, lo = (o, b) if o >= b else (b, o)
+    if _gap_criterion(hi + err, lo, gap_tolerance, abs_gap_tol) is not None:
+        return
+    logger.warning(
+        "Certificate withdrawn: the objective cannot be evaluated at the incumbent to "
+        "better than %.3e (float64 rounding; an interval enclosure of the objective "
+        "at the incumbent is that wide), which does not fit inside the requested gap "
+        "(rel %g, abs %g) around objective %.12g and bound %.12g. Reporting "
+        "status='feasible' with no bound; rescaling or re-centring the model's "
+        "variables removes the cancellation (#1551).",
+        err,
+        gap_tolerance,
+        abs_gap_tol,
+        o,
+        b,
+    )
+    result.gap_certified = False
+    result.status = "feasible"
+    result.bound = None
+    result.gap = None
+    result.bound_valid = False
+    result.bound_source = None
+    result.solver_stats["certificate/objective_unresolved"] = 1.0
+
+
 def _warn_abs_gap_ignored(route: str, abs_gap_tolerance: Optional[float]) -> None:
     """Say so when *route* cannot honour an ``abs_gap_tolerance`` the caller set.
 
@@ -9728,6 +9843,13 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # #1059 route/fallback merge -- so it judges the pair actually published.
         if _gap_tols is not None:
             _refuse_unclosed_published_pair(result, _gap_tols[0], _gap_tols[1])
+            # #1551: same choke point, for a pair finer than the objective's own
+            # float resolution at the incumbent.
+            _model_arg = args[0] if args else kwargs.get("model")
+            if isinstance(_model_arg, Model):
+                _withhold_unresolved_objective_certificate(
+                    result, _model_arg, _gap_tols[0], _gap_tols[1]
+                )
         # #1243: say which of the two criteria stopped the search. Derived from
         # the returned (incumbent, bound) pair with the SAME arithmetic the
         # convergence test uses, so the two can never disagree; ``None`` -- the
