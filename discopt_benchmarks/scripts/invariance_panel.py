@@ -147,9 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     for k in _floats(args.objscales):
         transforms.append((f"obj{k:g}", nli.scale_objective_nl, k, k))
 
-    tally = {
-        name: {"ok": 0, "false": 0, "lost": 0, "open": 0, "refused": 0} for name, *_ in transforms
-    }
+    kinds = ("ok", "false", "lost", "open", "raised", "refused")
+    tally = {name: dict.fromkeys(kinds, 0) for name, *_ in transforms}
     rows: list[dict] = []
     executed = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -175,7 +174,18 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 p = Path(tmp) / f"{f.stem}__{name}.nl"
                 p.write_text(new, encoding="latin-1")
-                res = _solve(p, args.time_limit)
+                try:
+                    res = _solve(p, args.time_limit)
+                except Exception as exc:  # noqa: BLE001 - counted and printed, never hidden
+                    # A raise where the as-given model answers is itself a
+                    # representation dependence; it is its own verdict.
+                    executed += 1
+                    tally[name]["raised"] += 1
+                    why = f"{type(exc).__name__}: {exc}"
+                    rows.append({"instance": f.stem, "transform": name, "verdict": "raised",
+                                 "why": why, "as_given": base})  # fmt: skip
+                    print(f"  {name}: RAISED {why}", flush=True)
+                    continue
                 executed += 1
                 verdict, why = _judge(base, res, scale, oracle.get(f.stem))
                 tally[name][verdict] += 1
@@ -184,14 +194,15 @@ def main(argv: list[str] | None = None) -> int:
                 if verdict in ("false", "lost"):
                     print(f"  {name}: {verdict.upper()} {why}", flush=True)
 
-    print("\ntransform         ok false  lost  open  refsd")
+    print("\ntransform         ok false  lost  open raisd refsd")
     for name, t in tally.items():
-        cells = (t["ok"], t["false"], t["lost"], t["open"], t["refused"])
+        cells = (t["ok"], t["false"], t["lost"], t["open"], t["raised"], t["refused"])
         print(f"{name:<14} " + " ".join(f"{v:>5}" for v in cells))
     n_false = sum(t["false"] for t in tally.values())
     n_lost = sum(t["lost"] for t in tally.values())
+    n_raised = sum(t["raised"] for t in tally.values())
     print(f"executed {executed} transformed solves over {len(files)} instances; "
-          f"false {n_false}, lost {n_lost}")  # fmt: skip
+          f"false {n_false}, lost {n_lost}, raised {n_raised}")  # fmt: skip
     if args.out:
         args.out.write_text(json.dumps({"tally": tally, "rows": rows}, indent=1, default=str))
     if executed == 0:
