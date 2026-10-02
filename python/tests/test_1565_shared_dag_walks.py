@@ -359,3 +359,37 @@ def test_collect_variables_on_shared_dag_equals_unshared():
         a = g._collect_variables(body)
         b = g._collect_variables(_unshare(body))
         assert list(a) == list(b) and [id(v) for v in a.values()] == [id(v) for v in b.values()]
+
+
+def test_in_loop_incumbent_obbt_deadline_never_exceeds_time_limit(monkeypatch):
+    """The in-B&B incumbent-cutoff OBBT (Phase C) is clamped to the solve's clock.
+
+    It used to receive ``now + 5.0`` whatever was left of ``time_limit``, so an
+    incumbent found just before the limit let it run up to 5 s past it (measured on
+    an OMLT reduced-space net: 35.4 s at ``time_limit=30``). With ``time_limit=3`` the
+    old deadline is always more than 5 s after the solve began; the clamped one is at
+    most ``time_limit`` after it.
+    """
+    import time
+    from pathlib import Path
+
+    from discopt._relax import obbt as ob
+
+    orig = ob.obbt_tighten_root
+    seen: list[float] = []
+
+    def _spy(*args, **kwargs):
+        if "incumbent_cutoff" in kwargs and kwargs.get("rounds") == 2:
+            assert kwargs.get("deadline") is not None
+            seen.append(float(kwargs["deadline"]))
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(ob, "obbt_tighten_root", _spy)
+    nl = Path(__file__).parent / "data" / "minlplib_nl" / "ex1222.nl"
+    m = dm.from_nl(str(nl))
+    T = 3.0
+    t0 = time.perf_counter()
+    m.solve(time_limit=T)
+    assert seen, "the in-loop incumbent-cutoff OBBT never ran; the test checked nothing"
+    for d in seen:
+        assert d - t0 <= T + 0.5, f"Phase C deadline {d - t0:.2f}s after start, limit {T}s"

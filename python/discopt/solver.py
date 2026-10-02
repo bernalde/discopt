@@ -573,6 +573,10 @@ _POUNCE_BATCH_MIN_VARS = 50
 # budget. Nodes that start fully past the deadline are skipped (see the serial
 # loop), so at most one node per batch can overrun by this floor.
 _DEADLINE_NODE_FLOOR_S = 0.1
+
+#: Wall budget of the in-loop incumbent-cutoff OBBT (Phase C), clamped to the
+#: remaining ``time_limit`` at the call site (#1565).
+_PERIODIC_OBBT_BUDGET_S = 5.0
 # Dense-Jacobian compilation guard. ``NLPEvaluator.evaluate_jacobian`` uses
 # ``jax.jit(jax.jacfwd(...))`` — a forward-mode dense Jacobian whose compiled XLA
 # program replicates the whole constraint system once per input variable. For a
@@ -18789,7 +18793,14 @@ def solve_model(
         # --- Periodic OBBT with incumbent cutoff (Phase C) ---
         # When a new incumbent is found and bounds are still wide,
         # re-run OBBT with the incumbent objective as a cutoff.
-        if _incumbent_improved and n_vars <= 200:
+        # #1565: the phase's 5 s budget is clamped to what is left of ``time_limit``
+        # and the phase is not launched once the budget is spent. Before this the
+        # deadline was ``now + 5.0`` regardless of the clock, so an incumbent found
+        # just before the limit let this phase run up to 5 s past it (measured: an
+        # OMLT reduced-space net at ``time_limit=30`` returned at 35.4 s). Skipping or
+        # shortening OBBT only forgoes a tightening -- the box stays valid.
+        _pc_budget = min(_PERIODIC_OBBT_BUDGET_S, _remaining_budget())
+        if _incumbent_improved and n_vars <= 200 and _pc_budget > _DEADLINE_NODE_FLOOR_S:
             incumbent_info = tree.incumbent()
             if incumbent_info is not None:
                 inc_sol, inc_obj = incumbent_info
@@ -18811,7 +18822,7 @@ def solve_model(
                         ub=np.array(ub),
                         rounds=2,
                         incumbent_cutoff=float(inc_obj),
-                        deadline=_role2_deadline(time.perf_counter() + 5.0),
+                        deadline=_role2_deadline(time.perf_counter() + _pc_budget),
                         time_limit_per_lp=0.1,
                         prefer_pounce=nlp_solver == "pounce",
                     )
