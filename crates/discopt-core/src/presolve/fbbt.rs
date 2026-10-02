@@ -576,12 +576,13 @@ pub fn forward_propagate_into<'a>(
     }
     scratch.order.sort_unstable();
 
-    // `Sum` needs to know how many elements it folds; nothing else does, so the
-    // shape pass is paid only by arenas that contain a reduction (#1364).
+    // A reduction (`Sum`, single-argument `Prod`) needs to know how many elements
+    // it folds; nothing else does, so the shape pass is paid only by arenas that
+    // contain one (#1364, and #1582 for `Prod`).
     let reduce_counts = if scratch
         .order
         .iter()
-        .any(|i| matches!(arena.get(ExprId(*i)), ExprNode::Sum { .. }))
+        .any(|i| is_counted_reduction(arena, ExprId(*i)))
     {
         sum_reduce_counts(arena)
     } else {
@@ -623,7 +624,13 @@ pub fn forward_propagate(arena: &ExprArena, id: ExprId, var_bounds: &[Interval])
 /// this arena; a shape error (a model this arena cannot shape) leaves every entry
 /// `None`, which the `Sum` rule reads as "abstain".
 ///
-/// Indexed by node id; non-`Sum` nodes are `None` and never read.
+/// Indexed by node id; nodes that are not a counted reduction (see
+/// [`is_counted_reduction`]) are `None` and never read.
+///
+/// A single-argument `Prod` is the other reduction this table serves: it is the
+/// product of ALL of its argument's elements (`expr.rs::reduction_values`), so its
+/// enclosure is the `n`-fold independent product of the argument's hull -- not
+/// the hull itself, which is what the forward rule returned before #1582.
 fn sum_reduce_counts(arena: &ExprArena) -> Vec<Option<usize>> {
     let n = arena.len();
     let mut out = vec![None; n];
@@ -640,6 +647,20 @@ fn sum_reduce_counts(arena: &ExprArena) -> Vec<Option<usize>> {
     let shapes = crate::expand::shapes_of(arena).ok();
 
     for (i, slot) in out.iter_mut().enumerate() {
+        if let ExprNode::FunctionCall {
+            func: MathFunc::Prod,
+            args,
+        } = arena.get(ExprId(i))
+        {
+            if args.len() == 1 {
+                // Full reduction over every element of the one argument.
+                let from_shapes = shapes
+                    .as_ref()
+                    .map(|sh| sh[args[0].0].iter().product::<usize>());
+                *slot = from_shapes.or_else(|| single_element_fold(arena, args[0]));
+            }
+            continue;
+        }
         let ExprNode::Sum { operand, axis } = arena.get(ExprId(i)) else {
             continue;
         };
@@ -659,6 +680,63 @@ fn sum_reduce_counts(arena: &ExprArena) -> Vec<Option<usize>> {
         *slot = from_shapes.or_else(|| single_element_fold(arena, *operand));
     }
     out
+}
+
+/// Whether `id` is a reduction whose interval rule reads a fold count from
+/// [`sum_reduce_counts`]: a `Sum`, or a single-argument `Prod`.
+fn is_counted_reduction(arena: &ExprArena, id: ExprId) -> bool {
+    match arena.get(id) {
+        ExprNode::Sum { .. } => true,
+        ExprNode::FunctionCall {
+            func: MathFunc::Prod,
+            args,
+        } => args.len() == 1,
+        _ => false,
+    }
+}
+
+/// Sound enclosure of the product of `n` elements, each enclosed by `a`.
+///
+/// The elements vary independently inside the hull, so the product ranges over
+/// the `n`-fold *independent* interval product `a * a * ... * a` -- not `a^n`
+/// (which would claim `x0*x1 >= 0` for `x in [-1, 2]^2`), and not `a` itself.
+/// Returning `a` is what this code did before #1582, and it is narrow, not
+/// conservative: on `p == prod(x)` with `x0, x1 in [1, 2]`, `x2 in [-1, -0.5]`
+/// the block hull is `[-1, 2]` and the rule gave `p in [-1, 2]`, while the true
+/// range is `[-4, -0.5]` -- an invalid FBBT tightening that cut feasible points.
+///
+/// Independent interval multiplication is associative (it is the exact set
+/// product up to outward rounding), so square-and-multiply evaluates the n-fold
+/// product in `O(log n)` multiplications. `None` (unknown fold count) abstains.
+fn interval_prod_of(a: Interval, n: Option<usize>) -> Interval {
+    match n {
+        // The empty product is 1 (`expr.rs` folds `.product()` over no values).
+        Some(0) => Interval::point(1.0),
+        Some(1) => a,
+        None => Interval::entire(),
+        Some(mut k) => {
+            let mut acc: Option<Interval> = None;
+            let mut base = a;
+            while k > 0 {
+                if k & 1 == 1 {
+                    acc = Some(match acc {
+                        None => base,
+                        Some(r) => interval_mul(&r, &base),
+                    });
+                }
+                k >>= 1;
+                if k > 0 {
+                    base = interval_mul(&base, &base);
+                }
+            }
+            let r = acc.expect("k >= 2 sets at least one bit");
+            if r.lo.is_nan() || r.hi.is_nan() {
+                Interval::entire()
+            } else {
+                r
+            }
+        }
+    }
 }
 
 /// `Some(1)` when `id` provably stands for exactly one scalar element.
@@ -906,6 +984,12 @@ fn eval_node_interval(
                 MathFunc::Entropy => entropy_interval(&a0),
                 MathFunc::Abs => interval_abs(&a0),
                 MathFunc::Sign => Interval::new(-1.0, 1.0),
+                // Single-argument Min/Max (audited with #1582): returning the
+                // argument's hull IS sound here, unlike `Prod`, because the min or
+                // max of any set of elements is itself one of those elements and
+                // so lies inside their hull. (`expr.rs` evaluates a one-argument
+                // Min/Max as `a0`, which is also inside the hull.) The modeling
+                // layer never emits one -- `.min()`/`.max()` fold to binary calls.
                 MathFunc::Min => {
                     if args.len() > 1 {
                         let a1 = node_bounds[args[1].0];
@@ -923,9 +1007,14 @@ fn eval_node_interval(
                     }
                 }
                 MathFunc::Prod => {
-                    // Single-arg prod is identity; multi-arg is a product chain.
+                    // Single-arg prod is a FULL REDUCTION over its argument's
+                    // elements (`expr.rs::reduction_values`), not the identity:
+                    // `a0` is only the hull of those elements. Identity is right
+                    // only for a one-element argument, which the fold count
+                    // encodes (`Some(1)`). Multi-arg is a product chain of
+                    // scalars.
                     if args.len() == 1 {
-                        a0
+                        interval_prod_of(a0, reduce_counts.get(id.0).copied().flatten())
                     } else {
                         let mut result = a0;
                         for arg in &args[1..] {
@@ -4303,5 +4392,175 @@ mod min_distance_fixture_tests {
             println!("min_distance[{form:?}]: feasible_checked={feasible_checked}");
             assert!(feasible_checked > 1000, "{form:?}: probe did not fire");
         }
+    }
+}
+
+/// #1582: a single-argument `Prod` over an ARRAY is the product of all its
+/// elements, not the identity on the argument's hull.
+#[cfg(test)]
+mod prod_reduction_tests {
+    use super::*;
+    use crate::expr::*;
+
+    /// `p - prod(x) == 0` with `x` a block of `lb.len()` elements and `p` scalar.
+    fn prod_model(lb: &[f64], ub: &[f64], p_lb: f64, p_ub: f64) -> ModelRepr {
+        let n = lb.len();
+        let mut arena = ExprArena::new();
+        let x = arena.add(ExprNode::Variable {
+            name: "x".into(),
+            index: 0,
+            size: n,
+            shape: vec![n],
+        });
+        let p = arena.add(ExprNode::Variable {
+            name: "p".into(),
+            index: 1,
+            size: 1,
+            shape: vec![],
+        });
+        let prod = arena.add(ExprNode::FunctionCall {
+            func: MathFunc::Prod,
+            args: vec![x],
+        });
+        let body = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Sub,
+            left: p,
+            right: prod,
+        });
+        ModelRepr {
+            arena,
+            objective: p,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![ConstraintRepr {
+                body,
+                sense: ConstraintSense::Eq,
+                rhs: 0.0,
+                name: Some("c".into()),
+            }],
+            variables: vec![
+                VarInfo {
+                    name: "x".into(),
+                    var_type: VarType::Continuous,
+                    offset: 0,
+                    size: n,
+                    shape: vec![n],
+                    lb: lb.to_vec(),
+                    ub: ub.to_vec(),
+                },
+                VarInfo {
+                    name: "p".into(),
+                    var_type: VarType::Continuous,
+                    offset: n,
+                    size: 1,
+                    shape: vec![],
+                    lb: vec![p_lb],
+                    ub: vec![p_ub],
+                },
+            ],
+            n_vars: n + 1,
+        }
+    }
+
+    /// The reviewer's repro: the true `p` range is `[-4, -0.5]`; the identity rule
+    /// returned the block hull `[-1, 2]` and cut every `p < -1`.
+    #[test]
+    fn prod_of_array_is_not_identity() {
+        let m = prod_model(&[1.0, 1.0, -1.0], &[2.0, 2.0, -0.5], -10.0, 10.0);
+        let b = fbbt(&m, 20, 1e-9);
+        assert!(
+            b[1].lo <= -4.0 && b[1].hi >= -0.5,
+            "p bound {:?} does not contain the true range [-4, -0.5]",
+            b[1]
+        );
+    }
+
+    #[test]
+    fn interval_prod_of_counts() {
+        let a = Interval::new(-1.0, 2.0);
+        let one = interval_prod_of(a, Some(0));
+        assert!(one.lo == 1.0 && one.hi == 1.0);
+        let same = interval_prod_of(a, Some(1));
+        assert!(same.lo == a.lo && same.hi == a.hi);
+        // Independent product, not a^2 (which would be [0, 4]).
+        let two = interval_prod_of(a, Some(2));
+        assert!(two.lo <= -2.0 && two.hi >= 4.0, "{two:?}");
+        assert!(two.lo >= -2.0 - 1e-12 && two.hi <= 4.0 + 1e-12, "{two:?}");
+        let three = interval_prod_of(a, Some(3));
+        assert!(three.lo <= -4.0 && three.hi >= 8.0, "{three:?}");
+        assert!(
+            three.lo >= -4.0 - 1e-12 && three.hi <= 8.0 + 1e-12,
+            "{three:?}"
+        );
+        let e = interval_prod_of(a, None);
+        assert!(e.lo == f64::NEG_INFINITY && e.hi == f64::INFINITY);
+        // Square-and-multiply encloses the linear fold for every k.
+        let b = Interval::new(-0.7, 1.3);
+        for k in 2..40usize {
+            let mut lin = b;
+            for _ in 1..k {
+                lin = interval_mul(&lin, &b);
+            }
+            let fast = interval_prod_of(b, Some(k));
+            assert!(fast.lo <= lin.lo + 1e-12 * lin.lo.abs().max(1.0), "k={k}");
+            assert!(fast.hi >= lin.hi - 1e-12 * lin.hi.abs().max(1.0), "k={k}");
+        }
+    }
+
+    /// Feasible-point sampling: no point with `p = prod(x)` inside random boxes
+    /// may be cut, and an executed-check count proves the probe fired.
+    #[test]
+    fn prod_fbbt_never_cuts_a_feasible_point() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut checks = 0usize;
+        for _ in 0..400 {
+            let n = 2 + (next() * 4.0) as usize; // 2..=5 elements
+            let lb: Vec<f64> = (0..n).map(|_| -3.0 + 6.0 * next()).collect();
+            let ub: Vec<f64> = lb.iter().map(|l| l + 3.0 * next()).collect();
+            let m = prod_model(&lb, &ub, -50.0, 50.0);
+            let b = fbbt(&m, 20, 1e-9);
+            for _ in 0..20 {
+                let x: Vec<f64> = (0..n).map(|i| lb[i] + next() * (ub[i] - lb[i])).collect();
+                let p: f64 = x.iter().product();
+                if p.abs() > 50.0 {
+                    continue;
+                }
+                assert!(
+                    b.iter().all(|iv| iv.lo <= iv.hi),
+                    "declared infeasible but x={x:?}, p={p} is feasible"
+                );
+                assert!(
+                    p >= b[1].lo - 1e-9 && p <= b[1].hi + 1e-9,
+                    "feasible p={p} (x={x:?}) cut: p bound {:?}",
+                    b[1]
+                );
+                let hull = b[0];
+                assert!(
+                    x.iter()
+                        .all(|xi| *xi >= hull.lo - 1e-9 && *xi <= hull.hi + 1e-9),
+                    "feasible x={x:?} cut from block hull {hull:?}"
+                );
+                checks += 1;
+            }
+        }
+        println!("prod_fbbt sampling: executed checks={checks}");
+        assert!(checks > 2000, "probe did not fire: {checks} checks");
+    }
+
+    /// A one-element argument keeps the identity rule, which is right there.
+    #[test]
+    fn prod_of_scalar_is_identity() {
+        let m = prod_model(&[-2.0], &[3.0], -10.0, 10.0);
+        let b = fbbt(&m, 20, 1e-9);
+        assert!(
+            (b[1].lo + 2.0).abs() < 1e-12 && (b[1].hi - 3.0).abs() < 1e-12,
+            "{:?}",
+            b[1]
+        );
     }
 }

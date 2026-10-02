@@ -131,6 +131,39 @@ def _var_key(node) -> Optional[str]:
     return None
 
 
+def _prod_to_sympy(node, syms: dict):
+    """SymPy image of a ``prod`` node.
+
+    ``FunctionCall("prod", a)`` with ONE argument is a full reduction: the product
+    of every element of ``a`` (``jnp.prod`` over the flattened operand, and
+    ``expr.rs::reduction_values`` in Rust). Translating ``a`` to a single symbol and
+    calling ``sympy.prod`` on it fed a scalar where an iterable belongs and raised
+    ``TypeError: reduce() arg 2 must support iteration``. The elements are spelled
+    out instead, exactly as the hand-written ``x[0] * x[1] * ...`` would be. With
+    several arguments the call is a plain product of scalars.
+    """
+    from discopt.modeling import core
+
+    if len(node.args) != 1:
+        out = sp.Integer(1)
+        for a in node.args:
+            out = out * _to_sympy(a, syms)
+        return out
+    arg = node.args[0]
+    shape = core._known_shape(arg)
+    if shape is None:
+        raise SymbolicTranslationError("cut recognizer: prod over an expression of unknown shape")
+    if shape == ():
+        return _to_sympy(arg, syms)
+    if int(np.prod(shape)) == 0:
+        # The empty product is 1, matching the evaluator.
+        return sp.Integer(1)
+    out = sp.Integer(1)
+    for elem in arg._flat_elements("prod"):
+        out = out * _to_sympy(elem, syms)
+    return out
+
+
 def _to_sympy(node, syms: dict):
     from discopt.modeling import core
 
@@ -169,6 +202,8 @@ def _to_sympy(node, syms: dict):
             return sp.Abs(x)
         raise SymbolicTranslationError(f"cut recognizer: unary op {node.op!r}")
     if isinstance(node, core.FunctionCall):
+        if node.func_name == "prod":
+            return _prod_to_sympy(node, syms)
         args = [_to_sympy(a, syms) for a in node.args]
         fn = getattr(sp, node.func_name, None)
         if fn is None:
