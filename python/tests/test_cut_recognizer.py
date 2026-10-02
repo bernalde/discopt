@@ -468,14 +468,34 @@ def test_structure_cuts_presolve_auto_closes_gas_network():
 
 @pytest.mark.slow
 def test_structure_cuts_optout_leaves_gap_open():
-    """`structure_cuts=False` disables the presolve: the gas network then exits
-    uncertified on the loose McCormick bound (the pre-fix behaviour)."""
+    """`structure_cuts=False` disables the presolve: the gas network's root bound
+    is then the loose McCormick bound and the gap stays open (pre-fix behaviour).
+
+    Re-derived 2026-10-02. This used to solve to completion in 20 s and assert the
+    FINAL bound stayed below 2.0. That stopped holding at c618b022 (#355, the
+    incremental per-node McCormick LP: the 20 s bound rose 1.0 -> 2.56, first-
+    parent bisect), and today the opt-out arm certifies the optimum in 9 nodes
+    (bound 3.00249) -- branching alone now closes what the cut used to be needed
+    for. That is the tree getting stronger, not the opt-out breaking, so the
+    probe is now the ROOT: a root-only search (``max_nodes=1``) isolates what the
+    presolve contributes and is deterministic (3 reps, identical bounds).
+    Measured: opt-out root bound 0.5, gap open; with the cuts 2.5026.
+    """
     from discopt.benchmarks.problems.gas_network_minlp import build_gas_network_minlp
 
-    m = build_gas_network_minlp()
-    r = m.solve(time_limit=20, gap_tolerance=1e-4, structure_cuts=False)
-    # No cut -> bound stuck far below the optimum (loose), search does not close.
-    assert r.bound is None or r.bound < 2.0
+    r = build_gas_network_minlp().solve(
+        time_limit=20, gap_tolerance=1e-4, structure_cuts=False, max_nodes=1
+    )
+    # No cut -> the root bound is far below the optimum (3.0026), the gap open.
+    assert r.root_bound is not None and r.root_bound < 2.0, r.root_bound
+    assert r.bound is None or r.bound < 2.0, r.bound
+    assert not r.gap_certified and r.status != "optimal", (r.status, r.gap_certified)
+
+    # Control arm (CLAUDE.md SS6): the same root-only search WITH the presolve
+    # must lift the bound past the threshold, else the assertion above would pass
+    # just as well on a build where the presolve does nothing at all.
+    r_on = build_gas_network_minlp().solve(time_limit=20, gap_tolerance=1e-4, max_nodes=1)
+    assert r_on.root_bound is not None and r_on.root_bound >= 2.0, r_on.root_bound
 
 
 def test_structure_cuts_presolve_noop_on_unrelated_model():

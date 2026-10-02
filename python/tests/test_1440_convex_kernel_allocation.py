@@ -36,9 +36,21 @@ from discopt.solvers import _convex_kernel as ck
 
 _NL = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl", "clay0303hfsg.nl")
 
-#: ``known_optima.toml``: MINLPLib ``=opt=``. The kernel certifies 26669.10957 at a
-#: generous budget, agreeing to 8 significant figures.
-REFERENCE_OPTIMUM = 26669.10955143
+
+def _reference_optimum() -> float:
+    """Read the optimum from the shared registry -- never a transcribed literal."""
+    from _optima import known_optimum
+
+    return float(known_optimum("clay0303hfsg"))
+
+
+#: ``known_optima.toml``: the exact optimum at 1e-9 feasibility, 26669.1095724859
+#: (BARON via GAMS; MINLPLib ``=opt=`` 26669.10957). This file used to transcribe
+#: 26669.10955143, a 1e-6-tolerance incumbent 2.1e-5 below the optimum, against
+#: which the kernel's sound certified bound (26669.109572282887) read as a false
+#: bound -- and ``test_a_generous_budget_certifies_the_reference_optimum`` failed
+#: from the commit that added it. The registry entry records the evidence.
+REFERENCE_OPTIMUM = _reference_optimum()
 
 #: Budget at which the decline is robust. Measured: declines at 2, 4, 6, 8, 10 and
 #: 12 s, consuming ~100% of each; certifies at 16 s using 99.6% of it.

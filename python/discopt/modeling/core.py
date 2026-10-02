@@ -8919,7 +8919,7 @@ class Model:
         #
         # Measured on ``clay0303hfsg`` (kernel-eligible, declines at any budget below
         # ~16 s): at a 12 s limit the attempt holds a point with objective 47287.5613
-        # against a reference optimum of 26669.10955143 -- valid, not a false primal
+        # against a reference optimum of 26669.10957 -- valid, not a false primal
         # -- while proving a bound of 23239.60-25496.44. Today that solve returns an
         # incumbent of NONE with the kernel on; with the kernel off it returns an
         # incumbent but a bound of -0.0, a 100% gap. Adopting both halves reports a
