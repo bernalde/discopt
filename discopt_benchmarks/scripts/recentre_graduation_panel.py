@@ -38,7 +38,7 @@ from discopt.validation.feasibility import verify_point  # noqa: E402
 from test_1537_invariance import FAMILIES  # noqa: E402
 
 
-def _solve(model, flag: str, tl: float):
+def _solve(model, flag: str, tl: float):  # model: freshly built by the caller
     os.environ["DISCOPT_RECENTRE"] = flag
     t0 = time.perf_counter()
     try:
@@ -71,11 +71,14 @@ def main() -> int:
     lost = {"0": 0, "1": 0}  # certified in the OTHER arm but not this one
     neutral_checked = neutral_diff = compared = 0
 
-    def record(label, base, model, neutral: bool):
+    def record(label, base, make, neutral: bool):
         nonlocal compared, neutral_checked, neutral_diff
         out = {}
         for flag in ("0", "1"):  # interleaved: same instance, back to back
-            r, err, wall, bad = _solve(model, flag, tl)
+            # A fresh model per arm: a solve writes constraint-implied bounds back
+            # onto its model (propagate_bounds_to_model), so reusing one object gave
+            # each arm a different, already-tightened starting box.
+            r, err, wall, bad = _solve(make(), flag, tl)
             t = tally[flag]
             t["wall"] += wall
             if err:
@@ -100,7 +103,8 @@ def main() -> int:
             lost["0"] += 1
         moved = r1 is not None and (r1.solver_stats or {}).get("recentre/variables_moved")
         note = ""
-        if neutral and not moved and r0 is not None and r1 is not None:
+        finished = r0 is not None and r0.status in ("optimal", "infeasible")
+        if neutral and not moved and finished and r1 is not None:
             neutral_checked += 1
             same = (r0.status, r0.node_count, r0.objective, r0.bound) == (
                 r1.status,
@@ -123,28 +127,36 @@ def main() -> int:
 
     for path in corpus:  # A + B
         name = os.path.basename(path)
-        m = dm.from_nl(path)
         os.environ["DISCOPT_RECENTRE"] = "0"
         try:
-            base = m.solve(time_limit=tl)
+            base = dm.from_nl(path).solve(time_limit=tl)
         except Exception as exc:
             print(f"{name}: base raised {type(exc).__name__}", flush=True)
             continue
-        record(f"A {name}", base, m, neutral=True)
+        record(f"A {name}", base, lambda p=path: dm.from_nl(p), neutral=True)
         if not base.gap_certified:
             continue
         for off, seed in ((1e3, 1), (1e6, 2)):
-            record(f"B {name} shift{off:g}", base, translate(m, off, seed=seed), neutral=False)
+            record(
+                f"B {name} shift{off:g}",
+                base,
+                lambda p=path, o=off, sd=seed: translate(dm.from_nl(p), o, seed=sd),
+                neutral=False,
+            )
 
     for fam, build in FAMILIES.items():  # C
         for s in range(4):
-            m = build(s)
             os.environ["DISCOPT_RECENTRE"] = "0"
-            base = m.solve(time_limit=tl)
+            base = build(s).solve(time_limit=tl)
             if not base.gap_certified:
                 continue
             for off, seed in ((1e3, 1), (1e6, 2)):
-                record(f"C {fam}[{s}] shift{off:g}", base, translate(m, off, seed=seed), False)
+                record(
+                    f"C {fam}[{s}] shift{off:g}",
+                    base,
+                    lambda b=build, i=s, o=off, sd=seed: translate(b(i), o, seed=sd),
+                    False,
+                )
 
     print(f"\nCOMPARED {compared}; bound-neutral checked {neutral_checked}, drifted {neutral_diff}")
     for flag, t in tally.items():
