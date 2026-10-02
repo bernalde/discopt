@@ -9880,6 +9880,7 @@ def solve_model(
     strategy: str = "best_first",
     max_nodes: int = 100_000,
     ipopt_options: Optional[dict] = None,
+    pounce_options: Optional[dict] = None,
     nlp_solver: str = "pounce",
     sparse: Optional[bool] = None,
     cutting_planes: bool = False,
@@ -9926,6 +9927,10 @@ def solve_model(
     root_cut_max: Optional[int] = None,
     _lns_enabled: bool = True,
     rens: bool = True,
+    # #1535: which engine solves a pure LP / MILP; see ``_resolve_lp_milp_backend``.
+    milp_backend: Optional[str] = None,
+    milp_cuts: Optional[bool] = None,
+    branching_rule: Optional[str] = None,
     # #917: extra wall-clock seconds this solve may take *only if* it holds an
     # incumbent when ``time_limit`` expires. Set by ``Model.solve`` to the #844
     # fallback reserve it withheld, so a primary that found a primal reclaims the
@@ -10011,8 +10016,48 @@ def solve_model(
         ``best_first`` still drives the proof of optimality).
     max_nodes : int, default 100_000
         Maximum number of B&B nodes before stopping.
+    milp_backend : {"highs", "native"}, optional
+        Engine for a pure LP or MILP model (#1535). The default ``None`` defers
+        to the ``DISCOPT_LP_MILP_BACKEND`` env var, which itself defaults to
+        HiGHS. ``"highs"`` names HiGHS with discopt-verified certificates, by
+        far the faster choice. ``"native"`` forces discopt's own branch and
+        bound -- the in-house LP solve (Rust simplex, POUNCE if it declines)
+        for an LP, discopt's MILP tree for a MILP -- so the search can be
+        watched: ``node_count`` is the tree's, ``strategy`` selects nodes,
+        ``branching_rule`` picks the branching variable, ``node_callback``
+        fires after every batch, and ``milp_cuts`` switches the root cut loop.
+        Meant for teaching and inspection on small models, not for
+        performance. ``lazy_constraints`` / ``incumbent_callback`` /
+        ``cut_callback`` send a MILP to spatial branch and bound, which honours
+        them (#748); ``algorithm_route`` names the engine that ran. Refused for
+        a model that is not an LP or MILP, with ``nlp_bb=True``, and (for
+        ``"native"``) with ``nlp_solver="simplex"`` or an explicit ``solver``;
+        ``"highs"`` is refused with any callback, since HiGHS runs none.
+    milp_cuts : bool, optional
+        Only with ``milp_backend="native"`` on a MILP. ``False`` skips the root
+        cut loop (cover, clique and Gomory cuts) so the tree branches on the
+        plain LP relaxation; ``None``/``True`` keeps it (the default). Lets the
+        effect of cutting planes be shown one switch at a time.
+    branching_rule : str, optional
+        Only with ``milp_backend="native"`` on a MILP: which fractional integer
+        variable a node branches on. ``"pseudocost"`` (the tree's default:
+        reliability pseudocosts, most-fractional until a variable has
+        observations), ``"most_fractional"``, ``"least_fractional"`` or
+        ``"strong"`` (full strong branching: both child LPs of every candidate
+        are solved and the largest product of objective degradations wins; the
+        probe LPs are counted in ``solver_stats["branching/strong_probe_lps"]``,
+        not in ``node_count``). Changes only the order of the search, never a
+        bound.
     ipopt_options : dict, optional
-        Options passed to cyipopt (only used when ``nlp_solver="ipopt"``).
+        Options passed to the NLP engine: POUNCE (the default ``nlp_solver``)
+        or cyipopt (``nlp_solver="ipopt"``).
+    pounce_options : dict, optional
+        Alias of ``ipopt_options`` (#1533): the same dictionary under a name that
+        says where it goes. Passing both is an error unless they are equal. Under
+        ``solver="pounce"`` an LP or convex QP reaches POUNCE's convex
+        interior-point method, which accepts only ``tol``, ``max_iter``,
+        ``max_wall_time``, ``print_level``, ``tau`` and ``tau_max``; any other key
+        raises ``ValueError`` there rather than being ignored.
     nlp_solver : str, default "pounce"
         Numerical engine for every problem class. The default ``"pounce"``
         (POUNCE — pure-Rust Ipopt port) is now the universal default: it
@@ -10118,7 +10163,21 @@ def solve_model(
         is distinct from the algebraic ``mip_nlp_method="goa"``. See
         ``docs/dev/solve-routing.md`` §4 for the locked contract (#323).
     solver : str or None, default None
-        Optional global-solver selector. Use ``"amp"`` to dispatch to
+        Optional global-solver selector. Use ``"pounce"`` for exactly one POUNCE
+        interior-point solve of the model as written (#1533): an LP goes to
+        POUNCE's convex LP IPM (``lp-ipm``), a QP whose Hessian discopt proves
+        positive semidefinite (an exact rational test) to its ``qp-ipm``, and every
+        other continuous model -- including a QP not so proved -- to the filter
+        line-search NLP IPM. No convexity classification, presolve, bound
+        tightening, spatial B&B or HiGHS fallback runs. An LP or convex QP is
+        reported ``"optimal"``; the NLP arm makes no global claim and reports
+        ``"local_optimal"`` (or ``"local_limit"`` / ``"local_infeasible"``) with no
+        bound, even for a model that happens to be convex. The arm taken is in
+        ``SolveResult.algorithm_route`` (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``,
+        ``"pounce:nlp"``). Integer or binary variables, and logical/disjunctive
+        constraints, raise ``ValueError``, as does an ``nlp_solver`` other than
+        ``"pounce"``; any other option left at a non-default value is ignored
+        with a warning naming it. Use ``"amp"`` to dispatch to
         Adaptive Multivariate Partitioning instead of branch-and-bound.
         Use ``"gurobi"`` to dispatch LP, MILP, QP, MIQP, QCP, QCQP, MIQCP,
         and MIQCQP models to the optional Gurobi backend. General NLP/MINLP
@@ -10259,6 +10318,8 @@ def solve_model(
     # without threading a field through ~18 SolveResult construction sites.
     abs_gap_tol = _resolve_abs_gap_tolerance(abs_gap_tolerance)
     _validate_solve_budgets(gap_tolerance, time_limit)
+    # #1533: ``pounce_options`` names the same POUNCE options as ``ipopt_options``.
+    ipopt_options = _resolve_pounce_options(ipopt_options, pounce_options)
     _GAP_TOLERANCES.append((float(gap_tolerance), abs_gap_tol))
 
     # --- Enforce float64 precision ---
@@ -10369,6 +10430,30 @@ def solve_model(
     trivial = _constant_objective_result(model, _solve_t0)
     if trivial is not None:
         return trivial
+
+    # --- #1533: solver="pounce" -- one POUNCE interior-point solve, nothing else ---
+    # Dispatched before every presolve, reformulation and cut-injection pass below:
+    # the route's contract is that the model as written reaches the IPM.
+    if (solver if solver is not None else kwargs.get("solver")) == "pounce":
+        kwargs.pop("solver", None)
+        if kwargs:
+            raise TypeError(
+                f"solver='pounce' got unsupported options {sorted(kwargs)}; pass "
+                "POUNCE settings through pounce_options."
+            )
+        _pounce_ignored = _pounce_route_ignored(locals())
+        return _solve_pounce_route(
+            model,
+            time_limit=time_limit,
+            t_start=_solve_t0,
+            options=ipopt_options,
+            initial_point=initial_point,
+            warm_start=warm_start,
+            lazy_constraints=lazy_constraints,
+            incumbent_callback=incumbent_callback,
+            nlp_solver=nlp_solver,
+            ignored=_pounce_ignored,
+        )
 
     # Slice held back from the search for the root-relaxation fallback so that
     # bound recovery happens INSIDE ``time_limit`` (see ``_ROOT_FALLBACK_RESERVE_S``).
@@ -10653,8 +10738,92 @@ def solve_model(
     ):
         raise ValueError(
             f"Unknown solver={_solver!r}. Choose one of None, 'amp', 'gurobi', "
-            "'mip-nlp', 'gp', 'gp-minlp', 'sgo', 'bb', 'direct', 'surrogate'."
+            "'mip-nlp', 'gp', 'gp-minlp', 'sgo', 'bb', 'direct', 'surrogate', 'pounce'."
         )
+
+    # #1535: resolve the LP/MILP engine once. An explicit ``milp_backend`` names an
+    # engine; every combination that would quietly run a different one is refused
+    # rather than ignored (CLAUDE.md §3).
+    _lpm_backend = _resolve_lp_milp_backend(milp_backend)
+    _tree_opts = [
+        n
+        for n, v in (("milp_cuts", milp_cuts), ("branching_rule", branching_rule))
+        if v is not None
+    ]
+    if _tree_opts and _lpm_backend != "native":
+        raise ValueError(
+            f"{', '.join(_tree_opts)} steer discopt's native MILP tree; pass "
+            "milp_backend='native' with them (the HiGHS route runs its own search)."
+        )
+    if branching_rule is not None and branching_rule not in _MILP_BRANCHING_RULES:
+        raise ValueError(
+            f"branching_rule={branching_rule!r}: expected one of {', '.join(_MILP_BRANCHING_RULES)}"
+        )
+    if milp_backend is not None:
+        # Imported under its own name: the #1456 pre-solve inventory records passes
+        # by name, and ``classify_problem`` is already there.
+        from discopt._relax.problem_classifier import ProblemClass as _PC
+        from discopt._relax.problem_classifier import classify_problem
+
+        _lpm_class = classify_problem(model)
+        if _lpm_class not in (_PC.LP, _PC.MILP):
+            raise ValueError(
+                f"milp_backend={milp_backend!r} selects the engine for an LP or MILP "
+                f"model; this model is {_lpm_class.value}."
+            )
+        if _lpm_backend == "native" and _solver not in (None, "bb"):
+            raise ValueError(
+                f"milp_backend='native' and solver={_solver!r} name different engines."
+            )
+        if _lpm_backend == "native" and nlp_solver == "simplex":
+            raise ValueError(
+                "milp_backend='native' runs discopt's MILP tree; nlp_solver='simplex' "
+                "names the monolithic Rust MILP engine. Pass one or the other."
+            )
+        if _tree_opts and (
+            _lpm_class != _PC.MILP
+            or _feasibility_callback_names(lazy_constraints, incumbent_callback)
+            or cut_callback is not None
+        ):
+            raise ValueError(
+                f"{', '.join(_tree_opts)} steer discopt's MILP tree, which "
+                + (
+                    "does not run for an LP."
+                    if _lpm_class != _PC.MILP
+                    else "lazy_constraints/incumbent_callback/cut_callback bypass (they "
+                    "route to spatial branch and bound, #748)."
+                )
+            )
+        if (
+            _lpm_backend == "highs"
+            and _lpm_class == _PC.MILP
+            and (node_callback is not None or cut_callback is not None)
+        ):
+            raise ValueError(
+                "milp_backend='highs' runs HiGHS, which exposes no node or cut hook; "
+                "node_callback/cut_callback need discopt's own search (leave "
+                "milp_backend unset, or pass milp_backend='native')."
+            )
+        if _lpm_backend == "highs" and _feasibility_callback_names(
+            lazy_constraints, incumbent_callback
+        ):
+            # #1535 review 2: these callbacks route an LP/MILP to spatial branch and
+            # bound (#748, #1500); HiGHS never runs, so naming it is a contradiction.
+            raise ValueError(
+                "milp_backend='highs' cannot honour lazy_constraints/"
+                "incumbent_callback: they need discopt's spatial branch and bound, "
+                "which screens candidate incumbents. Leave milp_backend unset, or "
+                "pass milp_backend='native'."
+            )
+        if nlp_bb is True:
+            # #1535 review 1: ``nlp_bb=True`` returns from NLP-based B&B before the
+            # LP/MILP dispatch is reached, so the named engine (and any tree option)
+            # would silently not run.
+            raise ValueError(
+                f"milp_backend={milp_backend!r} and nlp_bb=True name different "
+                "engines: nlp_bb=True runs NLP-based branch and bound, which takes "
+                "neither milp_backend nor branching_rule/milp_cuts."
+            )
     gurobi_options = kwargs.pop("gurobi_options", None) if _solver == "gurobi" else None
 
     # --- #1500: feasibility callbacks are enforced by the spatial B&B only ---
@@ -10680,6 +10849,15 @@ def solve_model(
             _feasibility_callbacks,
             "the decomposition engines solve their own master/subproblems and "
             "never screen candidate incumbents.",
+        )
+    if cut_callback is not None and nlp_bb is True:
+        # #1535: the NLP-BB loop has no cut hook; the callback would never be
+        # called while the solve reported as if it had been. The auto-select
+        # already steps aside for a cut callback; an explicit request is refused.
+        raise ValueError(
+            "cut_callback is not supported with nlp_bb=True: NLP-based branch and "
+            "bound has no hook that applies user cuts. Leave nlp_bb unset so the "
+            "spatial branch and bound, which does, solves the model."
         )
     if _feasibility_callbacks and gdp_method in ("oa", "loa"):
         _refuse_unenforced_callbacks(
@@ -11539,6 +11717,9 @@ def solve_model(
     # lazy_constraints, which the GP path would drop just the same.
     if (
         _solver is None
+        # #1535: an explicit ``milp_backend`` names the LP/MILP engine; a linear GP
+        # must reach it rather than leave on the log-space route.
+        and milp_backend is None
         and not _has_bb_callbacks
         and not _feasibility_callbacks
         and not skip_convex_check
@@ -11554,7 +11735,13 @@ def solve_model(
             nlp_bb=nlp_bb,
             nlp_solver=nlp_solver,
             lagrangian_bound=lagrangian_bound,
-            has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+            has_callbacks=(
+                lazy_constraints is not None
+                or incumbent_callback is not None
+                or node_callback is not None
+                or cut_callback is not None
+            ),
+            backend=_lpm_backend,
         ):
             gp_result = solve_gp(
                 model,
@@ -12375,6 +12562,7 @@ def solve_model(
                     strategy=strategy,
                     max_nodes=max_nodes,
                     ipopt_options=ipopt_options,
+                    pounce_options=pounce_options,
                     nlp_solver=nlp_solver,
                     sparse=sparse,
                     cutting_planes=cutting_planes,
@@ -12417,6 +12605,12 @@ def solve_model(
                     root_cut_max=root_cut_max,
                     _lns_enabled=_lns_enabled,
                     rens=rens,
+                    # #1535: always None here in practice (refused upfront for a
+                    # model that is not an LP or MILP), forwarded so the probe can
+                    # never answer under a different engine choice than the caller's.
+                    milp_backend=milp_backend,
+                    milp_cuts=milp_cuts,
+                    branching_rule=branching_rule,
                     **kwargs,
                 )
                 if _ipx_probe is not None:
@@ -12559,7 +12753,13 @@ def solve_model(
         nlp_bb=nlp_bb,
         nlp_solver=nlp_solver,
         lagrangian_bound=lagrangian_bound,
-        has_callbacks=lazy_constraints is not None or incumbent_callback is not None,
+        has_callbacks=(
+            lazy_constraints is not None
+            or incumbent_callback is not None
+            or node_callback is not None
+            or cut_callback is not None
+        ),
+        backend=_lpm_backend,
     ):
         logger.info("Root presolve skipped: the HiGHS LP/MILP route presolves internally")
         presolve = False
@@ -13048,9 +13248,47 @@ def solve_model(
     _pure_continuous_force_spatial = _callbacks_force_bb and _pure_continuous
     if problem_class is not None:
         if problem_class == ProblemClass.LP and not _callbacks_force_bb:
-            if _lp_milp_backend() == "highs":
+            _lp_unused = [
+                n
+                for n, cb in (("node_callback", node_callback), ("cut_callback", cut_callback))
+                if cb is not None
+            ]
+            if _tree_opts:
+                # #1535 review 4: validated against the RAW model's class, which was
+                # a MILP; root presolve fixed every integer, so no tree will run.
+                warnings.warn(
+                    f"{', '.join(_tree_opts)} unused: presolve fixed every integer "
+                    "variable, so the model was solved as an LP with no "
+                    "branch-and-bound tree.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if _lp_unused:
+                # #1535: an LP is solved without branch and bound -- there is no
+                # node to report and no relaxation to cut. Say so instead of
+                # returning as if the callback had been consulted.
+                warnings.warn(
+                    f"{' and '.join(_lp_unused)} not called: this model is an LP, "
+                    "solved by a single simplex run with no branch-and-bound tree.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if _lpm_backend == "highs":
                 return _solve_lp_highs(model, t_start, time_limit)
-            return _solve_lp(model, t_start, time_limit)
+            _lp_res = _solve_lp(model, t_start, time_limit)
+            if _lpm_backend == "native" and _lp_res.algorithm_route is None:
+                _lp_stats = _lp_res.solver_stats or {}
+                _lp_engine = (
+                    "Rust simplex"
+                    if "lp/engine_simplex" in _lp_stats
+                    else "POUNCE (simplex declined)"
+                    if "lp/engine_pounce" in _lp_stats
+                    else "no engine certified"
+                )
+                _lp_res.algorithm_route = (
+                    f"native-lp: discopt LP solve, {_lp_engine} (milp_backend='native')"
+                )
+            return _lp_res
         elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
                 if _pure_continuous_convexity_known and _pure_continuous_is_convex:
@@ -13072,14 +13310,22 @@ def solve_model(
             # NLP-BB auto-select already take. Trades the specialized engine's
             # speed for correctness (CLAUDE.md §1). This mirrors the #740 fix on
             # the spatial path.
-            if lazy_constraints is None and incumbent_callback is None:
+            #
+            # #1535: ``cut_callback`` joins them. Neither MILP engine has a cut hook,
+            # so the callback was silently never called on a MILP (0 calls, on both
+            # the HiGHS and the native route); the spatial path separates it.
+            # ``node_callback`` needs a tree to observe: HiGHS and the monolithic
+            # Rust engine expose none, so it keeps the MILP on ``_solve_milp_bb``.
+            _observe_tree = node_callback is not None
+            if lazy_constraints is None and incumbent_callback is None and cut_callback is None:
                 # #1229 HiGHS route (default; DISCOPT_LP_MILP_BACKEND=rust opts out). An explicit
                 # ``nlp_solver="simplex"`` still names the Rust engine, and
                 # ``lagrangian_bound`` still needs the per-node Python path.
                 if (
-                    _lp_milp_backend() == "highs"
+                    _lpm_backend == "highs"
                     and nlp_solver != "simplex"
                     and not lagrangian_bound
+                    and not _observe_tree
                 ):
                     _highs_res = _solve_milp_highs(
                         model,
@@ -13108,8 +13354,15 @@ def solve_model(
                 # Carries the engine's valid dual bound and the work it spent
                 # back out when it DEFERS, so neither is thrown away (see below).
                 _deferred: dict = {}
-                _want_engine = nlp_solver == "simplex" or (
-                    _milp_engine_default_on() and not lagrangian_bound
+                # #1535: ``milp_backend="native"`` asks for the MILP tree below,
+                # the engine whose search the caller's options actually steer.
+                _want_engine = (
+                    _lpm_backend != "native"
+                    and not _observe_tree
+                    and (
+                        nlp_solver == "simplex"
+                        or (_milp_engine_default_on() and not lagrangian_bound)
+                    )
                 )
                 # #1243: the monolithic engine's RELATIVE arm is
                 # ``TreeManager::gap()``, whose denominator is FLOORED AT 1.0, so
@@ -13191,15 +13444,38 @@ def solve_model(
                     initial_point=initial_point,
                     incumbent_time_extension=incumbent_time_extension,
                     abs_gap_tol=abs_gap_tol,
+                    node_callback=node_callback,
+                    root_cuts=milp_cuts is not False,
+                    branching_rule=branching_rule or "pseudocost",
                 )
+                if _lpm_backend == "native" and _bb_res.algorithm_route is None:
+                    _bb_res.algorithm_route = (
+                        f"native-milp: discopt MILP branch and bound "
+                        f"(milp_backend='native', strategy={strategy!r}, "
+                        f"branching_rule={branching_rule or 'pseudocost'!r}, "
+                        f"root cuts {'off' if milp_cuts is False else 'on'})"
+                    )
+                elif _observe_tree and _bb_res.algorithm_route is None:
+                    _bb_res.algorithm_route = (
+                        "milp-tree: discopt MILP branch and bound (node_callback set; "
+                        "the HiGHS route has no tree to observe)"
+                    )
                 return _merge_engine_stats(
                     _merge_engine_bound(_bb_res, _engine_bound, model),
                     _deferred.get("stats"),
                 )
+            if _lpm_backend == "native":
+                # #1535: the caller asked for discopt's own search and gets it -- the
+                # spatial tree, the one engine that screens these callbacks (#748).
+                # Say so on the result rather than let it read as the MILP tree.
+                _ROUTE_FALLBACK_NOTE.append(
+                    "native-spatial: discopt spatial branch and bound (milp_backend="
+                    "'native' with lazy_constraints/incumbent_callback/cut_callback, #748)"
+                )
             logger.info(
-                "MILP with a lazy_constraints/incumbent_callback — routing to spatial "
-                "Branch-and-Bound (the specialized MILP engine cannot honor these "
-                "callbacks; #748)"
+                "MILP with a lazy_constraints/incumbent_callback/cut_callback — routing "
+                "to spatial Branch-and-Bound (the specialized MILP engines cannot honor "
+                "these callbacks; #748)"
             )
             # Fall through to the spatial/McCormick path below.
         elif problem_class == ProblemClass.MIQP:
@@ -13466,8 +13742,15 @@ def solve_model(
     # per-node cut application; its primal heuristics inject incumbents without
     # consulting the callback — INT-1, #413). Fall through to the spatial-B&B
     # loop, which enforces both correctly, rather than silently drop the
-    # rejection and accept the excluded point.
-    if nlp_bb is None and lazy_constraints is None and incumbent_callback is None:
+    # rejection and accept the excluded point. #1535: ``cut_callback`` too -- the
+    # NLP-BB loop has no cut hook, so a convex model (a MILP routed here by #748
+    # included) ran with the callback never called.
+    if (
+        nlp_bb is None
+        and lazy_constraints is None
+        and incumbent_callback is None
+        and cut_callback is None
+    ):
         if not _root_convexity_known:
             _root_convexity_known, _root_is_convex, _root_constraint_mask = (
                 _classify_model_convexity(
@@ -20134,8 +20417,17 @@ def _solve_continuous(
     warm_start: Optional[dict] = None,
     gap_tolerance: float = 1e-6,
     certify_convex: bool = False,
+    tighten_bounds: bool = True,
+    raw_status_out: Optional[list] = None,
 ) -> SolveResult:
     """Solve a purely continuous model directly with NLP solver (no B&B).
+
+    ``tighten_bounds=False`` hands the NLP the declared box as-is, skipping the
+    nonlinear bound tightening (and the infeasibility proof it can return). Only
+    ``solver="pounce"`` passes it (#1533): that route promises one interior-point
+    solve of the model as written, and a box the solver tightened first changes
+    the iterates a reader of the log is studying. ``raw_status_out``, when a list
+    is passed, receives the NLP backend's own return code (Ipopt numbering).
 
     ``warm_start`` is the dual half of ``Model.solve(warm_start=...)`` (#1247):
     ``{"x", "constraint_duals", "bound_duals_lower", "bound_duals_upper",
@@ -20161,9 +20453,12 @@ def _solve_continuous(
     raw_lb, raw_ub = evaluator.variable_bounds
     lb = np.asarray(raw_lb, dtype=np.float64).copy()
     ub = np.asarray(raw_ub, dtype=np.float64).copy()
-    tightened_lb, tightened_ub, nonlinear_infeasible = _apply_nonlinear_tightening_with_status(
-        model, lb, ub
-    )
+    if tighten_bounds:
+        tightened_lb, tightened_ub, nonlinear_infeasible = _apply_nonlinear_tightening_with_status(
+            model, lb, ub
+        )
+    else:
+        tightened_lb, tightened_ub, nonlinear_infeasible = lb, ub, False
     if nonlinear_infeasible:
         wall_time = time.perf_counter() - t_start
         return SolveResult(
@@ -20277,6 +20572,8 @@ def _solve_continuous(
             backend_evaluator, x0, constraint_bounds=constraint_bounds, options=opts
         )
     jax_time += time.perf_counter() - t_jax_start
+    if raw_status_out is not None:
+        raw_status_out.append(nlp_result.raw_status)
 
     wall_time = time.perf_counter() - t_start
     python_time = wall_time - jax_time
@@ -20537,6 +20834,305 @@ def _solve_continuous(
         solve_report=nlp_result.solve_report,
         error=_error_reason if status == "error" else None,
     )
+
+
+#: ``SolveResult.algorithm_route`` for each arm of ``solver="pounce"`` (#1533).
+POUNCE_ROUTE_LP = "pounce:lp-ipm"
+POUNCE_ROUTE_QP = "pounce:qp-ipm"
+POUNCE_ROUTE_NLP = "pounce:nlp"
+
+#: Ipopt's ``Infeasible_Problem_Detected``: the NLP converged to a point of
+#: locally minimal infeasibility.
+_IPOPT_INFEASIBLE_PROBLEM = 2
+
+#: ``solve_model`` parameters ``solver="pounce"`` honours (#1533). Every other
+#: parameter left at a non-default value is reported as ignored, so the list of
+#: ignored options cannot fall behind the signature.
+_POUNCE_ROUTE_HONOURED = frozenset(
+    {
+        "model",
+        "time_limit",
+        "ipopt_options",
+        "pounce_options",
+        "nlp_solver",
+        "initial_point",
+        "warm_start",
+        "lazy_constraints",
+        "incumbent_callback",
+        "solver",
+        "kwargs",
+    }
+)
+
+
+def _pounce_route_ignored(values: Mapping[str, Any]) -> list[str]:
+    """The ``solve_model`` parameters set to non-default values that the route ignores."""
+    import inspect
+
+    ignored = []
+    for name, param in inspect.signature(solve_model).parameters.items():
+        if name in _POUNCE_ROUTE_HONOURED or name not in values:
+            continue
+        val, default = values[name], param.default
+        if val is default:
+            continue
+        try:
+            same = type(val) is type(default) and bool(val == default)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            ignored.append(name)
+    return ignored
+
+
+#: The statuses a ``solver="pounce"`` result may carry a dual bound under.
+_POUNCE_ROUTE_CERTIFIED = frozenset({"optimal", "infeasible", "unbounded"})
+
+
+def _resolve_pounce_options(
+    ipopt_options: Optional[dict], pounce_options: Optional[dict]
+) -> Optional[dict]:
+    """``pounce_options`` is an alias of ``ipopt_options`` (#1533).
+
+    Both reach the same POUNCE option registry. Passing both is accepted only when
+    they agree; two different dictionaries would leave one silently unused.
+    """
+    if pounce_options is None:
+        return ipopt_options
+    if not isinstance(pounce_options, dict):
+        raise TypeError(f"pounce_options must be a dict, got {type(pounce_options).__name__}")
+    if ipopt_options is not None and dict(ipopt_options) != dict(pounce_options):
+        raise ValueError(
+            "solve() got both pounce_options and ipopt_options with different contents. "
+            "They are two names for the same POUNCE options; pass one."
+        )
+    return dict(pounce_options)
+
+
+def _strip_local_claims(result: SolveResult) -> SolveResult:
+    """No dual bound and no certified gap on a result that is not a certificate."""
+    result.gap_certified = False
+    result._set_bound(None, valid=False)
+    result.root_bound = None
+    result.gap = None
+    result.root_gap = None
+    return result
+
+
+def _solve_pounce_route(
+    model: Model,
+    *,
+    time_limit: float,
+    t_start: float,
+    options: Optional[dict],
+    initial_point: Optional[np.ndarray],
+    warm_start: Optional[dict],
+    lazy_constraints,
+    incumbent_callback,
+    nlp_solver: str,
+    ignored: list[str],
+) -> SolveResult:
+    """``Model.solve(solver="pounce")``: one POUNCE interior-point solve (#1533).
+
+    The model's class picks the algorithm and nothing else runs:
+
+    * **LP** -> POUNCE's convex LP interior-point method (``lp-ipm``,
+      :mod:`discopt.solvers.convex_ipm_pounce`);
+    * **QP** whose Hessian :func:`convex_ipm_pounce.certify_psd` proves PSD ->
+      the same engine's ``qp-ipm``;
+    * everything else continuous -- a QP not proved PSD, a QCQP, an NLP -> the
+      filter line-search NLP interior-point method, once.
+
+    Convexity of a QP is proved by discopt, not taken from POUNCE's own PSD check:
+    that check scales its tolerance by ``max|Q_ij|`` and ignores the box, so it
+    admits ``-1e-9 x**2 + y**2`` on ``x in [-1e4, 1e4]``, where the convex IPM stops
+    at a saddle that the route would then certify (#1533 review).
+
+    No convexity classification, presolve, bound tightening, spatial B&B, or
+    HiGHS/simplex fallback. An LP or PSD QP is convex, so its KKT point is a
+    global optimum and is reported ``optimal`` after the matrix route's
+    primal-feasibility (and, for a QP, KKT-stationarity) guards. The NLP arm
+    proves nothing global: a converged solve is ``local_optimal``, a limit with a
+    point ``local_limit``, a local infeasibility ``local_infeasible``, and none
+    carries a bound. That holds for a convex NLP too -- establishing convexity is
+    the classification this route exists to skip.
+
+    Raises:
+        ValueError: integer/binary variables, GDP/logical/SOS constraints, a
+            feasibility callback, ``nlp_solver`` other than POUNCE, or an option
+            the convex engine does not have.
+    """
+    import warnings
+
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
+    from discopt.modeling.core import Constraint
+
+    _refuse_unenforced_callbacks(
+        "solver='pounce'",
+        _feasibility_callback_names(lazy_constraints, incumbent_callback),
+        "it is a single local interior-point solve with no hook that screens candidate points.",
+    )
+    if nlp_solver != "pounce":
+        # #1533 review: ``"ipm"``/``"sparse_ipm"`` were accepted and then replaced by
+        # ``"pounce"`` -- an accepted value with no effect. Only one value is honoured.
+        raise ValueError(
+            f"solver='pounce' always runs POUNCE's interior-point methods, but "
+            f"nlp_solver={nlp_solver!r} was passed. Drop nlp_solver, or drop "
+            f"solver='pounce'."
+        )
+    discrete = [v.name for v in model._variables if v.var_type in (VarType.BINARY, VarType.INTEGER)]
+    if discrete:
+        raise ValueError(
+            "solver='pounce' solves continuous LP/QP/NLP models with an interior-point "
+            "method, which cannot enforce integrality; this model has integer or binary "
+            f"variables: {', '.join(discrete)}. Use the default solver (solver=None) for "
+            "a mixed-integer model."
+        )
+    structured = sorted(
+        {type(c).__name__ for c in model._constraints if not isinstance(c, Constraint)}
+    )
+    if structured:
+        raise ValueError(
+            "solver='pounce' solves algebraic continuous models only; this model has "
+            f"logical/disjunctive constraints ({', '.join(structured)}), whose "
+            "reformulation introduces binary variables. Use the default solver."
+        )
+    if ignored:
+        warnings.warn(
+            "solver='pounce' ignores "
+            + ", ".join(sorted(ignored))
+            + ": it is a single interior-point solve with no branch-and-bound tree, "
+            "no relaxation and no global gap. Pass solver options through "
+            "pounce_options.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    def _remaining() -> float:
+        return max(float(time_limit) - (time.perf_counter() - t_start), 0.0)
+
+    pclass = classify_problem(model)
+
+    if pclass in (ProblemClass.LP, ProblemClass.QP):
+        from discopt.solvers import convex_ipm_pounce as _cvx
+
+        engine_opts = _cvx.convex_engine_options(options)  # refuse before solving
+        raw: dict[str, Any] = {}
+        is_lp = pclass == ProblemClass.LP
+        route = POUNCE_ROUTE_LP if is_lp else POUNCE_ROUTE_QP
+
+        def _recorded(fn):
+            def call(**kw):
+                out = fn(options=engine_opts, **kw)
+                raw["iterations"] = out.iterations
+                raw["status"] = out.status
+                return out
+
+            return call
+
+        reject_reason: list[str] = []
+        try:
+            if is_lp:
+                outcome = _solve_lp_matrix(
+                    model,
+                    t_start,
+                    _remaining(),
+                    _recorded(_cvx.solve_lp),
+                    "POUNCE lp-ipm",
+                    strict=True,
+                    relaxes_huge_bounds=True,
+                )
+            else:
+                outcome = _solve_qp_matrix(
+                    model,
+                    t_start,
+                    _remaining(),
+                    _recorded(_cvx.solve_qp),
+                    "POUNCE qp-ipm",
+                    strict=True,
+                    relaxes_huge_bounds=True,
+                    reject_reason=reject_reason,
+                )
+        except _cvx.IndefiniteQPError as exc:
+            logger.info("solver='pounce': %s Solving locally with the NLP IPM.", exc)
+            outcome = None
+            pclass = ProblemClass.NLP  # fall to the NLP arm below
+        if pclass != ProblemClass.NLP:
+            wall = time.perf_counter() - t_start
+            if isinstance(outcome, _DeferredUnbounded):
+                result = SolveResult(
+                    status="error",
+                    wall_time=wall,
+                    error=(
+                        "POUNCE reported the problem unbounded, but it treats a declared "
+                        "bound of magnitude >= 1e15 (including the 9.999e19 default box "
+                        "of a variable declared without bounds) as infinite, so over the "
+                        "box as declared the optimum may sit at that corner instead. "
+                        "Give the unbounded variables explicit infinite bounds "
+                        "(lb=-numpy.inf / ub=numpy.inf) or realistic finite ones."
+                    ),
+                )
+            elif outcome is None:
+                st = raw.get("status")
+                if st in (SolveStatus.ITERATION_LIMIT, SolveStatus.TIME_LIMIT):
+                    result = SolveResult(status=st.value, wall_time=wall)
+                else:
+                    result = SolveResult(
+                        status="error",
+                        wall_time=wall,
+                        error=(
+                            f"POUNCE {route.split(':')[1]} returned no verified answer "
+                            f"(engine status {getattr(st, 'value', st)!r})."
+                            + (" " + " ".join(reject_reason) if reject_reason else "")
+                        ),
+                    )
+            else:
+                result = outcome
+            if result.status not in _POUNCE_ROUTE_CERTIFIED:
+                _strip_local_claims(result)
+            result.algorithm_route = route
+            stats = dict(result.solver_stats or {})
+            if "iterations" in raw:
+                stats["pounce/iterations"] = float(raw["iterations"])
+            result.solver_stats = stats
+            return result
+
+    # NLP arm: the filter line-search IPM, once, over the declared box.
+    raw_status: list = []
+    result = _solve_continuous(
+        model,
+        _remaining(),
+        options,
+        time.perf_counter(),
+        "pounce",
+        initial_point=initial_point,
+        warm_start=warm_start,
+        tighten_bounds=False,
+        raw_status_out=raw_status,
+    )
+    result.wall_time = time.perf_counter() - t_start
+    if result.status == "optimal":
+        result.status = "local_optimal"
+    elif result.status == "infeasible" or (
+        result.status == "error" and raw_status and raw_status[0] == _IPOPT_INFEASIBLE_PROBLEM
+    ):
+        # The NLP engine converged to a point of locally minimal infeasibility
+        # (Ipopt code 2, which the backend reports as ``error``). On a nonconvex
+        # model that is not a proof, so the claim is the local one.
+        result.status = "local_infeasible"
+        result.error = None
+    elif result.status == "iteration_limit" and result.x:
+        result.status = "local_limit"
+    elif result.status == "unbounded":
+        result.status = "error"
+        result.error = (
+            "POUNCE's NLP iterates diverged; that suggests, but does not prove, an "
+            "objective unbounded below on the feasible set."
+        )
+    _strip_local_claims(result)
+    result.convex_fast_path = False
+    result.algorithm_route = POUNCE_ROUTE_NLP
+    return result
 
 
 def _solve_nlp_bb(
@@ -23898,6 +24494,13 @@ def _solve_lp(
                 held = held or result
                 continue
             if result is not None:
+                # #1535: record which engine answered, so a route label can name
+                # it (POUNCE answers when the simplex declines). Instrumentation.
+                if isinstance(result, SolveResult):
+                    _tag = (
+                        "lp/engine_simplex" if engine is _solve_lp_simplex else "lp/engine_pounce"
+                    )
+                    result.solver_stats = {**(result.solver_stats or {}), _tag: 1.0}
                 return result
         return held
 
@@ -27185,6 +27788,38 @@ def _lp_milp_backend() -> str:
     return val
 
 
+#: Values the ``milp_backend=`` keyword of :func:`solve_model` accepts (#1535).
+_MILP_BACKEND_VALUES = ("highs", "native")
+
+
+def _resolve_lp_milp_backend(milp_backend: Optional[str]) -> str:
+    """The engine for a pure LP / MILP: ``"highs"``, ``"rust"`` or ``"native"``.
+
+    ``milp_backend=None`` defers to :func:`_lp_milp_backend` (the
+    ``DISCOPT_LP_MILP_BACKEND`` env var, default ``"highs"``), so a solve that does
+    not name a backend is unchanged. An explicit keyword wins over the env var:
+
+    * ``"highs"`` -- the #1229 HiGHS route, with discopt-verified certificates.
+    * ``"native"`` (#1535) -- discopt's own branch and bound, for teaching and for
+      inspecting the search: an LP goes to the in-house Rust simplex, a MILP to the
+      Python-driven MILP tree (``_solve_milp_bb``), the engine that honours
+      ``strategy``, ``max_nodes``, ``node_callback`` and ``milp_cuts``. It does NOT
+      go to the monolithic Rust engine (``_solve_milp_simplex``), which takes none
+      of those options. Far slower than HiGHS on anything but small models.
+
+    ``"rust"`` is reachable only through the env var: it is the legacy opt-out to the
+    monolithic Rust engine, kept for A/B runs, not a documented interface.
+    """
+    if milp_backend is None:
+        return _lp_milp_backend()
+    val = milp_backend.strip().lower() if isinstance(milp_backend, str) else milp_backend
+    if val not in _MILP_BACKEND_VALUES:
+        raise ValueError(
+            f"milp_backend={milp_backend!r}: expected one of {', '.join(_MILP_BACKEND_VALUES)}"
+        )
+    return val
+
+
 def _highs_takes_pure_lp_milp(
     model: Model,
     *,
@@ -27193,8 +27828,12 @@ def _highs_takes_pure_lp_milp(
     nlp_solver: str,
     lagrangian_bound: bool,
     has_callbacks: bool,
+    backend: Optional[str] = None,
 ) -> bool:
     """Whether the #1229 HiGHS route will solve *model*, decided before root presolve.
+
+    ``backend`` is the solve's resolved LP/MILP engine (``_resolve_lp_milp_backend``);
+    ``None`` reads the env var, for callers that have no ``milp_backend`` keyword.
 
     Mirrors the LP / MILP HiGHS dispatch conditions in ``_solve_impl``. discopt's root
     presolve only tightens bounds, and HiGHS presolves the model itself, so running it
@@ -27203,7 +27842,9 @@ def _highs_takes_pure_lp_milp(
     which this answers ``True`` but that later leaves the route still gets a valid,
     merely looser, declared box -- skipping presolve is never unsound.
     """
-    if _lp_milp_backend() != "highs" or solver_name == "gurobi":
+    if backend is None:
+        backend = _lp_milp_backend()
+    if backend != "highs" or solver_name == "gurobi":
         return False
     from discopt._relax.problem_classifier import ProblemClass, classify_problem
 
@@ -28191,6 +28832,146 @@ def _solve_milp_simplex(
     )
 
 
+#: Branching rules the native MILP tree accepts (#1535). ``"pseudocost"`` is the
+#: tree's own default (reliability pseudocosts, most-fractional until a column has
+#: observations); the others are chosen here and handed to the tree as branch hints.
+_MILP_BRANCHING_RULES = ("pseudocost", "most_fractional", "least_fractional", "strong")
+
+
+def _milp_branching_hints(
+    rule: str,
+    node_solve: Callable,
+    lp_data,
+    int_cols: np.ndarray,
+    batch_ids,
+    batch_lb,
+    batch_ub,
+    result_lbs: np.ndarray,
+    result_sols: np.ndarray,
+    cutoff: float,
+    n_vars: int,
+    n_orig: int,
+    t_start: float,
+    time_limit: float,
+) -> tuple[list[tuple[int, int]], int]:
+    """The ``(node_id, column)`` branch hints ``rule`` picks for one batch (#1535).
+
+    Only nodes the tree will branch -- a real bound below ``cutoff`` and at least one
+    fractional integer column -- get a hint. A hint changes WHICH column is branched
+    on, never a bound: ``process_evaluated`` still splits at ``floor``/``ceil`` of the
+    node's value, an exhaustive cover, so the rule cannot cut off a feasible point.
+
+    * ``"most_fractional"`` -- fractional part closest to 1/2.
+    * ``"least_fractional"`` -- fractional part closest to an integer.
+    * ``"strong"`` -- full strong branching: solve both child LPs for every
+      candidate and take the largest product of objective degradations, an
+      infeasible child counting as an infinite degradation. The probe LPs are not
+      tree nodes; their number is returned so the caller can report it.
+
+    ``"pseudocost"`` returns no hints: that is the tree's own rule.
+    """
+    hints: list[tuple[int, int]] = []
+    probes = 0
+    if rule == "pseudocost" or int_cols.size == 0:
+        return hints, probes
+    for i in range(len(batch_ids)):
+        lb_i = float(result_lbs[i])
+        if not lb_i < _SENTINEL_THRESHOLD or lb_i >= cutoff:
+            continue
+        vals = result_sols[i][int_cols]
+        frac = vals - np.floor(vals)
+        cand = np.flatnonzero((frac > 1e-5) & (frac < 1.0 - 1e-5))
+        if cand.size == 0:
+            continue
+        if rule == "most_fractional":
+            pick = cand[int(np.argmin(np.abs(frac[cand] - 0.5)))]
+        elif rule == "least_fractional":
+            pick = cand[int(np.argmin(np.minimum(frac[cand], 1.0 - frac[cand])))]
+        else:  # strong
+            node_lb = np.asarray(batch_lb[i], dtype=np.float64)
+            node_ub = np.asarray(batch_ub[i], dtype=np.float64)
+            best_score = -np.inf
+            pick = cand[0]
+            for k in cand:
+                col = int(int_cols[k])
+                v = float(result_sols[i][col])
+                deltas = []
+                for side in ("down", "up"):
+                    clb, cub = node_lb.copy(), node_ub.copy()
+                    if side == "down":
+                        cub[col] = np.floor(v)
+                    else:
+                        clb[col] = np.ceil(v)
+                    out = node_solve(lp_data, clb, cub, n_vars, n_orig, t_start, time_limit)
+                    probes += 1
+                    if out is None:  # stalled probe: no information, not a proof
+                        deltas.append(0.0)
+                    elif out[2] == "optimal" and out[0] < _SENTINEL_THRESHOLD:
+                        deltas.append(max(float(out[0]) - lb_i, 0.0))
+                    else:
+                        deltas.append(np.inf)
+                score = max(deltas[0], 1e-6) * max(deltas[1], 1e-6)
+                if score > best_score:
+                    best_score = score
+                    pick = k
+        hints.append((int(batch_ids[i]), int(int_cols[pick])))
+    return hints, probes
+
+
+def _fire_milp_node_callback(
+    node_callback: Callable,
+    model: Model,
+    tree,
+    result_lbs: np.ndarray,
+    result_sols: np.ndarray,
+    n_orig: int,
+    tree_bound_valid: bool,
+    t_start: float,
+) -> None:
+    """Call ``node_callback(ctx, model)`` once for a processed MILP-tree batch (#1535).
+
+    The MILP tree minimizes internally (``-obj`` for a MAXIMIZE), so every
+    objective-valued field is mapped back to the user's sense: ``incumbent_obj`` is
+    the best objective found, ``best_bound`` the certified global dual bound
+    (:func:`_certified_callback_bound`), and ``node_bound`` the relaxation bound of
+    the batch's best node -- all three comparable with ``SolveResult.objective``.
+    ``x_relaxation`` is that node's LP point over the model's own variables (the
+    standard-form slack columns are dropped). When no node of the batch has a
+    relaxation (all infeasible or unsettled), ``node_bound`` and ``x_relaxation``
+    are ``None``. A raising callback is logged and the
+    search continues, as on the spatial path.
+    """
+    from discopt.callbacks import CallbackContext
+    from discopt.modeling.core import ObjectiveSense as _ObjSense
+
+    is_max = model._objective is not None and model._objective.sense == _ObjSense.MAXIMIZE
+    sign = -1.0 if is_max else 1.0
+    stats = tree.stats()
+    inc = tree.incumbent()
+    inc_obj = None
+    if inc is not None and inc[1] < _SENTINEL_THRESHOLD:
+        inc_obj = sign * float(inc[1])
+    best = int(np.argmin(result_lbs))
+    # #1535 review 5: a batch whose every node is infeasible or unsettled holds only
+    # sentinels -- no relaxation bound and no relaxation point (the stored row is
+    # the box midpoint). Report that as ``None`` rather than a +-1e30 "bound".
+    has_relaxation = bool(result_lbs[best] < _SENTINEL_THRESHOLD)
+    bound = _certified_callback_bound(stats.get("global_lower_bound"), tree_bound_valid, is_max)
+    ctx = CallbackContext(
+        node_count=stats["total_nodes"],
+        incumbent_obj=inc_obj,
+        best_bound=bound,
+        gap=(stats.get("gap") if bound is not None else None),
+        elapsed_time=time.perf_counter() - t_start,
+        x_relaxation=(np.asarray(result_sols[best][:n_orig]).copy() if has_relaxation else None),
+        node_bound=(sign * float(result_lbs[best]) if has_relaxation else None),
+    )
+    try:
+        node_callback(ctx, model)
+    except Exception as e:  # noqa: BLE001 - a user callback must not abort the solve
+        logger.warning("Node callback raised an exception: %s", e)
+
+
 def _solve_milp_bb(
     model: Model,
     time_limit: float,
@@ -28211,6 +28992,11 @@ def _solve_milp_bb(
     # ``solve_model``. Defaulted so a direct caller of this driver keeps the
     # established behaviour exactly.
     abs_gap_tol: float = _DEFAULT_ABS_GAP_TOL,
+    # #1535: observe the search (called after every processed batch, as on the
+    # spatial path) and switch the root cut loop off to show what it buys.
+    node_callback: Optional[Callable] = None,
+    root_cuts: bool = True,
+    branching_rule: str = "pseudocost",
 ) -> SolveResult:
     """Solve a MILP via B&B with LP relaxation solves at each node.
 
@@ -28324,6 +29110,9 @@ def _solve_milp_bb(
         clique_edges=_clique_edges,
         int_idx=_cut_int_idx,
         prefer_pounce=prefer_pounce,
+        # ``root_cuts=False`` (#1535, ``milp_cuts=False``): zero rounds leaves
+        # ``lp_data`` untouched -- the plain LP relaxation, which is always valid.
+        max_rounds=5 if root_cuts else 0,
     )
     if _n_cuts:
         logger.info(
@@ -28353,6 +29142,12 @@ def _solve_milp_bb(
     t_rust_start = time.perf_counter()
     tree = PyTreeManager(n_vars, lb.tolist(), ub.tolist(), int_offsets, int_sizes, strategy)
     tree.initialize()
+    # #1535: integer columns and probe count for a caller-chosen branching rule.
+    _branch_int_cols = np.array(
+        [j for off, sz in zip(int_offsets, int_sizes) for j in range(off, off + int(sz))],
+        dtype=np.int64,
+    )
+    _strong_probes = 0
     # #933 part (a): install the root LP relaxation bound (proved just above by
     # the same structured-node engine that bounds every node on this path, over
     # exactly this [lb, ub] box) into the tree root, so ``global_lower_bound``
@@ -28793,6 +29588,33 @@ def _solve_milp_bb(
             _debug_quit = True
             break
 
+        if branching_rule != "pseudocost":
+            # #1535: set before the #1414 hints below, which must win for their
+            # nodes (a later hint for the same node replaces an earlier one).
+            _inc_now = tree.incumbent()
+            _rule_hints, _n_probes = _milp_branching_hints(
+                branching_rule,
+                _node_solve,
+                lp_data,
+                _branch_int_cols,
+                batch_ids,
+                batch_lb,
+                batch_ub,
+                result_lbs,
+                result_sols,
+                float(_inc_now[1]) if _inc_now is not None else np.inf,
+                n_vars,
+                n_orig,
+                t_start,
+                time_limit,
+            )
+            _strong_probes += _n_probes
+            if _rule_hints:
+                tree.set_branch_hints(
+                    np.array([nid for nid, _ in _rule_hints], dtype=np.int64),
+                    np.array([col for _, col in _rule_hints], dtype=np.int64),
+                )
+
         t_rust_start = time.perf_counter()
         if _unpromotable_hints:
             # #1414: name the column whose rounding broke a row, so step 3 of
@@ -28817,6 +29639,20 @@ def _solve_milp_bb(
         ):
             _debug_quit = True
             break
+
+        # #1535: node callback, after the tree has applied this batch -- the same
+        # hook and ``CallbackContext`` the spatial path fires. Observation only.
+        if node_callback is not None:
+            _fire_milp_node_callback(
+                node_callback,
+                model,
+                tree,
+                result_lbs,
+                result_sols,
+                n_orig,
+                _gap_certified,
+                t_start,
+            )
 
         # Root-node certification snapshot (cert:T0.1).
         if iteration == 0:
@@ -29187,6 +30023,10 @@ def _solve_milp_bb(
     # than inferred from a wall-clock reading.
     if _incumbent_extension_taken > 0.0:
         _milp_solver_stats["budget/incumbent_extension_s"] = float(_incumbent_extension_taken)
+    # #1535: strong-branching probe LPs are solved outside the tree, so they are
+    # not in ``node_count``; report them so the rule's real cost is visible.
+    if _strong_probes:
+        _milp_solver_stats["branching/strong_probe_lps"] = float(_strong_probes)
 
     # #1383: the certificate must survive the FINAL (objective, bound) pair.
     # Everything above may still have moved `obj_val` after the tree computed

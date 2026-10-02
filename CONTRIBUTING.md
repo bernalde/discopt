@@ -80,8 +80,8 @@ python -m venv .venv && source .venv/bin/activate
 # `ipopt` extra adds the optional cyipopt fallback.
 pip install -e ".[dev,pounce,ipopt,highs]"
 
-# Build Rust-Python bindings
-cd crates/discopt-python && maturin develop && cd ../..
+# Build Rust-Python bindings (from the repo root, not crates/discopt-python/)
+maturin develop --release
 ```
 
 ## Running Tests
