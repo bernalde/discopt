@@ -1536,6 +1536,7 @@ def solve_milp_std(
     )
     if f is None:
         return _solve_milp_std(sf, **kw)
+    t0 = time.perf_counter()
     out = _solve_milp_std(_scale_logicals(sf, f), **kw)
     # Back to ``sf``'s variables: x = f x'; a reduced cost is per unit of the column,
     # d = d' / f; a primal ray is a direction in column space. Row duals and a Farkas
@@ -1546,6 +1547,24 @@ def solve_milp_std(
         out.col_dual = np.asarray(out.col_dual, dtype=np.float64) / f
     if out.ray is not None and out.status == "unbounded" and np.size(out.ray) == sf.n:
         out.ray = np.asarray(out.ray, dtype=np.float64) * f
+    # The rescaling is exact for the MODEL, not for its tolerances: the slack's bound
+    # ``s' >= -tol`` is ``s >= -f tol`` in ``sf``'s variables, so a point can be
+    # feasible in the scaled form and violate a row of ``sf`` by up to ``f tol``. On
+    # ``min -x + 3z, x <= M z`` (M = 1e8, #1414's class) that let x = ub, z = 0 -- a
+    # 10-unit violation, 1.5e-7 in the scaled slack -- be certified at -10 against a
+    # true -7. So the mapped point is re-verified on ``sf`` itself, with the same
+    # checks the route applies to every HiGHS point; if it fails, the rescaled answer
+    # is discarded and ``sf`` is solved as given (the pre-#1537 path, whose #1295
+    # guard then decides what may be certified).
+    if out.x is not None:
+        why = readback_problem(out.x, sf) or feasibility_problem(out.x, sf, check_integrality=True)
+        if why:
+            if kw["time_limit"] is not None:
+                kw["time_limit"] = max(0.0, float(kw["time_limit"]) - (time.perf_counter() - t0))
+            plain = _solve_milp_std(sf, **kw)
+            plain.stats["milp/logicals_rescale_refused"] = 1.0
+            plain.labels["milp/logicals_rescale_refused"] = why
+            return plain
     out.stats["milp/logicals_rescaled"] = float(np.count_nonzero(f != 1.0))
     return out
 

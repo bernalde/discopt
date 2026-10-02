@@ -25605,7 +25605,7 @@ def _linear_node_verified_empty(A_ub, b_ub, A_eq, b_eq, node_lb, node_ub) -> boo
             b_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else b_eq,
             bounds=list(zip(lb.tolist(), ub0.tolist())),
         )
-        return res0.status == SolveStatus.INFEASIBLE
+        return bool(res0.status == SolveStatus.INFEASIBLE)
     from discopt.solvers.lp_milp_highs import solve_lp as _highs_solve_lp
 
     ub = np.asarray(node_ub, dtype=np.float64)
@@ -25617,7 +25617,7 @@ def _linear_node_verified_empty(A_ub, b_ub, A_eq, b_eq, node_lb, node_ub) -> boo
         b_eq=None if A_eq is None or np.asarray(A_eq).shape[0] == 0 else b_eq,
         bounds=list(zip(lb.tolist(), ub.tolist())),
     )
-    return res.status == SolveStatus.INFEASIBLE
+    return bool(res.status == SolveStatus.INFEASIBLE)
 
 
 def _structured_node_recovery(
