@@ -8212,13 +8212,26 @@ class Model:
             system, and its objective is the honest one.
 
             The repaired point is adopted only if ``verify_point`` accepts it on the
-            declared model and its objective does not cross the published bound (a
-            verified point past a valid bound means the bound is wrong: refuse to
-            move, loudly). The bound is never touched. The certificate is re-asked
+            declared model. If its objective then crosses the published bound, the
+            bound is refuted (a verified point past it): the certificate is withdrawn
+            and the bound cleared with its validity flag (#1244's rule), loudly.
+            Otherwise the bound is never touched. The certificate is re-asked
             of the new ``(objective, bound)`` pair by the same arbiter that grants it
             (``_withhold_stale_certificate``): downgrade-only, so a solve whose
             certified objective was bought with a residual loses the certificate,
             and a solve whose was not keeps it.
+
+            Nested internal solves (the root-relaxation fallback in ``solver.py``,
+            ``solve_mpec``, ``estimate``, ``infeasibility``) run this too, by design
+            and harmlessly: those callers read ``x``/``objective``, or ``bound``
+            only behind ``status == "optimal"``. The repair is downgrade-only on
+            status/certificate and clears a bound only when a verified point refutes
+            it, so a nested caller can lose a bound that was invalid, never gain one.
+
+            Known staleness (diagnostic only, never a certificate input):
+            ``gap_criterion``, ``kkt`` and the duals still describe the solver's
+            pre-repair point; the repaired point is within the solver's own
+            feasibility tolerance of it.
             """
             from discopt.validation.feasibility import incumbent_repair_enabled
 
@@ -8283,16 +8296,10 @@ class Model:
             old_obj, new_obj = float(res.objective), float(verdict.objective)
             bnd = res.bound
             has_bound = bnd is not None and _np.isfinite(float(bnd))
-            if has_bound and _bound_crosses_objective(float(bnd), new_obj, is_max):
-                _log.error(
-                    "incumbent repair (#1537 E): the repaired, verified point has objective "
-                    "%.12g beyond the published bound %.12g -- the bound is invalid. "
-                    "Keeping the unrepaired incumbent.",
-                    new_obj,
-                    float(bnd),
-                )
-                stats["certificate/repair_declined"] = "repaired objective crosses the bound"
-                return
+            # A verified point past the published bound refutes the bound (CLAUDE.md
+            # §1): ``bound <= incumbent`` (min) is the certificate invariant. Decided
+            # here, before anything is written, and acted on after the write-back.
+            bound_refuted = has_bound and _bound_crosses_objective(float(bnd), new_obj, is_max)
             off = 0
             for n, shp in zip(_names, _shapes):
                 size = int(_np.prod(shp)) if shp else 1
@@ -8304,6 +8311,28 @@ class Model:
             stats["certificate/repair_excess_before"] = float(rep.excess_before)
             # Magnitude only: the ``certificate/`` family is non-negative floats.
             stats["certificate/repair_objective_shift"] = float(abs(new_obj - old_obj))
+            if bound_refuted:
+                # #1244's rule, as in ``_withhold_stale_certificate``'s crossing arm:
+                # the incumbent is verified and the bound is not, so the bound is the
+                # weaker claim -- clear it with its validity flag and its gap, and
+                # withdraw the certificate it supported. Never publish either.
+                _log.error(
+                    "incumbent repair (#1537 E): the repaired, verified point has objective "
+                    "%.12g beyond the published bound %.12g (%s sense) -- the bound is "
+                    "invalid. Withdrawing the certificate and the bound.",
+                    new_obj,
+                    float(bnd),
+                    "max" if is_max else "min",
+                )
+                if res.gap_certified:
+                    stats["certificate/repair_decertified"] = 1.0
+                res.gap_certified = False
+                if res.status == "optimal":
+                    res.status = "feasible"
+                res._set_bound(None, valid=False)
+                res.gap = None
+                stats["certificate/repair_bound_refuted"] = 1.0
+                return
             if not has_bound:
                 return
             from discopt.solvers._gap import optimality_gap as _optimality_gap

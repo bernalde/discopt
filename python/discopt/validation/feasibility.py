@@ -978,17 +978,23 @@ class RepairResult:
 
 
 def _row_senses_and_rhs(evaluator):
-    """``(sense, rhs)`` per flat row, from the evaluator's own row map."""
+    """``(sense, rhs, None)`` per flat row, from the evaluator's own row map.
+
+    A row whose sense is not one of ``<=``/``>=``/``==`` returns ``(None, None,
+    reason)`` rather than raising: ``verify_point`` reports such a point not-ok, and
+    the repair -- a post-solve publication step -- declines rather than crash the
+    solve that produced the point.
+    """
     senses: list[str] = []
     rhs: list[float] = []
     for start, stop, con in evaluator.constraint_row_map():
         s = _sense_str(con)
         if s is None:
-            raise ValueError(f"unknown constraint sense {con.sense!r}")
+            return None, None, f"unknown constraint sense {getattr(con, 'sense', None)!r}"
         r = float(getattr(con, "rhs", 0.0) or 0.0)
         senses.extend([s] * (stop - start))
         rhs.extend([r] * (stop - start))
-    return np.array(senses, dtype=object), np.array(rhs, dtype=np.float64)
+    return np.array(senses, dtype=object), np.array(rhs, dtype=np.float64), None
 
 
 def _signed_rows(evaluator, x, senses, rhs):
@@ -1066,7 +1072,10 @@ def repair_point(model, x_flat, *, evaluator, variables=None) -> RepairResult:
     if evaluator.n_constraints <= 0:
         return RepairResult(None, 0.0, 0.0, 0, "no rows")
 
-    senses, rhs = _row_senses_and_rhs(evaluator)
+    senses, rhs, sense_problem = _row_senses_and_rhs(evaluator)
+    if sense_problem is not None:
+        # Excess unknown, not zero: the caller records the decline.
+        return RepairResult(None, math.inf, math.inf, 0, sense_problem)
     frozen = model_integer_mask(model) | (lb == ub)
     # E's repair, first half: the point the solver CLAIMS -- integers snapped
     # (#1380) and every column inside its declared box.

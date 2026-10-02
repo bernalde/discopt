@@ -156,3 +156,67 @@ def test_flag_off_publishes_the_unrepaired_point(monkeypatch):
     assert "certificate/incumbent_repaired" not in (off.solver_stats or {})
     assert on.solver_stats["certificate/incumbent_repaired"] == 1.0
     assert on.bound == off.bound and on.node_count == off.node_count
+
+
+# ── PR #1573 review: a repaired point that refutes the bound ──────────────────
+
+
+@pytest.fixture
+def no_kernel(monkeypatch):
+    """Keep the convex kernel out of the way, so ``solve_model`` is what returns."""
+    import discopt.solvers._convex_kernel as ck
+
+    monkeypatch.setattr(ck, "try_convex_solve", lambda *a, **k: None)
+
+
+def _publish(monkeypatch, result):
+    import discopt.solver as solver
+
+    monkeypatch.setattr(solver, "solve_model", lambda model, **kw: result)
+
+
+def test_a_repaired_point_past_the_bound_withdraws_certificate_and_bound(monkeypatch, no_kernel):
+    """``min -1000 x`` s.t. ``x + y == 1``: a route certifies ``obj = bound = -500``
+    at ``y = 0.5 - 8e-7``. Repaired, the point verifies at ``-500.0004`` -- past the
+    published bound, which a verified point refutes. Before the fix the repair was
+    declined and ``optimal``/certified/bound ``-500`` was published (CLAUDE.md §1);
+    now the certificate and the bound are both withdrawn, loudly."""
+    from discopt.modeling.core import SolveResult
+
+    m = dm.Model("cross")
+    x = m.continuous("x", lb=0.0, ub=2.0)
+    y = m.continuous("y", lb=0.0, ub=1.0)
+    m.subject_to(x + y == 1.0)
+    m.minimize(-1000.0 * x)
+    fake = SolveResult(
+        status="optimal",
+        objective=-500.0,
+        bound=-500.0,
+        gap=0.0,
+        x={"x": np.array(0.5), "y": np.array(0.5 - 8e-7)},
+        gap_certified=True,
+    )
+    fake._set_bound(-500.0, valid=True, source="bnb_tree")
+    _publish(monkeypatch, fake)
+    r = m.solve(time_limit=5.0)
+
+    assert r.gap_certified is False and r.status == "feasible", (r.status, r.gap_certified)
+    assert r.bound is None and r.bound_valid is False and r.gap is None
+    assert r.solver_stats["certificate/repair_bound_refuted"] == 1.0
+    assert r.solver_stats["certificate/repair_decertified"] == 1.0
+    # The published point is the verified one, and its objective is honest.
+    check = verify_point(m, _flat(r, m), with_objective=True)
+    assert check.ok, check.reason
+    assert abs(check.objective - r.objective) <= 1e-9 and r.objective < -500.0
+
+
+def test_an_unknown_row_sense_declines_the_repair(monkeypatch):
+    """A row sense the repair cannot read declines (``verify_point`` reports such a
+    point not-ok) rather than raising out of the solve."""
+    import discopt.validation.feasibility as F
+
+    m = _minimax(1.0)
+    ev = make_evaluator(m)
+    monkeypatch.setattr(F, "_sense_str", lambda con: None)
+    rep = repair_point(m, _BAD, evaluator=ev)
+    assert rep.x is None and "unknown constraint sense" in rep.reason, rep
