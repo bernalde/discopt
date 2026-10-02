@@ -8058,6 +8058,17 @@ class Model:
         # ``last_attempt_seconds()`` is EXACTLY 0.0 whenever DISCOPT_CONVEX_KERNEL is
         # off (it is reset on entry and the clock starts after the flag check), so the
         # default path subtracts a literal zero and every deadline below is unchanged.
+        def _guard_unresolved_objective(res: "SolveResult") -> None:
+            """#1551 guard at this method's tolerances (see ``solver``)."""
+            from discopt.solver import (
+                _resolve_abs_gap_tolerance,
+                _withhold_unresolved_objective_certificate,
+            )
+
+            _withhold_unresolved_objective_certificate(
+                res, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            )
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8131,6 +8142,9 @@ class Model:
             except Exception:
                 _ck_res = None
             if _ck_res is not None:
+                # #1551: this return skips ``solve_model`` and everything below,
+                # so the evaluation-error guard has to run here too.
+                _guard_unresolved_objective(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -8869,6 +8883,17 @@ class Model:
                     stacklevel=2,
                 )
 
+        # --- #1551: a certificate finer than the objective's float resolution ---
+        # ``solve_model``'s wrapper runs the same check on every result it returns;
+        # repeated here for what this method does after that call (the #844
+        # fallback merge), and BEFORE the derived reports below so ``sensitivity``,
+        # ``validation_report`` and the no-bound diagnostic describe the result the
+        # caller is handed, not the pre-withdrawal one. Idempotent: a withdrawn
+        # certificate is not re-tested. The convex-kernel fast path returns early
+        # and calls the same guard at its own return.
+        if isinstance(result, SolveResult):
+            _guard_unresolved_objective(result)
+
         if llm:
             try:
                 result._explanation = result._explain_with_llm()
@@ -9043,21 +9068,6 @@ class Model:
             and result.x is not None
         ):
             self._reconcile_objective_with_model(result)
-
-        # --- #1551: a certificate finer than the objective's float resolution ---
-        # ``solve_model``'s wrapper runs the same check; repeated here because the
-        # convex-kernel fast path above returns without passing through it, and
-        # after the reconciliation so it judges the objective actually published.
-        # Idempotent: a withdrawn certificate is not re-tested.
-        if isinstance(result, SolveResult):
-            from discopt.solver import (
-                _resolve_abs_gap_tolerance,
-                _withhold_unresolved_objective_certificate,
-            )
-
-            _withhold_unresolved_objective_certificate(
-                result, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
-            )
 
         # --- #1313: remember the point this model was solved to ---------------- #
         # ``Model.sensitivity()`` runs its own local NLP, whose starting point

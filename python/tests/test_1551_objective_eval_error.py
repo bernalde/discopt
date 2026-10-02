@@ -80,8 +80,8 @@ def test_enclosure_contains_the_exact_value():
         exact = F(6) * k * k + F(B) * k + F(C)
         enc = evaluate_interval(m._objective.expression, m, {y: Interval.point(float(k))})
         assert F(float(enc.lo)) <= exact <= F(float(enc.hi))
-        err = _objective_evaluation_error(m, {"y": np.array(float(k))})
-        assert err == pytest.approx(float(enc.hi - enc.lo))
+        err, reason = _objective_evaluation_error(m, {"y": np.array(float(k))})
+        assert reason == "" and err == pytest.approx(float(enc.hi - enc.lo))
         checked += 1
     assert checked == 3
 
@@ -131,5 +131,74 @@ def test_guard_unit():
 
 def test_unmeasurable_point_is_not_measured():
     m, _, _ = _expanded(BAD_C)
-    assert _objective_evaluation_error(m, {}) is None
-    assert _objective_evaluation_error(dm.Model("empty"), {}) is None
+    assert _objective_evaluation_error(m, {}) == (None, "the point carries no value for 'y'")
+    assert _objective_evaluation_error(dm.Model("empty"), {}) == (None, "no objective")
+
+
+def test_not_applicable_keeps_the_certificate_and_says_why():
+    """A model the check does not apply to keeps its certificate, visibly."""
+    m, _, _ = _expanded(BAD_C)
+    r = _certified(-5.9375, -5.9375, float(math.ceil(BAD_C) + 1))
+    r.x = {}
+    _withhold_unresolved_objective_certificate(r, m, 1e-4, 1e-6)
+    assert r.gap_certified and r.bound == -5.9375
+    assert r.solver_stats["certificate/objective_eval_error_skipped"] == (
+        "the point carries no value for 'y'"
+    )
+
+
+def test_a_failed_measurement_fails_closed(monkeypatch):
+    """A measurement that raises withdraws the certificate (review on #1556)."""
+    import discopt._relax.convexity.interval_eval as ie
+
+    def boom(*a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(ie, "evaluate_interval", boom)
+    m, _, _ = _expanded(0.9)
+    r = _certified(1.0, 1.0, 1.0)
+    r.root_bound, r.root_gap = 1.0, 0.0
+    _withhold_unresolved_objective_certificate(r, m, 1e-4, 1e-6)
+    assert not r.gap_certified and r.status == "feasible"
+    assert r.bound is None and not r.bound_valid
+    assert r.root_bound is None and r.root_gap is None
+    assert r.solver_stats["certificate/objective_eval_error_skipped"].startswith("RecursionError")
+    assert r.solver_stats["certificate/objective_unresolved"] == 1.0
+
+
+@pytest.mark.parametrize("n_terms", [2000])
+def test_loop_built_objective_is_measured(n_terms):
+    """``f = f + term`` in a loop is as deep as it has terms; the guard must still
+    measure it. On the first revision of #1556 this raised ``RecursionError``, the
+    guard skipped, and the #1551 false certificate came back (bound +8.17e-4)."""
+    m, _, opt = _expanded(BAD_C)
+    f = m._objective.expression
+    for i in range(n_terms):
+        f = f + 1e-3 * m.continuous(f"z{i}", lb=0, ub=1)
+    m.minimize(f)
+    r = m.solve(time_limit=60)
+    stats = r.solver_stats or {}
+    assert "certificate/objective_eval_error_skipped" not in stats
+    assert not r.gap_certified
+    assert r.bound is None or F(r.bound) <= opt
+    assert stats.get("certificate/objective_unresolved") == 1.0
+
+
+def test_convex_kernel_return_is_guarded(monkeypatch):
+    """The convex-kernel fast path returns from ``Model.solve`` before
+    ``solve_model``; its result must pass the guard too."""
+    import discopt.solvers._convex_kernel as ck
+
+    m, _, _ = _expanded(BAD_C)
+    y0 = float(math.ceil(BAD_C) + 1)
+    calls = []
+
+    def fake(model, **kwargs):
+        calls.append(model)
+        return _certified(-5.9375, -5.9375, y0)
+
+    monkeypatch.setattr(ck, "try_convex_solve", fake)
+    r = m.solve(time_limit=30)
+    assert calls == [m]
+    assert not r.gap_certified and r.bound is None
+    assert r.solver_stats["certificate/objective_unresolved"] == 1.0
