@@ -4158,8 +4158,9 @@ class SolveResult:
           restoration-phase counts ``restoration_calls``,
           ``restoration_inner_iters``, ``restoration_outer_iters``,
           ``restoration_wall_secs``.
-        * ``report["iterations"]`` -- the trajectory, one dict per main-phase
-          iteration with ``iter``, ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
+        * ``report["iterations"]`` -- the trajectory, one dict per printed
+          iteration row (see below for restoration rows) with ``iter``,
+          ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
           ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
           ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
           ``"R"`` marks an entry into restoration) and ``ls_trials``. The final
@@ -4167,14 +4168,19 @@ class SolveResult:
         * ``report["solution"]``, ``report["problem"]``,
           ``report["fair_metadata"]`` (solver version, timestamps).
 
-        The trajectory matches POUNCE's printed iteration table row for row on
-        the main phase, with two POUNCE-side exceptions (jkitchin/pounce#979): the inner
-        restoration-phase rows (printed as ``24r``, ``25r``, ...) are not in it --
-        restoration shows up as the ``"R"`` row and the ``restoration_*`` counts --
-        and ``inf_pr`` is POUNCE's internal primal infeasibility on its
-        slack-reformulated, scaled problem rather than the printed column's
-        violation of the original constraints, so the two differ wherever a slack
-        sits off its constraint value (typically the first iterations).
+        With a POUNCE that carries jkitchin/pounce#979 (``main``; not yet in a
+        release) the trajectory matches POUNCE's printed iteration table row for
+        row on every column: each row has ``phase`` (``"main"`` or
+        ``"restoration"``), the inner restoration rows (printed as ``24r``,
+        ``25r``, ...) are included in printed order, and the slack-form residual
+        is ``inf_pr_internal``. Select ``phase == "main"`` for the outer
+        trajectory. On pounce-solver 0.12.0 rows carry no ``phase``, only the
+        main-phase rows are present -- restoration shows up as the ``"R"`` row and
+        the ``restoration_*`` counts -- and ``inf_pr`` is POUNCE's internal primal
+        infeasibility on its slack-reformulated, scaled problem rather than the
+        printed column's violation of the original constraints, so the two differ
+        wherever a slack sits off its constraint value (typically the first
+        iterations).
 
         It describes the problem POUNCE was handed: for a maximization that is
         the negated objective, and for an LP or QP the matrix form with slacks

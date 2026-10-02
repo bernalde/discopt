@@ -20,8 +20,13 @@ What the report holds, measured on pounce-solver 0.12.0 (not assumed):
   that entered restoration) and ``ls_trials``.
 * ``solution``, ``problem`` and ``fair_metadata`` (solver version, timestamps).
 
-Two places the report does **not** reproduce the printed table, both POUNCE-side
-(tracked upstream as jkitchin/pounce#979):
+Two places the 0.12.0 report does **not** reproduce the printed table, both
+POUNCE-side and both fixed by jkitchin/pounce#979 (on POUNCE ``main``, not yet in
+a release). With that fix each row also carries ``phase`` (``"main"`` or
+``"restoration"``), the inner restoration rows are in ``iterations`` in printed
+order, ``inf_pr`` is the printed column and the internal residual moves to
+``inf_pr_internal`` -- the report then matches the printed table row for row on
+every column (measured on POUNCE ``main`` 672320d). On 0.12.0:
 
 1. The inner restoration-phase rows (printed with an ``r`` suffix, e.g. ``24r``)
    are not in ``iterations``; the restoration phase appears only as the ``"R"``
