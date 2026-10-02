@@ -7595,6 +7595,47 @@ class Model:
             legacy ``DISCOPT_RLT=1`` environment variable. Sound regardless of
             setting (a constraint×bound product never removes a feasible point).
             Passed through to :func:`discopt.solver.solve_model`.
+        milp_backend : {"highs", "native"}, optional
+            Engine for a pure LP or MILP model. The default ``None`` defers to
+            the ``DISCOPT_LP_MILP_BACKEND`` environment variable, which itself
+            defaults to HiGHS. ``"highs"`` names HiGHS with discopt-verified
+            certificates, by far the faster choice; it reports
+            ``node_count == 0``. ``"native"`` forces discopt's own branch and
+            bound so the search can be studied: the in-house LP solve (Rust
+            simplex, POUNCE if it declines) for an LP, discopt's MILP tree for
+            a MILP. On the
+            MILP tree ``node_count`` is the tree's, ``strategy`` selects the
+            next node (``"best_first"``, ``"depth_first"``, ``"best_estimate"``),
+            ``batch_size=1`` evaluates one node at a time (default 16 per
+            batch), ``branching_rule`` picks the variable to branch on,
+            ``node_callback`` fires after every batch, ``max_nodes`` caps the
+            tree and ``milp_cuts`` switches the root cut loop.
+            ``algorithm_route`` names the engine that ran. Refused for a model
+            that is not an LP or MILP and with ``nlp_bb=True``; ``"highs"`` is
+            refused with any callback, since HiGHS runs none. ``lazy_constraints``,
+            ``incumbent_callback`` and ``cut_callback`` route a MILP to spatial
+            branch and bound, the engine that screens them. If presolve fixes
+            every integer the model is solved as an LP and ``branching_rule`` /
+            ``milp_cuts`` are unused (a warning says so). Overrides the
+            ``DISCOPT_LP_MILP_BACKEND`` environment variable. Passed through to
+            :func:`discopt.solver.solve_model`::
+
+                r = m.solve(milp_backend="native", strategy="depth_first",
+                            branching_rule="strong", batch_size=1, milp_cuts=False)
+                r.node_count, r.algorithm_route
+
+        milp_cuts : bool, optional
+            Only with ``milp_backend="native"`` on a MILP. ``False`` skips the
+            root cut loop (cover, clique and Gomory cuts), so the tree branches
+            on the plain LP relaxation; the default keeps it.
+        branching_rule : str, optional
+            Only with ``milp_backend="native"`` on a MILP: which fractional
+            integer variable a node branches on. ``"pseudocost"`` (default:
+            reliability pseudocosts, most-fractional until a variable has
+            observations), ``"most_fractional"``, ``"least_fractional"`` or
+            ``"strong"`` (solves both child LPs of every candidate; those probe
+            LPs are reported in ``solver_stats["branching/strong_probe_lps"]``,
+            not in ``node_count``). Changes the search order, never a bound.
         initial_solution : dict, optional
             Initial feasible solution mapping Variable objects to values
             (scalars, lists, or numpy arrays).  Used as a warm-start point
@@ -7647,7 +7688,10 @@ class Model:
             return ``True`` to accept or ``False`` to reject.
         node_callback : callable, optional
             Node callback. Called after each batch of nodes is processed.
-            Should accept ``(ctx, model)`` and return ``None``.
+            Should accept ``(ctx, model)`` and return ``None``. A MILP with a
+            node callback is solved by discopt's MILP tree rather than HiGHS
+            (which exposes no nodes), so the callback sees real nodes. An LP has
+            no tree; the callback is not called and a warning says so.
         cut_callback : callable, optional
             Cut callback, invoked at **every** node — spatial ones included,
             unlike ``lazy_constraints``, which fires only at integer-feasible
@@ -7655,6 +7699,9 @@ class Model:
             :class:`~discopt.callbacks.NodeCutContext` carrying the node's BOX,
             its relaxation solution and the incumbent, and returns a list of
             :class:`~discopt.callbacks.CutResult` (possibly empty).
+            Runs on discopt's spatial branch and bound: a MILP with a cut
+            callback leaves the HiGHS and MILP-tree routes, which have no cut
+            hook, and ``nlp_bb=True`` with a cut callback is refused.
 
             **Every returned cut is validated before it is accepted.** A cut the
             solver derives is a theorem; one you hand it is an assertion, and
