@@ -74,7 +74,7 @@ import pytest  # noqa: E402
 from discopt.modeling.core import from_nl  # noqa: E402
 
 _DATA = Path(__file__).parent / "data" / "minlplib_nl"
-_CLAY0303_OPT = 26669.10955143
+_CLAY0303_OPT = 26669.1095724859  # known_optima.toml (corrected 2026-10-02)
 
 
 @pytest.mark.slow
