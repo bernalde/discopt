@@ -30,7 +30,7 @@ import os
 import discopt.modeling as dm
 import numpy as np
 import pytest
-from _invariance import certified_answer_changed, rescale_rows, translate
+from _invariance import invariance_violation, rescale_rows, translate
 from discopt._tape_nlp_evaluator import cached_tape_evaluator
 from discopt.validation.feasibility import verify_point
 
@@ -188,48 +188,87 @@ def test_harness_refuses_rather_than_guesses():
 # ── panels ────────────────────────────────────────────────────────────────────
 
 
-def _run_panel(cases, transforms, time_limit):
-    compared, lost, false = 0, [], []
+class KnownFalseCertificate(AssertionError):
+    """A transformed solve contradicted its certified base: the failure a
+    ``KNOWN_FALSE`` / ``KNOWN_CORPUS`` xfail is allowed to absorb. Any OTHER
+    failure (a base that stopped certifying, a cell that compared nothing) is a
+    plain ``AssertionError`` and is NOT absorbed, so a marker cannot outlive its
+    bug by failing for the wrong reason (#1546 review)."""
+
+
+def _run_panel(cases, transforms, time_limit, *, require_certified_base=False):
+    """Solve each case and its transforms; return ``(certified, lost, violations)``.
+
+    ``certified`` counts comparisons whose transformed solve was CERTIFIED and
+    checked against a certified base -- the number of things actually measured,
+    not the number of solves (#1546 review: a cell where every certificate is
+    lost used to pass while comparing nothing). Every transformed result, certified
+    or not, goes through :func:`invariance_violation` (bound and incumbent too).
+    """
+    certified, lost, violations = 0, [], []
     for label, model in cases:
         base = model.solve(time_limit=time_limit)
         if not base.gap_certified:
+            assert not require_certified_base, f"{label}: base no longer certifies"
             continue  # nothing certified to compare against
         for tname, tf in transforms.items():
-            other = tf(model).solve(time_limit=time_limit)
-            compared += 1
-            why = certified_answer_changed(base, other)
+            transformed = tf(model)
+            other = transformed.solve(time_limit=time_limit)
+            why = invariance_violation(base, other, model, transformed)
             if why:
-                false.append((label, tname, why))
-            elif not other.gap_certified:
+                violations.append((label, tname, why))
+            elif other.gap_certified:
+                certified += 1
+            else:
                 lost.append((label, tname, other.status))
-    return compared, lost, false
+    return certified, lost, violations
 
 
-#: Known false certificates, each tied to the issue that tracks it. ``strict``: a
-#: fix turns the xfail into a failure, so the marker cannot outlive the bug.
-KNOWN_FALSE = {
-    ("polynomial", "shift1e6"): "#1542: a shifted cubic certifies infeasible / super-optimal",
+def _xfail(reason: str, raises):
+    return pytest.mark.xfail(strict=True, raises=raises, reason=reason)
+
+
+#: Known false results, each tied to the issue tracking it. ``strict`` + a pinned
+#: ``raises``: a fix flips the xfail to a failure, and a failure for any other
+#: reason is not absorbed.
+KNOWN_FALSE: dict = {
+    # Re-measured on main after #1548: still false (now -37 vs -45 rather than a
+    # false infeasible), and #1548 notes its own generator does not reproduce it.
+    ("polynomial", "shift1e6"): (
+        "#1542: a shifted cubic is certified at the wrong optimum",
+        KnownFalseCertificate,
+    ),
 }
 
 
 def _panel_params():
     for fam in FAMILIES:
         for tname in TRANSFORMS:
-            reason = KNOWN_FALSE.get((fam, tname))
-            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
+            known = KNOWN_FALSE.get((fam, tname))
+            marks = [_xfail(*known)] if known else []
             yield pytest.param(fam, tname, marks=marks, id=f"{fam}-{tname}")
 
 
 @pytest.mark.correctness
 @pytest.mark.parametrize("family, transform", list(_panel_params()))
 def test_generated_panel(family, transform):
+    known = (family, transform) in KNOWN_FALSE
     cases = [(f"{family}[{s}]", FAMILIES[family](s)) for s in range(4)]
-    compared, lost, false = _run_panel(cases, {transform: TRANSFORMS[transform]}, time_limit=10)
-    print(f"\n{family} x {transform}: compared={compared} false={len(false)} lost={len(lost)}")
+    certified, lost, violations = _run_panel(
+        cases, {transform: TRANSFORMS[transform]}, time_limit=10, require_certified_base=known
+    )
+    print(
+        f"\n{family} x {transform}: certified={certified} "
+        f"violations={len(violations)} lost={len(lost)}"
+    )
     for row in lost:
         print("  lost:", row)
-    assert compared >= 3, f"{family} x {transform}: only {compared} certified bases to compare"
-    assert not false, false
+    if violations:
+        raise KnownFalseCertificate(violations)
+    assert certified >= 1, (
+        f"{family} x {transform}: no transformed solve certified, so nothing was "
+        f"compared (lost={lost})"
+    )
 
 
 TRANSFORM_GROUPS = {
@@ -238,21 +277,17 @@ TRANSFORM_GROUPS = {
 }
 
 #: Known corpus failures, per (instance, transform group) so the group that still
-#: passes keeps guarding the instance. ``strict``: a fix flips the xfail to a failure.
-KNOWN_CORPUS = {
-    ("st_miqp3.nl", "shift"): "#1543: shifted integer QP certifies infeasible",
-    ("st_miqp4.nl", "shift"): "#1543: shifted integer QP certifies infeasible",
-    ("alan.nl", "shift"): "#1543: MIQP-BB refuses its own infeasible point (RuntimeError)",
-    ("nvs09.nl", "shift"): "#1544: RecursionError in the native spatial kernel builder",
-}
+#: passes keeps guarding the instance: ``(reason, the exception the failure raises)``.
+#: Re-measured on main after #1548 / #1549 -- see the PR for the run.
+KNOWN_CORPUS: dict = {}
 
 
 def _corpus_params():
     for path in CORPUS:
         for group in TRANSFORM_GROUPS:
             name = os.path.basename(path)
-            reason = KNOWN_CORPUS.get((name, group))
-            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
+            known = KNOWN_CORPUS.get((name, group))
+            marks = [_xfail(*known)] if known else []
             yield pytest.param(path, group, marks=marks, id=f"{name}-{group}")
 
 
@@ -260,10 +295,17 @@ def _corpus_params():
 @pytest.mark.correctness
 @pytest.mark.parametrize("path, group", list(_corpus_params()))
 def test_corpus_panel(path, group):
-    cases = [(os.path.basename(path), dm.from_nl(path))]
-    compared, lost, false = _run_panel(cases, TRANSFORM_GROUPS[group], time_limit=20)
-    if compared == 0:
-        pytest.skip("base solve not certified within 20 s: no certificate to compare against")
+    name = os.path.basename(path)
+    known = (name, group) in KNOWN_CORPUS
+    cases = [(name, dm.from_nl(path))]
+    certified, lost, violations = _run_panel(
+        cases, TRANSFORM_GROUPS[group], time_limit=20, require_certified_base=known
+    )
     for row in lost:
         print("  lost:", row)
-    assert not false, false
+    if violations:
+        raise KnownFalseCertificate(violations)
+    if certified == 0 and not lost:
+        # The base did not certify within 20 s: nothing to compare. Never taken by a
+        # KNOWN entry (require_certified_base makes that a hard failure instead).
+        pytest.skip("base solve not certified within 20 s: no certificate to compare against")

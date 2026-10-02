@@ -81,7 +81,15 @@ def _rebuild(
     for con in model._constraints:
         if type(con) is not Constraint:
             raise ValueError(f"invariance harness: cannot rebuild a {type(con).__name__} row")
-    for attr in ("_piecewise_domains", "_complementarities", "_lowered_complementarities"):
+    # ``_builder_linear_blocks`` holds the fast-path rows (``constraint(fast=True)``
+    # / ``add_linear_constraints``), which never enter ``_constraints``: rebuilding
+    # without them would silently drop rows (#1546 review).
+    for attr in (
+        "_piecewise_domains",
+        "_complementarities",
+        "_lowered_complementarities",
+        "_builder_linear_blocks",
+    ):
         if getattr(model, attr, None):
             raise ValueError(f"invariance harness: cannot rebuild a model with {attr}")
     if not row_scale > 0.0:
@@ -156,4 +164,55 @@ def certified_answer_changed(base, other, *, rel: float = 1e-4, abs_tol: float =
     tol = max(abs_tol, rel * max(1.0, abs(base.objective)))
     if abs(other.objective - base.objective) > tol:
         return f"certified {other.objective!r}, base certified {base.objective!r}"
+    return ""
+
+
+def invariance_violation(
+    base, other, original: Model, transformed: Model, *, rel: float = 1e-4, abs_tol: float = 1e-6
+) -> str:
+    """'' when the transformed solve's result is consistent with the certified
+    ``base`` of the original model; else the reason. Checks every result, not
+    only certified ones (#1546 review):
+
+    * a certificate must agree with the base (:func:`certified_answer_changed`);
+    * a published dual bound must not cross the base optimum, certified or not
+      (an uncertified result can still publish a false bound);
+    * a published incumbent, mapped back to the original coordinates, must be
+      feasible for the ORIGINAL model and must not beat the base optimum.
+    """
+    from discopt.modeling.core import ObjectiveSense
+    from discopt.validation.feasibility import verify_point
+
+    why = certified_answer_changed(base, other, rel=rel, abs_tol=abs_tol)
+    if why or not (base.status == "optimal" and base.gap_certified):
+        return why
+    tol = max(abs_tol, rel * max(1.0, abs(base.objective)))
+    maximize = original._objective.sense is ObjectiveSense.MAXIMIZE
+    if other.bound is not None and np.isfinite(other.bound):
+        crosses = (
+            other.bound < base.objective - tol if maximize else other.bound > base.objective + tol
+        )
+        if crosses:
+            return f"bound {other.bound!r} crosses the base optimum {base.objective!r}"
+    if other.x is not None and other.status in ("optimal", "feasible"):
+        flat = np.concatenate(
+            [
+                np.ravel(np.asarray(other.x[v.name], dtype=np.float64))
+                for v in transformed._variables
+            ]
+        )
+        x = flat - transformed._invariance_shift
+        check = verify_point(original, x, with_objective=True)
+        if not check.ok:
+            return f"published incumbent is infeasible in the original model ({check.reason})"
+        better = (
+            check.objective > base.objective + tol
+            if maximize
+            else check.objective < base.objective - tol
+        )
+        if better:
+            return (
+                f"published incumbent {check.objective!r} beats the certified base "
+                f"{base.objective!r}"
+            )
     return ""
