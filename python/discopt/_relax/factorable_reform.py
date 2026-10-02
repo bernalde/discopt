@@ -399,7 +399,9 @@ class _Lifter:
         self.aux_constraints.append(Constraint(BinaryOp("-", w, pow_expr), "==", 0.0))
         return w
 
-    def expression(self, expr: Expression, *, lb_floor: float | None = None) -> Variable | None:
+    def expression(
+        self, expr: Expression, *, lb_floor: float | None = None, integer: bool = False
+    ) -> Variable | None:
         """Return an aux variable equal to *expr* (creating it on first use), or
         ``None`` if a finite bound for it cannot be established.
 
@@ -417,6 +419,11 @@ class _Lifter:
         abstains on an argument whose lower bound is negative). The floor is part
         of the cache key so a floored aux is never reused where an unfloored one
         is expected (which would unsoundly tighten the other use site).
+
+        *integer*, when true, types a NEWLY created aux ``INTEGER``. The caller
+        asserts *expr* is integer-valued at every integer-feasible point
+        (:func:`_is_integer_valued_affine`), so the type is exact, never a
+        restriction. A cached aux is returned as it was created.
         """
         key = (repr(expr), lb_floor)
         cached = self._expr_cache.get(key)
@@ -431,7 +438,8 @@ class _Lifter:
             return None
         name = f"_fr_aux_{self._counter}"
         self._counter += 1
-        w = Variable(name, VarType.CONTINUOUS, (), lo, hi, self.model)
+        vtype = VarType.INTEGER if integer else VarType.CONTINUOUS
+        w = Variable(name, vtype, (), lo, hi, self.model)
         self.model._variables.append(w)
         self._expr_cache[key] = w
         # Clear any sign-definite division in the defining equality ``w == expr``
@@ -501,6 +509,80 @@ def _rebuild_product(coeff: float, atoms: list[Expression]) -> Expression:
 # multilinear product of variables directly.
 _DISTRIBUTE_TERM_LIMIT = 1024  # est. distributed-term count above which a product is lifted
 
+# A product is also lifted, whatever its term count, when multiplying it out would
+# CANCEL catastrophically (#1544). Expanding ``prod_k f_k`` sums terms whose
+# magnitudes multiply ``mag(f_k) = sum_j max|t_kj|`` over the box, while the value
+# itself is at most ``prod_k max|f_k|``; the ratio ``prod_k mag(f_k) / max|f_k|``
+# is the factor by which float64 rounding in the expanded polynomial is amplified.
+# Under an exact change of variables ``x = y - c`` it grows like
+# ``(2c / width)**n``: nvs09 shifted by c ~ 1e3 has ten factors ``y_k - c_k`` over
+# width-6 boxes, ratio ~1e25, and its distributed objective evaluated to -1123.3
+# at a point whose true value is 10.87. At this limit the amplified rounding is
+# ~2e-10 relative, below the solver's tolerances; above it the factors are lifted
+# to auxes ``w_k == f_k`` (exact equalities, each well conditioned).
+_DISTRIBUTE_CANCELLATION_LIMIT = 1e6
+
+
+def _additive_terms(expr: Expression) -> list[Expression]:
+    """Flatten ``+``/``-``/``neg`` into additive terms (signs dropped)."""
+    if isinstance(expr, BinaryOp) and expr.op in ("+", "-"):
+        return _additive_terms(expr.left) + _additive_terms(expr.right)
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        return _additive_terms(expr.operand)
+    return [expr]
+
+
+def _distribution_cancellation(factors: list[Expression], model: Model) -> float:
+    """Rounding amplification of multiplying *factors* out (see
+    :data:`_DISTRIBUTE_CANCELLATION_LIMIT`).
+
+    A factor whose magnitude cannot be measured (an unbounded term, or a factor
+    identically zero over the box) contributes 1: "cannot measure" is not evidence
+    of cancellation, and such a factor could not be lifted to a bounded aux anyway.
+    """
+    ratio = 1.0
+    for f in factors:
+        terms = _additive_terms(f)
+        if len(terms) < 2:
+            continue
+        mag = 0.0
+        for t in terms:
+            t_lo, t_hi = _bound_expression(t, model)
+            mag += max(abs(t_lo), abs(t_hi))
+        lo, hi = _bound_expression(f, model)
+        size = max(abs(lo), abs(hi))
+        if not (np.isfinite(mag) and np.isfinite(size)) or size == 0.0:
+            continue
+        ratio *= max(1.0, mag / size)
+    return ratio
+
+
+def _is_integer_valued_affine(expr: Expression) -> bool:
+    """True when *expr* is affine with integral coefficients and constant over
+    integer/binary scalar variables, so it is integer at every integer-feasible
+    point (e.g. ``y - 1450`` with ``y`` integer)."""
+    if isinstance(expr, Constant):
+        v = np.asarray(expr.value, dtype=np.float64)
+        return v.size == 1 and bool(np.isfinite(v).all()) and float(v.reshape(())).is_integer()
+    if isinstance(expr, Variable):
+        return expr.var_type != VarType.CONTINUOUS and int(np.prod(expr.shape)) == 1
+    if isinstance(expr, IndexExpression):
+        return (
+            isinstance(expr.base, Variable)
+            and expr.base.var_type != VarType.CONTINUOUS
+            and np.ndim(np.empty(expr.base.shape)[expr.index]) == 0
+        )
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        return _is_integer_valued_affine(expr.operand)
+    if isinstance(expr, BinaryOp):
+        if expr.op in ("+", "-"):
+            return _is_integer_valued_affine(expr.left) and _is_integer_valued_affine(expr.right)
+        if expr.op == "*":
+            for a, b in ((expr.left, expr.right), (expr.right, expr.left)):
+                if isinstance(a, Constant) and _is_integer_valued_affine(a):
+                    return _is_integer_valued_affine(b)
+    return False
+
 
 def _collect_mul_factors(expr: Expression) -> list[Expression]:
     """Flatten a left/right-nested ``*`` chain into its factor list."""
@@ -513,16 +595,23 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
     """Lift the factors of any product whose naive distribution would explode.
 
     Walks *expr*; at each ``*``-rooted product whose estimated distributed term
-    count exceeds :data:`_DISTRIBUTE_TERM_LIMIT`, lifts every multi-term-sum
+    count exceeds :data:`_DISTRIBUTE_TERM_LIMIT`, or whose expansion would cancel
+    catastrophically (:data:`_DISTRIBUTE_CANCELLATION_LIMIT`), lifts every multi-term-sum
     factor ``f`` to an aux ``w == f`` (an exact equality) and rebuilds the
     product over the auxes, so the relaxation sees a bilinear/multilinear product
     of bounded variables instead of a high-degree expanded polynomial.  Sound:
     each ``w == f`` is exact and the lifted product is McCormick-relaxable.
-    Identity-preserving for every node under the limit, so non-blowup
-    constraints/objectives are byte-for-byte unchanged.
+    Identity-preserving for every node under the limits, so non-blowup
+    constraints/objectives are byte-for-byte unchanged. A lifted factor that is
+    integer-valued (``y - c`` with ``y`` integer, ``c`` integral) gets an
+    ``INTEGER`` aux, so the lift keeps the integrality the factor had.
     """
     if isinstance(expr, BinaryOp):
-        if expr.op == "*" and _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT:
+        if expr.op == "*" and (
+            _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
+            or _distribution_cancellation(_collect_mul_factors(expr), model)
+            > _DISTRIBUTE_CANCELLATION_LIMIT
+        ):
             new_factors: list[Expression] = []
             changed = False
             for f in _collect_mul_factors(expr):
@@ -537,7 +626,7 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
                     # Recurse first so a factor that is *itself* a blowup product
                     # has its inner factors lifted before this one is bounded.
                     f_lifted = _prelift_blowup_products(f, model, lifter)
-                    w = lifter.expression(f_lifted)
+                    w = lifter.expression(f_lifted, integer=_is_integer_valued_affine(f_lifted))
                     if w is not None:
                         new_factors.append(w)
                         changed = True

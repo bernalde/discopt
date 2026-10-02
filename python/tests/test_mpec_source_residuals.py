@@ -483,6 +483,156 @@ def test_selector_outside_its_box_is_not_hidden_by_the_product():
     )
 
 
+def _indicator_model(*, active_value=1):
+    """One indicator plus a harmless relation."""
+    from discopt.modeling.core import _IndicatorConstraint
+
+    m = dm.Model(f"indicator_{active_value}")
+    x = m.continuous("x", lb=0.0, ub=2.0)
+    s = m.binary("s")
+    m.minimize(x)
+    m._constraints.append(
+        _IndicatorConstraint(
+            indicator=s,
+            constraint=x <= 1.0,
+            active_value=active_value,
+            name="conditional_cap",
+        )
+    )
+    pair = complementarity(0.0 * x, 1.0 + 0.0 * x, name="harmless")
+    m._complementarities.append(pair)
+    return m, pair
+
+
+def _indicator_report(*, active_value=1, selector, body_value):
+    """Measure the indicator model at ``(x, selector)``."""
+    m, pair = _indicator_model(active_value=active_value)
+    return source_residual_report(m, [pair], x_flat=np.array([body_value, selector], dtype=float))
+
+
+@pytest.mark.parametrize(
+    "active_value,selector,body_value,expected",
+    [
+        pytest.param(1, 1.0, 0.5, 0.0, id="active-satisfied"),
+        pytest.param(1, 1.0, 1.5, 0.5, id="active-violated"),
+        pytest.param(1, 0.0, 1.5, 0.0, id="inactive-body-violated"),
+        pytest.param(0, 0.0, 1.5, 0.5, id="active-value-zero"),
+        pytest.param(0, 1.0, 1.5, 0.0, id="active-value-zero-inactive"),
+    ],
+)
+def test_indicator_source_residual_obeys_one_way_activation(
+    active_value, selector, body_value, expected
+):
+    """#1529: only the active implication contributes its wrapped-row residual."""
+    report = _indicator_report(active_value=active_value, selector=selector, body_value=body_value)
+    _checked(
+        report.primal_feasibility.value == pytest.approx(expected),
+        f"indicator residual is {report.primal_feasibility.value}, expected {expected}",
+    )
+
+
+def test_fractional_indicator_fails_through_the_separate_integrality_residual():
+    report = _indicator_report(active_value=1, selector=0.3, body_value=0.5)
+    _checked(
+        report.primal_feasibility.value == 0.0,
+        "the implication body is satisfied independently of selector integrality",
+    )
+    _checked(
+        report.integrality is not None and report.integrality.value == pytest.approx(0.21),
+        "a fractional selector must be rejected by the dedicated integrality residual",
+    )
+    _checked(
+        not report.source_satisfied,
+        "a clean implication body must not hide a non-integral selector",
+    )
+
+
+@pytest.mark.parametrize(
+    "active_value,selector",
+    [
+        pytest.param(1, 1.0 - 1.000005e-5, id="near-one"),
+        pytest.param(0, 1.000005e-5, id="near-zero"),
+    ],
+)
+def test_indicator_activation_matches_the_integrality_residual_tolerance(active_value, selector):
+    """An effectively integral selector cannot skip its active violated row."""
+    report = _indicator_report(active_value=active_value, selector=selector, body_value=1.5)
+    _checked(
+        report.integrality is not None and report.integrality.value <= 1e-5,
+        "the boundary selector must pass the report's declared integrality gate",
+    )
+    _checked(
+        report.primal_feasibility.value == pytest.approx(0.5),
+        "the same boundary selector must activate and measure its violated row",
+    )
+    _checked(not report.source_satisfied, "the active row violation must fail the whole report")
+
+
+def test_accept_local_incumbent_accepts_a_satisfied_integral_indicator_model():
+    """#1529 acceptance: the complete indicator report can pass the handoff gate."""
+    m, _pair = _indicator_model(active_value=1)
+
+    class _LocalResult:
+        x = {"x": np.array(0.5), "s": np.array(1.0)}
+
+    accepted = accept_local_incumbent(m, _LocalResult())
+    _checked(accepted == pytest.approx(0.5), f"the verified objective is {accepted!r}")
+
+
+@pytest.mark.parametrize(
+    "selector_kind,selector_value",
+    [
+        pytest.param("continuous", 0.5, id="continuous-fractional"),
+        pytest.param("continuous", 1.0, id="continuous-at-one"),
+        pytest.param("integer", 2.0, id="integer-outside-boolean-box"),
+        pytest.param("integer", 1.0, id="integer-at-one"),
+    ],
+)
+def test_indicator_source_residual_refuses_nonbinary_variables(selector_kind, selector_value):
+    """An if_then selector must be covered by the binary-integrality gate."""
+    m = dm.Model("nonbinary_indicator")
+    x = m.continuous("x", lb=0.0, ub=2.0)
+    selector = getattr(m, selector_kind)("selector", lb=0.0, ub=2.0)
+    m.minimize(x)
+    m.if_then(selector, [x <= 1.0])
+    pair = complementarity(0.0 * x, 1.0 + 0.0 * x, name="harmless")
+    m._complementarities.append(pair)
+    point = np.array([1.5, selector_value])
+
+    with pytest.raises(ValueError, match="requires a binary variable selector"):
+        source_residual_report(m, [pair], x_flat=point)
+    _checked(
+        accept_local_incumbent(m, None, x_flat=point) is None,
+        "an undefined indicator must not become an accepted local incumbent",
+    )
+
+
+@pytest.mark.parametrize(
+    "selector_shape,selector_values,active_value,error",
+    [
+        pytest.param((2,), [1.0, 0.0], 1, "one finite scalar", id="vector"),
+        # evaluate_at_point rejects NaN before indicator dispatch sees a value.
+        pytest.param((), np.nan, 1, "point evaluation of .* is not finite", id="nonfinite"),
+        pytest.param((), 1.0, 2, "active_value=2", id="nonboolean-active-value"),
+    ],
+)
+def test_indicator_source_residual_refuses_undefined_selector_semantics(
+    selector_shape, selector_values, active_value, error
+):
+    from discopt.modeling.core import _IndicatorConstraint
+
+    m = dm.Model("undefined_indicator")
+    x = m.continuous("x", lb=0.0, ub=2.0)
+    s = m.binary("s", shape=selector_shape)
+    m.minimize(x)
+    m._constraints.append(_IndicatorConstraint(s, x <= 1.0, active_value=active_value, name="bad"))
+    pair = complementarity(0.0 * x, 1.0 + 0.0 * x, name="harmless")
+    m._complementarities.append(pair)
+    point = np.concatenate([np.array([0.5]), np.asarray(selector_values, dtype=float).reshape(-1)])
+    with pytest.raises(ValueError, match=error):
+        source_residual_report(m, [pair], x_flat=point)
+
+
 # ──────────── B. the distinct terminal status, and what it may claim ────────────
 
 
