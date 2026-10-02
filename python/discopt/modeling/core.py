@@ -8079,6 +8079,17 @@ class Model:
         # ``last_attempt_seconds()`` is EXACTLY 0.0 whenever DISCOPT_CONVEX_KERNEL is
         # off (it is reset on entry and the clock starts after the flag check), so the
         # default path subtracts a literal zero and every deadline below is unchanged.
+        def _guard_unresolved_objective(res: "SolveResult") -> None:
+            """#1551 guard at this method's tolerances (see ``solver``)."""
+            from discopt.solver import (
+                _resolve_abs_gap_tolerance,
+                _withhold_unresolved_objective_certificate,
+            )
+
+            _withhold_unresolved_objective_certificate(
+                res, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            )
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8152,6 +8163,9 @@ class Model:
             except Exception:
                 _ck_res = None
             if _ck_res is not None:
+                # #1551: this return skips ``solve_model`` and everything below,
+                # so the evaluation-error guard has to run here too.
+                _guard_unresolved_objective(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -8890,6 +8904,17 @@ class Model:
                     stacklevel=2,
                 )
 
+        # --- #1551: a certificate finer than the objective's float resolution ---
+        # ``solve_model``'s wrapper runs the same check on every result it returns;
+        # repeated here for what this method does after that call (the #844
+        # fallback merge), and BEFORE the derived reports below so ``sensitivity``,
+        # ``validation_report`` and the no-bound diagnostic describe the result the
+        # caller is handed, not the pre-withdrawal one. Idempotent: a withdrawn
+        # certificate is not re-tested. The convex-kernel fast path returns early
+        # and calls the same guard at its own return.
+        if isinstance(result, SolveResult):
+            _guard_unresolved_objective(result)
+
         if llm:
             try:
                 result._explanation = result._explain_with_llm()
@@ -8956,9 +8981,13 @@ class Model:
         # could not bound this objective" would misdescribe it; its missing bound is
         # the route's contract. Scoped to that route only: every other route keeps
         # both diagnostics below exactly as before.
+        # #1551: a bound withdrawn because the objective is unresolvable at the
+        # incumbent was produced and then refused, with its own WARNING; "could not
+        # bound this objective" would misdescribe that too.
         _no_bound_by_design = isinstance(result, SolveResult) and (
-            result.algorithm_route or ""
-        ).startswith("pounce:")
+            (result.algorithm_route or "").startswith("pounce:")
+            or bool((result.solver_stats or {}).get("certificate/objective_unresolved"))
+        )
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a

@@ -6332,6 +6332,173 @@ def _refuse_unclosed_published_pair(
     result.solver_stats["certificate/published_pair_refused"] = 1.0
 
 
+#: Upper bound on Python frames :func:`evaluate_interval` spends per DAG level
+#: (``_eval`` -> ``_eval_impl`` -> a per-op helper -> ``_eval``), for sizing the
+#: recursion headroom of the #1551 measurement.
+_EVAL_ERROR_FRAMES_PER_NODE = 4
+
+
+def _objective_evaluation_error(model: Model, x: Mapping[str, Any]) -> tuple[Optional[float], str]:
+    """Rigorous bound on the rounding error of evaluating the objective at ``x``.
+
+    The width of an outward-rounded interval enclosure of ``model``'s objective
+    expression, evaluated at the degenerate box ``x``. The exact value of the
+    objective *as written* (float coefficients taken at face value) lies inside
+    that enclosure, and so does any float64 evaluation of it, so the width bounds
+    how far apart the two can be.
+
+    Returns ``(width, "")``, or ``(None, reason)`` when the question does not
+    apply: no resident objective (absent, or held by the Rust builder behind a
+    placeholder), a variable the point carries no usable value for, or an atom
+    the interval evaluator cannot enclose (an unbounded enclosure). Callers treat
+    ``None`` as "not measured", never as "measured 0". Anything else -- including
+    a failure of the walk itself -- RAISES; the caller decides what a failed
+    measurement means.
+
+    The walk recurses once per DAG level, so an objective accumulated in a Python
+    loop (``f = f + term``) is as deep as it has terms. It runs on the large-stack
+    runner the convexity walk uses (#266, #1520) with headroom sized from the
+    objective's own node count; a few thousand terms otherwise exhaust the
+    default limit, and the guard then skipped exactly the models it exists for.
+    """
+    objective = getattr(model, "_objective", None)
+    if objective is None:
+        return None, "no objective"
+    if getattr(objective, "_is_placeholder", False):
+        return None, "objective held by the builder, not resident in the expression DAG"
+    from discopt._relax.convexity.interval import Interval
+    from discopt._relax.convexity.interval_ad import _expr_node_count_capped, _stack_depth
+    from discopt._relax.convexity.interval_eval import evaluate_interval
+    from discopt._relax.convexity.rules import _run_with_deep_recursion
+
+    box: dict = {}
+    for v in model._variables:
+        if v.name not in x:
+            return None, f"the point carries no value for {v.name!r}"
+        val = np.asarray(x[v.name], dtype=np.float64)
+        if val.size != int(np.prod(v.shape)) or not np.all(np.isfinite(val)):
+            return None, f"the point's value for {v.name!r} is not a finite {v.shape} array"
+        box[v] = Interval.point(val.reshape(v.shape))
+    expr = objective.expression
+    n_nodes = _expr_node_count_capped(expr, 10**7)
+    enc = _run_with_deep_recursion(
+        lambda: evaluate_interval(expr, model, box),
+        depth_need=_stack_depth() + _EVAL_ERROR_FRAMES_PER_NODE * n_nodes + 200,
+    )
+    width = float(np.max(np.asarray(enc.hi, dtype=np.float64) - enc.lo))
+    if not np.isfinite(width):
+        return None, "the interval evaluator cannot enclose an atom of the objective"
+    return width, ""
+
+
+def _withhold_unresolved_objective_certificate(
+    result: SolveResult, model: Model, gap_tolerance: float, abs_gap_tol: float
+) -> None:
+    """Withdraw a certificate finer than the objective's own float resolution (#1551).
+
+    Every certificate is computed from float64 evaluations of the objective. When
+    the objective cannot be evaluated at the incumbent more accurately than the
+    gap tolerance -- catastrophic cancellation between large terms -- the solver
+    cannot tell the values it is comparing apart, and the gap it closed is noise.
+
+    Measured on ``min 6y^2 + By + C`` (``y`` integer in ``[c, c+3]``,
+    ``B = -(12c+12)``, ``C = 6c^2+12c``) at ``c = 2345678.9``: each term is
+    ~3.3e13, whose ulp is ~4e-3, and the OA auto-route returned
+    ``objective = bound = -5.9375`` with ``gap_certified=True`` while the exact
+    optimum of that function is ``-5.93832`` -- a lower bound 8.2e-4 ABOVE the
+    optimum, past the 5.9e-4 tolerance the certificate was granted at. The
+    interval enclosure of the objective at the incumbent is 0.039 wide.
+
+    The test: widen the published gap by the enclosure width and re-ask
+    :func:`_gap_criterion` -- the same arbiter that grants and retains every
+    other certificate. A pair that still closes is left alone, so a well-scaled
+    objective (width at the ulp of its value) is never touched.
+
+    Fails CLOSED. A measurement that raises (a walk that cannot complete, a defect
+    in the evaluator) withdraws the certificate: the guard exists because a
+    certificate can be finer than its own arithmetic, so "could not check" is not
+    evidence that it is not. The earlier form of this guard kept the certificate on
+    any exception, and a ``RecursionError`` on a loop-built objective brought the
+    #1551 false certificate straight back (PR review on #1556). A model the check
+    does not APPLY to (see :func:`_objective_evaluation_error`) keeps its
+    certificate, and the reason is recorded in
+    ``solver_stats["certificate/objective_eval_error_skipped"]`` so a skip is never
+    invisible.
+
+    On a withdrawal the bound goes with the certificate. It was computed from the
+    same unresolvable evaluations, it is the number that crossed the optimum in
+    the measurement above, and the #1244 rule is to clear a claim together with
+    its number rather than publish a bound this guard has just declined to stand
+    behind. The root bound is cleared for the same reason. Downgrade-only
+    otherwise: never raises a certificate or a status.
+    """
+    if not result.gap_certified or result.status != "optimal":
+        return
+    if result.objective is None or result.bound is None or result.x is None:
+        return
+    o, b = float(result.objective), float(result.bound)
+    if not (np.isfinite(o) and np.isfinite(b)):
+        return
+    hi, lo = (o, b) if o >= b else (b, o)
+    # Judge only the error's MARGINAL effect. A pair that does not close at these
+    # tolerances even with no error was certified at others -- ``solver="amp"``
+    # meets ``rel_gap``, not ``gap_tolerance`` -- and the ``Model.solve`` call site
+    # only knows the caller's ``gap_tolerance``; that pair is #1536's business.
+    if _gap_criterion(hi, lo, gap_tolerance, abs_gap_tol) is None:
+        return
+    if result.solver_stats is None:
+        result.solver_stats = {}
+    stats = result.solver_stats
+    try:
+        err, reason = _objective_evaluation_error(model, result.x)
+    except Exception as exc:  # noqa: BLE001 - fails closed, below
+        stats["certificate/objective_eval_error_skipped"] = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "Certificate withdrawn: the objective's evaluation error at the incumbent "
+            "could not be measured (%s: %s), so the certificate cannot be shown to be "
+            "coarser than the objective's float resolution. Reporting status='feasible' "
+            "with no bound (#1551).",
+            type(exc).__name__,
+            exc,
+        )
+        _withdraw_unresolved_certificate(result)
+        return
+    if err is None:
+        stats["certificate/objective_eval_error_skipped"] = reason
+        logger.debug("Objective evaluation-error check not applicable: %s (#1551).", reason)
+        return
+    stats["certificate/objective_eval_error"] = err
+    if _gap_criterion(hi + err, lo, gap_tolerance, abs_gap_tol) is not None:
+        return
+    logger.warning(
+        "Certificate withdrawn: the objective cannot be evaluated at the incumbent to "
+        "better than %.3e (float64 rounding; an interval enclosure of the objective "
+        "at the incumbent is that wide), which does not fit inside the requested gap "
+        "(rel %g, abs %g) around objective %.12g and bound %.12g. Reporting "
+        "status='feasible' with no bound; rescaling or re-centring the model's "
+        "variables removes the cancellation (#1551).",
+        err,
+        gap_tolerance,
+        abs_gap_tol,
+        o,
+        b,
+    )
+    _withdraw_unresolved_certificate(result)
+
+
+def _withdraw_unresolved_certificate(result: SolveResult) -> None:
+    """The #1551 withdrawal: certificate, status, bound, gap and root bound together."""
+    result.gap_certified = False
+    result.status = "feasible"
+    result._set_bound(None, valid=False)
+    result.gap = None
+    result.root_bound = None
+    result.root_gap = None
+    if result.solver_stats is None:
+        result.solver_stats = {}
+    result.solver_stats["certificate/objective_unresolved"] = 1.0
+
+
 def _warn_abs_gap_ignored(route: str, abs_gap_tolerance: Optional[float]) -> None:
     """Say so when *route* cannot honour an ``abs_gap_tolerance`` the caller set.
 
@@ -9754,6 +9921,13 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # #1059 route/fallback merge -- so it judges the pair actually published.
         if _gap_tols is not None:
             _refuse_unclosed_published_pair(result, _gap_tols[0], _gap_tols[1])
+            # #1551: same choke point, for a pair finer than the objective's own
+            # float resolution at the incumbent.
+            _model_arg = args[0] if args else kwargs.get("model")
+            if isinstance(_model_arg, Model):
+                _withhold_unresolved_objective_certificate(
+                    result, _model_arg, _gap_tols[0], _gap_tols[1]
+                )
         # #1243: say which of the two criteria stopped the search. Derived from
         # the returned (incumbent, bound) pair with the SAME arithmetic the
         # convergence test uses, so the two can never disagree; ``None`` -- the
