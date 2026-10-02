@@ -98,8 +98,8 @@ def _verdict(r, truth: float) -> str:
 def test_invariance_panel(kind):
     """Every transform of every seeded model certifies the enumerated optimum.
 
-    Measured on ``1a6556b`` (12 seeds): ``linear`` x ``rows1e6`` lost 12/12, every
-    other cell 0 false / 0 lost. With this fix: 0 / 0 everywhere. Unmarked on
+    The issue's 12-seed measurement on ``1a6556b``: ``linear`` x ``rows1e6`` lost 12/12, every
+    other cell 0 false / 0 lost. This test runs the first 6 seeds: 0 / 0 everywhere. Unmarked on
     purpose -- ~15 s for all three kinds -- so it runs on every PR (workstream B)."""
     compared = 0
     bad = []

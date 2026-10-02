@@ -1475,12 +1475,9 @@ def logical_column_scales(sf: StdForm, n_struct: Optional[int]) -> Optional[np.n
     absA = abs(A).tocoo()  # noqa: N806
     row_max = np.zeros(sf.m)
     np.maximum.at(row_max, absA.row, absA.data)
-    col_nnz = np.diff(A.indptr)
     scales = np.ones(sf.n)
-    cand = np.zeros(sf.n, dtype=bool)
-    cand[n_struct:] = True
-    cand &= (col_nnz == 1) & (sf.c == 0.0)
-    cand[sf.int_idx] = False
+    cand = _logical_columns(sf)
+    cand[:n_struct] = False
     lo_open, hi_open = sf.xl <= -INF, sf.xu >= INF
     for j in np.flatnonzero(cand):
         i, a = int(A.indices[A.indptr[j]]), abs(float(A.data[A.indptr[j]]))
