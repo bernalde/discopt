@@ -42,6 +42,7 @@ from pathlib import Path
 import discopt.modeling as dm
 import numpy as np
 import pytest
+from _invariance import rescale_rows
 from discopt.modeling.core import SolveResult
 from discopt.validation.feasibility import verify_point
 
@@ -169,73 +170,11 @@ def test_verify_point_judges_the_rows_of_the_evaluator_it_is_given():
 # ── the reported instance ───────────────────────────────────────────────────
 
 
-def _substitute(expr, var_map):
-    from discopt.modeling.core import (
-        BinaryOp,
-        Constant,
-        FunctionCall,
-        IndexExpression,
-        MatMulExpression,
-        Parameter,
-        SumExpression,
-        SumOverExpression,
-        UnaryOp,
-        Variable,
-    )
-
-    if isinstance(expr, Variable):
-        return var_map[id(expr)]
-    if isinstance(expr, (Constant, Parameter)):
-        return expr
-    if isinstance(expr, IndexExpression):
-        return IndexExpression(_substitute(expr.base, var_map), expr.index)
-    if isinstance(expr, BinaryOp):
-        return BinaryOp(expr.op, _substitute(expr.left, var_map), _substitute(expr.right, var_map))
-    if isinstance(expr, UnaryOp):
-        return UnaryOp(expr.op, _substitute(expr.operand, var_map))
-    if type(expr) is FunctionCall:
-        return FunctionCall(expr.func_name, *(_substitute(a, var_map) for a in expr.args))
-    if isinstance(expr, MatMulExpression):
-        return MatMulExpression(_substitute(expr.left, var_map), _substitute(expr.right, var_map))
-    if isinstance(expr, SumExpression):
-        return SumExpression(_substitute(expr.operand, var_map), axis=expr.axis)
-    if isinstance(expr, SumOverExpression):
-        return SumOverExpression([_substitute(t, var_map) for t in expr.terms])
-    raise TypeError(f"no substitution rule for {type(expr).__name__}")
-
-
-def _rescale_rows(model, scale):
-    """A fresh copy of ``model`` with every row body multiplied by ``scale``
-    (the #1537 invariance harness's row transform). Refuses rather than guesses."""
-    from discopt.modeling.core import Constraint, Model, Objective, VarType
-
-    assert all(type(c) is Constraint for c in model._constraints)
-    new = Model(f"{model.name}_rows{scale:g}")
-    var_map = {}
-    for v in model._variables:
-        shape = v.shape if v.shape else ()
-        if v.var_type is VarType.CONTINUOUS:
-            y = new.continuous(v.name, shape=shape, lb=v.lb, ub=v.ub)
-        elif v.var_type is VarType.BINARY:
-            y = new.binary(v.name, shape=shape)
-        else:
-            y = new.integer(v.name, shape=shape, lb=v.lb, ub=v.ub)
-        var_map[id(v)] = y
-    for con in model._constraints:
-        body = scale * (_substitute(con.body, var_map) - con.rhs)
-        new._constraints.append(Constraint(body=body, sense=con.sense, rhs=0.0, name=con.name))
-    new._objective = Objective(
-        expression=_substitute(model._objective.expression, var_map),
-        sense=model._objective.sense,
-    )
-    return new
-
-
 @pytest.mark.slow
 @pytest.mark.parametrize("scale", [1.0, 1e6])
 def test_tls2_certified_incumbent_passes_verify_point(scale):
     m = dm.from_nl(str(DATA / "tls2.nl"))
-    t = _rescale_rows(m, scale) if scale != 1.0 else m
+    t = rescale_rows(m, scale) if scale != 1.0 else m
     res = t.solve(time_limit=float(os.environ.get("DISCOPT_1561_TL", "20")))
     assert res.x, f"no incumbent ({res.status})"
     x = np.concatenate(
