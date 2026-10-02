@@ -167,6 +167,103 @@ def test_verify_point_judges_the_rows_of_the_evaluator_it_is_given():
     assert verify_point(m, x, evaluator=make_evaluator(looser)).ok
 
 
+# ── a solve that EXTENDS the model (structure cuts) ─────────────────────────
+#
+# Structure cuts (``cut_recognizer``) append auxiliary columns and rows to the
+# caller's model during the solve. The backstop must judge the point on the
+# DECLARED columns and rows: flattening ``x`` over the extended column list and
+# feeding it to the pre-solve evaluator is a length mismatch, which the first
+# version of the backstop turned into a withdrawn certificate on a correct
+# solve (``build_gas_network_minlp``: 19 declared columns, 21 after the cuts).
+
+
+def _extending_route(monkeypatch, result, *, aux_in_x: bool):
+    """A route that appends an aux column + a row on it, as structure cuts do."""
+    import discopt.solver as solver
+
+    def _solve_model(model, **kw):
+        u = model.continuous("u_cut_0", lb=0.0, ub=1e6)
+        xv = next(v for v in model._variables if v.name == "x")
+        model.subject_to(u == 2.0 * xv, name="cut_def_0")
+        if aux_in_x:
+            result.x = dict(result.x, u_cut_0=np.array(2.0 * float(result.x["x"])))
+        return result
+
+    monkeypatch.setattr(solver, "solve_model", _solve_model)
+
+
+@pytest.mark.parametrize("aux_in_x", [True, False], ids=["aux-in-x", "aux-not-in-x"])
+def test_a_solve_that_appends_variables_keeps_a_valid_certificate(monkeypatch, no_kernel, aux_in_x):
+    m = _model(nonlinear=True)
+    n_declared = len(m._variables)
+    _extending_route(monkeypatch, _certified(4.0, 1.0), aux_in_x=aux_in_x)
+    res = m.solve(time_limit=5.0)
+
+    assert len(m._variables) == n_declared + 1, "the stub did not extend the model"
+    assert res.status == "optimal" and res.gap_certified is True, (
+        res.status,
+        res.solver_stats,
+    )
+    assert "certificate/incumbent_unverified" not in (res.solver_stats or {})
+
+
+def test_an_extended_solve_still_decertifies_a_bad_declared_point(monkeypatch, no_kernel):
+    """Judging the declared columns must not become judging nothing."""
+    m = _model(nonlinear=True)
+    _extending_route(monkeypatch, _certified(FRAC_X, FRAC_Y), aux_in_x=True)
+    res = m.solve(time_limit=5.0)
+
+    assert res.status == "feasible" and res.gap_certified is False
+    assert (res.solver_stats or {}).get("certificate/incumbent_unverified") == 1.0
+
+
+def test_verify_point_judges_the_declared_variables_it_is_given():
+    from discopt._tape_nlp_evaluator import make_evaluator
+    from discopt.validation.feasibility import declared_variables
+
+    m = _model(nonlinear=True)
+    ev = make_evaluator(m)
+    declared = declared_variables(m)
+    m.continuous("u_cut_0", lb=0.0, ub=1.0)  # appended after the snapshot
+
+    assert verify_point(m, np.array([4.0, 1.0]), evaluator=ev, variables=declared).ok
+    assert not verify_point(m, np.array([FRAC_X, FRAC_Y]), evaluator=ev, variables=declared).ok
+    wrong_len = verify_point(m, np.array([4.0, 1.0, 0.5]), evaluator=ev, variables=declared)
+    assert not wrong_len.ok and "declared 2" in str(wrong_len.reason)
+    with pytest.raises(ValueError, match="requires an explicit evaluator"):
+        verify_point(m, np.array([4.0, 1.0]), variables=declared)
+
+
+def test_declared_bounds_are_frozen_at_the_snapshot():
+    """A bound tightened in place after the snapshot does not move the verdict."""
+    from discopt._tape_nlp_evaluator import make_evaluator
+    from discopt.validation.feasibility import declared_variables
+
+    m = _model(nonlinear=True)
+    ev = make_evaluator(m)
+    declared = declared_variables(m)
+    m._variables[0].ub = np.asarray(3.0)  # x <= 3 now cuts the point x = 4
+    assert verify_point(m, np.array([4.0, 1.0]), evaluator=ev, variables=declared).ok
+
+
+@pytest.mark.slow
+def test_gas_network_structure_cuts_keep_their_certificate():
+    """The real instance: structure cuts append 2 aux columns (19 -> 21)."""
+    pytest.importorskip("sympy")
+    from discopt.benchmarks.problems.gas_network_minlp import build_gas_network_minlp
+
+    m = build_gas_network_minlp()
+    n_declared = len(m._variables)
+    res = m.solve(time_limit=90, gap_tolerance=1e-4)
+
+    assert len(m._variables) > n_declared, "structure cuts did not extend the model"
+    assert res.status == "optimal" and res.gap_certified is True, (
+        res.status,
+        res.solver_stats,
+    )
+    assert "certificate/incumbent_unverified" not in (res.solver_stats or {})
+
+
 # ── the reported instance ───────────────────────────────────────────────────
 
 
