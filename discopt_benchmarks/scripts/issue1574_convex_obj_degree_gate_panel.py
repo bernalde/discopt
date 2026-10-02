@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""#1574 graduation panel -- ``DISCOPT_CONVEX_OBJ_DEGREE_GATE``.
+"""#1574 graduation panel -- ``DISCOPT_CONVEX_OBJ_DEGREE_GATE`` (RETIRED).
+
+RECORDED RESULT (2026-10-02, 30 s/arm, 75 models): cert-clean -- 0 violations
+over 52,785 executed checks -- but NOT net-positive: 12 instances flip to
+admitted and every finished one is bit-identical ON vs OFF (2107 vs 2107 nodes,
+11 vs 11 certified, no bound gain or loss). Per CLAUDE.md §5 the flag and its
+implementation were RETIRED in the PR that fixed #1569/#1574; this script is
+kept as the measurement. The flag no longer exists on ``main``, so the script
+refuses to run there; to reproduce, check out commit ``fd318ffc`` (branch
+``claude/convex-obj-gate-1569-1574`` before the retirement).
 
 The flag changes how :func:`discopt.solver._objective_is_convex_quadratic` decides
 that the objective is a convex quadratic (objective-only polynomial degree bound,
@@ -298,7 +307,11 @@ def main() -> int:
 
     print(f"discopt loaded from {discopt.__file__}", flush=True)
     if not hasattr(SolverTuning(), "convex_obj_degree_gate"):
-        raise SystemExit("loaded discopt has no convex_obj_degree_gate; wrong tree")
+        raise SystemExit(
+            "loaded discopt has no convex_obj_degree_gate: the flag was retired "
+            "(#1574). Re-run from commit fd318ffc; on this tree both arms would "
+            "run identical code."
+        )
 
     optima = json.loads(_OPTIMA.read_text()) if _OPTIMA.exists() else {}
     names = (

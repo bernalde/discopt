@@ -4,15 +4,16 @@
   variable's WHOLE ``lb``/``ub`` array ``v.size`` times, so every model with a
   ``shape=(n,)`` variable raised inside the Hessian call, a broad ``except`` filed
   it as a user-code failure, and the bound never engaged on an array model.
-* #1574 -- ``DISCOPT_CONVEX_OBJ_DEGREE_GATE``: decide "at most quadratic" from the
-  objective alone (``polynomial_degree_bound``) and test definiteness on the
-  Hessian's support, so weighted squares (``c*x**2``) and DAE ``integral(u**2)``
-  objectives get the bound.
 
-Both are bound-changing in effect, so besides the gate verdicts these tests run
-the §5 differential bound test (the convex bound never exceeds the box optimum)
-and feasible-point sampling (never exceeds the objective at any point of the box)
-on the newly admitted models.
+The fix is bound-changing in effect on array models, so besides the gate verdicts
+these tests run the §5 differential bound test (the convex bound never exceeds the
+box optimum) and feasible-point sampling (never exceeds the objective at any point
+of the box) on the newly admitted models, and pin that the gate still abstains on
+objectives the constant-Hessian argument does not cover.
+
+(#1574's objective-only degree gate was built, panelled cert-clean but not
+net-positive, and retired per CLAUDE.md §5; its measurement is
+``discopt_benchmarks/scripts/issue1574_convex_obj_degree_gate_panel.py``.)
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from discopt import solver
 from discopt._tape_nlp_evaluator import build_evaluator
 from scipy.optimize import minimize
 
-_FLAG = "DISCOPT_CONVEX_OBJ_DEGREE_GATE"
 _WARN = "convex-quadratic objective test failed"
 
 
@@ -69,39 +69,12 @@ def _issue1569_scalar():
     return m
 
 
-def _array_2y():
-    m = dm.Model("arr2y")
-    x = m.continuous("x", shape=(3,), lb=-2, ub=2)
-    y = m.continuous("y", lb=-3, ub=3)
-    m.subject_to(x[0] * x[1] >= 0.5)
-    m.subject_to(x[2] * y >= -1)
-    m.minimize(sum((x[i] - 0.3) ** 2 for i in range(3)) + 2 * y**2)
-    return m
-
-
-def _dae():
-    from discopt.dae import ContinuousSet, DAEBuilder
-
-    m = dm.Model("dae")
-    cs = ContinuousSet("t", bounds=(0, 1), nfe=3, ncp=2)
-    dae = DAEBuilder(m, cs)
-    dae.add_state("x", initial=1.0, bounds=(-5, 5))
-    dae.add_control("u", bounds=(-2, 2))
-    dae.set_ode(lambda t, s, a, c: {"x": -(s["x"] ** 3) + c["u"]})
-    dae.discretize()
-    xv = dae.get_state("x")
-    m.minimize(dae.integral(lambda t, s, a, c: c["u"] ** 2) + 10 * (xv[-1, -1] - 0.2) ** 2)
-    return m
-
-
-def _two_var(obj_fn, cubic_con: bool = False):
+def _two_var(obj_fn):
     m = dm.Model("two")
     x = m.continuous("x", lb=-2, ub=3)
     y = m.continuous("y", lb=-1, ub=2)
     z = m.continuous("z", lb=-1, ub=1)
     m.subject_to(x * y >= -1.5)
-    if cubic_con:
-        m.subject_to(z**3 + x <= 2)
     m.minimize(obj_fn(x, y, z))
     return m
 
@@ -213,23 +186,7 @@ def test_1569_differential_bound_on_array_model():
     assert _assert_bound_sound_on_boxes(_issue1569([-2.0, -1.0, -3.0], [2.0, 3.0, 1.0])) > 0
 
 
-# ============================================================================ #1574
-def test_1574_flag_off_keeps_legacy_verdicts(monkeypatch):
-    monkeypatch.delenv(_FLAG, raising=False)
-    assert _gate(_array_2y()) is False  # scaled square -> general_nl
-    assert _gate(_dae()) is False
-    assert _gate(_two_var(lambda x, y, z: x**2 + y**2, cubic_con=True)) is False
-
-
-def test_1574_flag_on_admits_weighted_squares_and_dae(monkeypatch):
-    monkeypatch.setenv(_FLAG, "1")
-    assert _gate(_array_2y()) is True
-    # positive definite on the objective's support (controls + final state) only
-    assert _gate(_dae()) is True
-    # the constraint cubic no longer rejects a convex quadratic objective
-    assert _gate(_two_var(lambda x, y, z: 3 * x**2 + 0.5 * y**2, cubic_con=True)) is True
-
-
+# ======================================================= abstention (soundness)
 @pytest.mark.parametrize(
     "obj",
     [
@@ -237,41 +194,11 @@ def test_1574_flag_on_admits_weighted_squares_and_dae(monkeypatch):
         lambda x, y, z: dm.exp(x) + y**2,  # transcendental
         lambda x, y, z: x * y,  # indefinite quadratic
         lambda x, y, z: 2 * x**2 - y**2,  # indefinite, weighted
-        lambda x, y, z: (x - y) ** 2,  # PSD but singular on its support
+        lambda x, y, z: (x - y) ** 2,  # PSD but singular
         lambda x, y, z: 2 * x + y,  # linear
         lambda x, y, z: x**2 / y,  # variable denominator
     ],
     ids=["cubic", "exp", "bilinear", "indefinite", "singular", "linear", "ratio"],
 )
-def test_1574_flag_on_still_abstains(monkeypatch, obj):
-    monkeypatch.setenv(_FLAG, "1")
+def test_gate_abstains_outside_constant_hessian_convexity(obj):
     assert _gate(_two_var(obj)) is False
-
-
-def test_1574_maximize_concave_quadratic(monkeypatch):
-    """Maximizing a concave weighted quadratic is minimizing a convex one."""
-    monkeypatch.setenv(_FLAG, "1")
-    m = _two_var(lambda x, y, z: x**2)
-    m.maximize(-2 * m._variables[0] ** 2 - 0.5 * m._variables[1] ** 2)
-    assert _gate(m) is True
-    m.maximize(2 * m._variables[0] ** 2 + 0.5 * m._variables[1] ** 2)
-    assert _gate(m) is False
-
-
-@pytest.mark.parametrize("builder", [_array_2y, _dae], ids=["arr2y", "dae"])
-def test_1574_differential_bound_on_admitted_models(monkeypatch, builder):
-    monkeypatch.setenv(_FLAG, "1")
-    m = builder()
-    assert _gate(m) is True
-    assert _assert_bound_sound_on_boxes(m) > 0
-
-
-def test_1574_solve_parity_flag_on_vs_off(monkeypatch):
-    """Bound-changing but objective-preserving: both arms certify the same optimum."""
-    out = {}
-    for flag in ("0", "1"):
-        monkeypatch.setenv(_FLAG, flag)
-        r = _array_2y().solve(time_limit=20)
-        assert r.status == "optimal"
-        out[flag] = r.objective
-    assert out["1"] == pytest.approx(out["0"], abs=1e-6)

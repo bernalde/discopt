@@ -3144,28 +3144,21 @@ def _objective_is_convex_quadratic(
 ) -> bool:
     """Whether the internally-minimized objective is a convex quadratic.
 
-    True iff (a) the objective is at most quadratic and (b) the objective Hessian
-    is PSD. A quadratic has a *constant* Hessian, so a PSD verdict at one point
-    holds on the whole space, hence on every B&B node box; the objective is then
-    convex everywhere and its supporting-hyperplane underestimator (see
+    True iff (a) no term in the model is higher than bilinear/square — so the
+    objective is at most quadratic — and (b) the objective Hessian is PSD. A
+    quadratic has a *constant* Hessian, so a PSD verdict at one point holds on the
+    whole space, hence on every B&B node box; the objective is then convex
+    everywhere and its supporting-hyperplane underestimator (see
     :func:`_convex_objective_lower_bound`) is a rigorous lower bound.
 
-    How (a) is decided depends on ``DISCOPT_CONVEX_OBJ_DEGREE_GATE``
-    (``SolverTuning.convex_obj_degree_gate``, #1574):
-
-    * **OFF (legacy)** — the model-wide term classifier: abstain if *any* term in
-      the model is above bilinear/square or is ``general_nl``. Conservative twice
-      over: a scaled square ``c * x**2`` is filed under ``general_nl``, and a cubic
-      in a *constraint* rejects a quadratic objective.
-    * **ON** — :func:`discopt._relax.quadratic_form.polynomial_degree_bound` on the
-      **objective alone**. It is a structural *upper* bound on the polynomial
-      degree, so ``<= 2`` proves the objective is a polynomial of degree at most
-      two (its docstring's caution is about *exactly* quadratic, which this gate
-      does not need); a transcendental, variable denominator, fractional exponent,
-      ``MatMul`` or ``CustomCall`` returns ``None`` and abstains. The constraints
-      never enter the objective's curvature, so they are not consulted.
-
-    In both modes the two-point constant-Hessian check below is the backstop.
+    (a) is decided by the model-wide term classifier, which is conservative: a
+    scaled square ``c * x**2`` is filed under ``general_nl`` and a cubic in a
+    constraint rejects a quadratic objective. An objective-only degree gate that
+    removed both abstentions was built and RETIRED per CLAUDE.md §5 (#1574):
+    cert-clean on a 75-model panel but not net-positive — every finished
+    instance it admitted was bit-identical in nodes and bound, because this box
+    bound is dominated by the LP bound there. The measurement is
+    ``discopt_benchmarks/scripts/issue1574_convex_obj_degree_gate_panel.py``.
 
     This is the structural fact the spatial McCormick relaxation throws away: it
     linearizes a convex x^2 with two tangents (a gap of width^2/4 at the midpoint —
@@ -3194,33 +3187,22 @@ def _objective_is_convex_quadratic(
     # pull the powers robustly across either shape.
     _monos = list(t.monomial.items() if hasattr(t.monomial, "items") else t.monomial)
     _n_square_terms = sum(1 for _, deg in _monos if int(deg) == 2)
-    if _tuning().convex_obj_degree_gate:
-        from discopt._relax.quadratic_form import polynomial_degree_bound
-
-        _deg = polynomial_degree_bound(model._objective.expression)
-        if _deg is None or _deg > 2:
-            return False
-        # Budget-gate term count: the classifier's lifted quadratic terms plus every
-        # ``general_nl`` entry (each scaled square is at least one quadratic term).
-        # Model-wide, so an over-estimate of the objective's nnz — it only abstains.
-        _obj_quad_nnz = len(t.bilinear) + _n_square_terms + len(t.general_nl)
-    else:
-        # Reject anything above degree two anywhere in the model. ``monomial`` maps
-        # ``var -> power``, so a cubic ``x**3`` shows up as power 3 here even though
-        # it leaves ``general_nl`` empty — without this guard it would be mistaken
-        # for a quadratic and the single-point Hessian below would not characterize
-        # the (non-constant) curvature, an unsound over-claim.
-        if (
-            t.trilinear
-            or t.multilinear
-            or t.fractional_power
-            or t.bilinear_with_fp
-            or t.ratio_of_products
-            or t.general_nl
-            or any(int(deg) > 2 for _, deg in _monos)
-        ):
-            return False
-        _obj_quad_nnz = len(t.bilinear) + _n_square_terms
+    # Reject anything above degree two anywhere in the model. ``monomial`` maps
+    # ``var -> power``, so a cubic ``x**3`` shows up as power 3 here even though
+    # it leaves ``general_nl`` empty — without this guard it would be mistaken
+    # for a quadratic and the single-point Hessian below would not characterize
+    # the (non-constant) curvature, an unsound over-claim.
+    if (
+        t.trilinear
+        or t.multilinear
+        or t.fractional_power
+        or t.bilinear_with_fp
+        or t.ratio_of_products
+        or t.general_nl
+        or any(int(deg) > 2 for _, deg in _monos)
+    ):
+        return False
+    _obj_quad_nnz = len(t.bilinear) + _n_square_terms
 
     # #654 budget gate: the PSD test below forces the dense objective-Hessian
     # compile (``jacfwd∘jacfwd``), whose XLA codegen is super-linear in the
@@ -3289,23 +3271,7 @@ def _objective_is_convex_quadratic(
     # already exact via interval arithmetic, so only engage on genuine
     # curvature. The margin is scale-aware (#1397): see
     # ``_hessian_is_psd_with_margin``.
-    H_sym = 0.5 * (H1 + H1.T)
-    if _tuning().convex_obj_degree_gate:
-        # #1574: test definiteness on the objective's Hessian SUPPORT — the
-        # variables whose row/column is not identically zero. A symmetric matrix
-        # whose other rows/columns are exactly zero is PSD iff its support block
-        # is, so this is exact, not a relaxation of the test. Without it, any
-        # objective that leaves a variable out (a DAE ``integral(u**2)`` touches
-        # the controls, never the interior states) has eig_min == 0 on the full
-        # space and is declined by the positive-definite margin. The Hessian is
-        # constant (degree <= 2 is proven above), so its zero pattern is
-        # structural, not an accident of the sample point; an empty support is
-        # a linear objective and is still declined.
-        support = np.flatnonzero(np.any(H_sym != 0.0, axis=0))
-        if support.size == 0:
-            return False
-        H_sym = H_sym[np.ix_(support, support)]
-    return _hessian_is_psd_with_margin(H_sym)
+    return _hessian_is_psd_with_margin(0.5 * (H1 + H1.T))
 
 
 def _convex_objective_lower_bound(evaluator, node_lb, node_ub) -> float:

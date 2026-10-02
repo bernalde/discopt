@@ -320,41 +320,6 @@ class SolverTuning:
     soundness gap the sharp path closes), so it can return ``None`` where the
     legacy path returned a value — never the reverse."""
 
-    # --- #1574 convex-quadratic objective node bound: objective-only degree gate
-    convex_obj_degree_gate: bool = field(
-        default_factory=lambda: _env_flag("DISCOPT_CONVEX_OBJ_DEGREE_GATE", default=False)
-    )
-    """Decide "the objective is at most quadratic" from the **objective alone**,
-    with :func:`discopt._relax.quadratic_form.polynomial_degree_bound`, instead of
-    from the model-wide term classifier (``DISCOPT_CONVEX_OBJ_DEGREE_GATE``,
-    issue #1574). **Default OFF — documented opt-in, kept**, per the §5 panel
-    (``discopt_benchmarks/scripts/issue1574_convex_obj_degree_gate_panel.py``,
-    30 s/arm, interleaved, 66 in-repo .nl + 4 DAE + 3 weighted-least-squares +
-    2 array models, 2026-10-02): **cert-clean** (0 violations over 52,785 executed
-    checks — incumbents feasibility-verified, oracle bracket, and box
-    differential + 200-point sampling on every admitted ``(model, evaluator)``) but
-    **not net-positive**: 12 instances flip to admitted, and on every one that
-    finishes, node count and certified bound are bit-identical ON vs OFF (2107 vs
-    2107 nodes; certified 11 vs 11). The supporting-hyperplane bound is a pure
-    *box* bound and on this corpus the LP relaxation already matches or beats it
-    (e.g. the DAE ``integral(u**2)`` box minimum is 0). Recorded in
-    ``docs/dev/flag-retirement-audit.md``. **What would change it:** a panel over
-    models whose quadratic objective's box minimum is far above the McCormick/LP
-    objective bound (badly scaled or wide-box least-squares fits with
-    off-diagonal Hessians), where the bound is load-bearing.
-
-    The classifier files a scaled square ``c * x**2`` under ``general_nl`` and
-    rejects the whole model when *any* constraint is above degree two, so the
-    convex-quadratic objective node bound (:func:`discopt.solver.
-    _objective_is_convex_quadratic`) abstained on every weighted least-squares
-    objective and every DAE ``integral(u**2)`` (collocation quadrature weights
-    multiply each square). The degree bound is a structural *upper* bound, so a
-    result ``<= 2`` proves the objective is a polynomial of degree at most two —
-    which, with the unchanged two-point constant-Hessian backstop and PSD test, is
-    all the constant-Hessian convexity argument needs. Anything it cannot bound
-    (transcendental, variable denominator, fractional exponent, ``MatMul``,
-    ``CustomCall``) returns ``None`` and abstains, exactly as before."""
-
     # --- RLT (reformulation-linearization) families ---------------------------
     rlt: bool = field(default_factory=lambda: _env_flag("DISCOPT_RLT", default=False))
     """Legacy whole-relaxation RLT toggle (``DISCOPT_RLT``). The ``rlt=`` argument
