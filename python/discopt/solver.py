@@ -22834,22 +22834,12 @@ def _solve_nlp_bb(
         # violation is a sub-solver artefact (POUNCE's ``bound_relax_factor``
         # admits ``1e-8*(1+|b|)``), the projection is the nearest point satisfying
         # every bound, and integer bounds are integral so it cannot break
-        # integrality. It is adopted only when the projected point clears this
-        # same gate, rows included; the objective below is re-evaluated at
-        # whichever point leaves, and the certificate is re-tested downstream.
-        _box_proj = np.clip(sol_flat, _declared_box[:, 0], _declared_box[:, 1])
-        if not np.array_equal(_box_proj, sol_flat):
-            _proj_excess, _, _ = _nonlinear_point_excess(
-                evaluator,
-                _box_proj,
-                cl_list,
-                cu_list,
-                n_rows=_declared_rows,
-                box=_declared_box,
-            )
-            if _proj_excess <= _NLPBB_EXIT_ABS_TOL:
-                sol_flat = _box_proj
-                x_dict = _unpack_solution(model, sol_flat)
+        # integrality. It is attempted ONLY when the point as returned would be
+        # refused -- an incumbent the gate already accepts leaves untouched, so no
+        # solve the gate passed before reports a different point -- and adopted
+        # only when the projected point clears this same gate, rows included. The
+        # objective below is re-evaluated at whichever point leaves, and the
+        # certificate is re-tested downstream.
         _exit_excess, _exit_where, _exit_cmp = _nonlinear_point_excess(
             evaluator,
             sol_flat,
@@ -22858,6 +22848,21 @@ def _solve_nlp_bb(
             n_rows=_declared_rows,
             box=_declared_box,
         )
+        if _exit_excess > _NLPBB_EXIT_ABS_TOL:
+            _box_proj = np.clip(sol_flat, _declared_box[:, 0], _declared_box[:, 1])
+            if not np.array_equal(_box_proj, sol_flat):
+                _proj = _nonlinear_point_excess(
+                    evaluator,
+                    _box_proj,
+                    cl_list,
+                    cu_list,
+                    n_rows=_declared_rows,
+                    box=_declared_box,
+                )
+                if _proj[0] <= _NLPBB_EXIT_ABS_TOL:
+                    sol_flat = _box_proj
+                    x_dict = _unpack_solution(model, sol_flat)
+                    _exit_excess, _exit_where, _exit_cmp = _proj
         if _exit_excess > _NLPBB_EXIT_ABS_TOL:
             raise RuntimeError(
                 "NLP-BB returned an infeasible point labeled feasible/optimal: "
@@ -23146,43 +23151,41 @@ def _solve_node_nlp(
     We override variable bounds to use the node-specific bounds
     rather than the global bounds.
     """
-    # Pre-screen: detect trivially infeasible nodes by evaluating constraints
-    # at the midpoint. When the feasible region is very narrow (most variables
-    # pinned) and constraints are violated, NLP solvers like POUNCE can stall
-    # for thousands of iterations instead of quickly returning infeasible.
+    # Pre-screen: a node whose box is a single point needs no NLP -- the point is
+    # the whole box, so evaluating the rows there IS the feasibility question.
+    # NLP solvers like POUNCE can stall for thousands of iterations on such a box
+    # instead of returning infeasible quickly.
+    #
+    # #1542 (review of #1550): this used to fire when all but ONE variable was
+    # "pinned", judged on bounds clipped to ``+-STARTING_POINT_CLIP``, and certified
+    # INFEASIBLE after sampling two points. Two samples of a box with a free
+    # variable are not a proof: with ``(x-5)**2 >= 9`` on ``x in [0, 10]`` both
+    # samples sat at ``x = 5`` and the node was declared empty although ``x = 0``
+    # is feasible. And a clipped box only looks pinned -- ``[-105, -100]`` clips
+    # to the single point ``-100`` -- which is how a feasible shifted MINLP came
+    # back certified ``infeasible``. So it now certifies only when every RAW bound
+    # pair is equal and finite, and judges that point with the NLP-BB exit gate's
+    # own arbiter (``_nonlinear_point_excess``: abs 1e-6 net of term-scaled
+    # noise), so it cannot call a point infeasible that the gate would accept.
     if constraint_bounds is not None and evaluator.n_constraints > 0:
         from discopt.solvers import NLPResult
 
-        x_mid = np.clip(x0, node_lb, node_ub)
-        # Clip first: unbounded vars produce inf-(-inf)=NaN under raw subtract,
-        # which then disables this pre-screen on every node with free vars.
-        lb_c, ub_c = _clip_start_box(node_lb, node_ub)
-        span = ub_c - lb_c
-        n_pinned = np.sum(span < 1e-10)
-        if n_pinned >= len(span) - 1:
-            # Nearly all variables pinned: evaluate constraints at midpoint
+        _pt_lb = np.asarray(node_lb, dtype=np.float64)
+        _pt_ub = np.asarray(node_ub, dtype=np.float64)
+        if _pt_lb.size > 0 and np.all(np.isfinite(_pt_lb)) and np.array_equal(_pt_lb, _pt_ub):
             try:
-                g = evaluator.evaluate_constraints(x_mid)
-                infeasible = False
-                for k, (cl, cu) in enumerate(constraint_bounds):
-                    if g[k] < cl - 1e-6 or g[k] > cu + 1e-6:
-                        infeasible = True
-                        break
-                if infeasible:
-                    # Verify at the bounds midpoint too
-                    x_check = 0.5 * (lb_c + ub_c)
-                    g2 = evaluator.evaluate_constraints(x_check)
-                    still_infeasible = False
-                    for k, (cl, cu) in enumerate(constraint_bounds):
-                        if g2[k] < cl - 1e-6 or g2[k] > cu + 1e-6:
-                            still_infeasible = True
-                            break
-                    if still_infeasible:
-                        return NLPResult(
-                            status=SolveStatus.INFEASIBLE,
-                            x=x_mid,
-                            objective=_INFEASIBILITY_SENTINEL,
-                        )
+                _pt_excess, _, _pt_cmp = _nonlinear_point_excess(
+                    evaluator,
+                    _pt_lb,
+                    [cl for cl, _ in constraint_bounds],
+                    [cu for _, cu in constraint_bounds],
+                )
+                if _pt_cmp > 0 and _pt_excess > _NLPBB_EXIT_ABS_TOL:
+                    return NLPResult(
+                        status=SolveStatus.INFEASIBLE,
+                        x=_pt_lb.copy(),
+                        objective=_INFEASIBILITY_SENTINEL,
+                    )
             except Exception as exc:  # noqa: BLE001 - falls through to the NLP solver
                 # #1520: kept as a sound fallback (the probe only ever declares a
                 # node infeasible; skipping it leaves the NLP to decide).

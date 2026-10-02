@@ -30,6 +30,10 @@ from discopt.constants import STARTING_POINT_CLIP, clip_start_box
 from discopt.validation.feasibility import verify_point
 
 _MIXED_SHIFT = np.array([798491.0, -1314226.0, -1100101.0, -1228561.0, 555147.0])
+# Integers span [0, 4] and continuous [0, 5] before the shift, so these put every
+# upper bound at exactly -100, or every lower bound at exactly +100.
+_TOUCH_MINUS = np.array([-104.0, -104.0, -104.0, -105.0, -105.0])
+_TOUCH_PLUS = np.full(5, 100.0)
 
 
 def _build(seed: int, shift: np.ndarray):
@@ -66,6 +70,17 @@ def _flat(result, model):
         pytest.param(1, _MIXED_SHIFT, id="seed1-mixed-shift"),
         pytest.param(9, np.full(5, 1e6), id="seed9-uniform-1e6"),
         pytest.param(5, np.full(5, 1e6), id="seed5-uniform-1e6"),
+        # Review of #1550: a box TOUCHING the +-STARTING_POINT_CLIP window at one
+        # end (every ub == -100, or every lb == +100) collapsed exactly like one
+        # lying outside it, and came back certified infeasible on all three seeds.
+        *[
+            pytest.param(seed, _TOUCH_MINUS, id=f"seed{seed}-ub-touches-minus100")
+            for seed in (1, 2, 5)
+        ],
+        *[
+            pytest.param(seed, _TOUCH_PLUS, id=f"seed{seed}-lb-touches-plus100")
+            for seed in (1, 2, 5)
+        ],
     ],
 )
 def test_shifted_model_keeps_the_unshifted_answer(seed, shift):
@@ -102,11 +117,16 @@ def test_shifted_model_keeps_the_unshifted_answer(seed, shift):
 @pytest.mark.unit
 def test_clip_start_box_stays_inside_the_box():
     C = STARTING_POINT_CLIP
-    lb = np.array([-np.inf, 0.0, -5.0, 1.3e6, -1.3e6 - 5.0, 50.0, -np.inf, 1e6])
-    ub = np.array([np.inf, np.inf, 5.0, 1.3e6 + 5.0, -1.3e6, 1e6, -1e6, np.inf])
+    lb = np.array(
+        [-np.inf, 0.0, -5.0, 1.3e6, -1.3e6 - 5.0, 50.0, -np.inf, 1e6, -105.0, C, -np.inf, C]
+    )
+    ub = np.array(
+        [np.inf, np.inf, 5.0, 1.3e6 + 5.0, -1.3e6, 1e6, -1e6, np.inf, -C, 105.0, -C, np.inf]
+    )
     lo, hi = clip_start_box(lb, ub)
-    # Unchanged wherever the box meets [-C, C]: identical to the bare clip.
-    meets = (lb <= C) & (ub >= -C)
+    # Unchanged wherever the box overlaps (-C, C) in more than a point: identical
+    # to the bare clip.
+    meets = (lb < C) & (ub > -C)
     np.testing.assert_array_equal(lo[meets], np.clip(lb, -C, C)[meets])
     np.testing.assert_array_equal(hi[meets], np.clip(ub, -C, C)[meets])
     # Always a non-degenerate finite window inside the box.
@@ -117,6 +137,16 @@ def test_clip_start_box_stays_inside_the_box():
     np.testing.assert_array_equal(hi[3:5], ub[3:5])
     assert (lo[6], hi[6]) == (-1e6 - 2 * C, -1e6)
     assert (lo[7], hi[7]) == (1e6, 1e6 + 2 * C)
+    # Touching the window at exactly +-C (review of #1550): the bare clip gives
+    # the single point +-C; the window keeps the box's own width.
+    assert (lo[8], hi[8]) == (-105.0, -C)
+    assert (lo[9], hi[9]) == (C, 105.0)
+    assert (lo[10], hi[10]) == (-3 * C, -C)
+    assert (lo[11], hi[11]) == (C, 3 * C)
+    # A genuinely fixed box stays the point it is.
+    lo_p, hi_p = clip_start_box(np.array([C, -C, 7.0]), np.array([C, -C, 7.0]))
+    np.testing.assert_array_equal(lo_p, [C, -C, 7.0])
+    np.testing.assert_array_equal(hi_p, [C, -C, 7.0])
 
 
 @pytest.mark.unit
@@ -133,3 +163,65 @@ def test_exit_gate_does_not_forgive_box_violation_by_magnitude():
     # The same point, shifted to the origin, gets the same verdict.
     excess0, _, _ = _nonlinear_point_excess(None, x - box[:, 0], None, None, box=box - box[:, :1])
     assert excess0 > _NLPBB_EXIT_ABS_TOL
+
+
+def _ring_model():
+    """``(x - 5)**2 >= 9`` on ``x in [0, 10]``: feasible at ``x <= 2`` and ``x >= 8``."""
+    m = dm.Model("ring")
+    x = m.continuous("x", lb=0, ub=10)
+    m.subject_to((x - 5) ** 2 >= 9)
+    m.minimize(x)
+    return m
+
+
+@pytest.mark.unit
+def test_node_prescreen_does_not_certify_a_box_with_a_free_variable():
+    """Review of #1550: the pre-screen sampled two points and certified INFEASIBLE.
+
+    Both samples of ``[0, 10]`` sit at ``x = 5``, where the row is violated, but
+    ``x = 0`` is feasible. Two samples are not a proof; the NLP must decide.
+    """
+    from discopt.solver import _infer_constraint_bounds, _make_evaluator, _solve_node_nlp
+    from discopt.solvers import SolveStatus
+
+    m = _ring_model()
+    ev = _make_evaluator(m)
+    cl, cu = _infer_constraint_bounds(m, ev)
+    cb = list(zip(cl, cu))
+    # Precondition: the midpoint really is infeasible, so the old pre-screen fired.
+    g_mid = float(ev.evaluate_constraints(np.array([5.0]))[0])
+    assert g_mid > cu[0] + 1e-6, (g_mid, cb)
+
+    r = _solve_node_nlp(
+        ev,
+        np.array([5.0]),
+        np.array([0.0]),
+        np.array([10.0]),
+        cb,
+        {},
+        nlp_solver="pounce",
+        convex=True,
+    )
+    assert r.status != SolveStatus.INFEASIBLE, (r.status, r.x)
+    assert r.status in (SolveStatus.OPTIMAL, SolveStatus.ITERATION_LIMIT), r.status
+    xr = float(np.asarray(r.x).ravel()[0])
+    assert (xr <= 2.0 + 1e-5) or (xr >= 8.0 - 1e-5), xr
+
+
+@pytest.mark.unit
+def test_node_prescreen_still_certifies_a_genuinely_fixed_infeasible_point():
+    from discopt.solver import _infer_constraint_bounds, _make_evaluator, _solve_node_nlp
+    from discopt.solvers import SolveStatus
+
+    m = _ring_model()
+    ev = _make_evaluator(m)
+    cl, cu = _infer_constraint_bounds(m, ev)
+    cb = list(zip(cl, cu))
+    # x pinned at 5: the box IS that point, and the row is violated by 9 there.
+    pinned = np.array([5.0])
+    r = _solve_node_nlp(ev, pinned, pinned, pinned.copy(), cb, {}, nlp_solver="pounce", convex=True)
+    assert r.status == SolveStatus.INFEASIBLE
+    # ...and pinned at a feasible point it is not.
+    feas = np.array([1.0])
+    r2 = _solve_node_nlp(ev, feas, feas, feas.copy(), cb, {}, nlp_solver="pounce", convex=True)
+    assert r2.status != SolveStatus.INFEASIBLE, r2.status

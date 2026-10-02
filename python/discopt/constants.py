@@ -52,14 +52,15 @@ def clip_start_box(lb, ub):
 
     ``np.clip(b, -STARTING_POINT_CLIP, STARTING_POINT_CLIP)`` on each bound is the
     window wherever the box meets ``[-STARTING_POINT_CLIP, STARTING_POINT_CLIP]``,
-    and this returns exactly that there. A box lying ENTIRELY outside it (#1542:
+    and this returns exactly that there. A box outside it, or touching it (#1542:
     ``[1.3e6, 1.3e6 + 5]``, a model written in shifted coordinates) collapses under
     the bare clip to the single point ``±STARTING_POINT_CLIP`` -- outside the box,
     with span 0. The NLP-BB node pre-screen read that as "every variable pinned",
     evaluated the rows at a point the box does not contain, and returned a false
     ``infeasible`` certificate on a feasible MINLP. Such a box gets a window of the
     same width ``2 * STARTING_POINT_CLIP`` anchored at its near end instead, so the
-    result always satisfies ``lb <= lo <= hi <= ub`` for a non-empty box.
+    result always satisfies ``lb <= lo <= hi <= ub`` for a non-empty box, and
+    ``lo < hi`` whenever ``lb < ub``.
     """
     import numpy as np
 
@@ -68,8 +69,10 @@ def clip_start_box(lb, ub):
     c = STARTING_POINT_CLIP
     lo = np.clip(lb, -c, c)
     hi = np.clip(ub, -c, c)
-    above = lb > c
-    below = ub < -c
+    # ``>=`` / ``<=``, not strict: a box TOUCHING the window (``[-105, -100]``)
+    # meets it in one point only, so the bare clip collapses it just the same.
+    above = lb >= c
+    below = ub <= -c
     if np.any(above) or np.any(below):
         lo = np.where(above, lb, np.where(below, np.maximum(lb, ub - 2.0 * c), lo))
         hi = np.where(above, np.minimum(ub, lb + 2.0 * c), np.where(below, ub, hi))
