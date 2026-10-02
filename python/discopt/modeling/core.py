@@ -7595,6 +7595,47 @@ class Model:
             legacy ``DISCOPT_RLT=1`` environment variable. Sound regardless of
             setting (a constraint×bound product never removes a feasible point).
             Passed through to :func:`discopt.solver.solve_model`.
+        milp_backend : {"highs", "native"}, optional
+            Engine for a pure LP or MILP model. The default ``None`` defers to
+            the ``DISCOPT_LP_MILP_BACKEND`` environment variable, which itself
+            defaults to HiGHS. ``"highs"`` names HiGHS with discopt-verified
+            certificates, by far the faster choice; it reports
+            ``node_count == 0``. ``"native"`` forces discopt's own branch and
+            bound so the search can be studied: the in-house LP solve (Rust
+            simplex, POUNCE if it declines) for an LP, discopt's MILP tree for
+            a MILP. On the
+            MILP tree ``node_count`` is the tree's, ``strategy`` selects the
+            next node (``"best_first"``, ``"depth_first"``, ``"best_estimate"``),
+            ``batch_size=1`` evaluates one node at a time (default 16 per
+            batch), ``branching_rule`` picks the variable to branch on,
+            ``node_callback`` fires after every batch, ``max_nodes`` caps the
+            tree and ``milp_cuts`` switches the root cut loop.
+            ``algorithm_route`` names the engine that ran. Refused for a model
+            that is not an LP or MILP and with ``nlp_bb=True``; ``"highs"`` is
+            refused with any callback, since HiGHS runs none. ``lazy_constraints``,
+            ``incumbent_callback`` and ``cut_callback`` route a MILP to spatial
+            branch and bound, the engine that screens them. If presolve fixes
+            every integer the model is solved as an LP and ``branching_rule`` /
+            ``milp_cuts`` are unused (a warning says so). Overrides the
+            ``DISCOPT_LP_MILP_BACKEND`` environment variable. Passed through to
+            :func:`discopt.solver.solve_model`::
+
+                r = m.solve(milp_backend="native", strategy="depth_first",
+                            branching_rule="strong", batch_size=1, milp_cuts=False)
+                r.node_count, r.algorithm_route
+
+        milp_cuts : bool, optional
+            Only with ``milp_backend="native"`` on a MILP. ``False`` skips the
+            root cut loop (cover, clique and Gomory cuts), so the tree branches
+            on the plain LP relaxation; the default keeps it.
+        branching_rule : str, optional
+            Only with ``milp_backend="native"`` on a MILP: which fractional
+            integer variable a node branches on. ``"pseudocost"`` (default:
+            reliability pseudocosts, most-fractional until a variable has
+            observations), ``"most_fractional"``, ``"least_fractional"`` or
+            ``"strong"`` (solves both child LPs of every candidate; those probe
+            LPs are reported in ``solver_stats["branching/strong_probe_lps"]``,
+            not in ``node_count``). Changes the search order, never a bound.
         initial_solution : dict, optional
             Initial feasible solution mapping Variable objects to values
             (scalars, lists, or numpy arrays).  Used as a warm-start point
@@ -7647,7 +7688,10 @@ class Model:
             return ``True`` to accept or ``False`` to reject.
         node_callback : callable, optional
             Node callback. Called after each batch of nodes is processed.
-            Should accept ``(ctx, model)`` and return ``None``.
+            Should accept ``(ctx, model)`` and return ``None``. A MILP with a
+            node callback is solved by discopt's MILP tree rather than HiGHS
+            (which exposes no nodes), so the callback sees real nodes. An LP has
+            no tree; the callback is not called and a warning says so.
         cut_callback : callable, optional
             Cut callback, invoked at **every** node — spatial ones included,
             unlike ``lazy_constraints``, which fires only at integer-feasible
@@ -7655,6 +7699,9 @@ class Model:
             :class:`~discopt.callbacks.NodeCutContext` carrying the node's BOX,
             its relaxation solution and the incumbent, and returns a list of
             :class:`~discopt.callbacks.CutResult` (possibly empty).
+            Runs on discopt's spatial branch and bound: a MILP with a cut
+            callback leaves the HiGHS and MILP-tree routes, which have no cut
+            hook, and ``nlp_bb=True`` with a cut callback is refused.
 
             **Every returned cut is validated before it is accepted.** A cut the
             solver derives is a theorem; one you hand it is an assertion, and
@@ -7696,6 +7743,32 @@ class Model:
                 r.objective       # ~0.0 at the origin
                 r.bound           # None -- no dual information
                 r.gap_certified   # False -- by design
+
+            Use ``solver="pounce"`` for exactly one POUNCE interior-point solve of
+            the model as written, with no convexity classification, presolve,
+            spatial branch-and-bound or HiGHS fallback (#1533). An LP goes to
+            POUNCE's convex LP IPM (``lp-ipm``) and a QP whose Hessian discopt
+            proves positive semidefinite (an exact rational test) to its
+            ``qp-ipm``; both are convex, so they report ``"optimal"``. Every other
+            continuous model -- a QP not so proved, a QCQP, an NLP -- goes to the
+            filter line-search NLP IPM once and reports ``"local_optimal"`` with
+            no bound and ``gap_certified=False``, since nothing global was
+            proved. ``result.algorithm_route`` names the arm
+            (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``, ``"pounce:nlp"``) and
+            ``result.solver_stats["pounce/iterations"]`` the convex engine's
+            iteration count. A local infeasibility is ``"local_infeasible"``.
+            Integer/binary variables, and an ``nlp_solver`` other than
+            ``"pounce"``, raise ``ValueError``; any other option left at a
+            non-default value is ignored with a warning naming it.
+            Options go in ``pounce_options`` (an alias of ``ipopt_options``)::
+
+                r = m.solve(solver="pounce",
+                            pounce_options={"print_level": 5, "tol": 1e-9})
+
+            The convex LP/QP engine accepts ``tol``, ``max_iter``,
+            ``max_wall_time``, ``print_level`` (any positive value prints its
+            iteration trace), ``tau`` and ``tau_max``; an NLP-engine option such
+            as ``mu_strategy`` on an LP raises rather than being ignored.
 
             Use ``solver="amp"`` to select
             Adaptive Multivariate Partitioning. AMP-specific keyword
@@ -8858,6 +8931,13 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
+        # #1533: solver="pounce" never builds a relaxation, so "the relaxation layer
+        # could not bound this objective" would misdescribe it; its missing bound is
+        # the route's contract. Scoped to that route only: every other route keeps
+        # both diagnostics below exactly as before.
+        _no_bound_by_design = isinstance(result, SolveResult) and (
+            result.algorithm_route or ""
+        ).startswith("pounce:")
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a
@@ -8873,6 +8953,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
             and (_poles := _objective_poles_or_none(self))
         ):
             # #1493: a POLE, not a missing envelope. ``min 1/x`` on ``[-5, 5]``
@@ -8901,6 +8982,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
         ):
             _logging.getLogger("discopt.solver").warning(
                 "No valid dual bound was produced for model %r: the relaxation "

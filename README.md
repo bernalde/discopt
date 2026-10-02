@@ -198,8 +198,8 @@ pip install "discopt[ipopt]"
 From a source checkout:
 
 ```bash
-# Build Rust-Python bindings
-cd crates/discopt-python && maturin develop && cd ../..
+# Build Rust-Python bindings (from the repo root, not crates/discopt-python/)
+maturin develop --release
 
 # Run the fast default PR battery
 cargo test -p discopt-core

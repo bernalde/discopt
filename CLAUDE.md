@@ -231,12 +231,19 @@ source install (matches `CONTRIBUTING.md`):
 
 ```bash
 pip install -e ".[dev,pounce,ipopt,highs]"        # discopt itself
-cd crates/discopt-python && maturin develop && cd ../..   # build the Rust bindings
+maturin develop --release                        # build the Rust bindings (repo root!)
 cd discopt_benchmarks && pip install -e ".[dev]" && cd ..  # benchmark harness (separate pkg)
 ```
 
-Re-run `maturin develop` after any change under `crates/`; the Python tests import the
-compiled extension, not the Rust source.
+Re-run `maturin develop --release` **from the repo root** after any change under `crates/`;
+the Python tests import the compiled extension, not the Rust source. The root
+`pyproject.toml` is what maps the build to `discopt._rust`
+(`module-name = "discopt._rust"`, `python-source = "python"`). Running maturin inside
+`crates/discopt-python/` instead installs a *separate* `discopt-python` package with a
+top-level `_rust` module and leaves `python/discopt/_rust.abi3.so` stale — the symptom is
+`AttributeError: ... PyTreeManager has no attribute ...` on tests that pass in CI. Without
+`--release` you get an opt-level-0 build (`cargo test` measured ~9x slower; see the header of
+`.github/workflows/ci.yml`).
 
 ### Tests
 ```bash
