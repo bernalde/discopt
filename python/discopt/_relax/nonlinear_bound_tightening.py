@@ -1558,11 +1558,19 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
             arg_endpoint_b = arg_coeff * float(tightened_ub[arg_idx]) + arg_offset
             current_arg_lb = min(arg_endpoint_a, arg_endpoint_b)
             current_arg_ub = max(arg_endpoint_a, arg_endpoint_b)
+            # #1537: the argument endpoints are affine images of the box, rounded at
+            # the magnitude of what was summed -- ulp(1e6) ~ 1.2e-10 once the model is
+            # written in ``x = y - 1e6``. Every PROOF below is taken on outward-widened
+            # intervals and judged against the row's own feasibility tolerance (in
+            # function units), as #1397/#1415 do for the square rules; the bare 1e-12
+            # here certified hda infeasible after translation (a sqrt range touching
+            # its required range at one point read as empty).
+            arg_slack = _roundoff_slack(arg_endpoint_a, arg_endpoint_b, arg_offset)
             if domain_lb is not None:
                 current_arg_lb = max(current_arg_lb, domain_lb)
             if domain_ub is not None:
                 current_arg_ub = min(current_arg_ub, domain_ub)
-            if current_arg_lb > current_arg_ub + 1e-12:
+            if current_arg_lb > current_arg_ub + _EMPTY_INTERVAL_FEAS_TOL + arg_slack:
                 _prove_infeasible(
                     self.name,
                     constraint,
@@ -1571,6 +1579,18 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
 
             func_min = _monotone_function_value(func_name, current_arg_lb)
             func_max = _monotone_function_value(func_name, current_arg_ub)
+            # Outward function range for the proof: f on the widened argument
+            # interval (clipped to the domain), plus the function's own rounding.
+            wide_arg_lb = current_arg_lb - arg_slack
+            wide_arg_ub = current_arg_ub + arg_slack
+            if domain_lb is not None:
+                wide_arg_lb = max(wide_arg_lb, domain_lb)
+            if domain_ub is not None:
+                wide_arg_ub = min(wide_arg_ub, domain_ub)
+            wide_func_min = _monotone_function_value(func_name, wide_arg_lb)
+            wide_func_max = _monotone_function_value(func_name, wide_arg_ub)
+            wide_func_min -= _roundoff_slack(wide_func_min)
+            wide_func_max += _roundoff_slack(wide_func_max)
 
             linear_target_values = (
                 -constant_term - func_coeff * func_min,
@@ -1600,7 +1620,12 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
 
             feasible_func_lb = max(required_func_lb, func_min)
             feasible_func_ub = min(required_func_ub, func_max)
-            if feasible_func_lb > feasible_func_ub + 1e-12:
+            required_slack = _roundoff_slack(
+                abs(constant_term), linear_expr_lb, linear_expr_ub
+            ) / abs(func_coeff)
+            if max(required_func_lb - required_slack, wide_func_min) > min(
+                required_func_ub + required_slack, wide_func_max
+            ) + _EMPTY_INTERVAL_FEAS_TOL / abs(func_coeff):
                 _prove_infeasible(
                     self.name,
                     constraint,
@@ -1726,22 +1751,33 @@ class MonotoneFunctionBoundsRule(NonlinearBoundTighteningRule):
             arg_endpoint_b = arg_coeff * float(tightened_ub[flat_idx]) + arg_offset
             current_arg_lb = min(arg_endpoint_a, arg_endpoint_b)
             current_arg_ub = max(arg_endpoint_a, arg_endpoint_b)
+            # #1537: proofs on outward-widened intervals; see the equality rule.
+            arg_slack = _roundoff_slack(arg_endpoint_a, arg_endpoint_b, arg_offset)
             if domain_lb is not None:
                 current_arg_lb = max(current_arg_lb, domain_lb)
             if domain_ub is not None:
                 current_arg_ub = min(current_arg_ub, domain_ub)
-            if current_arg_lb > current_arg_ub + 1e-12:
+            if current_arg_lb > current_arg_ub + _EMPTY_INTERVAL_FEAS_TOL + arg_slack:
                 _prove_infeasible(
                     self.name,
                     constraint,
                     f"{func_name} argument domain is empty on the current box",
                 )
 
-            func_min = _monotone_function_value(func_name, current_arg_lb)
-            func_max = _monotone_function_value(func_name, current_arg_ub)
+            wide_lo = current_arg_lb - arg_slack
+            wide_hi = current_arg_ub + arg_slack
+            if domain_lb is not None:
+                wide_lo = max(wide_lo, domain_lb)
+            if domain_ub is not None:
+                wide_hi = min(wide_hi, domain_ub)
+            wide_min = _monotone_function_value(func_name, wide_lo)
+            wide_max = _monotone_function_value(func_name, wide_hi)
             rhs = -constant_term / func_coeff
+            proof_tol = (_EMPTY_INTERVAL_FEAS_TOL + _roundoff_slack(constant_term)) / abs(
+                func_coeff
+            )
             if func_coeff > 0.0:
-                if rhs < func_min - 1e-12:
+                if rhs < wide_min - _roundoff_slack(wide_min) - proof_tol:
                     _prove_infeasible(
                         self.name,
                         constraint,
@@ -1751,7 +1787,7 @@ class MonotoneFunctionBoundsRule(NonlinearBoundTighteningRule):
                 if upper is not None:
                     arg_ub = upper if arg_ub is None else min(arg_ub, upper)
             else:
-                if rhs > func_max + 1e-12:
+                if rhs > wide_max + _roundoff_slack(wide_max) + proof_tol:
                     _prove_infeasible(
                         self.name,
                         constraint,
@@ -2356,7 +2392,9 @@ class PositiveAffineReciprocalBoundsRule(NonlinearBoundTighteningRule):
             rhs = -scaled_numerator / constant_term
             if not np.isfinite(rhs):
                 continue
-            if arg_lb > rhs + 1e-12:
+            # #1537: arg_lb is an affine image of the box (rounded at the magnitude of
+            # ``const`` and the box), rhs a quotient; prove only past both roundings.
+            if arg_lb > rhs + _EMPTY_INTERVAL_FEAS_TOL + _roundoff_slack(arg_lb, const, rhs):
                 _prove_infeasible(
                     self.name,
                     constraint,
