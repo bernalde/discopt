@@ -5990,6 +5990,28 @@ def _gap_converged(tree, gap_tolerance: float, abs_gap_tol: float = _DEFAULT_ABS
     return _gap_values_converged(ub, lb, gap_tolerance, abs_gap_tol)
 
 
+def _tree_drained(tree) -> bool:
+    """Whether the tree has no open node left -- the EXHAUSTION half of
+    ``tree.is_finished()`` only.
+
+    ``TreeManager::is_finished`` (``tree_manager.rs``) is also true when the tree's
+    own relative gap ``(inc - glb) / max(1, |inc|)`` drops below a hard-coded
+    ``1e-8``, with nodes still open. That shortcut ignores the caller's
+    ``gap_tolerance``/``abs_gap_tolerance``: a solve asking for ``1e-9`` stopped at a
+    gap of 3.8e-9 (#1242's entropy acceptance model, 79 nodes, 4 still open), and
+    :func:`_tree_exhausted_with_proof` then read the stopped tree as an EXHAUSTED one
+    and labelled it ``optimal`` -- a certificate only #1383's final re-check
+    withdrew. At any tolerance ``>= 1e-8`` (the defaults are ``1e-4``/``1e-6``)
+    :func:`_gap_converged` fires on every state the shortcut does, so the loops
+    are unchanged there; below it the caller's tolerance is now the one obeyed.
+
+    The loops call this after ``process_evaluated``, so ``pending_results`` is
+    empty and ``open_nodes == 0`` together with ``is_finished()`` is exactly the
+    Rust ``open_count() == 0 && pending_results.is_empty()`` arm.
+    """
+    return bool(tree.is_finished()) and int(tree.stats()["open_nodes"]) == 0
+
+
 def _tree_exhausted_with_proof(tree) -> bool:
     """``tree.is_finished()`` as an optimality proof, i.e. no unproven removal.
 
@@ -6005,7 +6027,7 @@ def _tree_exhausted_with_proof(tree) -> bool:
     The MILP driver applies the same rule (``milp_driver.rs``,
     ``decide_status``).
     """
-    if not tree.is_finished():
+    if not _tree_drained(tree):
         return False
     stats = tree.stats()
     if bool(stats.get("bound_unresolved", False)):
@@ -19032,7 +19054,7 @@ def solve_model(
         iteration += 1
 
         # Check termination
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -22607,7 +22629,7 @@ def _solve_nlp_bb(
         iteration += 1
 
         # Check termination
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -30453,7 +30475,7 @@ def _solve_milp_bb(
                     _root_glb_rigorous = _root_glb_internal
 
         iteration += 1
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -31351,7 +31373,7 @@ def _solve_miqp_bb(
                     _root_glb_rigorous = _root_glb_internal
 
         iteration += 1
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break

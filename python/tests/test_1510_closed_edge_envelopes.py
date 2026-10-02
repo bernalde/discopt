@@ -1,4 +1,5 @@
-"""Closed lower domain edge envelopes for asin/acos/acosh (issue #1510, item 3).
+"""Closed lower domain edge envelopes for asin/acos/acosh (issue #1510, item 3),
+extended to xlogx/entropy and sqrt (#1242).
 
 ``uniform_relax._UNIVARIATE_FN``'s domain guard admitted ``hi = +1`` for
 ``asin``/``acos`` but demanded ``lo > -1`` (and ``lo > 1`` for ``acosh``), so a box
@@ -34,6 +35,17 @@ pytestmark = [pytest.mark.relaxation]
 
 FLAG = "DISCOPT_CLOSED_EDGE_ENVELOPES"
 
+
+def _xlogx_np(t):
+    """``t ln t`` with its continuous extension ``0`` at ``t = 0`` (nan below)."""
+    t = np.asarray(t, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(t == 0.0, 0.0, t * np.log(t))
+
+
+#: The lower bound interval arithmetic gives ``1 - y`` over ``y in [0, 1]``.
+_AFFINE_ROUNDED_ZERO = 1.0 + np.nextafter(-1.0, -2.0)
+
 #: ``(label, atom, numpy f, lo, hi)`` -- boxes that START at a closed lower edge.
 EDGE_CASES = [
     ("asin[-1,0]", dm.asin, np.arcsin, -1.0, 0.0),
@@ -47,6 +59,17 @@ EDGE_CASES = [
     # edge (``asin(x - 1)`` over ``x in [0, 1]``); read as the edge.
     ("asin[-1-ulp,0]", dm.asin, np.arcsin, np.nextafter(-1.0, -2.0), 0.0),
     ("acosh[1-ulp,2]", dm.acosh, np.arccosh, np.nextafter(1.0, 0.0), 2.0),
+    # #1242: ``xlogx`` (the ``entropy`` atom) is finite at its closed edge 0
+    # (``0 ln 0 = 0``) but ``dom_ok`` demanded ``lo > 0``; and ``1 - y`` over
+    # ``y in [0, 1]`` arrives as ``lo = -2.2e-16`` (``-1 * [0, 1]`` is rounded
+    # outward), which also defeated ``sqrt``'s ``lo >= 0``.
+    ("xlogx[0,1]", dm.xlogx, _xlogx_np, 0.0, 1.0),
+    ("xlogx[0,0.2]", dm.xlogx, _xlogx_np, 0.0, 0.2),
+    ("xlogx[0,1e-6]", dm.xlogx, _xlogx_np, 0.0, 1e-6),
+    ("xlogx[-2.2e-16,1]", dm.xlogx, _xlogx_np, _AFFINE_ROUNDED_ZERO, 1.0),
+    ("xlogx[-ulp,3]", dm.xlogx, _xlogx_np, np.nextafter(0.0, -1.0), 3.0),
+    ("sqrt[-2.2e-16,1]", dm.sqrt, np.sqrt, _AFFINE_ROUNDED_ZERO, 1.0),
+    ("sqrt[-ulp,4]", dm.sqrt, np.sqrt, np.nextafter(0.0, -1.0), 4.0),
 ]
 
 #: Boxes where the flag must change nothing: interior boxes, the already-admitted
@@ -62,6 +85,11 @@ NOOP_CASES = [
     ("acos[-0.5,1]", dm.acos, np.arccos, -0.5, 1.0),
     ("acosh[1.5,3]", dm.acosh, np.arccosh, 1.5, 3.0),
     ("acosh[0.999,2]", dm.acosh, np.arccosh, 0.999, 2.0),
+    # sqrt's exact edge was already admitted; a box genuinely below 0 keeps the floor.
+    ("sqrt[0,1]", dm.sqrt, np.sqrt, 0.0, 1.0),
+    ("sqrt[-1e-9,1]", dm.sqrt, np.sqrt, -1e-9, 1.0),
+    ("xlogx[-1e-9,1]", dm.xlogx, _xlogx_np, -1e-9, 1.0),
+    ("xlogx[0.1,2]", dm.xlogx, _xlogx_np, 0.1, 2.0),
 ]
 
 
@@ -200,9 +228,13 @@ def test_bound_tightens_and_never_crosses(flag, label, atom, fnp, lo, hi):
     """``bound_ON >= bound_OFF`` and ``bound_ON <= true box optimum`` over 32
     normalized objective directions; at least one direction strictly improves."""
     # The graph over the DOMAIN part of the box (an outward-rounded ``lo`` one ulp
-    # outside it has no graph point there).
+    # outside it has no graph point there). ``round(lo, 12)`` is the edge itself
+    # (every edge here is an integer), which a grid from a ``lo`` that sits
+    # ``2.2e-16`` outside would otherwise step over.
     with np.errstate(invalid="ignore"):
-        grid = np.append(np.linspace(lo, hi, 200001), np.nextafter(lo, hi))
+        grid = np.append(
+            np.linspace(lo, hi, 200001), [np.nextafter(lo, hi), float(np.round(lo, 12))]
+        )
         fv = fnp(grid)
     keep = np.isfinite(fv)
     grid, fv = grid[keep], fv[keep]
@@ -253,3 +285,34 @@ def test_affine_argument_reaching_the_edge_is_enveloped(flag):
     opt = -math.pi / 2
     assert a1.shape[0] > a0.shape[0]
     assert off - 1e-9 <= on <= opt + 1e-9, (off, on, opt)
+
+
+@pytest.mark.parametrize(
+    "label,atom,true_min",
+    [("xlogx(1-y)", dm.xlogx, -1.0 / np.e), ("sqrt(1-y)", dm.sqrt, 0.0)],
+)
+def test_root_lp_of_an_affine_edge_argument_is_bounded(flag, label, atom, true_min):
+    """#1242: ``min atom(1 - y)`` over ``y in [0, 1]``. The argument's interval is
+    ``[-2.2e-16, 1 + 2.2e-16]``; without the edge the atom got no envelope AND an
+    unbounded aux column, the root LP came back ``unbounded``, and the solver
+    dropped the McCormick relaxer for the WHOLE tree (``_mc_mode = "none"``) --
+    the entropy acceptance solve then converged only first-order and could not
+    certify to 1e-9. With the edge the aux column is also pinned to the image of
+    the clamped argument, so the safe LP bound certifies."""
+    from discopt._relax.mccormick_lp import MccormickLPRelaxer
+
+    def solve():
+        m = dm.Model()
+        y = m.continuous("y", lb=0.0, ub=1.0)
+        m.minimize(atom(1 - y))
+        return MccormickLPRelaxer(m).solve_at_node(np.array([0.0]), np.array([1.0]))
+
+    flag("0")
+    off = solve()
+    flag(None)
+    on = solve()
+    assert off.status != "optimal" and off.lower_bound is None, (off.status, off.lower_bound)
+    assert on.status == "optimal", on.status
+    assert on.lower_bound is not None and np.isfinite(on.lower_bound)
+    assert on.lower_bound <= true_min + 1e-12, (on.lower_bound, true_min)
+    assert on.lower_bound >= true_min - 1e-9, "edge envelope bound is needlessly loose"

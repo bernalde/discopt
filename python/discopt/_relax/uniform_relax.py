@@ -421,11 +421,23 @@ def _dacosh(t: float) -> float:
 # verdict is a closed-form sign argument on ``f''`` stated at its definition.
 # --------------------------------------------------------------------------- #
 def _xlogx(t: float) -> float:
-    """``dm.xlogx`` / the ``entropy`` intrinsic: ``t ln t``, domain ``t > 0``."""
+    """``dm.xlogx`` / the ``entropy`` intrinsic: ``t ln t`` on ``t >= 0``.
+
+    ``t = 0`` is the continuous extension ``0`` (``lim t ln t = 0``, the value
+    ``dm.xlogx`` itself takes there), so a box whose argument starts at the CLOSED
+    edge ``0`` gets a secant through ``(0, 0)`` (#1242 / #1510 class)."""
+    t = float(t)
+    if t == 0.0:
+        return 0.0
     return t * math.log(t)
 
 
 def _xlogx_prime(t: float) -> float:
+    """``ln t + 1``; ``-inf`` at the vertical tangent ``t = 0`` (like ``_dsqrt``),
+    which ``_tangent_row`` drops rather than emitting."""
+    t = float(t)
+    if t == 0.0:
+        return -math.inf
     return math.log(t) + 1.0
 
 
@@ -2155,6 +2167,7 @@ def _build_univariate_call(ctx: _Builder, node: CNode, w: int) -> Envelope:
         if edge_lo is None:
             return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
         lo = edge_lo  # #1510: the closed lower domain edge
+        _pin_closed_edge_aux(ctx, w, fname, lo, hi)
     tight = _emit_1d(ctx, w, lt, lo, hi, f, fp, curv_fn(lo, hi))
     return Envelope(rows=[], tight=tight)
 
@@ -2165,7 +2178,18 @@ def _build_univariate_call(ctx: _Builder, node: CNode, w: int) -> Envelope:
 #: ``lo > -1`` / ``lo > 1`` while the mirror edge ``hi = +1`` of asin/acos was
 #: already admitted -- so the box that touches the edge, the very one holding an
 #: edge optimum (#1492), got only the interval floor.
-_CLOSED_LOWER_EDGE: dict[str, float] = {"asin": -1.0, "acos": -1.0, "acosh": 1.0}
+_CLOSED_LOWER_EDGE: dict[str, float] = {
+    "asin": -1.0,
+    "acos": -1.0,
+    "acosh": 1.0,
+    # #1242: ``xlogx``/``entropy`` and ``sqrt`` are finite at their closed edge 0
+    # (``0 ln 0 = 0``, ``sqrt 0 = 0``). ``sqrt``'s ``dom_ok`` already admits
+    # ``lo = 0`` exactly; the entry here catches the OUTWARD-ROUNDED affine
+    # argument (``1 - y`` over ``[0, 1]`` arrives as ``lo = -2.2e-16``), which
+    # otherwise left the aux column unbounded and the root LP ``unbounded``.
+    "entropy": 0.0,
+    "sqrt": 0.0,
+}
 
 
 def _closed_edge_envelopes_enabled() -> bool:
@@ -2181,6 +2205,17 @@ def _closed_edge_envelopes_enabled() -> bool:
     epigraph, 2-D coupled, MINLP) ON vs OFF: 0 unsound on either arm, 0
     certification regressions, 1 gain, nodes 878 -> 132 over the 87 models both
     arms certify, wall 32.0 s -> 22.1 s.
+
+    Extended by #1242 to ``entropy`` (``xlogx``) and ``sqrt`` at ``lo = 0``, where
+    an affine argument such as ``1 - y`` arrives outward-rounded as
+    ``[-2.2e-16, 1]`` and got no envelope and a FREE aux column (root LP
+    unbounded, McCormick relaxer dropped for the whole tree). Panel (2026-10-02):
+    31-model synthetic family (1-D binary mixtures, ``+-sqrt(1 - y)``, 2-D coupled
+    mixtures, MINLP, affine epigraph; grid oracle) ON vs OFF: 0 unsound, 0
+    incorrect, 0 certification regressions, 11 gains (``feasible``/``unknown`` ->
+    ``optimal``), nodes 12743 -> 215 and wall 19.6 s -> 4.8 s over the 20 models
+    both arms certify (``sqrt(y) + sqrt(1 - y)`` takes more nodes: 19 -> 27,
+    11 -> 31, 7 -> 7).
     """
     return os.environ.get("DISCOPT_CLOSED_EDGE_ENVELOPES", "1").strip() != "0"
 
@@ -2214,6 +2249,34 @@ def _closed_edge_lo(fname: str, lo: float, hi: float) -> Optional[float]:
     if not (edge - _CLOSED_EDGE_TOL * max(1.0, abs(edge)) <= lo <= edge):
         return None
     return edge
+
+
+def _pin_closed_edge_aux(ctx: _Builder, w: int, fname: str, lo: float, hi: float) -> None:
+    """Intersect the aux column of ``w = fname(arg)`` with the interval image of
+    the CLAMPED argument box ``[edge, hi]`` (#1242).
+
+    The column was sized from the interval enclosure of the whole node, which saw
+    the outward-rounded ``lo`` below the edge and abstained (``entropy`` returns
+    ``[-inf, inf]`` for ``lo < 0``). The envelope rows alone then bound the LP
+    optimum but leave a free column, and the safe (Neumaier-Shcherbina) LP bound
+    declines on a free column with a nonzero dual residual -- the root LP came
+    back ``uncertified``, the McCormick relaxer was dropped for the whole tree,
+    and the certificate fell back to first-order interval bounds. The image is
+    taken with the same sound, outward-rounded interval rule, over exactly the
+    argument values the model can take (``_closed_edge_lo``'s argument), so the
+    intersection removes no feasible point.
+    """
+    from discopt._relax.convexity import interval as _iv
+
+    rule = getattr(_iv, fname, None)
+    if rule is None:
+        return
+    img = rule(Interval(np.array(lo), np.array(hi)))
+    ilo, ihi = float(np.asarray(img.lo).reshape(())), float(np.asarray(img.hi).reshape(()))
+    if math.isfinite(ilo):
+        ctx.col_lb[w] = max(ctx.col_lb[w], ilo)
+    if math.isfinite(ihi):
+        ctx.col_ub[w] = min(ctx.col_ub[w], ihi)
 
 
 def _registered_envelope_entry(fname: str):
