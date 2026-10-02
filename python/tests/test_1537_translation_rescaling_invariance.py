@@ -323,3 +323,48 @@ def test_convex_qp_node_lower_bound_is_rigorous_at_a_drifted_point():
     for z in (None, [0.0], [1e-9]):
         b = _convex_qp_node_lower_bound(P, q, k, G, h, None, None, lo, hi, drifted, z=z)
         assert b <= true_min + 1e-6, (z, b)
+
+
+# ── nonlinear FBBT: an emptiness proof must survive the arithmetic ─────────────
+
+
+def test_monotone_equality_touching_ranges_is_not_a_proof():
+    """``sqrt(a) == y - c`` with ``a in [d**2, 4]`` (sqrt range [d, 2]) and
+    ``y in [c, c + d]``: the ranges touch at ``d = 0.07``. At ``c = 1e6`` the
+    computed ``(c + d) - c`` is 0.06999999994877726, 5e-11 short -- the bare 1e-12
+    slack read that as an empty intersection and proved the model infeasible (hda's
+    shape under the corpus panel's ``x = y + 1e6``)."""
+    from discopt._relax.nonlinear_bound_tightening import tighten_nonlinear_bounds
+    from discopt.solver import _extract_variable_info
+
+    checked = 0
+    for c0 in (0.0, 1e6):
+        m = dm.Model("touch")
+        d = 0.07
+        a = m.continuous("a", lb=d * d, ub=4.0)
+        y = m.continuous("y", lb=c0, ub=c0 + d)
+        m.subject_to(y - c0 - dm.sqrt(a) == 0)
+        m.minimize(y)
+        _, lb, ub, _, _ = _extract_variable_info(m)
+        _, _, stats = tighten_nonlinear_bounds(m, lb, ub)
+        assert not stats.infeasible, (c0, stats.infeasibility_reason)
+        checked += 1
+    assert checked == 2
+
+
+@pytest.mark.slow
+def test_translated_hda_is_not_certified_infeasible(tmp_path):
+    """The corpus panel's hda finding: certified ``infeasible`` under x = y + 1e6
+    (MINLPLib optimum -5964.5), from the monotone-equality rule above."""
+    from pathlib import Path
+
+    from discopt.modeling.core import from_nl
+    from discopt.validation.nl_invariance import translate_nl
+
+    src = Path(__file__).parent / "data" / "minlplib_nl" / "hda.nl"
+    out = tmp_path / "hda_shift.nl"
+    out.write_text(translate_nl(src.read_text(encoding="latin-1"), 1e6), encoding="latin-1")
+    # The contradiction appears only once the root FBBT has run to its full budget,
+    # which scales with the time limit; 5 s stops short of it (measured).
+    r = from_nl(str(out)).solve(time_limit=30)
+    assert r.status != "infeasible", "a feasible model was certified infeasible"
