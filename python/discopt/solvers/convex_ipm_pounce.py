@@ -228,11 +228,14 @@ def _solve(
     ub: np.ndarray,
     time_limit: Optional[float],
     options: Optional[dict],
-) -> Tuple[str, Any, float, np.ndarray, np.ndarray, np.ndarray]:
+    solve_report: bool = False,
+) -> Tuple[str, Any, float, np.ndarray, np.ndarray, np.ndarray, Optional[dict]]:
     """Run :func:`pounce.qp.solve_qp` once; map nothing yet.
 
-    Returns ``(raw_status, result, wall, A, cl, cu)`` where ``A, cl, cu`` is the
-    stacked row system the certificate checks need.
+    Returns ``(raw_status, result, wall, A, cl, cu, report)`` where ``A, cl, cu``
+    is the stacked row system the certificate checks need and ``report`` is the
+    ``pounce.solve-report/v1`` document when ``solve_report`` is set (#1534),
+    else ``None``.
     """
     from pounce.qp import solve_qp as _pounce_solve_qp
 
@@ -248,6 +251,7 @@ def _solve(
     h = None if b_ub is None else np.asarray(b_ub, dtype=np.float64).ravel()
     b = None if b_eq is None else np.asarray(b_eq, dtype=np.float64).ravel()
 
+    started_unix_nanos = time.time_ns()
     t0 = time.perf_counter()
     try:
         res = _pounce_solve_qp(
@@ -262,7 +266,7 @@ def _solve(
             tol=opts.get("tol"),
             max_iter=opts.get("max_iter"),
             time_limit=limit,
-            collect_iterates=print_level > 0,
+            collect_iterates=print_level > 0 or solve_report,
             method="ipm",
             tau=opts.get("tau"),
             tau_max=opts.get("tau_max"),
@@ -279,7 +283,17 @@ def _solve(
         _print_trace("lp-ipm" if P is None else "qp-ipm", res)
 
     A_rows, cl, cu = _stack_constraints(A_ub, b_ub, A_eq, b_eq, n)
-    return res.status, res, wall, A_rows, cl, cu
+    report = None
+    if solve_report:
+        from discopt.solvers._pounce_report import convex_report
+
+        report = convex_report(
+            res,
+            wall_time=wall,
+            n_constraints=int(A_rows.shape[0]),
+            started_unix_nanos=started_unix_nanos,
+        )
+    return res.status, res, wall, A_rows, cl, cu, report
 
 
 def _verdict_status(
@@ -339,12 +353,16 @@ def solve_lp(
     warm_basis: Optional[object] = None,
     time_limit: Optional[float] = None,
     options: Optional[dict] = None,
+    solve_report: bool = False,
 ) -> LPResult:
     """Solve ``min c'x`` s.t. ``A_ub x <= b_ub``, ``A_eq x = b_eq`` with POUNCE's lp-ipm.
 
     ``bounds`` default to ``(0, +inf)`` (the shared LP contract). ``warm_basis``
     is accepted for signature compatibility and ignored: an IPM has no basis.
     ``options`` must be a subset of :data:`CONVEX_OPTION_KEYS`.
+    ``solve_report=True`` attaches the solve's ``pounce.solve-report/v1``
+    document as ``LPResult.solve_report`` (#1534), built by
+    :func:`discopt.solvers._pounce_report.convex_report`.
     """
     del warm_basis
     if not POUNCE_AVAILABLE:
@@ -352,8 +370,8 @@ def solve_lp(
     c_arr = np.asarray(c, dtype=np.float64).ravel()
     n = len(c_arr)
     lb, ub = _engine_box(bounds, n, default_lb=0.0)
-    raw, res, wall, A, cl, cu = _solve(
-        None, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options
+    raw, res, wall, A, cl, cu, report = _solve(
+        None, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options, solve_report
     )
     iters = int(res.iters)
     if raw != "optimal":
@@ -363,6 +381,7 @@ def solve_lp(
             iterations=iters,
             wall_time=wall,
             ray_verified=True if status == SolveStatus.UNBOUNDED else None,
+            solve_report=report,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)
@@ -376,6 +395,7 @@ def solve_lp(
         rc_absum=np.abs(np.asarray(res.z_lb)) + np.abs(np.asarray(res.z_ub)),
         iterations=iters,
         wall_time=wall,
+        solve_report=report,
     )
 
 
@@ -391,10 +411,13 @@ def solve_qp(
     time_limit: Optional[float] = None,
     gap_tolerance: float = 1e-4,
     options: Optional[dict] = None,
+    solve_report: bool = False,
 ) -> QPResult:
     """Solve ``min ½x'Qx + c'x`` s.t. linear rows with POUNCE's qp-ipm.
 
     ``bounds`` default to free variables (the shared QP contract).
+    ``solve_report=True`` attaches the solve's ``pounce.solve-report/v1``
+    document as ``QPResult.solve_report`` (#1534).
 
     Raises:
         IndefiniteQPError: ``Q`` is not PSD (POUNCE's own check).
@@ -416,8 +439,8 @@ def solve_qp(
             "convex QP IPM may not certify its answer."
         )
     lb, ub = _engine_box(bounds, n, default_lb=-np.inf)
-    raw, res, wall, A, cl, cu = _solve(
-        Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options
+    raw, res, wall, A, cl, cu, report = _solve(
+        Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options, solve_report
     )
     iters = int(res.iters)
     if raw != "optimal":
@@ -425,6 +448,7 @@ def solve_qp(
             status=_verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr),
             iterations=iters,
             wall_time=wall,
+            solve_report=report,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)
@@ -438,4 +462,5 @@ def solve_qp(
         iterations=iters,
         wall_time=wall,
         kkt_error=res.kkt_error,
+        solve_report=report,
     )

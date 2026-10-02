@@ -4136,9 +4136,20 @@ class SolveResult:
         ``pounce --json-output <file> --json-detail full`` (#1534). Set on the
         routes that make a single POUNCE call: the continuous single-NLP route
         (convex fast path, and the local NLP on a convexity-unknown model), the
-        continuous QP route, and the LP route when POUNCE answered it. ``None``
-        elsewhere: every branch-and-bound route (no single NLP, as for ``kkt``),
-        an LP answered by the simplex or HiGHS, and the cyipopt backend.
+        continuous QP route, the LP route when POUNCE answered it, and all three
+        arms of ``solver="pounce"`` (``pounce:lp-ipm``, ``pounce:qp-ipm``,
+        ``pounce:nlp``), on every status they return. ``None`` elsewhere: every
+        branch-and-bound route (no single NLP, as for ``kkt``), an LP answered by
+        the simplex or HiGHS, and the cyipopt backend.
+
+        On ``pounce:lp-ipm`` / ``pounce:qp-ipm`` the document is built by discopt
+        from POUNCE's ``QpResult`` (its Python convex entry point writes none),
+        with the same field mapping POUNCE's CLI uses for that engine
+        (:func:`discopt.solvers._pounce_report.convex_report`;
+        ``report["fair_metadata"]["generated_by"]`` says so). That engine has no
+        line search, regularization or restoration phase, so those columns are
+        zero there and its rows match the table printed at ``print_level > 0``
+        exactly.
 
         Keys (the document's own; nothing is renamed):
 
@@ -4148,39 +4159,32 @@ class SolveResult:
           ``restoration_inner_iters``, ``restoration_outer_iters``,
           ``restoration_wall_secs``.
         * ``report["iterations"]`` -- the trajectory, one dict per printed
-          iteration row with ``iter``, ``objective``, ``inf_pr``, ``inf_du``,
-          ``mu``, ``d_norm``, ``regularization``, ``alpha_dual``,
-          ``alpha_primal``, ``alpha_primal_char`` (the line-search flag printed
-          after ``alpha_pr``; ``"R"`` marks restoration) and ``ls_trials``, plus
-          ``phase`` (``"main"`` or ``"restoration"``) and ``inf_pr_internal`` on
-          POUNCE versions that include jkitchin/pounce#980 (see below). The final
+          iteration row (see below for restoration rows) with ``iter``,
+          ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
+          ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
+          ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
+          ``"R"`` marks restoration; see below) and ``ls_trials``. The final
           barrier parameter is ``report["iterations"][-1]["mu"]``.
         * ``report["solution"]``, ``report["problem"]``,
           ``report["fair_metadata"]`` (solver version, timestamps).
 
-        How closely the trajectory follows POUNCE's printed iteration table
-        depends on the installed POUNCE, since ``pounce-solver>=0.12`` admits
-        both behaviors (jkitchin/pounce#979):
-
-        * **POUNCE with pounce#980 (after 0.12.0).** The trajectory reproduces
-          the printed table row for row. The inner restoration rows (printed
-          ``24r``, ``25r``, ...) are present with ``phase="restoration"``; their
-          ``iter`` continues the outer count, so the main-phase row that leaves
-          restoration repeats the last restoration row's index. As in the
-          printed table, one restoration call puts ``"R"`` on two rows (entering
-          and leaving), so count entries as ``phase`` transitions from ``"main"``
-          to ``"restoration"`` (or use ``statistics["restoration_calls"]``), and
-          filter on ``phase == "main"`` for one row per outer iteration.
-          ``inf_pr`` is the printed column -- the violation of the original
-          constraints -- and POUNCE's internal residual on its slack-reformulated,
-          scaled problem is ``inf_pr_internal``.
-        * **POUNCE 0.12.0.** No ``phase`` or ``inf_pr_internal`` keys (read a
-          missing ``phase`` as ``"main"``). Only the main-phase rows are present
-          -- restoration shows up as the ``"R"`` row that entered it and the
-          ``restoration_*`` counts -- and ``inf_pr`` is the *internal*
-          slack-form residual, not the printed column, so the two differ
-          wherever a slack sits off its constraint value (typically the first
-          iterations).
+        With a POUNCE that carries jkitchin/pounce#979 (``main``; not yet in a
+        release) the trajectory matches POUNCE's printed iteration table row for
+        row on every column: each row has ``phase`` (``"main"`` or
+        ``"restoration"``), the inner restoration rows (printed as ``24r``,
+        ``25r``, ...) are included in printed order, and the slack-form residual
+        is ``inf_pr_internal``. Select ``phase == "main"`` for the outer
+        trajectory. As in the printed table, one restoration call puts ``"R"``
+        on two rows -- the entry (a ``"restoration"`` row) and the return to the
+        main phase -- so count calls with ``statistics["restoration_calls"]`` or
+        the ``"main"`` -> ``"restoration"`` transitions, not the ``"R"`` rows.
+        On pounce-solver 0.12.0 rows carry no ``phase``, only the
+        main-phase rows are present -- restoration shows up as the ``"R"`` row and
+        the ``restoration_*`` counts -- and ``inf_pr`` is POUNCE's internal primal
+        infeasibility on its slack-reformulated, scaled problem rather than the
+        printed column's violation of the original constraints, so the two differ
+        wherever a slack sits off its constraint value (typically the first
+        iterations).
 
         It describes the problem POUNCE was handed: for a maximization that is
         the negated objective, and for an LP or QP the matrix form with slacks

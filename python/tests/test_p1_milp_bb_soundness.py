@@ -88,9 +88,9 @@ class TestNonKKTRecoveredByPounce:
         seen = {"n": 0}
 
         def _untrusted(*a, **k):
-            clean, infeasible, obj_vals, x_vals = _real_nodes(*a, **k)
+            clean, infeasible, obj_vals, lb_vals, x_vals = _real_nodes(*a, **k)
             seen["n"] += 1
-            return np.zeros_like(clean), infeasible, obj_vals, x_vals
+            return np.zeros_like(clean), infeasible, obj_vals, lb_vals, x_vals
 
         monkeypatch.setattr(S, "_pounce_qp_relaxation_nodes", _untrusted)
         r = _miqp().solve(time_limit=60, batch_size=8)
@@ -117,8 +117,8 @@ class TestNonKKTDecertifiesWhenUnrecoverable:
         _real_nodes = S._pounce_qp_relaxation_nodes
 
         def _untrusted(*a, **k):
-            clean, infeasible, obj_vals, x_vals = _real_nodes(*a, **k)
-            return np.zeros_like(clean), infeasible, obj_vals, x_vals
+            clean, infeasible, obj_vals, lb_vals, x_vals = _real_nodes(*a, **k)
+            return np.zeros_like(clean), infeasible, obj_vals, lb_vals, x_vals
 
         monkeypatch.setattr(S, "_pounce_qp_relaxation_nodes", _untrusted)
         monkeypatch.setattr(S, "_pounce_recover_node_bound", lambda *a, **k: None)

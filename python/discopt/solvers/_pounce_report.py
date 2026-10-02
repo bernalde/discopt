@@ -20,8 +20,13 @@ What the report holds, measured on pounce-solver 0.12.0 (not assumed):
   that entered restoration) and ``ls_trials``.
 * ``solution``, ``problem`` and ``fair_metadata`` (solver version, timestamps).
 
-Two places the report does **not** reproduce the printed table, both POUNCE-side
-(tracked upstream as jkitchin/pounce#979):
+Two places the 0.12.0 report does **not** reproduce the printed table, both
+POUNCE-side and both fixed by jkitchin/pounce#979 (on POUNCE ``main``, not yet in
+a release). With that fix each row also carries ``phase`` (``"main"`` or
+``"restoration"``), the inner restoration rows are in ``iterations`` in printed
+order, ``inf_pr`` is the printed column and the internal residual moves to
+``inf_pr_internal`` -- the report then matches the printed table row for row on
+every column (measured on POUNCE ``main`` 672320d). On 0.12.0:
 
 1. The inner restoration-phase rows (printed with an ``r`` suffix, e.g. ``24r``)
    are not in ``iterations``; the restoration phase appears only as the ``"R"``
@@ -34,6 +39,14 @@ Two places the report does **not** reproduce the printed table, both POUNCE-side
    the bound push, the iterations after a restoration exit) they differ visibly --
    0.94 printed against 0.955 reported at iteration 0 of a one-row problem. Every
    other column matches the printed table to the digits it prints.
+
+The convex LP/QP interior-point method (``lp-ipm`` / ``qp-ipm``, reached through
+:func:`pounce.qp.solve_qp`) has no ``report_path``: that Python entry point
+returns a ``QpResult`` and never writes the document. :func:`convex_report`
+builds it from the ``QpResult`` instead, mapping the fields exactly as POUNCE's
+own CLI does when it writes ``--json-output`` for ``solver_selection=lp-ipm`` /
+``qp-ipm`` (``run_convex_qp`` in ``pounce-cli``), so one consumer reads both
+engines' reports the same way.
 """
 
 from __future__ import annotations
@@ -42,6 +55,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Optional
 
 _logger = logging.getLogger(__name__)
@@ -103,3 +117,108 @@ def _read_report(path: str) -> Optional[dict]:
             SOLVE_REPORT_SCHEMA,
         )
     return report
+
+
+#: ``QpResult.status`` -> ``(status, status_upstream, solve_result_num)``, the same
+#: mapping as ``qp_status_to_ars`` / ``status_to_solve_result_num`` in POUNCE's CLI.
+_CONVEX_STATUS: dict[str, tuple[str, str, int]] = {
+    "optimal": ("SolveSucceeded", "Solve_Succeeded", 0),
+    "optimal_inaccurate": ("SolvedToAcceptableLevel", "Solved_To_Acceptable_Level", 1),
+    "primal_infeasible": ("InfeasibleProblemDetected", "Infeasible_Problem_Detected", 200),
+    "dual_infeasible": ("DivergingIterates", "Diverging_Iterates", 300),
+    "iteration_limit": ("MaximumIterationsExceeded", "Maximum_Iterations_Exceeded", 400),
+    "time_limit": ("MaximumWallTimeExceeded", "Maximum_WallTime_Exceeded", 400),
+    "numerical_failure": ("InternalError", "Internal_Error", 500),
+}
+
+
+def convex_report(
+    res: Any, *, wall_time: float, n_constraints: int, started_unix_nanos: int
+) -> dict:
+    """The ``pounce.solve-report/v1`` document for one convex ``lp-ipm``/``qp-ipm`` solve.
+
+    ``res`` is the :class:`pounce.qp.QpResult` of a solve run with
+    ``collect_iterates=True``; ``res.iterates`` becomes ``report["iterations"]``
+    row for row, so the trajectory is exactly the table
+    ``convex_ipm_pounce._print_trace`` prints at ``print_level > 0``.
+
+    The convex IPM has no line search, no Hessian regularization and no
+    restoration phase, so -- as in POUNCE's CLI report for this engine -- each row's
+    ``d_norm`` and ``regularization`` are ``0.0``, ``ls_trials`` is ``0``,
+    ``alpha_primal_char`` is ``" "``, ``inf_pr_internal`` equals ``inf_pr``, and
+    every ``restoration_*`` count is zero. The evaluation counts the NLP report
+    carries do not exist for a matrix-form solve and are omitted, not zeroed.
+    ``fair_metadata["generated_by"]`` names this function, so a consumer can tell
+    the document from one POUNCE wrote itself.
+    """
+    import pounce
+
+    raw = str(res.status)
+    status, upstream, srn = _CONVEX_STATUS.get(raw, ("InternalError", "Internal_Error", 500))
+    x = [float(v) for v in res.x]
+    obj = float(res.obj)
+    residuals = dict(res.residuals or {})
+
+    def _res(key: str) -> float:
+        v = residuals.get(key)
+        return float("nan") if v is None else float(v)
+
+    iterations = [
+        {
+            "iter": int(it["iter"]),
+            "objective": float(it["objective"]),
+            "inf_pr": float(it["primal_infeasibility"]),
+            "inf_pr_internal": float(it["primal_infeasibility"]),
+            "inf_du": float(it["dual_infeasibility"]),
+            "mu": float(it["mu"]),
+            "d_norm": 0.0,
+            "regularization": 0.0,
+            "alpha_dual": float(it["alpha_dual"]),
+            "alpha_primal": float(it["alpha_primal"]),
+            "alpha_primal_char": " ",
+            "ls_trials": 0,
+            "phase": "main",
+        }
+        for it in res.iterates
+    ]
+    return {
+        "schema": SOLVE_REPORT_SCHEMA,
+        "fair_metadata": {
+            "created_at_iso": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_unix_nanos / 1e9)
+            ),
+            "created_at_unix_nanos": int(started_unix_nanos),
+            "elapsed_seconds": float(wall_time),
+            "solver": {"name": "pounce", "version": str(getattr(pounce, "__version__", ""))},
+            "generated_by": "discopt.solvers._pounce_report.convex_report",
+        },
+        "problem": {
+            "n_variables": len(x),
+            "n_constraints": int(n_constraints),
+            "n_objectives": 1,
+            "minimize": True,
+        },
+        "solution": {
+            "engine": "cvx-qp",
+            "engine_status": raw,
+            "status": status,
+            "status_upstream": upstream,
+            "solve_result_num": srn,
+            "objective": obj,
+            "x": x,
+        },
+        "statistics": {
+            "iteration_count": int(res.iters),
+            "final_objective": obj,
+            "final_constr_viol": _res("primal_infeasibility"),
+            "final_dual_inf": _res("dual_infeasibility"),
+            "final_compl": _res("complementarity"),
+            "final_kkt_error": _res("kkt_error"),
+            "total_wallclock_time_secs": float(wall_time),
+            "restoration_calls": 0,
+            "restoration_inner_iters": 0,
+            "restoration_outer_iters": 0,
+            "restoration_wall_secs": 0.0,
+        },
+        "iterations": iterations,
+    }

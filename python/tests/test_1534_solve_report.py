@@ -6,19 +6,11 @@ iteration history can be read without raising ``print_level`` and parsing the
 console table. Branch-and-bound routes report ``None``, as they do for ``kkt``.
 
 The line-for-line tests compare the report against the table POUNCE prints at
-``print_level=5`` on the same solve. The report's shape depends on the installed
-POUNCE (jkitchin/pounce#979, fixed by pounce#980, after 0.12.0):
-
-* POUNCE 0.12.0 -- no ``phase`` key. The inner restoration rows (``24r``) are not
-  in the report, and ``inf_pr`` is POUNCE's internal slack-form residual, so it is
-  not compared against the printed column.
-* POUNCE with pounce#980 -- every row carries ``phase``; the inner restoration
-  rows are present with ``phase="restoration"``, ``inf_pr`` is the printed
-  violation, and the internal residual is ``inf_pr_internal``. Every column, on
-  every row, must match the printed digits.
-
-The tests detect which shape they got from the presence of ``phase`` and assert
-the stronger contract when it is there.
+``print_level=5`` on the same solve. With jkitchin/pounce#979 (POUNCE ``main``, which
+CI installs) every printed row, ``r`` rows included, must match on every column,
+``inf_pr`` included. On pounce-solver 0.12.0, which lacks it, the inner restoration
+rows are absent and ``inf_pr`` is the internal slack-form residual, so only the
+main-phase rows are compared and ``inf_pr`` is skipped (``_compare_main_rows``).
 """
 
 from __future__ import annotations
@@ -47,39 +39,31 @@ def _printed_rows(text: str) -> list[tuple[str, ...]]:
     return [m.groups() for line in text.splitlines() if (m := _ROW.match(line))]
 
 
-def _has_phase(iterations) -> bool:
-    """True when the report carries pounce#980's per-row ``phase`` key."""
-    has = ["phase" in it for it in iterations]
-    assert all(has) or not any(has), "some rows carry 'phase' and some do not"
-    return bool(has) and has[0]
+def _main_rows(iterations) -> list[dict]:
+    """The main-phase report rows (rows without ``phase`` predate pounce#979: all main)."""
+    return [it for it in iterations if it.get("phase", "main") == "main"]
 
 
-def _phase(it) -> str:
-    # Reports from before pounce#980 have no ``phase``; every row is main-phase.
-    return it.get("phase", "main")
+def _compare_main_rows(printed, iterations) -> int:
+    """Assert every printed row matches its report row; return the count compared.
 
-
-def _compare_rows(printed, iterations) -> int:
-    """Assert the printed table matches the report row for row; return the count.
-
-    Before pounce#980 the report holds only the main-phase rows and its ``inf_pr``
-    is a different quantity, so only the main-phase rows are compared and
-    ``inf_pr`` is skipped. With ``phase`` present, every printed row -- the
-    ``r``-suffixed restoration rows included -- must be in the report, in order,
-    with ``inf_pr`` matching too.
+    A report that carries ``phase`` (POUNCE with jkitchin/pounce#979) holds the inner
+    restoration rows too and its ``inf_pr`` is the printed column, so every printed
+    row is compared, ``inf_pr`` included. An older report is compared on its
+    main-phase rows only, without ``inf_pr``.
     """
-    full = _has_phase(iterations)
-    rows = printed if full else [row for row in printed if row[1] == ""]
-    assert len(rows) == len(iterations), (len(rows), len(iterations))
+    full = any("phase" in it for it in iterations)
+    if not full:
+        printed = [row for row in printed if row[1] == ""]
+    assert len(printed) == len(iterations), (len(printed), len(iterations))
     compared = 0
-    for row, it in zip(rows, iterations):
-        it_no, r, obj, inf_pr, inf_du, lg_mu, d_norm, _rg, a_du, a_pr, flag, ls = row
+    for row, it in zip(printed, iterations):
+        it_no, r_flag, obj, inf_pr, inf_du, lg_mu, d_norm, _rg, a_du, a_pr, flag, ls = row
         assert int(it_no) == it["iter"]
-        assert _phase(it) == ("restoration" if r == "r" else "main")
-        assert f"{it['objective']:.7e}" == obj
         if full:
+            assert it["phase"] == ("restoration" if r_flag else "main")
             assert f"{it['inf_pr']:.2e}" == inf_pr
-            assert "inf_pr_internal" in it
+        assert f"{it['objective']:.7e}" == obj
         assert f"{it['inf_du']:.2e}" == inf_du
         assert f"{math.log10(it['mu']):.1f}" == lg_mu
         assert f"{it['d_norm']:.2e}" == d_norm
@@ -89,24 +73,6 @@ def _compare_rows(printed, iterations) -> int:
         assert int(ls) == it["ls_trials"]
         compared += 1
     return compared
-
-
-def _restoration_entries(iterations) -> list[int]:
-    """The ``iter`` of each entry into restoration.
-
-    With ``phase``, an entry is a main -> restoration transition; the ``R`` flag is
-    not usable there because one restoration call puts it on two rows (the entry
-    and the return to the main phase), exactly as the printed table does. Without
-    ``phase`` (POUNCE 0.12.0) the inner rows are absent and the ``R`` row is the
-    entry.
-    """
-    if _has_phase(iterations):
-        return [
-            cur["iter"]
-            for prev, cur in zip([{"phase": "main"}, *iterations], iterations)
-            if _phase(prev) == "main" and _phase(cur) == "restoration"
-        ]
-    return [it["iter"] for it in iterations if it["alpha_primal_char"] == "R"]
 
 
 def _convex_nlp():
@@ -150,7 +116,7 @@ def test_trajectory_matches_printed_table_line_for_line(capfd):
     res = _convex_nlp().solve(ipopt_options={"print_level": 5})
     printed = _printed_rows(capfd.readouterr().out)
     assert printed, "the printed iteration table was not captured"
-    assert _compare_rows(printed, res.solve_report["iterations"]) > 0
+    assert _compare_main_rows(printed, res.solve_report["iterations"]) > 0
 
 
 def test_restoration_entries_and_counts(capfd):
@@ -164,19 +130,16 @@ def test_restoration_entries_and_counts(capfd):
     rep = res.solve_report
     assert rep is not None
     stats = rep["statistics"]
-    its = rep["iterations"]
-    entries = _restoration_entries(its)
+    main = _main_rows(rep["iterations"])
+    entries = [it["iter"] for it in main if it["alpha_primal_char"] == "R"]
     assert stats["restoration_calls"] >= 1
     assert len(entries) == stats["restoration_calls"]
+    restoration = [it for it in rep["iterations"] if it.get("phase") == "restoration"]
+    if restoration:  # POUNCE with jkitchin/pounce#979
+        assert len(restoration) == stats["restoration_inner_iters"]
     printed = _printed_rows(capfd.readouterr().out)
     assert any(row[1] == "r" for row in printed)
-    # Before pounce#980 the inner restoration rows are printed but not reported.
-    n_inner = sum(_phase(it) == "restoration" for it in its)
-    if _has_phase(its):
-        assert n_inner == sum(row[1] == "r" for row in printed) > 0
-    else:
-        assert n_inner == 0
-    assert _compare_rows(printed, its) > 0
+    assert _compare_main_rows(printed, rep["iterations"]) > 0
 
 
 def test_qp_route_attaches_report():
@@ -263,3 +226,103 @@ def test_missing_report_warns_and_is_none(monkeypatch, caplog):
     assert res.status == "optimal"
     assert res.solve_report is None
     assert "[pounce-solve-report-missing]" in caplog.text
+
+
+# --- solver="pounce" (#1533): every arm attaches the report ------------------------
+#
+# The LP and QP arms run POUNCE's convex IPM through ``pounce.qp.solve_qp``, which
+# writes no report; discopt builds the document from its ``QpResult``
+# (``_pounce_report.convex_report``). Reopened #1534: those two arms returned
+# ``solve_report=None``.
+
+# One row of ``convex_ipm_pounce._print_trace``: iter objective inf_pr inf_du mu a_pr a_du
+_CONVEX_ROW = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+
+
+def _pounce_lp():
+    m = dm.Model("lp")
+    x = m.continuous("x", shape=(2,), lb=0.0, ub=10.0)
+    m.minimize(-x[0] - 2.0 * x[1])
+    m.subject_to(x[0] + x[1] <= 4.0)
+    return m
+
+
+def _pounce_qp():
+    m = dm.Model("qp")
+    x = m.continuous("x", shape=(2,), lb=0.0, ub=1.0)
+    m.minimize(x[0] ** 2 + x[1] ** 2 - 3.0 * x[0] - 4.0 * x[1])
+    m.subject_to(x[0] + x[1] <= 1.0)
+    return m
+
+
+def _check_convex_report(res, route):
+    assert res.algorithm_route == route
+    rep = res.solve_report
+    assert rep is not None and rep["schema"] == _SCHEMA
+    assert rep["solution"]["engine"] == "cvx-qp"
+    assert rep["fair_metadata"]["generated_by"].endswith("convex_report")
+    stats = rep["statistics"]
+    assert stats["iteration_count"] == res.solver_stats["pounce/iterations"]
+    assert stats["restoration_calls"] == 0
+    its = rep["iterations"]
+    assert [it["iter"] for it in its] == list(range(len(its)))
+    for key in ("objective", "inf_pr", "inf_du", "mu", "alpha_primal", "alpha_dual"):
+        assert all(math.isfinite(it[key]) for it in its), key
+    return rep
+
+
+@pytest.mark.parametrize(
+    ("build", "route", "optimum"),
+    [(_pounce_lp, "pounce:lp-ipm", -8.0), (_pounce_qp, "pounce:qp-ipm", -3.125)],
+)
+def test_pounce_solver_convex_arms_attach_report(build, route, optimum):
+    res = build().solve(solver="pounce")
+    assert res.status == "optimal"
+    assert res.objective == pytest.approx(optimum, abs=1e-6)
+    rep = _check_convex_report(res, route)
+    assert rep["statistics"]["iteration_count"] >= 1
+    assert rep["solution"]["status_upstream"] == "Solve_Succeeded"
+    assert rep["solution"]["x"] == pytest.approx(list(res.x["x"]), abs=1e-6)
+
+
+def test_pounce_solver_nlp_arm_attaches_report():
+    res = _convex_nlp().solve(solver="pounce")
+    assert res.algorithm_route == "pounce:nlp"
+    assert res.solve_report is not None and res.solve_report["schema"] == _SCHEMA
+    assert len(res.solve_report["iterations"]) >= 1
+
+
+@pytest.mark.parametrize("build", [_pounce_lp, _pounce_qp])
+def test_pounce_solver_convex_trajectory_matches_printed_table(build, capsys):
+    res = build().solve(solver="pounce", pounce_options={"print_level": 1})
+    out = capsys.readouterr().out
+    printed = [m.groups() for line in out.splitlines() if (m := _CONVEX_ROW.match(line))]
+    its = res.solve_report["iterations"]
+    assert len(printed) == len(its) >= 1
+    for row, it in zip(printed, its):
+        it_no, obj, inf_pr, inf_du, mu, a_pr, a_du = row
+        assert int(it_no) == it["iter"]
+        assert f"{it['objective']:.7e}" == obj
+        assert f"{it['inf_pr']:.2e}" == inf_pr
+        assert f"{it['inf_du']:.2e}" == inf_du
+        assert f"{it['mu']:.2e}" == mu
+        assert f"{it['alpha_primal']:.2e}" == a_pr
+        assert f"{it['alpha_dual']:.2e}" == a_du
+
+
+def test_pounce_solver_convex_report_on_a_limit():
+    """The report is attached on a non-optimal outcome too, where it is most needed."""
+    res = _pounce_qp().solve(solver="pounce", pounce_options={"max_iter": 1})
+    assert res.status == "iteration_limit"
+    rep = _check_convex_report(res, "pounce:qp-ipm")
+    assert rep["solution"]["status_upstream"] == "Maximum_Iterations_Exceeded"
+
+
+def test_convex_backend_report_is_opt_in():
+    from discopt.solvers import convex_ipm_pounce as cvx
+
+    kw = dict(c=np.array([-1.0, -2.0]), A_ub=np.array([[1.0, 1.0]]), b_ub=np.array([4.0]))
+    assert cvx.solve_lp(**kw).solve_report is None
+    rep = cvx.solve_lp(**kw, solve_report=True).solve_report
+    assert rep is not None and rep["schema"] == _SCHEMA
+    assert rep["problem"]["n_constraints"] == 1
