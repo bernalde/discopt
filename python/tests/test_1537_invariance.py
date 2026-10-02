@@ -209,7 +209,19 @@ def _run_panel(cases, transforms, time_limit, *, require_certified_base=False):
     for label, model in cases:
         base = model.solve(time_limit=time_limit)
         if not base.gap_certified:
-            assert not require_certified_base, f"{label}: base no longer certifies"
+            if require_certified_base:
+                # A known cell exists to exercise its bug, so a base that stops
+                # certifying for any REASON is a hard failure -- except running out
+                # of wall clock on a loaded runner, which says nothing about the bug
+                # and must not fail an xfail cell for timing (#1546 review). Keyed on
+                # wall time, not status: a timed-out solve holding an incumbent
+                # reports "feasible", not "time_limit" (measured on tls2).
+                if base.wall_time >= 0.95 * time_limit:
+                    pytest.skip(
+                        f"{label}: base stopped at the {time_limit:g} s wall-time limit "
+                        f"({base.status}, {base.wall_time:.1f} s)"
+                    )
+                raise AssertionError(f"{label}: base no longer certifies ({base.status})")
             continue  # nothing certified to compare against
         for tname, tf in transforms.items():
             transformed = tf(model)
@@ -295,6 +307,14 @@ KNOWN_CORPUS: dict = {
         "#1537 E: row tolerance depends on the coordinates' magnitudes",
         KnownFalseCertificate,
     ),
+    # NOT #1537 E: after rows x1e6 the published incumbent violates row 18 by
+    # 6.669e-6, and fails verify_point on the SCALED model too (6.669 vs 1.0
+    # allowed) -- a real false certificate. The base certifies in ~15 s unloaded,
+    # so a loaded run skipped this cell and missed it (#1546 review).
+    ("tls2.nl", "rows"): (
+        "#1561: rows x1e6 certifies an incumbent infeasible in the scaled model",
+        KnownFalseCertificate,
+    ),
 }
 
 
@@ -322,6 +342,6 @@ def test_corpus_panel(path, group):
     if violations:
         raise KnownFalseCertificate(violations)
     if certified == 0 and not lost:
-        # The base did not certify within 20 s: nothing to compare. Never taken by a
-        # KNOWN entry (require_certified_base makes that a hard failure instead).
+        # The base did not certify within 20 s: nothing to compare. A KNOWN entry
+        # never gets here: _run_panel skips it on a wall-time miss, fails otherwise.
         pytest.skip("base solve not certified within 20 s: no certificate to compare against")
