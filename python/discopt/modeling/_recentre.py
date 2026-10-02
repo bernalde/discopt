@@ -93,14 +93,15 @@ def plan_shifts(model: Model, ratio: float) -> dict[int, np.ndarray]:
 
     * **narrow offset** -- both bounds finite and ``|lb| >= ratio * max(1, ub-lb)``
       (anchor ``lb``); or
-    * **one-sided offset** -- one bound finite with magnitude ``>= ratio`` and the
-      other effectively open (``|.| >= 1e10`` or infinite): anchor that bound.
+    * **one-sided offset** -- a finite ``lb`` with ``|lb| >= ratio`` on a box at
+      least as wide as that offset (an open ``ub`` counts as infinitely wide):
+      anchor ``lb``; or an open ``lb`` with ``|ub| >= ratio``: anchor ``ub``.
       Without this, ``x in [1e6, 1e15]`` keeps a user's ``x - 1e6`` unfolded and
       st_miqp4 / alan still certify infeasible / crash under a shift (#1543).
 
-    Measured on the unshifted in-repo corpus at ratio 100: the narrow rule moves
-    one component of one model (tanksize), the one-sided rule none, so the pass
-    leaves 65 of 66 corpus models exactly as they were.
+    Measured on the unshifted in-repo corpus at ratio 100: 4 of 66 models have a
+    component to move (ex14_1_9 1, hda 2, heatexch_gen2 13, tanksize 12); the
+    other 62 are left exactly as they were.
 
     The shift is the anchor rounded to an integer, so integer and binary domains
     stay integral.
@@ -113,7 +114,11 @@ def plan_shifts(model: Model, ratio: float) -> dict[int, np.ndarray]:
         ub_fin = np.isfinite(ub) & (np.abs(ub) < _OPEN)
         width = np.where(lb_fin & ub_fin, ub - lb, np.inf)
         narrow = lb_fin & ub_fin & (np.abs(lb) >= ratio * np.maximum(1.0, width))
-        from_lb = lb_fin & ~ub_fin & (np.abs(lb) >= ratio)
+        # One-sided: the box is at least as wide as its offset (an open bound gives
+        # width = inf). A fixed "open" cutoff alone missed x in [-1.3e6, 9.9987e9]
+        # (a 1e10 bound after a shift) and left its (y - c)**2 unfolded -- the #1543
+        # trigger, certified 262 vs the true 2 on shifted st_miqp2.
+        from_lb = lb_fin & ~narrow & (np.abs(lb) >= ratio) & (width >= np.abs(lb))
         from_ub = ub_fin & ~lb_fin & (np.abs(ub) >= ratio)
         if np.any(narrow | from_lb | from_ub):
             plan[id(v)] = np.where(

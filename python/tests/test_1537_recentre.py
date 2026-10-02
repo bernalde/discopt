@@ -171,10 +171,12 @@ def test_1542_shifted_cubic(flag_on):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("name", ["st_miqp3", "st_miqp4", "alan"])
+@pytest.mark.parametrize("name", ["st_miqp2", "st_miqp3", "st_miqp4", "alan"])
 def test_corpus_shift_false_certificates_recover(flag_on, name):
     """The false-certificate / guard-refusal shift failures of the invariance
-    corpus panel (#1543) come back certified at the base optimum."""
+    corpus panel (#1543) come back certified at the base optimum. st_miqp2 is the
+    graduation panel's ON-arm false certificate (262 vs 2): its x1 box
+    [-1.3e6, 9.9987e9] slipped past a fixed "open" cutoff and stayed unfolded."""
     m = dm.from_nl(os.path.join(CORPUS, f"{name}.nl"))
     base = m.solve(time_limit=20)
     assert base.gap_certified
