@@ -346,7 +346,12 @@ class TestOAEdgeCases:
         assert result.status == "infeasible"
         assert result.objective is None
         assert result.gap is None
-        assert result.x == {}
+        # ``x is None``, the documented ``SolveResult.x`` contract ("None if no
+        # feasible solution found"). #1105 (29e59e3c) moved every no-incumbent
+        # OA exit from ``x={}`` to ``x=None`` deliberately -- an empty dict was
+        # truth-tested as an existing incumbent downstream -- and this slow-only
+        # assertion was missed because CI does not run ``-m slow``.
+        assert result.x is None
 
     def test_no_incumbent_on_limit_is_not_reported_infeasible(self):
         """A resource-limited OA run with no incumbent must NOT claim "infeasible".
