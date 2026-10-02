@@ -122,9 +122,11 @@ def test_flag_on_never_cuts_a_feasible_point(monkeypatch):
     assert checked == 60 * 22
 
 
-def test_declined_expansion_falls_back_to_the_proxy_view_bit_identically(monkeypatch):
-    """A row ``expand`` refuses (``dm.maximum`` has no scalar opcode) runs the
-    pre-#1568 proxy view, and says so instead of failing silently."""
+def test_refused_row_stays_on_the_proxy_view_and_says_so(monkeypatch):
+    """A row ``expand`` refuses (``dm.maximum`` has no scalar opcode) keeps its
+    pre-#1568 proxy-view form -- per row, not for the whole view -- is counted
+    as ``array_rows_on_hull``, and the outcome names it instead of failing
+    silently. With no other array row to expand, the box is the OFF box."""
 
     def build():
         m = dm.Model("decline")
@@ -142,10 +144,56 @@ def test_declined_expansion_falls_back_to_the_proxy_view_bit_identically(monkeyp
     monkeypatch.setenv(FLAG, "1")
     on = _kernel(build(), lb, ub)
     assert off["array_rows"] is None
-    assert on["array_rows"].startswith("declined: expand refused")
+    assert off["array_rows_added"] == 0 and off["array_rows_on_hull"] == 0
+    assert on["array_rows"].startswith("partial: constraint 0:"), on["array_rows"]
+    assert on["array_rows_added"] == 0 and on["array_rows_on_hull"] == 1
     for k in ("lb", "ub"):
         np.testing.assert_array_equal(on[k], off[k])
     assert on["bounds_tightened"] == off["bounds_tightened"]
+
+
+def test_refused_row_does_not_block_its_neighbours(monkeypatch):
+    """Per-row mode: the sigmoid layer's rows expand (and tighten exactly as the
+    per-element model does) even with an unexpandable ``maximum`` row beside them."""
+    monkeypatch.setenv(FLAG, "1")
+
+    def build(vector_rows):
+        m = _layer_model(vector_rows=vector_rows)
+        w = m.continuous("w", shape=(3,), lb=-10, ub=10)
+        u = m.continuous("u", shape=(3,), lb=-2, ub=2)
+        m.subject_to(w - dm.maximum(u, 0.5) == 0)
+        return m
+
+    vec = build(True)
+    lb, ub = _halved_box(vec)
+    d = _kernel(vec, lb, ub)
+    assert d["array_rows"].startswith("partial: constraint 2:"), d["array_rows"]
+    assert d["array_rows_added"] == 20 and d["array_rows_on_hull"] == 1
+    monkeypatch.delenv(FLAG, raising=False)
+    sca = _kernel(build(False), lb, ub)
+    n = 2 + 10 + 10
+    np.testing.assert_allclose(d["lb"][:n], sca["lb"][:n], rtol=0, atol=1e-9)
+    np.testing.assert_allclose(d["ub"][:n], sca["ub"][:n], rtol=0, atol=1e-9)
+
+
+def test_kwarg_overrides_the_environment(monkeypatch):
+    m = _layer_model(vector_rows=True)
+    lb, ub = _halved_box(m)
+    r = model_to_repr(m, getattr(m, "_builder", None))
+    monkeypatch.setenv(FLAG, "1")
+    off = r.in_tree_presolve(lb.copy(), ub.copy(), 0, 1, expand_array_rows=False)
+    assert off["array_rows"] is None and off["array_rows_added"] == 0
+    monkeypatch.delenv(FLAG, raising=False)
+    on = r.in_tree_presolve(lb.copy(), ub.copy(), 0, 1, expand_array_rows=True)
+    assert on["array_rows"] == "expanded" and on["array_rows_added"] == 20
+    assert on["array_rows_on_hull"] == 0
+
+
+def test_unknown_outcome_is_refused_loudly():
+    import discopt.solver as S
+
+    with pytest.raises(ValueError):
+        S._note_array_rows({"ran": True, "array_rows": "bogus: x", "array_rows_added": 0})
 
 
 @pytest.mark.slow
@@ -171,3 +219,4 @@ def test_discopt_ml_sigmoid_layer_certifies_with_the_flag(monkeypatch):
     assert r.gap_certified and r.status == "optimal"
     assert r.objective == pytest.approx(-0.220785, abs=1e-5)
     assert (r.solver_stats or {}).get("reduce/array_rows_expanded", 0) > 0
+    assert (r.solver_stats or {}).get("reduce/array_row_calls", 0) > 0

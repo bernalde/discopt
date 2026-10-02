@@ -312,6 +312,65 @@ pub(crate) fn shapes_of(arena: &ExprArena) -> Result<Vec<Vec<usize>>, ExpandErro
     let n = arena.len();
     let mut shapes: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
+        shapes[i] = node_shape(arena, i, &shapes)?;
+    }
+    Ok(shapes)
+}
+
+/// The operands of a node, in order (empty for a leaf).
+pub(crate) fn operands(node: &ExprNode) -> Vec<ExprId> {
+    match node {
+        ExprNode::BinaryOp { left, right, .. } | ExprNode::MatMul { left, right } => {
+            vec![*left, *right]
+        }
+        ExprNode::UnaryOp { operand, .. } | ExprNode::Sum { operand, .. } => vec![*operand],
+        ExprNode::Index { base, .. } => vec![*base],
+        ExprNode::FunctionCall { args, .. } => args.clone(),
+        ExprNode::SumOver { terms } => terms.clone(),
+        ExprNode::Constant(_)
+        | ExprNode::ConstantArray(..)
+        | ExprNode::Variable { .. }
+        | ExprNode::Parameter { .. } => Vec::new(),
+    }
+}
+
+/// Per-node variant of [`shapes_of`]: `Err` for a node this arena cannot shape
+/// AND for every node above one (carrying the deepest reason), `Ok(shape)` for
+/// the rest.
+///
+/// [`shapes_of`] is all-or-nothing, which is right for a consumer that must
+/// export the whole model. [`expand_rowwise`] (the in-tree FBBT view, #1568)
+/// expands row by row instead, so one unshapeable node must cost only the rows
+/// that contain it.
+pub(crate) fn shapes_of_partial(arena: &ExprArena) -> Vec<Result<Vec<usize>, ExpandError>> {
+    let n = arena.len();
+    let mut shapes: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut out: Vec<Result<Vec<usize>, ExpandError>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let bad_child = operands(arena.get(ExprId(i)))
+            .into_iter()
+            .find_map(|c| out[c.0].as_ref().err().cloned());
+        let r = match bad_child {
+            Some(e) => Err(e),
+            None => {
+                node_shape(arena, i, &shapes).map_err(|e| ExpandError(format!("node {i}: {e}")))
+            }
+        };
+        if let Ok(s) = &r {
+            shapes[i] = s.clone();
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// Shape of node `i` from its operands' (already computed) shapes.
+fn node_shape(
+    arena: &ExprArena,
+    i: usize,
+    shapes: &[Vec<usize>],
+) -> Result<Vec<usize>, ExpandError> {
+    {
         let s: Vec<usize> = match arena.get(ExprId(i)) {
             ExprNode::Constant(_) => Vec::new(),
             ExprNode::ConstantArray(_, shape) => shape.clone(),
@@ -382,9 +441,8 @@ pub(crate) fn shapes_of(arena: &ExprArena) -> Result<Vec<Vec<usize>>, ExpandErro
                 acc
             }
         };
-        shapes[i] = s;
+        Ok(s)
     }
-    Ok(shapes)
 }
 
 /// Numpy `@` result shape for the four rank combinations discopt emits.
@@ -432,9 +490,42 @@ pub(crate) fn func_code(f: MathFunc) -> Option<i32> {
     })
 }
 
-/// The inverse of [`func_code`]: the [`MathFunc`] an `OP_FUNC_BASE + code`
-/// instruction applies, or `None` for a code `func_code` never emits.
-/// `func_code_round_trips` pins the two together.
+/// Which [`MathFunc`]s an expansion may emit as an element-wise function
+/// instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuncSet {
+    /// Exactly [`func_code`]: what the AD tape and the `.nl` writer consume.
+    /// [`expand`] always uses this set.
+    Export,
+    /// [`FuncSet::Export`] plus the pointwise scalar functions that FBBT has
+    /// forward and backward rules for and that have no `func_code`: `asinh`,
+    /// `acosh`, `atanh`, `erf` and `entropy` (`x ln x`). Each one maps a scalar
+    /// to a scalar, and an array argument is applied element by element, so
+    /// expanding one per element is exact. Used only by the in-tree FBBT view
+    /// (#1568), which lowers the program straight back into an arena and never
+    /// hands it to a writer. The extra codes are 18-22.
+    Fbbt,
+}
+
+/// [`func_code`] widened to `set` (see [`FuncSet`]).
+pub(crate) fn func_code_in(f: MathFunc, set: FuncSet) -> Option<i32> {
+    func_code(f).or(match set {
+        FuncSet::Export => None,
+        FuncSet::Fbbt => match f {
+            MathFunc::Asinh => Some(18),
+            MathFunc::Acosh => Some(19),
+            MathFunc::Atanh => Some(20),
+            MathFunc::Erf => Some(21),
+            MathFunc::Entropy => Some(22),
+            _ => None,
+        },
+    })
+}
+
+/// The inverse of [`func_code_in`] with [`FuncSet::Fbbt`] (a superset of
+/// [`func_code`]): the [`MathFunc`] an `OP_FUNC_BASE + code` instruction
+/// applies, or `None` for a code neither emits. `func_code_round_trips` pins
+/// the two together.
 pub(crate) fn func_from_code(code: i32) -> Option<MathFunc> {
     Some(match code {
         0 => MathFunc::Exp,
@@ -455,6 +546,11 @@ pub(crate) fn func_from_code(code: i32) -> Option<MathFunc> {
         15 => MathFunc::Log1p,
         16 => MathFunc::Sigmoid,
         17 => MathFunc::Softplus,
+        18 => MathFunc::Asinh,
+        19 => MathFunc::Acosh,
+        20 => MathFunc::Atanh,
+        21 => MathFunc::Erf,
+        22 => MathFunc::Entropy,
         _ => return None,
     })
 }
@@ -557,7 +653,16 @@ pub fn expand(repr: &ModelRepr) -> Result<ScalarProgram, ExpandError> {
     let mut done = vec![false; arena.len()];
 
     for i in 0..arena.len() {
-        expand_node(arena, i, &shapes, &offsets, &mut em, &mut slots, &mut done)?;
+        expand_node(
+            arena,
+            i,
+            &shapes,
+            &offsets,
+            FuncSet::Export,
+            &mut em,
+            &mut slots,
+            &mut done,
+        )?;
     }
 
     let obj_slots = &slots[repr.objective.0];
@@ -593,12 +698,124 @@ pub fn expand(repr: &ModelRepr) -> Result<ScalarProgram, ExpandError> {
     })
 }
 
+/// The per-row result of [`expand_rowwise`].
+#[derive(Debug, Clone)]
+pub struct RowwiseProgram {
+    /// Every instruction emitted for the nodes that DID expand. Its
+    /// `objective_root` is `-1` when the objective failed; its `row_roots` and
+    /// `rows_per_constraint` cover only the constraints that expanded (a failed
+    /// constraint counts 0 rows there).
+    pub program: ScalarProgram,
+    /// The objective's root instruction, or why it has none.
+    pub objective: Result<i64, ExpandError>,
+    /// Per constraint, in [`ModelRepr::constraints`] order: its row roots, or
+    /// why its body did not expand.
+    pub rows: Vec<Result<Vec<i64>, ExpandError>>,
+}
+
+/// [`expand`] with a per-row failure mode, for consumers that can keep an
+/// unexpanded row in its original form (the in-tree FBBT view, #1568).
+///
+/// The node semantics are [`expand`]'s own -- every node goes through the same
+/// `expand_node` -- so a row that expands here expands to exactly what
+/// [`expand`] would emit (with `funcs = FuncSet::Export`). The differences: a
+/// node that cannot be shaped or expanded marks itself and every node above it
+/// as failed instead of aborting, and the objective and each constraint report
+/// separately whether their body expanded. A node with a failed operand is
+/// never handed to `expand_node`, whose operands must all be filled in.
+pub fn expand_rowwise(repr: &ModelRepr, funcs: FuncSet) -> RowwiseProgram {
+    let arena = &repr.arena;
+    let n = arena.len();
+    let partial = shapes_of_partial(arena);
+    let shapes: Vec<Vec<usize>> = partial
+        .iter()
+        .map(|r| r.as_ref().cloned().unwrap_or_default())
+        .collect();
+    let offsets: Vec<usize> = repr.variables.iter().map(|v| v.offset).collect();
+
+    let mut em = Emitter::new();
+    let mut slots: Vec<Vec<i64>> = vec![Vec::new(); n];
+    let mut done = vec![false; n];
+    let mut failed: Vec<Option<ExpandError>> = vec![None; n];
+
+    for i in 0..n {
+        if let Err(e) = &partial[i] {
+            failed[i] = Some(e.clone());
+            continue;
+        }
+        if let Some(e) = operands(arena.get(ExprId(i)))
+            .into_iter()
+            .find_map(|c| failed[c.0].clone())
+        {
+            failed[i] = Some(e);
+            continue;
+        }
+        if let Err(e) = expand_node(
+            arena, i, &shapes, &offsets, funcs, &mut em, &mut slots, &mut done,
+        ) {
+            failed[i] = Some(ExpandError(format!("node {i}: {e}")));
+        }
+    }
+
+    let objective = match &failed[repr.objective.0] {
+        Some(e) => Err(e.clone()),
+        None => {
+            let s = &slots[repr.objective.0];
+            if s.len() == 1 {
+                Ok(s[0])
+            } else {
+                Err(ExpandError(format!(
+                    "objective expands to {} scalar expressions; an objective must be scalar",
+                    s.len()
+                )))
+            }
+        }
+    };
+
+    let mut row_roots = Vec::new();
+    let mut rows_per_constraint = Vec::with_capacity(repr.constraints.len());
+    let mut rows = Vec::with_capacity(repr.constraints.len());
+    for c in &repr.constraints {
+        match &failed[c.body.0] {
+            Some(e) => {
+                rows_per_constraint.push(0);
+                rows.push(Err(e.clone()));
+            }
+            None => {
+                let r = slots[c.body.0].clone();
+                rows_per_constraint.push(r.len());
+                row_roots.extend_from_slice(&r);
+                rows.push(Ok(r));
+            }
+        }
+    }
+
+    let mut args_ptr = em.args_ptr;
+    args_ptr.push(em.args_flat.len() as i64);
+    RowwiseProgram {
+        program: ScalarProgram {
+            op: em.op,
+            a: em.a,
+            b: em.b,
+            k: em.k,
+            args_flat: em.args_flat,
+            args_ptr,
+            objective_root: *objective.as_ref().unwrap_or(&-1),
+            row_roots,
+            rows_per_constraint,
+        },
+        objective,
+        rows,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_node(
     arena: &ExprArena,
     i: usize,
     shapes: &[Vec<usize>],
     offsets: &[usize],
+    funcs: FuncSet,
     em: &mut Emitter,
     slots: &mut [Vec<i64>],
     done: &mut [bool],
@@ -717,7 +934,7 @@ fn expand_node(
                 if args.len() != 1 {
                     return err(format!("{f:?} with {} arguments", args.len()));
                 }
-                let code = match func_code(*f) {
+                let code = match func_code_in(*f, funcs) {
                     Some(c) => OP_FUNC_BASE + c,
                     None => return err(format!("no opcode for {f:?}")),
                 };
@@ -866,8 +1083,26 @@ mod tests {
                 covered += 1;
             }
         }
+        // The export set is unchanged: the `.nl` writer and the tape consume it.
         assert_eq!(covered, 18);
-        for c in [-1, 18, 19, 100] {
+        // The FBBT superset adds exactly the five pointwise functions, at codes
+        // 18-22, and still decodes them back.
+        let mut fbbt_only = Vec::new();
+        for f in all {
+            match (func_code(f), func_code_in(f, FuncSet::Fbbt)) {
+                (Some(a), Some(b)) => assert_eq!(a, b, "{f:?}"),
+                (None, Some(c)) => {
+                    assert_eq!(func_from_code(c), Some(f), "{f:?} (code {c})");
+                    fbbt_only.push(c);
+                }
+                (Some(_), None) => panic!("{f:?} lost from the FBBT set"),
+                (None, None) => {}
+            }
+            assert_eq!(func_code_in(f, FuncSet::Export), func_code(f), "{f:?}");
+        }
+        fbbt_only.sort();
+        assert_eq!(fbbt_only, vec![18, 19, 20, 21, 22]);
+        for c in [-1, 23, 100] {
             assert_eq!(func_from_code(c), None);
         }
     }

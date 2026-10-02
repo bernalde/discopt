@@ -37,6 +37,11 @@ pub struct PyModelRepr {
     /// renumber columns, so a transform's output must start from empty instead
     /// of inheriting indices that no longer mean anything (#1225).
     initial_point: Vec<(usize, f64)>,
+    /// The #1568 expanded array-row FBBT view, built on the first
+    /// `in_tree_presolve` call that wants it and reused at every later node.
+    /// Keyed on the repr's structure, never its bounds (the node box overrides
+    /// those), so `tighten_var_bounds` leaves it valid.
+    array_row_cache: discopt_core::bnb::ArrayRowViewCache,
 }
 
 impl PyModelRepr {
@@ -47,6 +52,7 @@ impl PyModelRepr {
             inner: parsed.model,
             complementarities: parsed.complementarities,
             initial_point: parsed.initial_point,
+            array_row_cache: Default::default(),
             // A repr recovered from a `.nl` parse has no builder rows.
             n_builder_constraints: 0,
         }
@@ -837,6 +843,7 @@ impl PyModelRepr {
                 inner: new_model,
                 complementarities: Vec::new(),
                 initial_point: Vec::new(),
+                array_row_cache: Default::default(),
             },
             dict.into(),
         ))
@@ -868,6 +875,7 @@ impl PyModelRepr {
                 inner: new_model,
                 complementarities: Vec::new(),
                 initial_point: Vec::new(),
+                array_row_cache: Default::default(),
             },
             dict.into(),
         ))
@@ -982,6 +990,17 @@ impl PyModelRepr {
     /// - `subtol_repaired`: int — sub-`FEAS_TOL` bound crossings repaired (#907).
     /// - `infeasible`: bool — `True` if the kernel detected emptiness.
     /// - `ran`: bool — `True` if the schedule actually fired at this depth.
+    /// - `array_rows`: str or None — how array-valued rows were seen (#1568):
+    ///   `"expanded"`, `"partial: <first refusal>"`, `"declined: <why>"`, or
+    ///   `None` for a scalar layout or with the expansion off.
+    /// - `array_rows_added`: int — scalar rows that replaced array-structured
+    ///   constraints at this call (0 when off, declined or skipped).
+    /// - `array_rows_on_hull`: int — array-structured constraints left in their
+    ///   proxy (hull) form at this call.
+    ///
+    /// `expand_array_rows` turns the #1568 elementwise row expansion on or off
+    /// for this call; `None` (the default) reads `DISCOPT_IN_TREE_ARRAY_ROWS`
+    /// (default OFF). The expanded view is built once per repr and cached.
     #[pyo3(signature = (
         node_lb,
         node_ub,
@@ -992,7 +1011,9 @@ impl PyModelRepr {
         incumbent=None,
         probing=false,
         probe_max_vars=32,
+        expand_array_rows=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn in_tree_presolve(
         &self,
         py: Python<'_>,
@@ -1005,19 +1026,26 @@ impl PyModelRepr {
         incumbent: Option<f64>,
         probing: bool,
         probe_max_vars: usize,
+        expand_array_rows: Option<bool>,
     ) -> PyResult<PyObject> {
-        use discopt_core::bnb::{run_in_tree_presolve_scalar, InTreePresolveOptions};
+        use discopt_core::bnb::{
+            run_in_tree_presolve_scalar_cached, ArrayRowsOutcome, InTreePresolveOptions,
+        };
         let opts = InTreePresolveOptions {
             depth_stride,
             max_iter,
             tol,
             probing,
             probe_max_vars,
+            expand_array_rows,
         };
         // #1513: per-SCALAR box (length `n_vars`), the B&B node box as-is. A
         // wrong length or an unscalarizable repr is a loud ValueError.
-        let delta = run_in_tree_presolve_scalar(
+        // #1568: the expanded array-row view is built once per repr and reused
+        // at every node (the cache rebuilds if the structure ever differs).
+        let delta = run_in_tree_presolve_scalar_cached(
             &self.inner,
+            &self.array_row_cache,
             &node_lb,
             &node_ub,
             node_depth,
@@ -1040,14 +1068,18 @@ impl PyModelRepr {
         // and each of these events could previously have fathomed a live node.
         out.set_item("subtol_repaired", delta.subtol_repaired)?;
         out.set_item("ran", delta.ran)?;
-        // #1568: "expanded" / "declined: <why>" / None (scalar layout or flag off),
-        // so a decline back to the proxy view is counted, not silent.
+        // #1568: "expanded" / "partial: <first refusal>" / "declined: <why>" /
+        // None (scalar layout or expansion off), so a row left in proxy form or
+        // a decline back to the proxy view is counted, not silent.
         let array_rows: Option<String> = match &delta.array_rows {
             None => None,
-            Some(Ok(())) => Some("expanded".to_string()),
-            Some(Err(why)) => Some(format!("declined: {why}")),
+            Some(ArrayRowsOutcome::Expanded) => Some("expanded".to_string()),
+            Some(ArrayRowsOutcome::Partial(why)) => Some(format!("partial: {why}")),
+            Some(ArrayRowsOutcome::Declined(why)) => Some(format!("declined: {why}")),
         };
         out.set_item("array_rows", array_rows)?;
+        out.set_item("array_rows_added", delta.array_rows_added)?;
+        out.set_item("array_rows_on_hull", delta.array_rows_on_hull)?;
         Ok(out.into_any().unbind())
     }
 
@@ -1310,6 +1342,7 @@ impl PyModelRepr {
                 inner: result.model,
                 complementarities: Vec::new(),
                 initial_point: Vec::new(),
+                array_row_cache: Default::default(),
             },
             stats.into(),
         ))
@@ -1340,6 +1373,7 @@ impl PyModelRepr {
                     inner: self.inner.clone(),
                     complementarities: self.complementarities.clone(),
                     initial_point: self.initial_point.clone(),
+                    array_row_cache: Default::default(),
                 },
                 PySubstitutionChain {
                     models: vec![self.inner.clone()],
@@ -1357,6 +1391,7 @@ impl PyModelRepr {
                 inner: reduced,
                 complementarities: Vec::new(),
                 initial_point: Vec::new(),
+                array_row_cache: Default::default(),
             },
             PySubstitutionChain {
                 models,
@@ -1802,6 +1837,7 @@ pub fn model_to_repr(
         n_builder_constraints,
         // Built from a Python Model, not parsed from a `.nl` file: no `x` segment.
         initial_point: Vec::new(),
+        array_row_cache: Default::default(),
     })
 }
 

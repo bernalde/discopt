@@ -17,8 +17,10 @@ pub mod tree_manager;
 // Re-export primary public types for convenience.
 pub use branching::{BranchDecision, Pseudocosts, VarBranchInfo};
 pub use in_tree_presolve::{
-    is_scalar_layout, run_in_tree_presolve, run_in_tree_presolve_scalar, run_in_tree_presolve_view,
-    scalarize_for_fbbt, InTreeDelta, InTreePresolveOptions, ScalarFbbtView,
+    array_rows_enabled, expand_rows_for_fbbt, is_scalar_layout, run_in_tree_presolve,
+    run_in_tree_presolve_scalar, run_in_tree_presolve_scalar_cached, run_in_tree_presolve_view,
+    scalarize_for_fbbt, ArrayRowStats, ArrayRowViewCache, ArrayRowsOutcome, InTreeDelta,
+    InTreePresolveOptions, ScalarFbbtView, ARRAY_ROW_INSTRUCTION_BUDGET,
 };
 pub use node::{Node, NodeId, NodeStatus};
 pub use pool::{NodePool, SelectionStrategy};
