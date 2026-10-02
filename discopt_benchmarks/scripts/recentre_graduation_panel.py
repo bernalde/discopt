@@ -66,8 +66,7 @@ def main() -> int:
 
     corpus = sorted(glob.glob(os.path.join(TESTS, "data", "minlplib_nl", "*.nl")))
     tally = {
-        arm: {"false": 0, "bad_point": 0, "raised": 0, "cert": 0, "wall": 0.0}
-        for arm in ("0", "1")
+        arm: {"false": 0, "bad_point": 0, "raised": 0, "cert": 0, "wall": 0.0} for arm in ("0", "1")
     }
     lost = {"0": 0, "1": 0}  # certified in the OTHER arm but not this one
     neutral_checked = neutral_diff = compared = 0
@@ -85,8 +84,10 @@ def main() -> int:
                 t["bad_point"] += 1
             if r is not None and r.gap_certified:
                 t["cert"] += 1
-            if r is not None and certified_answer_changed(base, r):
+            why = certified_answer_changed(base, r) if r is not None else ""
+            if why:
                 t["false"] += 1
+                print(f"FALSE flag={flag} {label}: {why}", flush=True)
             out[flag] = (r, err)
         compared += 1
         r0, r1 = out["0"][0], out["1"][0]
@@ -94,6 +95,7 @@ def main() -> int:
         c1 = bool(r1 is not None and r1.gap_certified)
         if c0 and not c1:
             lost["1"] += 1
+            print(f"LOST flag=1 {label}", flush=True)
         if c1 and not c0:
             lost["0"] += 1
         moved = r1 is not None and (r1.solver_stats or {}).get("recentre/variables_moved")
@@ -101,15 +103,23 @@ def main() -> int:
         if neutral and not moved and r0 is not None and r1 is not None:
             neutral_checked += 1
             same = (r0.status, r0.node_count, r0.objective, r0.bound) == (
-                r1.status, r1.node_count, r1.objective, r1.bound
+                r1.status,
+                r1.node_count,
+                r1.objective,
+                r1.bound,
             )
             if not same:
                 neutral_diff += 1
                 note = "  NEUTRALITY DRIFT"
+
         def fmt(r, err):
             return err if err else f"{r.status}/{'C' if r.gap_certified else '-'} n={r.node_count}"
-        print(f"{label:34s} OFF {fmt(*out['0']):28s} ON {fmt(*out['1']):28s}"
-              f"{' moved=' + str(int(moved)) if moved else ''}{note}", flush=True)
+
+        print(
+            f"{label:34s} OFF {fmt(*out['0']):28s} ON {fmt(*out['1']):28s}"
+            f"{' moved=' + str(int(moved)) if moved else ''}{note}",
+            flush=True,
+        )
 
     for path in corpus:  # A + B
         name = os.path.basename(path)
@@ -138,8 +148,10 @@ def main() -> int:
 
     print(f"\nCOMPARED {compared}; bound-neutral checked {neutral_checked}, drifted {neutral_diff}")
     for flag, t in tally.items():
-        print(f"flag={flag}: false={t['false']} bad_point={t['bad_point']} raised={t['raised']} "
-              f"certified={t['cert']} lost_vs_other={lost[flag]} wall={t['wall']:.0f}s")
+        print(
+            f"flag={flag}: false={t['false']} bad_point={t['bad_point']} raised={t['raised']} "
+            f"certified={t['cert']} lost_vs_other={lost[flag]} wall={t['wall']:.0f}s"
+        )
     return 0 if compared else 1
 
 
