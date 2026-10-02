@@ -225,3 +225,71 @@ def test_node_prescreen_still_certifies_a_genuinely_fixed_infeasible_point():
     feas = np.array([1.0])
     r2 = _solve_node_nlp(ev, feas, feas, feas.copy(), cb, {}, nlp_solver="pounce", convex=True)
     assert r2.status != SolveStatus.INFEASIBLE, r2.status
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "build, x0, lb, ub",
+    [
+        # Review of #1550: one variable free on a box touching +100.
+        pytest.param(
+            lambda m: m.subject_to(m._variables[0] >= 105),
+            [100.0],
+            [100.0],
+            [200.0],
+            id="x-in-100-200-x-ge-105",
+        ),
+        # The ring with a second variable fixed: "all but one pinned".
+        pytest.param(
+            lambda m: m.subject_to((m._variables[0] - 5) ** 2 + 0 * m._variables[1] >= 9),
+            [5.0, 1.0],
+            [0.0, 1.0],
+            [10.0, 1.0],
+            id="ring-with-y-fixed",
+        ),
+    ],
+)
+def test_node_prescreen_review_counterexamples_reach_the_nlp(build, x0, lb, ub):
+    from discopt.solver import _infer_constraint_bounds, _make_evaluator, _solve_node_nlp
+    from discopt.solvers import SolveStatus
+
+    m = dm.Model("cx")
+    m.continuous("x", lb=lb[0], ub=ub[0])
+    if len(lb) > 1:
+        m.continuous("y", lb=lb[1], ub=ub[1])
+    build(m)
+    m.minimize(m._variables[0])
+    ev = _make_evaluator(m)
+    cl, cu = _infer_constraint_bounds(m, ev)
+    r = _solve_node_nlp(
+        ev,
+        np.array(x0),
+        np.array(lb),
+        np.array(ub),
+        list(zip(cl, cu)),
+        {},
+        nlp_solver="pounce",
+        convex=True,
+    )
+    assert r.status != SolveStatus.INFEASIBLE, (r.status, r.x)
+
+
+@pytest.mark.unit
+def test_box_projection_keeps_integer_columns_integral():
+    """Review of #1550: an integer column with a NON-integral declared bound."""
+    from discopt.solver import _project_onto_declared_box
+
+    box = np.array([[0.5, 4.5], [1e6, 1e6 + 5.0], [-2.5, 3.7]])
+    # Column 0 integer, ub 4.5: the bare clip would give 4.5. Column 2 integer.
+    x = np.array([5.0, 1e6 - 9.95e-5, -3.0])
+    p = _project_onto_declared_box(x, box, int_offsets=[0, 2], int_sizes=[1, 1])
+    np.testing.assert_array_equal(p, [4.0, 1e6, -2.0])
+    # Inside the box already: unchanged.
+    inside = np.array([2.0, 1e6 + 1.0, 0.0])
+    np.testing.assert_array_equal(_project_onto_declared_box(inside, box, [0, 2], [1, 1]), inside)
+    # An integer column whose box holds no integer has no projection.
+    assert _project_onto_declared_box(np.array([0.7]), np.array([[0.2, 0.8]]), [0], [1]) is None
+    # Continuous columns clip to the declared bounds exactly.
+    np.testing.assert_array_equal(
+        _project_onto_declared_box(np.array([4.7]), np.array([[0.5, 4.5]])), [4.5]
+    )

@@ -3674,6 +3674,28 @@ _REFINE_DEGRADE_EPS = 1e-12
 _NLPBB_EXIT_RTOL = 1e-9
 
 
+def _project_onto_declared_box(x, box, int_offsets=(), int_sizes=()):
+    """The nearest point to ``x`` inside the declared ``box`` (#1542), or ``None``.
+
+    Continuous columns are clipped to ``[lb, ub]``. Integer columns are clipped to
+    ``[ceil(lb), floor(ub)]``, the integers the declared box actually admits: a
+    bare clip onto a non-integral bound (``ub = 4.5``) would trade a bound
+    violation for an integrality one. Returns ``None`` when an integer column's
+    box contains no integer -- there is no projection to make then, and the
+    caller's gate decides as before.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    lo = np.array(box[:, 0], dtype=np.float64)
+    hi = np.array(box[:, 1], dtype=np.float64)
+    for off, sz in zip(int_offsets, int_sizes):
+        sl = slice(int(off), int(off) + int(sz))
+        lo[sl] = np.ceil(lo[sl])
+        hi[sl] = np.floor(hi[sl])
+        if np.any(lo[sl] > hi[sl]):
+            return None
+    return np.clip(x, lo, hi)
+
+
 def _nonlinear_point_excess(
     evaluator,
     x,
@@ -22833,7 +22855,8 @@ def _solve_nlp_bb(
         # #1542: one repair IS exact -- projecting onto the declared box. A box
         # violation is a sub-solver artefact (POUNCE's ``bound_relax_factor``
         # admits ``1e-8*(1+|b|)``), the projection is the nearest point satisfying
-        # every bound, and integer bounds are integral so it cannot break
+        # every bound, and integer columns project onto the integers their box
+        # admits (``_project_onto_declared_box``), so it cannot break
         # integrality. It is attempted ONLY when the point as returned would be
         # refused -- an incumbent the gate already accepts leaves untouched, so no
         # solve the gate passed before reports a different point -- and adopted
@@ -22849,8 +22872,8 @@ def _solve_nlp_bb(
             box=_declared_box,
         )
         if _exit_excess > _NLPBB_EXIT_ABS_TOL:
-            _box_proj = np.clip(sol_flat, _declared_box[:, 0], _declared_box[:, 1])
-            if not np.array_equal(_box_proj, sol_flat):
+            _box_proj = _project_onto_declared_box(sol_flat, _declared_box, int_offsets, int_sizes)
+            if _box_proj is not None and not np.array_equal(_box_proj, sol_flat):
                 _proj = _nonlinear_point_excess(
                     evaluator,
                     _box_proj,
