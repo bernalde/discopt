@@ -244,12 +244,8 @@ def _xfail(reason: str, raises):
 #: ``raises``: a fix flips the xfail to a failure, and a failure for any other
 #: reason is not absorbed.
 KNOWN_FALSE: dict = {
-    # Re-measured on main after #1548: still false (now -37 vs -45 rather than a
-    # false infeasible), and #1548 notes its own generator does not reproduce it.
-    ("polynomial", "shift1e6"): (
-        "#1542: a shifted cubic is certified at the wrong optimum",
-        KnownFalseCertificate,
-    ),
+    # ("polynomial", "shift1e6") was here until #1542 fixed the separable
+    # objective floor's float expansion of the shifted cubic.
 }
 
 
@@ -304,6 +300,16 @@ KNOWN_CORPUS: dict = {
         KnownFalseCertificate,
     ),
     ("syn05hfsg.nl", "shift"): (
+        "#1537 E: row tolerance depends on the coordinates' magnitudes",
+        KnownFalseCertificate,
+    ),
+    # #1537 E again: after the 1e6 shift the B&B tree accepts an incumbent that
+    # slides along equality row 5 (x1 = 1.00000104, objective 30.9999959 vs 31),
+    # within the shifted row's scale-aware tolerance (|J||x| ~ 1.3e6) and 1.04e-6
+    # over the original's 1e-6. Pre-existing on main: sweeping translate()'s seed
+    # 0..11 at 1e6, main fails seed 8 (row 5, 1.295e-6) and #1542's exact affine
+    # folding, which changes the float path, also fails seed 2 -- the harness's.
+    ("ex1225.nl", "shift"): (
         "#1537 E: row tolerance depends on the coordinates' magnitudes",
         KnownFalseCertificate,
     ),

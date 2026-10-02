@@ -29,9 +29,13 @@ Theory references:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any
+
+import numpy as np
 
 from discopt._flat_index import resolve_scalar_slot
 from discopt._relax.scalarize import scalar_elements
@@ -558,6 +562,7 @@ def distribute_products(
     recognizable structure, never of correctness.  See the budget's definition
     for why it exists and what depends on it.
     """
+    expr = fold_affine_constants(expr, protected_squares)
     est = estimate_distributed_terms(expr)
     if est <= _DISTRIBUTE_TERM_BUDGET:
         return _distribute_unbudgeted(expr, protected_squares)
@@ -570,6 +575,202 @@ def distribute_products(
         f"{_DISTRIBUTE_TERM_BUDGET:,}",
     )
     return result
+
+
+def _scalar_constant(expr: Expression) -> float | None:
+    if not isinstance(expr, Constant):
+        return None
+    values = np.asarray(expr.value, dtype=np.float64).ravel()
+    if values.size != 1 or not math.isfinite(float(values[0])):
+        return None
+    return float(values[0])
+
+
+def _affine_atom_key(atom: Expression) -> tuple:
+    """Identity key under which two atoms of an affine form may be combined.
+
+    A scalar variable is keyed by the variable object, an integer-indexed element
+    of a variable by ``(variable, index)``; every other atom is keyed by its own
+    node identity, so structurally equal but distinct subtrees are never merged
+    (conservative: a missed merge only leaves the expression as it was).
+    """
+    if isinstance(atom, Variable):
+        return ("v", id(atom))
+    if isinstance(atom, IndexExpression) and isinstance(atom.base, Variable):
+        idx = atom.index
+        if type(idx) is int:
+            return ("i", id(atom.base), idx)
+        if isinstance(idx, tuple) and all(type(i) is int for i in idx):
+            return ("i", id(atom.base), idx)
+    return ("n", id(atom))
+
+
+def _is_affine_link(expr: Expression, protected: frozenset[int] | None) -> bool:
+    """``+``/``-``/``neg`` or a product/quotient by a scalar constant literal."""
+    if protected is not None and id(expr) in protected:
+        return False
+    if isinstance(expr, UnaryOp):
+        return expr.op == "neg"
+    if not isinstance(expr, BinaryOp):
+        return False
+    if expr.op in ("+", "-"):
+        return True
+    if expr.op == "*":
+        return _scalar_constant(expr.left) is not None or _scalar_constant(expr.right) is not None
+    if expr.op == "/":
+        rv = _scalar_constant(expr.right)
+        return rv is not None and rv != 0.0
+    return False
+
+
+def _affine_walk(expr: Expression, protected: frozenset[int] | None, visit) -> None:
+    """Call ``visit(kind, node, scale)`` on every leaf of the maximal affine form.
+
+    ``kind`` is ``"const"`` (with the leaf's value folded into ``scale``) or
+    ``"atom"``. ``scale`` is an exact ``Fraction``.
+    """
+    stack: list[tuple[Expression, Fraction]] = [(expr, Fraction(1))]
+    while stack:
+        node, scale = stack.pop()
+        const = _scalar_constant(node)
+        if const is not None:
+            visit("const", node, scale * Fraction(const))
+            continue
+        if not _is_affine_link(node, protected):
+            visit("atom", node, scale)
+            continue
+        if isinstance(node, UnaryOp):
+            stack.append((node.operand, -scale))
+            continue
+        assert isinstance(node, BinaryOp)  # _is_affine_link admits only these two
+        if node.op in ("+", "-"):
+            stack.append((node.right, scale if node.op == "+" else -scale))
+            stack.append((node.left, scale))
+            continue
+        lc = _scalar_constant(node.left)
+        rc = _scalar_constant(node.right)
+        if node.op == "*" and lc is not None:
+            stack.append((node.right, scale * Fraction(lc)))
+        elif node.op == "*" and rc is not None:
+            stack.append((node.left, scale * Fraction(rc)))
+        elif node.op == "/" and rc is not None and rc != 0.0:
+            stack.append((node.left, scale / Fraction(rc)))
+        else:  # unreachable: _is_affine_link admitted the node
+            raise AssertionError(f"not an affine link: {node!r}")
+
+
+def _fold_affine_root(expr: Expression, protected: frozenset[int] | None) -> Expression:
+    """Combine like atoms and constants of the affine form rooted at ``expr``.
+
+    Rebuilt only when something actually combines (two or more constant leaves,
+    or an atom repeated); otherwise ``expr`` is returned with identity intact.
+    """
+    n_const = 0
+    seen: set[tuple] = set()
+    repeated = False
+
+    def count(kind: str, node: Expression, scale: Fraction) -> None:
+        nonlocal n_const, repeated
+        if kind == "const":
+            n_const += 1
+            return
+        key = _affine_atom_key(node)
+        if key in seen:
+            repeated = True
+        seen.add(key)
+
+    _affine_walk(expr, protected, count)
+    if n_const < 2 and not repeated:
+        return expr
+
+    const_total = Fraction(0)
+    coeffs: dict[tuple, list] = {}
+
+    def collect(kind: str, node: Expression, scale: Fraction) -> None:
+        nonlocal const_total
+        if kind == "const":
+            const_total += scale
+            return
+        key = _affine_atom_key(node)
+        slot = coeffs.get(key)
+        if slot is None:
+            coeffs[key] = [node, scale]
+        else:
+            slot[1] += scale
+
+    _affine_walk(expr, protected, collect)
+    out: Expression | None = None
+    for atom, coeff in coeffs.values():
+        if coeff == 0:
+            continue
+        mag = abs(coeff)
+        term = atom if mag == 1 else BinaryOp("*", Constant(float(mag)), atom)
+        if out is None:
+            out = term if coeff > 0 else UnaryOp("neg", term)
+        else:
+            out = BinaryOp("+" if coeff > 0 else "-", out, term)
+    if const_total != 0:
+        cval = float(const_total)
+        if out is None:
+            out = Constant(cval)
+        else:
+            out = BinaryOp("+" if cval > 0 else "-", out, Constant(abs(cval)))
+    return out if out is not None else Constant(0.0)
+
+
+def fold_affine_constants(
+    expr: Expression, protected_squares: frozenset[int] | None = None
+) -> Expression:
+    """Fold each maximal affine subtree's like terms and constants exactly (#1542).
+
+    ``(z + c) - c`` denotes ``z``, but distributing it as written multiplies the
+    cancelling constants into every product it meets: ``((z + c) - c) * w``
+    becomes ``z*w + c*w - c*w`` and a square of it carries ``c**2`` terms. At
+    ``|c| ~ 1e6`` those terms are ``1e12``-scale, and once a downstream consumer
+    sums them in floating point (the factorable reform's ``_fr_aux_*`` defining
+    rows, the LP coefficients) the cancellation leaves an error of ``ulp(1e12)``
+    or more on an ``O(1)`` quantity -- enough to make st_e36's root McCormick LP
+    infeasible on a feasible model, certified as infeasible.
+
+    Each maximal ``+``/``-``/``neg``/scalar-constant-scaled subtree is collected
+    into ``sum(coeff * atom) + const`` with the coefficients and the constant
+    combined in exact rational arithmetic, each rounded once at the end. The
+    walk mirrors distribution's: it descends through ``BinaryOp``/``UnaryOp``
+    only, never into a protected node or a ``FunctionCall`` (whose ``id()`` keys
+    lift maps), and a subtree in which nothing combines keeps its identity.
+    """
+    memo: dict[tuple[int, bool], Expression] = {}
+
+    def fold(node: Expression, inside_affine: bool) -> Expression:
+        key = (id(node), inside_affine)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        if protected_squares is not None and id(node) in protected_squares:
+            result = node
+        elif isinstance(node, BinaryOp):
+            link = _is_affine_link(node, protected_squares)
+            left = fold(node.left, link)
+            right = fold(node.right, link)
+            result = (
+                node
+                if left is node.left and right is node.right
+                else BinaryOp(node.op, left, right)
+            )
+            if link and not inside_affine:
+                result = _fold_affine_root(result, protected_squares)
+        elif isinstance(node, UnaryOp):
+            link = _is_affine_link(node, protected_squares)
+            operand = fold(node.operand, link)
+            result = node if operand is node.operand else UnaryOp(node.op, operand)
+            if link and not inside_affine:
+                result = _fold_affine_root(result, protected_squares)
+        else:
+            result = node
+        memo[key] = result
+        return result
+
+    return fold(expr, False)
 
 
 def _distribute_within_budget(
