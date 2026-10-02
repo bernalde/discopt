@@ -69,7 +69,28 @@ class RecentreUnsupported(ValueError):
 
 
 def recentre_enabled() -> bool:
-    """``DISCOPT_RECENTRE`` -- default OFF until a graduation panel passes."""
+    """``DISCOPT_RECENTRE`` -- default OFF: a documented opt-out (CLAUDE.md §5).
+
+    Graduation panel (``discopt_benchmarks/scripts/recentre_graduation_panel.py``,
+    run 2026-10-02 on ``main`` after #1546/#1555, 20 s, 204 comparisons: the corpus
+    as written, the corpus under ``x = y - c`` with c ~ 1e3 / 1e6, and the #1537
+    generated families): ON vs OFF, false certificates **0 vs 2** (the #1542
+    ``polynomial`` 1e6 shift), certified **176 vs 162**, total wall **856 s vs
+    1157 s**, bound-neutral drift 0 of 48 untouched instances. It is NOT the
+    default because it loses three certificates the OFF arm keeps, which §5's
+    no-certification-regression bar forbids:
+
+    * ``nvs09`` (both shifts): the recentred box is ``[0, 6]``, and the solver is
+      translation-sensitive there with this flag OFF too -- the unshifted model
+      moved by -3 (box ``[0, 6]``) does not certify in 60 s (841 nodes) while its
+      own box ``[3, 9]`` certifies in 31. Writing the shift as a BinaryOp instead
+      of a two-term SumOver does not help (falsified: 645 vs 655 nodes).
+    * ``cvxnonsep_psig40r`` (1e3 shift): not analysed.
+
+    What would change it: the solver becoming invariant to small translations
+    (the #1537 class ``nvs09`` exposes), or a choice of recentred box that avoids
+    the sensitive region, followed by a re-run of the panel with zero losses.
+    """
     return os.environ.get(FLAG, "0") != "0"
 
 
