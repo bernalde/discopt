@@ -279,7 +279,23 @@ TRANSFORM_GROUPS = {
 #: Known corpus failures, per (instance, transform group) so the group that still
 #: passes keeps guarding the instance: ``(reason, the exception the failure raises)``.
 #: Re-measured on main after #1548 / #1549 -- see the PR for the run.
-KNOWN_CORPUS: dict = {}
+KNOWN_CORPUS: dict = {
+    # #1537 E: the feasibility tolerance is not invariant under the transform. The
+    # published incumbent satisfies the transformed rows within the solver's
+    # tolerance but violates the ORIGINAL row by more than 1e-6: ex14_1_9 by
+    # 9.98e-6 after rows x1e-3 (1e-8 in the solver's units), syn05hfsg row 38 by
+    # 6.73e-6 after a 1e6 shift (identical residual in both coordinates, accepted
+    # by verify_point's scale-aware tolerance there, rejected here). Both results
+    # are otherwise honest; #1548 already lists ex14_1_9 under E.
+    ("ex14_1_9.nl", "rows"): (
+        "#1537 E: absolute row tolerance not scale-invariant",
+        KnownFalseCertificate,
+    ),
+    ("syn05hfsg.nl", "shift"): (
+        "#1537 E: row tolerance depends on the coordinates' magnitudes",
+        KnownFalseCertificate,
+    ),
+}
 
 
 def _corpus_params():
