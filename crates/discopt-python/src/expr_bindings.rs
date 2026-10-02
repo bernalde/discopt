@@ -1040,6 +1040,14 @@ impl PyModelRepr {
         // and each of these events could previously have fathomed a live node.
         out.set_item("subtol_repaired", delta.subtol_repaired)?;
         out.set_item("ran", delta.ran)?;
+        // #1568: "expanded" / "declined: <why>" / None (scalar layout or flag off),
+        // so a decline back to the proxy view is counted, not silent.
+        let array_rows: Option<String> = match &delta.array_rows {
+            None => None,
+            Some(Ok(())) => Some("expanded".to_string()),
+            Some(Err(why)) => Some(format!("declined: {why}")),
+        };
+        out.set_item("array_rows", array_rows)?;
         Ok(out.into_any().unbind())
     }
 

@@ -24,7 +24,10 @@
 //! every node. `depth_stride = 1` runs at every node;
 //! `depth_stride = 0` disables the pass.
 
-use crate::expr::{ExprArena, ExprId, ExprNode, IndexElem, IndexSpec, ModelRepr, VarInfo, VarType};
+use crate::expr::{
+    BinOp, ConstraintRepr, ExprArena, ExprId, ExprNode, IndexElem, IndexSpec, ModelRepr, UnOp,
+    VarInfo, VarType,
+};
 use crate::presolve::fbbt::{
     any_empty_beyond, fbbt_with_cutoff, repair_subtol_crossings, Interval, FEAS_TOL,
 };
@@ -79,6 +82,13 @@ pub struct InTreeDelta {
     pub subtol_repaired: usize,
     /// True iff the schedule actually ran the pass at this node.
     pub ran: bool,
+    /// How the per-scalar kernel saw array-valued rows (#1568): `None` when the
+    /// model has a scalar layout (no view at all) or the flag is off;
+    /// `Some(Ok(()))` when [`expand_rows_for_fbbt`] expanded every row
+    /// elementwise; `Some(Err(reason))` when it declined and the proxy view
+    /// ([`scalarize_for_fbbt`]) ran instead. Surfaced so the caller can count a
+    /// decline -- never a silent fallback.
+    pub array_rows: Option<Result<(), String>>,
 }
 
 /// Run in-tree FBBT at a node with the given local bounds.
@@ -115,6 +125,7 @@ pub fn run_in_tree_presolve(
             infeasible: false,
             subtol_repaired: 0,
             ran: false,
+            array_rows: None,
         };
     }
 
@@ -243,6 +254,7 @@ pub fn run_in_tree_presolve(
         infeasible,
         subtol_repaired,
         ran: true,
+        array_rows: None,
     }
 }
 
@@ -368,51 +380,9 @@ fn single_element_flat(spec: &IndexSpec, shape: &[usize]) -> Option<usize> {
 /// layout is not the contiguous `offset_b = sum_{c<b} size_c` layout a node box
 /// is indexed by, or when a `Variable` node disagrees with its block.
 pub fn scalarize_for_fbbt(model: &ModelRepr) -> Result<ScalarFbbtView, String> {
-    let mut run = 0usize;
-    for (b, v) in model.variables.iter().enumerate() {
-        if v.offset != run {
-            return Err(format!(
-                "variable block {b} ('{}') has offset {} but the contiguous layout puts it at {run}",
-                v.name, v.offset
-            ));
-        }
-        if v.lb.len() != v.size || v.ub.len() != v.size {
-            return Err(format!(
-                "variable block {b} ('{}') has size {} but {} lower / {} upper bounds",
-                v.name,
-                v.size,
-                v.lb.len(),
-                v.ub.len()
-            ));
-        }
-        run += v.size;
-    }
-    if run != model.n_vars {
-        return Err(format!(
-            "variable blocks cover {run} scalars but the model declares n_vars = {}",
-            model.n_vars
-        ));
-    }
-    let n_scalar = run;
-
-    let mut variables: Vec<VarInfo> = Vec::with_capacity(n_scalar);
-    for v in &model.variables {
-        for k in 0..v.size {
-            variables.push(VarInfo {
-                name: if v.size == 1 {
-                    v.name.clone()
-                } else {
-                    format!("{}[{k}]", v.name)
-                },
-                var_type: v.var_type,
-                offset: v.offset + k,
-                size: 1,
-                shape: vec![],
-                lb: vec![v.lb[k]],
-                ub: vec![v.ub[k]],
-            });
-        }
-    }
+    check_contiguous_layout(model)?;
+    let n_scalar = model.n_vars;
+    let mut variables = scalar_slots(model);
     let mut proxy_of: Vec<Option<usize>> = vec![None; model.variables.len()];
     let mut proxies: Vec<(usize, usize, usize)> = Vec::new();
 
@@ -513,6 +483,221 @@ pub fn scalarize_for_fbbt(model: &ModelRepr) -> Result<ScalarFbbtView, String> {
     })
 }
 
+/// `DISCOPT_IN_TREE_ARRAY_ROWS` -- **default OFF** (#1568, CLAUDE.md §5).
+///
+/// ON: [`run_in_tree_presolve_scalar`] hands FBBT [`expand_rows_for_fbbt`]'s
+/// view, in which every array-valued constraint row is one scalar row per
+/// element, instead of [`scalarize_for_fbbt`]'s, in which an array-valued
+/// reference is a never-tightened hull proxy. It is bound-changing only on models
+/// with an array-valued row or reference: a scalar-layout model never builds a
+/// view, so the whole `.nl` corpus is unaffected by construction.
+pub fn array_rows_enabled() -> bool {
+    std::env::var("DISCOPT_IN_TREE_ARRAY_ROWS").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// Per-scalar `VarInfo`s for a contiguous layout: slot `j` is flat scalar `j`.
+fn scalar_slots(model: &ModelRepr) -> Vec<VarInfo> {
+    let mut variables: Vec<VarInfo> = Vec::with_capacity(model.n_vars);
+    for v in &model.variables {
+        for k in 0..v.size {
+            variables.push(VarInfo {
+                name: if v.size == 1 {
+                    v.name.clone()
+                } else {
+                    format!("{}[{k}]", v.name)
+                },
+                var_type: v.var_type,
+                offset: v.offset + k,
+                size: 1,
+                shape: vec![],
+                lb: vec![v.lb[k]],
+                ub: vec![v.ub[k]],
+            });
+        }
+    }
+    variables
+}
+
+/// The contiguous `offset_b = sum_{c<b} size_c` layout a node box is indexed by,
+/// or the reason `model` does not have it.
+fn check_contiguous_layout(model: &ModelRepr) -> Result<(), String> {
+    let mut run = 0usize;
+    for (b, v) in model.variables.iter().enumerate() {
+        if v.offset != run {
+            return Err(format!(
+                "variable block {b} ('{}') has offset {} but the contiguous layout puts it at {run}",
+                v.name, v.offset
+            ));
+        }
+        if v.lb.len() != v.size || v.ub.len() != v.size {
+            return Err(format!(
+                "variable block {b} ('{}') has size {} but {} lower / {} upper bounds",
+                v.name,
+                v.size,
+                v.lb.len(),
+                v.ub.len()
+            ));
+        }
+        run += v.size;
+    }
+    if run != model.n_vars {
+        return Err(format!(
+            "variable blocks cover {run} scalars but the model declares n_vars = {}",
+            model.n_vars
+        ));
+    }
+    Ok(())
+}
+
+/// A fully scalar FBBT view of `model`: every array-valued row expanded to one
+/// scalar row per element (issue #1568).
+///
+/// Built from [`crate::expand::expand`] -- the single row-major fan-out the AD
+/// tape and the `.nl` writer already use -- by lowering each scalar instruction
+/// back into an arena node. Variable references become the size-1 slot of their
+/// flat scalar, so FBBT reads and tightens each element on its own; there are no
+/// proxies. Each source constraint's sense and right-hand side apply to every
+/// row it expands to, which is what an elementwise `body sense rhs` means.
+///
+/// Soundness: the view denotes the same feasible set over the same scalars --
+/// the expansion is exact (it refuses rather than approximates) and the
+/// lowering is one node per instruction. FBBT on it is therefore valid for the
+/// node box, and only ever intersects it.
+///
+/// Refuses (`Err` naming why) when `expand` refuses or the layout is not
+/// contiguous; the caller then falls back to [`scalarize_for_fbbt`].
+pub fn expand_rows_for_fbbt(model: &ModelRepr) -> Result<ScalarFbbtView, String> {
+    use crate::expand::{
+        expand, func_from_code, OP_ABS, OP_ADD, OP_CONST, OP_DIV, OP_FUNC_BASE, OP_MUL, OP_NEG,
+        OP_POW, OP_SUB, OP_SUMOVER, OP_VAR,
+    };
+    check_contiguous_layout(model)?;
+    let n_scalar = model.n_vars;
+    let prog = expand(model).map_err(|e| format!("expand refused: {e}"))?;
+    if prog.rows_per_constraint.len() != model.constraints.len() {
+        return Err(format!(
+            "expand returned {} row groups for {} constraints",
+            prog.rows_per_constraint.len(),
+            model.constraints.len()
+        ));
+    }
+    let variables = scalar_slots(model);
+
+    let n_inst = prog.op.len();
+    let mut arena = ExprArena::with_capacity(n_inst);
+    let mut ids: Vec<ExprId> = Vec::with_capacity(n_inst);
+    let operand = |ids: &Vec<ExprId>, i: usize, j: i64| -> Result<ExprId, String> {
+        if j < 0 || (j as usize) >= i {
+            return Err(format!(
+                "instruction {i} has operand {j}, not an earlier instruction"
+            ));
+        }
+        Ok(ids[j as usize])
+    };
+    for i in 0..n_inst {
+        let op = prog.op[i];
+        let node = match op {
+            OP_CONST => ExprNode::Constant(prog.k[i]),
+            OP_VAR => {
+                let k = prog.k[i];
+                if !(k >= 0.0 && k.fract() == 0.0 && (k as usize) < n_scalar) {
+                    return Err(format!("instruction {i} references variable slot {k}"));
+                }
+                let slot = k as usize;
+                ExprNode::Variable {
+                    name: variables[slot].name.clone(),
+                    index: slot,
+                    size: 1,
+                    shape: vec![],
+                }
+            }
+            OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_POW => ExprNode::BinaryOp {
+                op: match op {
+                    OP_ADD => BinOp::Add,
+                    OP_SUB => BinOp::Sub,
+                    OP_MUL => BinOp::Mul,
+                    OP_DIV => BinOp::Div,
+                    _ => BinOp::Pow,
+                },
+                left: operand(&ids, i, prog.a[i])?,
+                right: operand(&ids, i, prog.b[i])?,
+            },
+            OP_NEG | OP_ABS => ExprNode::UnaryOp {
+                op: if op == OP_NEG { UnOp::Neg } else { UnOp::Abs },
+                operand: operand(&ids, i, prog.a[i])?,
+            },
+            OP_SUMOVER => {
+                let (lo, hi) = (prog.args_ptr[i] as usize, prog.args_ptr[i + 1] as usize);
+                let mut terms = Vec::with_capacity(hi - lo);
+                for &j in &prog.args_flat[lo..hi] {
+                    terms.push(operand(&ids, i, j)?);
+                }
+                ExprNode::SumOver { terms }
+            }
+            c if c >= OP_FUNC_BASE => {
+                let func = func_from_code(c - OP_FUNC_BASE)
+                    .ok_or_else(|| format!("instruction {i} has unknown function code {c}"))?;
+                ExprNode::FunctionCall {
+                    func,
+                    args: vec![operand(&ids, i, prog.a[i])?],
+                }
+            }
+            other => return Err(format!("instruction {i} has unsupported opcode {other}")),
+        };
+        ids.push(arena.add(node));
+    }
+    let root = |r: i64| -> Result<ExprId, String> {
+        if r < 0 || (r as usize) >= n_inst {
+            return Err(format!("root {r} is not an instruction"));
+        }
+        Ok(ids[r as usize])
+    };
+
+    let mut constraints = Vec::with_capacity(prog.row_roots.len());
+    let mut next = 0usize;
+    for (c, &n_rows) in model.constraints.iter().zip(&prog.rows_per_constraint) {
+        for r in 0..n_rows {
+            constraints.push(ConstraintRepr {
+                body: root(prog.row_roots[next])?,
+                sense: c.sense,
+                rhs: c.rhs,
+                name: c.name.as_ref().map(|n| {
+                    if n_rows == 1 {
+                        n.clone()
+                    } else {
+                        format!("{n}[{r}]")
+                    }
+                }),
+            });
+            next += 1;
+        }
+    }
+    if next != prog.row_roots.len() {
+        return Err(format!(
+            "row groups cover {next} rows but expand returned {}",
+            prog.row_roots.len()
+        ));
+    }
+
+    Ok(ScalarFbbtView {
+        model: ModelRepr {
+            arena,
+            objective: root(prog.objective_root)?,
+            objective_sense: model.objective_sense,
+            constraints,
+            n_vars: n_scalar,
+            variables,
+        },
+        n_scalar,
+        proxies: Vec::new(),
+    })
+}
+
 /// [`run_in_tree_presolve`] on a PER-SCALAR node box (issue #1513).
 ///
 /// `node_lb` / `node_ub` have one entry per scalar variable (`model.n_vars`),
@@ -543,10 +728,19 @@ pub fn run_in_tree_presolve_scalar(
             model, node_lb, node_ub, node_depth, incumbent, opts,
         ));
     }
-    let view = scalarize_for_fbbt(model)?;
-    Ok(run_in_tree_presolve_view(
-        &view, node_lb, node_ub, node_depth, incumbent, opts,
-    ))
+    let (view, array_rows) = if array_rows_enabled() {
+        match expand_rows_for_fbbt(model) {
+            Ok(v) => (v, Some(Ok(()))),
+            // The proxy view is the pre-#1568 behaviour, sound and looser; the
+            // reason travels back on the delta so the decline is counted.
+            Err(why) => (scalarize_for_fbbt(model)?, Some(Err(why))),
+        }
+    } else {
+        (scalarize_for_fbbt(model)?, None)
+    };
+    let mut d = run_in_tree_presolve_view(&view, node_lb, node_ub, node_depth, incumbent, opts);
+    d.array_rows = array_rows;
+    Ok(d)
 }
 
 /// Run the kernel on a prebuilt [`ScalarFbbtView`] (per-scalar box in and out).
@@ -1106,6 +1300,150 @@ mod tests {
         let d = run_in_tree_presolve_scalar(&model, &[4.0, 4.0], &[10.0, 10.0], 0, None, &opts1())
             .unwrap();
         assert!(d.ran && d.infeasible);
+    }
+
+    /// `y - x == 0` written as ONE array row over x, y ∈ [0,10]^2 (#1568), and
+    /// `z - sigmoid(w) == 0` as one array row over w ∈ [-4,4]^2, z ∈ [0,1]^2.
+    fn array_rows_model() -> ModelRepr {
+        let mut arena = ExprArena::new();
+        let x = arr_var(&mut arena, "x", 0, vec![2]);
+        let y = arr_var(&mut arena, "y", 1, vec![2]);
+        let w = arr_var(&mut arena, "w", 2, vec![2]);
+        let z = arr_var(&mut arena, "z", 3, vec![2]);
+        let lin = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Sub,
+            left: y,
+            right: x,
+        });
+        let sw = arena.add(ExprNode::FunctionCall {
+            func: crate::expr::MathFunc::Sigmoid,
+            args: vec![w],
+        });
+        let nl = arena.add(ExprNode::BinaryOp {
+            op: BinOp::Sub,
+            left: z,
+            right: sw,
+        });
+        let z0 = elem(&mut arena, z, 0);
+        let eq = |body| ConstraintRepr {
+            body,
+            sense: ConstraintSense::Eq,
+            rhs: 0.0,
+            name: Some("row".to_string()),
+        };
+        ModelRepr {
+            arena,
+            objective: z0,
+            objective_sense: ObjectiveSense::Minimize,
+            constraints: vec![eq(lin), eq(nl)],
+            variables: vec![
+                arr_vinfo("x", 0, vec![2], 0.0, 10.0),
+                arr_vinfo("y", 2, vec![2], 0.0, 10.0),
+                arr_vinfo("w", 4, vec![2], -4.0, 4.0),
+                arr_vinfo("z", 6, vec![2], 0.0, 1.0),
+            ],
+            n_vars: 8,
+        }
+    }
+
+    fn sigmoid(t: f64) -> f64 {
+        1.0 / (1.0 + (-t).exp())
+    }
+
+    /// #1568: through an array row the proxy view derives NOTHING per element
+    /// (the control), and the expanded view tightens each element on its own.
+    #[test]
+    fn expanded_rows_tighten_through_array_rows() {
+        let model = array_rows_model();
+        // x ∈ [0,1]^2 narrows y; w0 ∈ [1,2], w1 ∈ [-2,-1] narrows z elementwise.
+        let lb = [0.0, 0.0, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0];
+        let ub = [1.0, 1.0, 10.0, 10.0, 2.0, -1.0, 1.0, 1.0];
+
+        let proxy = scalarize_for_fbbt(&model).unwrap();
+        assert_eq!(proxy.n_proxies(), 4);
+        let p = run_in_tree_presolve_view(&proxy, &lb, &ub, 0, None, &opts1());
+        assert!(p.ran && !p.infeasible);
+        assert_eq!(
+            p.bounds_tightened, 0,
+            "control: hull proxies derive nothing"
+        );
+
+        let view = expand_rows_for_fbbt(&model).expect("every node here expands");
+        assert_eq!(view.n_proxies(), 0);
+        assert_eq!(
+            view.model().constraints.len(),
+            4,
+            "2 array rows x 2 elements"
+        );
+        let d = run_in_tree_presolve_view(&view, &lb, &ub, 0, None, &opts1());
+        assert!(d.ran && !d.infeasible);
+        for k in 0..2 {
+            assert!(d.ub[2 + k] <= 1.0 + 1e-9, "y[{k}] ub = {}", d.ub[2 + k]);
+        }
+        assert!(d.lb[6] >= sigmoid(1.0) - 1e-9 && d.ub[6] <= sigmoid(2.0) + 1e-9);
+        assert!(d.lb[7] >= sigmoid(-2.0) - 1e-9 && d.ub[7] <= sigmoid(-1.0) + 1e-9);
+        // The two z elements land in DISJOINT intervals -- impossible for a hull.
+        assert!(d.ub[7] < d.lb[6]);
+    }
+
+    /// Soundness and the differential bar on random node boxes: no feasible
+    /// point inside the box is cut, and the expanded box is never looser than
+    /// the proxy box.
+    #[test]
+    fn expanded_rows_never_cut_a_feasible_point() {
+        let model = array_rows_model();
+        let proxy = scalarize_for_fbbt(&model).unwrap();
+        let view = expand_rows_for_fbbt(&model).unwrap();
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let root_lb = [0.0, 0.0, 0.0, 0.0, -4.0, -4.0, 0.0, 0.0];
+        let root_ub = [10.0, 10.0, 10.0, 10.0, 4.0, 4.0, 1.0, 1.0];
+        let (mut points, mut boxes) = (0usize, 0usize);
+        for _ in 0..300 {
+            // A feasible point, then a random node box that contains it.
+            let x = [10.0 * rnd(), 10.0 * rnd()];
+            let w = [8.0 * rnd() - 4.0, 8.0 * rnd() - 4.0];
+            let pt = [
+                x[0],
+                x[1],
+                x[0],
+                x[1],
+                w[0],
+                w[1],
+                sigmoid(w[0]),
+                sigmoid(w[1]),
+            ];
+            let mut lb = root_lb;
+            let mut ub = root_ub;
+            for j in 0..8 {
+                lb[j] = root_lb[j] + (pt[j] - root_lb[j]) * rnd();
+                ub[j] = pt[j] + (root_ub[j] - pt[j]) * rnd();
+            }
+            let d = run_in_tree_presolve_view(&view, &lb, &ub, 0, None, &opts1());
+            let p = run_in_tree_presolve_view(&proxy, &lb, &ub, 0, None, &opts1());
+            assert!(!d.infeasible, "a box holding a feasible point was fathomed");
+            for j in 0..8 {
+                assert!(
+                    d.lb[j] <= pt[j] + 1e-7 && pt[j] <= d.ub[j] + 1e-7,
+                    "slot {j}: feasible {} cut by [{}, {}]",
+                    pt[j],
+                    d.lb[j],
+                    d.ub[j]
+                );
+                assert!(
+                    d.lb[j] >= p.lb[j] - 1e-9 && d.ub[j] <= p.ub[j] + 1e-9,
+                    "looser at {j}"
+                );
+                points += 1;
+            }
+            boxes += 1;
+        }
+        assert_eq!((boxes, points), (300, 2400));
     }
 
     /// On a scalar-layout model the per-scalar entry point IS the per-block

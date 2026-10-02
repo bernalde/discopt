@@ -2347,6 +2347,37 @@ def _in_tree_presolve_skipped() -> dict[str, int]:
     return dict(_IN_TREE_PRESOLVE_SKIPPED)
 
 
+# #1568: how the per-scalar kernel saw array-valued rows, per node call, when
+# ``DISCOPT_IN_TREE_ARRAY_ROWS`` is on (read in Rust, ``array_rows_enabled``):
+# ``expanded`` -- every row expanded elementwise; ``declined`` -- the expansion
+# refused and the proxy view (the pre-#1568 behaviour) ran instead. A decline is
+# a missing reduction, never a wrong bound, and is WARNED once per reason.
+_IN_TREE_ARRAY_ROWS: dict[str, int] = {}
+_IN_TREE_ARRAY_ROWS_DECLINED_SEEN: set[str] = set()
+
+
+def _in_tree_array_rows() -> dict[str, int]:
+    """Per-node outcomes of the #1568 array-row expansion this solve."""
+    return dict(_IN_TREE_ARRAY_ROWS)
+
+
+def _note_array_rows(delta: dict) -> None:
+    """Count one kernel call's ``array_rows`` outcome (#1568)."""
+    outcome = delta.get("array_rows")
+    if outcome is None:
+        return
+    key = "expanded" if outcome == "expanded" else "declined"
+    _IN_TREE_ARRAY_ROWS[key] = _IN_TREE_ARRAY_ROWS.get(key, 0) + 1
+    if key == "declined" and outcome not in _IN_TREE_ARRAY_ROWS_DECLINED_SEEN:
+        _IN_TREE_ARRAY_ROWS_DECLINED_SEEN.add(outcome)
+        logger.warning(
+            "in-tree FBBT array-row expansion (DISCOPT_IN_TREE_ARRAY_ROWS) %s; the "
+            "proxy view ran instead (#1568). Sound -- a missing reduction, not a wrong "
+            "bound.",
+            outcome,
+        )
+
+
 def _in_tree_array_fbbt_enabled() -> bool:
     """Whether in-tree FBBT runs on models with array variable blocks (#1513).
 
@@ -12901,6 +12932,8 @@ def solve_model(
     _IN_TREE_PRESOLVE_GLOBAL_CALLS = 0  # PF1 telemetry reset (issue #632)
     _IN_TREE_PRESOLVE_NLPBB_CALLS = 0  # #1513
     _IN_TREE_PRESOLVE_SKIPPED.clear()  # #1513
+    _IN_TREE_ARRAY_ROWS.clear()  # #1568
+    _IN_TREE_ARRAY_ROWS_DECLINED_SEEN.clear()
     _model_repr = None
     try:
         from discopt._rust import model_to_repr
@@ -16435,6 +16468,7 @@ def solve_model(
                     probing=_itp_probing,
                     probe_max_vars=_itp_probe_max,
                 )
+                _note_array_rows(_itp_delta)
                 if not _itp_delta["ran"]:
                     continue
                 _IN_TREE_PRESOLVE_GLOBAL_CALLS += 1
@@ -19884,6 +19918,9 @@ def solve_model(
     if _rf_stats is not None:
         for _rfk, _rfv in _rf_stats.items():
             _solver_stats[f"row_filter/{_rfk}"] = float(_rfv)
+    # #1568: array-row expansion outcomes, only when the flag produced any.
+    for _ark, _arv in _IN_TREE_ARRAY_ROWS.items():
+        _solver_stats[f"reduce/array_rows_{_ark}"] = float(_arv)
     # C-42 Part 2: node solves the global-bound-stall governor re-separated
     # (driver-side; the relaxer's ``lazy_reseparations`` counts the stride net).
     if _lazy_resep_fires > 0:
@@ -21882,6 +21919,7 @@ def _solve_nlp_bb(
                     probing=_itp_probing,
                     probe_max_vars=_itp_probe_max,
                 )
+                _note_array_rows(delta)
                 if delta["ran"]:
                     global _IN_TREE_PRESOLVE_NLPBB_CALLS
                     _IN_TREE_PRESOLVE_NLPBB_CALLS += 1

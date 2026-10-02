@@ -1,0 +1,173 @@
+"""#1568: in-tree FBBT through array-valued rows (``DISCOPT_IN_TREE_ARRAY_ROWS``).
+
+The per-scalar FBBT view (#1513) points every array-valued reference at a
+never-tightened hull proxy, so a row such as ``zh - (sum(W.T * x, axis=1) + b) == 0``
+or ``z - sigmoid(zh) == 0`` -- every ``discopt.ml`` layer -- tightens nothing
+per element, and branching on the inputs never reaches the activations. With the
+flag on, the view expands each array row into one scalar row per element.
+"""
+
+from __future__ import annotations
+
+import discopt.modeling as dm
+import numpy as np
+import pytest
+from discopt._rust import model_to_repr
+
+FLAG = "DISCOPT_IN_TREE_ARRAY_ROWS"
+
+
+def _net(width: int = 10, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    w1 = rng.normal(0, 1 / np.sqrt(2), size=(2, width))
+    b1 = rng.normal(0, 0.1, size=width)
+    w2 = rng.normal(0, 1 / np.sqrt(width), size=(width, 1))
+    b2 = rng.normal(0, 0.1, size=1)
+    return w1, b1, w2, b2
+
+
+def _sigmoid(t):
+    return 1.0 / (1.0 + np.exp(-t))
+
+
+def _layer_model(vector_rows: bool):
+    """One sigmoid layer, array variables, rows written as arrays or per element."""
+    w1, b1, w2, b2 = _net()
+    n = len(b1)
+    zl = b1 + np.minimum(-w1, w1).sum(0)
+    zu = b1 + np.maximum(-w1, w1).sum(0)
+    m = dm.Model("layer")
+    x = m.continuous("x", shape=(2,), lb=-1, ub=1)
+    zh = m.continuous("zh", shape=(n,), lb=zl, ub=zu)
+    z = m.continuous("z", shape=(n,), lb=_sigmoid(zl), ub=_sigmoid(zu))
+    if vector_rows:
+        m.subject_to(zh - (dm.sum(w1.T * x, axis=1) + b1) == 0)
+        m.subject_to(z - dm.sigmoid(zh) == 0)
+    else:
+        for j in range(n):
+            m.subject_to(zh[j] == sum(float(w1[i, j]) * x[i] for i in range(2)) + float(b1[j]))
+            m.subject_to(z[j] == dm.sigmoid(zh[j]))
+    m.minimize(sum(float(w2[j, 0]) * z[j] for j in range(n)) + float(b2[0]))
+    return m
+
+
+def _box(m):
+    lb = np.concatenate([np.ravel(np.broadcast_to(v.lb, v.shape)) for v in m._variables])
+    ub = np.concatenate([np.ravel(np.broadcast_to(v.ub, v.shape)) for v in m._variables])
+    return lb.astype(float), ub.astype(float)
+
+
+def _kernel(m, lb, ub):
+    repr_ = model_to_repr(m, getattr(m, "_builder", None))
+    return repr_.in_tree_presolve(lb.copy(), ub.copy(), 0, 1, 16, 1e-9, None, False, 0)
+
+
+def _halved_box(m):
+    lb, ub = _box(m)
+    lb[0], ub[0] = 0.0, 1.0  # x0 in [0, 1]
+    lb[1], ub[1] = -1.0, 0.0  # x1 in [-1, 0]
+    return lb, ub
+
+
+def test_flag_off_proxy_view_tightens_nothing_through_array_rows(monkeypatch):
+    """The control: the pre-#1568 behaviour, pinned so a fix is measurable."""
+    monkeypatch.delenv(FLAG, raising=False)
+    m = _layer_model(vector_rows=True)
+    d = _kernel(m, *_halved_box(m))
+    assert d["ran"] and not d["infeasible"]
+    assert d["array_rows"] is None
+    assert d["bounds_tightened"] == 0
+
+
+def test_flag_on_expands_rows_and_matches_the_scalar_row_model(monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    vec = _layer_model(vector_rows=True)
+    lb, ub = _halved_box(vec)
+    d = _kernel(vec, lb, ub)
+    assert d["ran"] and not d["infeasible"]
+    assert d["array_rows"] == "expanded"
+    assert d["bounds_tightened"] > 0
+    n = 10
+    zs = slice(2 + n, 2 + 2 * n)
+    width = (np.asarray(d["ub"]) - np.asarray(d["lb"]))[zs] / (ub - lb)[zs]
+    assert width.mean() < 0.6, width  # the activations now narrow with the inputs
+
+    # The expanded view IS the per-element model: same box out, to round-off.
+    sca = _layer_model(vector_rows=False)
+    ds = _kernel(sca, lb, ub)
+    np.testing.assert_allclose(d["lb"], ds["lb"], rtol=0, atol=1e-9)
+    np.testing.assert_allclose(d["ub"], ds["ub"], rtol=0, atol=1e-9)
+
+
+def test_flag_on_never_cuts_a_feasible_point(monkeypatch):
+    """Forward-pass points of random inputs inside random node boxes stay inside."""
+    monkeypatch.setenv(FLAG, "1")
+    w1, b1, _, _ = _net()
+    m = _layer_model(vector_rows=True)
+    root_lb, root_ub = _box(m)
+    rng = np.random.default_rng(1568)
+    checked = 0
+    for _ in range(60):
+        x = rng.uniform(-1, 1, size=2)
+        zh = x @ w1 + b1
+        pt = np.concatenate([x, zh, _sigmoid(zh)])
+        lb = root_lb + (pt - root_lb) * rng.uniform(0, 1, size=pt.size)
+        ub = pt + (root_ub - pt) * rng.uniform(0, 1, size=pt.size)
+        d = _kernel(m, lb, ub)
+        assert d["array_rows"] == "expanded"
+        assert not d["infeasible"], "a box holding a feasible point was fathomed"
+        assert np.all(np.asarray(d["lb"]) <= pt + 1e-7)
+        assert np.all(pt <= np.asarray(d["ub"]) + 1e-7)
+        checked += pt.size
+    assert checked == 60 * 22
+
+
+def test_declined_expansion_falls_back_to_the_proxy_view_bit_identically(monkeypatch):
+    """A row ``expand`` refuses (``dm.maximum`` has no scalar opcode) runs the
+    pre-#1568 proxy view, and says so instead of failing silently."""
+
+    def build():
+        m = dm.Model("decline")
+        x = m.continuous("x", shape=(3,), lb=-2, ub=2)
+        y = m.continuous("y", shape=(3,), lb=-10, ub=10)
+        m.subject_to(y - dm.maximum(x, 0.5) == 0)
+        m.minimize(dm.sum(y))
+        return m
+
+    m = build()
+    lb, ub = _box(m)
+    lb[:3], ub[:3] = 0.0, 1.0
+    monkeypatch.delenv(FLAG, raising=False)
+    off = _kernel(build(), lb, ub)
+    monkeypatch.setenv(FLAG, "1")
+    on = _kernel(build(), lb, ub)
+    assert off["array_rows"] is None
+    assert on["array_rows"].startswith("declined: expand refused")
+    for k in ("lb", "ub"):
+        np.testing.assert_array_equal(on[k], off[k])
+    assert on["bounds_tightened"] == off["bounds_tightened"]
+
+
+@pytest.mark.slow
+def test_discopt_ml_sigmoid_layer_certifies_with_the_flag(monkeypatch):
+    """The issue's case end to end: the ``discopt.ml`` full-space 2-10-1 sigmoid
+    network. Flag off it does not certify in 30 s (bound stalls near the interval
+    bound -0.313); with the flag it certifies the optimum -0.220785, the value the
+    per-element hand-built model certifies in 3 nodes."""
+    from discopt.ml import add_predictor
+    from discopt.ml.network import DenseLayer, NetworkDefinition
+
+    monkeypatch.setenv(FLAG, "1")
+    w1, b1, w2, b2 = _net()
+    m = dm.Model("nn")
+    x = m.continuous("x", shape=(2,), lb=-1.0, ub=1.0)
+    net = NetworkDefinition(
+        [DenseLayer(w1, b1, "sigmoid"), DenseLayer(w2, b2, "linear")],
+        input_bounds=(np.full(2, -1.0), np.full(2, 1.0)),
+    )
+    y, _ = add_predictor(m, x, net, method="full_space")
+    m.minimize(y[0])
+    r = m.solve(time_limit=30)
+    assert r.gap_certified and r.status == "optimal"
+    assert r.objective == pytest.approx(-0.220785, abs=1e-5)
+    assert (r.solver_stats or {}).get("reduce/array_rows_expanded", 0) > 0

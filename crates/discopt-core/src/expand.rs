@@ -432,6 +432,33 @@ pub(crate) fn func_code(f: MathFunc) -> Option<i32> {
     })
 }
 
+/// The inverse of [`func_code`]: the [`MathFunc`] an `OP_FUNC_BASE + code`
+/// instruction applies, or `None` for a code `func_code` never emits.
+/// `func_code_round_trips` pins the two together.
+pub(crate) fn func_from_code(code: i32) -> Option<MathFunc> {
+    Some(match code {
+        0 => MathFunc::Exp,
+        1 => MathFunc::Log,
+        2 => MathFunc::Log2,
+        3 => MathFunc::Log10,
+        4 => MathFunc::Sqrt,
+        5 => MathFunc::Sin,
+        6 => MathFunc::Cos,
+        7 => MathFunc::Tan,
+        8 => MathFunc::Atan,
+        9 => MathFunc::Sinh,
+        10 => MathFunc::Cosh,
+        11 => MathFunc::Asin,
+        12 => MathFunc::Acos,
+        13 => MathFunc::Tanh,
+        14 => MathFunc::Abs,
+        15 => MathFunc::Log1p,
+        16 => MathFunc::Sigmoid,
+        17 => MathFunc::Softplus,
+        _ => return None,
+    })
+}
+
 /// Append-only instruction buffer. Operands always have lower indices than the
 /// instruction referencing them, because nothing is emitted before its operands.
 struct Emitter {
@@ -794,6 +821,56 @@ fn expand_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn func_code_round_trips() {
+        // Every MathFunc func_code covers comes back from func_from_code, and no
+        // other code decodes: the in-tree FBBT lowering (#1568) depends on both.
+        let all = [
+            MathFunc::Exp,
+            MathFunc::Log,
+            MathFunc::Log2,
+            MathFunc::Log10,
+            MathFunc::Sqrt,
+            MathFunc::Sin,
+            MathFunc::Cos,
+            MathFunc::Tan,
+            MathFunc::Atan,
+            MathFunc::Sinh,
+            MathFunc::Cosh,
+            MathFunc::Asin,
+            MathFunc::Acos,
+            MathFunc::Tanh,
+            MathFunc::Abs,
+            MathFunc::Sign,
+            MathFunc::Min,
+            MathFunc::Max,
+            MathFunc::Prod,
+            MathFunc::Norm2,
+            MathFunc::Asinh,
+            MathFunc::Acosh,
+            MathFunc::Atanh,
+            MathFunc::Erf,
+            MathFunc::Log1p,
+            MathFunc::Sigmoid,
+            MathFunc::Softplus,
+            MathFunc::Entropy,
+            MathFunc::Norm1,
+            MathFunc::NormInf,
+            MathFunc::NormP(3),
+        ];
+        let mut covered = 0;
+        for f in all {
+            if let Some(c) = func_code(f) {
+                assert_eq!(func_from_code(c), Some(f), "{f:?} (code {c})");
+                covered += 1;
+            }
+        }
+        assert_eq!(covered, 18);
+        for c in [-1, 18, 19, 100] {
+            assert_eq!(func_from_code(c), None);
+        }
+    }
 
     fn shape_of(spec: IndexSpec, base: &[usize]) -> Vec<usize> {
         index_result_shape(&spec, base).expect("index is valid")
