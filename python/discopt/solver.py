@@ -6420,10 +6420,8 @@ def _withhold_unresolved_objective_certificate(
     )
     result.gap_certified = False
     result.status = "feasible"
-    result.bound = None
+    result._set_bound(None, valid=False)
     result.gap = None
-    result.bound_valid = False
-    result.bound_source = None
     result.solver_stats["certificate/objective_unresolved"] = 1.0
 
 
