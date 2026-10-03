@@ -2,9 +2,9 @@
 
 The pass rebuilds a model whose boxes sit far from the origin in coordinates
 ``x = z + c`` with every scalar affine subtree constant-folded, solves that, and
-maps the result back (``discopt/modeling/_recentre.py``). Default OFF (CLAUDE.md
-§5); these tests pin its mechanics and its fixes with the flag ON, and that the
-flag OFF changes nothing.
+maps the result back (``discopt/modeling/_recentre.py``). Default ON since the
+2026-10-03 graduation panel (CLAUDE.md §5); these tests pin its mechanics and its
+fixes with the flag ON, that it is on by default, and that ``=0`` changes nothing.
 """
 
 from __future__ import annotations
@@ -145,26 +145,35 @@ def _shifted_qp():
     return m
 
 
+def test_flag_is_on_by_default(monkeypatch):
+    """Graduated (#1537): with ``DISCOPT_RECENTRE`` unset the pass runs and moves
+    the far-offset variables, exactly as with ``=1``."""
+    monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
+    r = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert _moved(r) == 2.0
+    monkeypatch.setenv("DISCOPT_RECENTRE", "1")
+    r1 = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert (r.status, r.objective, r.bound, r.node_count, r.gap_certified) == (
+        r1.status,
+        r1.objective,
+        r1.bound,
+        r1.node_count,
+        r1.gap_certified,
+    )
+
+
 def test_flag_off_is_untouched(monkeypatch):
-    """Flag OFF the pass is never entered and the solve is bound-neutral: unset
-    and ``=0`` give identical node count, objective and bound, and a ``recentre``
-    that raises if called changes nothing either."""
+    """``DISCOPT_RECENTRE=0`` (the opt-out) never enters the pass: a ``recentre``
+    that raises if called changes nothing, and nothing is reported as moved."""
     import discopt.modeling._recentre as rmod
 
     def unreachable(*a, **k):
         raise AssertionError("recentre() was called with the flag OFF")
 
     monkeypatch.setattr(rmod, "recentre", unreachable)
-    runs = []
-    for value in (None, "0"):
-        if value is None:
-            monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
-        else:
-            monkeypatch.setenv("DISCOPT_RECENTRE", value)
-        r = _shifted_qp().solve(time_limit=20, deterministic=True)
-        assert _moved(r) is None and "recentre/skipped" not in r.solver_stats
-        runs.append((r.status, r.objective, r.bound, r.node_count, r.gap_certified))
-    assert runs[0] == runs[1]
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
+    r = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert _moved(r) is None and "recentre/skipped" not in r.solver_stats
 
 
 # ── the fixes (flag ON). Each was a false certificate or a crash on the main of
