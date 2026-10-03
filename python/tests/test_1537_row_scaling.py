@@ -219,13 +219,12 @@ def test_row_scaled_m3_certifies_with_row_prescale(monkeypatch):
     assert on.bound <= 37.8 + 1e-6
     assert on.objective == pytest.approx(37.8, abs=1e-4)
 
-    # Graduated default (#1537): with the variable unset the pre-pass runs.
+    # Default (#1537): the flag is default OFF (the re-panel lost a certificate),
+    # so with the variable unset the legacy factors run and the guard fires.
     monkeypatch.delenv("DISCOPT_LP_ROW_PRESCALE")
     profile_reset_py()
-    dflt = _per_row_scaled("m3.nl", 6.0).solve(time_limit=60)
-    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) == 0
-    assert dflt.gap_certified, (dflt.status, dflt.bound)
-    assert dflt.bound <= 37.8 + 1e-6
+    _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
 
 
 _HDA_ROOT_PROBE = """

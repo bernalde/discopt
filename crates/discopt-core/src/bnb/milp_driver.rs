@@ -1365,10 +1365,14 @@ fn has_unscalable_tiny_entry_with(
                 continue;
             }
             // The rhs floor: `1` in the caller's units with the flag off (the
-            // pre-#1537 guard, bit-identical); with it on, the row's own largest
-            // scaled magnitude, so the floor moves with the row and the verdict is
-            // row-scale invariant. (A literal `1` after the geometric-mean pre-pass
-            // would sit at the row's geometric mean instead -- a different, row-
+            // pre-#1537 guard, bit-identical). With it on, the floor is the row's own
+            // largest scaled magnitude. Dividing the test by `row_max[i]` turns it
+            // into the legacy floor-`1` test on the row normalised by its max, so
+            // this is the legacy threshold on a max-normalised row, not a looser
+            // one, and the verdict is row-scale invariant. The test
+            // `prescale_gate_floor_is_the_legacy_floor_on_max_normalised_rows`
+            // checks this numerically. (A literal `1` after the geometric-mean
+            // pre-pass would sit at the row's geometric mean instead, a row-
             // dependent threshold that withdrew the #1509 surrogate's certificate.)
             let floor = if prescale { row_max[i] } else { 1.0 };
             if open || a * reach > TINY_ENTRY_ROW_TOL * (rs[i] * b[i]).abs().max(floor) {
@@ -8812,8 +8816,8 @@ mod tiny_entry_tests {
     use super::*;
 
     /// The #1296 grid below was written against the raw-matrix (pre-#1537) gate,
-    /// so it is pinned to the `DISCOPT_LP_ROW_PRESCALE=0` arm; the graduated
-    /// default is covered by `row_prescale_gate_grid`.
+    /// so it is pinned to the `DISCOPT_LP_ROW_PRESCALE=0` arm; the opt-in
+    /// arm is covered by `row_prescale_gate_grid`.
     fn gate(dense: &[f64], m: usize, l: &[f64], u: &[f64], b: &[f64]) -> bool {
         gate_arm(dense, m, l, u, b, false)
     }
@@ -8823,7 +8827,7 @@ mod tiny_entry_tests {
         has_unscalable_tiny_entry_with(&SparseCols::from_dense(dense, m, n), m, n, l, u, b, pre)
     }
 
-    /// The #1296 grid under the graduated row pre-pass (#1537). Every verdict is
+    /// The #1296 grid under the opt-in row pre-pass (#1537). Every verdict is
     /// unchanged except the last case, whose small entry is the ONLY entry of its
     /// row (`1e-11·x0 <= 1`): that row is `x0 <= 1e11` written at a different scale,
     /// the pre-pass normalises it, equilibration no longer reads it as noise, and
@@ -8890,6 +8894,80 @@ mod tiny_entry_tests {
             checked += 1;
         }
         assert_eq!(checked, 7);
+    }
+
+    /// The gate's rhs floor under the pre-pass (#1537). With the pre-pass on, the
+    /// rhs test is `a * reach > TOL * max(|r_i b_i|, row_max_i)` in pre-passed
+    /// units. Dividing both sides by `row_max_i` gives
+    /// `(a / row_max_i) * reach > TOL * max(|r_i b_i| / row_max_i, 1)`, which is the
+    /// legacy floor-`1` test on the row divided by its own largest magnitude. So
+    /// the floor is not a looser threshold. It is the legacy threshold, applied to
+    /// a max-normalised row instead of to whatever scale the caller wrote. This
+    /// test checks that numerically on the #1296 grid. For every case and every
+    /// row scaling `D` (pow2 and non-pow2, up to 10^±6):
+    ///   ON(D·A, D·b) == OFF(maxnorm(A), maxnorm(b))   (the equivalence), and
+    ///   ON(D·A, D·b) == ON(A, b)                      (row-scale invariance).
+    /// The OFF arm is checked against the legacy verdicts so its floor is still
+    /// `1`. A scaling exists that changes an OFF verdict, which shows the
+    /// invariance check is not vacuous.
+    #[test]
+    fn prescale_gate_floor_is_the_legacy_floor_on_max_normalised_rows() {
+        let b = [1.0, 0.0];
+        #[allow(clippy::type_complexity)]
+        let cases: [(&[f64], &[f64], &[f64], bool); 7] = [
+            (&[1.0, 2.0, 0.0, 3.0], &[0.0, 0.0], &[1.0, INF], false),
+            (&[1.0, -1e-11, 0.0, 1.0], &[0.0, 0.0], &[1.0, INF], true),
+            (&[1.0, -1e-11, 0.0, 1.0], &[0.0, -INF], &[1.0, 5.0], true),
+            (&[1.0, -1e-11, 0.0, 1.0], &[0.0, 0.0], &[1.0, 10.0], false),
+            (&[1.0, -1e-11, 0.0, 1.0], &[0.0, 0.0], &[1.0, 1e11], true),
+            (&[1e-11, 0.0, 0.0, 1.0], &[0.0, 0.0], &[INF, INF], false),
+            (&[1e-11, 0.0, 1.0, 1.0], &[0.0, 0.0], &[INF, 1.0], true),
+        ];
+        let scalings: [[f64; 2]; 6] = [
+            [1.0, 1.0],
+            [1e3, 1e-4],
+            [3.0, 0.7],
+            [1e-6, 1e6],
+            [1024.0, 1.0 / 128.0],
+            [1e6, 1e-6],
+        ];
+        let scale = |dense: &[f64], bb: &[f64], d: [f64; 2]| {
+            let mut a = dense.to_vec();
+            for i in 0..2 {
+                for j in 0..2 {
+                    a[i * 2 + j] *= d[i];
+                }
+            }
+            (a, [bb[0] * d[0], bb[1] * d[1]])
+        };
+        let (mut checked, mut off_moved) = (0, 0);
+        for (dense, l, u, legacy) in cases {
+            assert_eq!(gate_arm(dense, 2, l, u, &b, false), legacy, "OFF {dense:?}");
+            let on_base = gate_arm(dense, 2, l, u, &b, true);
+            let rmax: Vec<f64> = (0..2)
+                .map(|i| dense[i * 2].abs().max(dense[i * 2 + 1].abs()))
+                .collect();
+            let (na, nb) = scale(dense, &b, [1.0 / rmax[0], 1.0 / rmax[1]]);
+            let reference = gate_arm(&na, 2, l, u, &nb, false);
+            for d in scalings {
+                let (sa, sb) = scale(dense, &b, d);
+                let on = gate_arm(&sa, 2, l, u, &sb, true);
+                assert_eq!(
+                    on, reference,
+                    "ON(D·A) != OFF(maxnorm A): {dense:?} D={d:?}"
+                );
+                assert_eq!(on, on_base, "ON not row-scale invariant: {dense:?} D={d:?}");
+                if gate_arm(&sa, 2, l, u, &sb, false) != legacy {
+                    off_moved += 1;
+                }
+                checked += 2;
+            }
+        }
+        assert_eq!(checked, 7 * 6 * 2);
+        assert!(
+            off_moved > 0,
+            "no scaling moved an OFF verdict: invariance check is vacuous"
+        );
     }
 
     #[test]

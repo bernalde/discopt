@@ -68,7 +68,7 @@ def _load_decline_lp():
 # The vendored LP was captured under the pre-#1537 equilibration factors, which
 # is what makes both in-house attempts fail and drives the generic-path chain
 # these tests exercise.  Under the #1537 row pre-pass
-# (``DISCOPT_LP_ROW_PRESCALE``, default ON) the first in-house attempt solves
+# (``DISCOPT_LP_ROW_PRESCALE=1``, opt-in) the first in-house attempt solves
 # this LP to a verified optimum by itself, so the chain is never reached.  The
 # chain tests therefore pin the legacy factors;
 # ``test_decline_lp_row_prescale_certifies_directly`` covers the new arm.

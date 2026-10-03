@@ -124,18 +124,13 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
-- **Row-scale-invariant simplex equilibration** (`fix(correctness)`, contributes to #1537).
+- **Opt-in row-scale-invariant simplex equilibration** (`fix(correctness)`, contributes to #1537).
   - **The bug.** Scaling a model's rows by powers of ten (10^[-6,6]) made the #1296 tiny-entry guard (`MilpTinyEntryDecert`) fire on m3/flay03m, so they lost their certificates. The model itself was unchanged; only the row scaling differed.
-  - **The fix.** `scaling::equilibrate` now first divides each row by the power of two nearest its largest magnitude. This is exact, and unscaling is bit-exact. The guard now judges the row-normalised matrix.
-  - **Default on.** `DISCOPT_LP_ROW_PRESCALE=0` restores the legacy factors.
-  - **Graduation panel.** 66-file corpus, 3 row transforms, 198 OFF/ON pairs.
-    - 0 false bounds.
-    - Certified instances: 145 -> 147.
-    - Total wall: 1347 -> 1264 s.
-    - Pure LP/MILP on the Rust backend, certified: 21 -> 38.
-  - **Claim baseline.** Rows hda, nvs05 and tspn12 are rebaselined. All three root bounds are lower and sound.
-    - hda's root LP breaks down numerically in both arms, on different LPs of its cut sequence.
-    - Its end-to-end bound and node count are unchanged.
+  - **The fix, behind `DISCOPT_LP_ROW_PRESCALE=1` (default OFF).**
+    - `scaling::equilibrate` first multiplies each row by the power of two nearest the clamped geometric mean of its extreme magnitudes. This is exact, and unscaling is bit-exact.
+    - The guard judges the row-normalised matrix, and its rhs floor is the row max. That is the legacy floor on a max-normalised row, checked on the #1296 grid.
+    - When the new factors end Numerical, the LP is retried once on the legacy factors before the #649 unscaled retry. hda's root bound is then identical to the legacy arm.
+  - **Why default OFF.** A re-panel of this factor (102 of 198 pairs) showed 0 false bounds and 0 failed point verifications, and ON gained m3 and cvxnonsep_psig40r. But ON lost one certificate at the 20 s limit: clay0303hfsg with rows scaled in 10^[-3,3] is about 2x slower at the root. With the flag unset, the factors, guard and retry path are bit-identical to before.
 - **`to_nl` writes the nonlinear rows first, as the `.nl` format requires** (`fix`, #1562).
   - **The bug.** The header's `nlc` names rows `C0 .. C{nlc-1}` as nonlinear, but both writers emitted rows in declaration order. A linear row declared before a nonlinear one therefore produced a file whose header named the wrong rows, and pyscipopt's reader segfaulted on it. Both writers now write `[nonlinear | linear]`, stable within each group, as Pyomo does.
   - **Header.** Line 2 now carries the true `neqns` count; it was always written as `0`.

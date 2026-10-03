@@ -59,7 +59,7 @@ const MAX_PASSES: usize = 4;
 pub(crate) const MAX_LINE_RANGE: f64 = 1e-10;
 
 /// Whether [`equilibrate`] starts from a power-of-two **row-normalisation**
-/// pre-pass (`DISCOPT_LP_ROW_PRESCALE`; default on, `0` is the opt-out) (#1537).
+/// pre-pass (`DISCOPT_LP_ROW_PRESCALE`; default off, `1` opts in) (#1537).
 ///
 /// Without it the first sweep is a *column* sweep on the raw matrix, so the
 /// [`MAX_LINE_RANGE`] noise filter judges an entry against entries of *other
@@ -125,13 +125,21 @@ impl Drop for RowPrescaleGuard {
 
 /// Default arm of `DISCOPT_LP_ROW_PRESCALE` when the variable is unset or empty.
 ///
-/// Graduated default-ON (CLAUDE.md §5, 2026-10-03, #1537): flag OFF vs ON over the
-/// 66-file corpus as written and with rows scaled in 10^[-3,3] / 10^[-6,6] (198
-/// interleaved pairs) gave 0 false bounds, 0 lost certificates, 0 failed point
-/// verifications, certified 145 -> 147, total wall 1347 -> 1264 s; the pure LP/MILP
-/// panel through this driver (49 pairs) certified 21 -> 38 with 0 false answers.
-/// `DISCOPT_LP_ROW_PRESCALE=0` keeps the pre-#1537 factors bit-identical.
-const ROW_PRESCALE_DEFAULT: bool = true;
+/// **Default OFF** (CLAUDE.md §5, #1537). The 2026-10-03 graduation panel ran an
+/// earlier factor (the power of two nearest the row's *largest* magnitude). That
+/// factor broke the Rust big-M route (`test_bigm_route_coef_tighten_1414`): x's
+/// scaled box fell below the primal tolerance and the returned points violated the
+/// original rows. The factor that replaced it (the clamped geometric mean, plus
+/// the legacy-factor retry in `dual.rs` and the `row_max` gate floor in
+/// `milp_driver.rs`) was re-paneled on the same protocol. On the first 102 of 198
+/// pairs it showed 0 false bounds, 0 bad objectives and 0 failed point
+/// verifications, but it **lost one certificate**: clay0303hfsg with rows scaled in
+/// 10^[-3,3] timed out at the 20 s limit with ON (OFF certified at 12.0 s; at a
+/// 40 s limit ON certified in 22.0 s, so the cost is a ~2x root slowdown, not a
+/// wrong answer). A lost certificate fails the cert-clean bar, so the flag stays
+/// OFF. What would change that: a full panel with no lost certificate.
+/// `DISCOPT_LP_ROW_PRESCALE=1` opts in.
+const ROW_PRESCALE_DEFAULT: bool = false;
 
 /// Parse a `DISCOPT_LP_ROW_PRESCALE` value. Pure, so the refusal is testable
 /// without touching the process environment.

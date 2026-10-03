@@ -3837,7 +3837,7 @@ mod tests {
     }
 
     // #1537: the #1595 witnesses (single-row and mixed-cost, cold and warm) under
-    // the graduated row pre-pass. The pre-pass rescales them so the sub-tol path is
+    // the opt-in row pre-pass. The pre-pass rescales them so the sub-tol path is
     // no longer needed; the answer must still be the true minimum.
     #[test]
     fn subtol_witnesses_are_solved_correctly_under_row_prescale() {

@@ -119,9 +119,14 @@ fn row_prescale_restores_the_row_scaled_certificate() {
     // The point is reported in original units on both spellings.
     assert!((scaled_on.x[0] - 2.0).abs() < 1e-6 && (scaled_on.x[1] - 1.5).abs() < 1e-6);
 
-    // Default arm (graduated, #1537): unset means ON.
+    // Default arm (#1537): unset means OFF -- the re-panel of the shipped factor
+    // lost a certificate, so the pre-pass is opt-in -- and the guard fires again.
     std::env::remove_var("DISCOPT_LP_ROW_PRESCALE");
     let (scaled_default, d4) = solve(1e5, 1e-6);
-    assert_eq!(d4, 0, "the default arm is not the row pre-pass");
-    assert_certified(&scaled_default, "scaled rows, default");
+    assert_eq!(d4, 1, "the default arm is not the legacy factors");
+    assert_eq!(
+        scaled_default.bound,
+        f64::NEG_INFINITY,
+        "{scaled_default:?}"
+    );
 }
