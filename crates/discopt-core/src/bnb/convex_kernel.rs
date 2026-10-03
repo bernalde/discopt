@@ -1292,6 +1292,14 @@ impl ConvexKernelSpec {
                 // if no subtree was silently discarded — an uncertified drop leaves a
                 // region with no bound at all, so a closed frontier gap proves nothing.
                 status = ConvexTreeStatus::Optimal;
+                // #1597: `node` was popped off the frontier but never solved, so
+                // the end-of-tree `frontier_max` (taken over `heap`) no longer sees
+                // it. Its parent bound is the only bound its subtree has; fold it in
+                // here, at every early exit, or the reported bound silently drops
+                // the BEST open node — the one the heap pops first. Measured on
+                // `cvxnonsep_psig40r` at the deadline: bound 86.9096 reported
+                // against the known optimum 86.5451 (a false dual bound).
+                leaf_dual_sense = leaf_dual_sense.max(node.parent_bound);
                 break;
             }
             if config
@@ -1299,10 +1307,12 @@ impl ConvexKernelSpec {
                 .is_some_and(|d| std::time::Instant::now() >= d)
             {
                 status = ConvexTreeStatus::TimeLimit;
+                leaf_dual_sense = leaf_dual_sense.max(node.parent_bound);
                 break;
             }
             if node_count >= config.max_nodes {
                 status = ConvexTreeStatus::NodeLimit;
+                leaf_dual_sense = leaf_dual_sense.max(node.parent_bound);
                 break;
             }
             // Fathom by parent bound vs incumbent.
@@ -1434,12 +1444,33 @@ impl ConvexKernelSpec {
                 // the subtree is simply unexplored, so the certificate is poisoned.
                 if r.status != LpStatus::Infeasible {
                     uncertified_drop = true;
+                    // #1597: the subtree leaves the tree unexplored, so its only
+                    // bound is the parent's (valid for every child box). Without
+                    // this the reported dual bound is the max over the OTHER
+                    // subtrees and can sit above the true optimum.
+                    leaf_dual_sense = leaf_dual_sense.max(node.parent_bound);
                 }
                 continue;
             }
             // Node dual in the sense convention, floored by the parent (rigorous:
             // a child's bound can only be ≤ the parent's in sense convention).
             let node_dual_sense = (sense * r.bound).min(node.parent_bound);
+            if node_count == 1 && node.branch.is_none() && node_dual_sense == f64::INFINITY {
+                // #1597: the ROOT relaxation solved but its Neumaier–Shcherbina
+                // bound declined, so nothing above any leaf is bounded and the
+                // tree can certify only if every leaf does. Measured over every
+                // MINLPLib instance (<= 2000 vars) the kernel accepts (144 routed),
+                // 6 have such a root and NONE certified within a 10 s budget —
+                // each burned the whole budget (normcon20r/30r, nsig20r/30r,
+                // psig30r, psig40r). The one "optimal" on main (nsig20r) stood on
+                // the incumbent-as-bound fallback, which now requires a bounded
+                // tree. Give the budget back to the default path instead: no
+                // bound, no certificate, and the declined attempt still hands
+                // over its incumbent.
+                uncertified_drop = true;
+                leaf_dual_sense = f64::INFINITY;
+                break;
+            }
             if !node_dual_sense.is_finite() {
                 // Uncertified node bound → cannot fathom on it, but we can still
                 // branch to make progress; treat its dual as the parent's.
@@ -1555,7 +1586,11 @@ impl ConvexKernelSpec {
         };
         let bound = if dual_sense.is_finite() {
             sense * dual_sense
-        } else if inc_sense > worse && !uncertified_drop {
+        } else if dual_sense == f64::NEG_INFINITY && inc_sense > worse && !uncertified_drop {
+            // `+∞` (sense convention) means some subtree left the tree carrying
+            // no bound at all (#1597: an unsolved popped node, or a leaf whose
+            // NS bound declined at the root); that is "no bound", never the
+            // incumbent.
             // No leaf produced a finite dual, but every node was accounted for, so
             // the incumbent itself is the tight bound. With `uncertified_drop` that
             // reasoning does not hold — report "no bound" rather than pass the
@@ -1565,7 +1600,11 @@ impl ConvexKernelSpec {
             sense * f64::INFINITY
         };
         ConvexTreeResult {
-            status: if incumbent.is_none() && status == ConvexTreeStatus::Optimal {
+            // An Optimal claim needs a bound to stand on: a `+∞` (sense) dual means a
+            // subtree is unbounded by anything this tree proved (#1597).
+            status: if (incumbent.is_none() || dual_sense == f64::INFINITY)
+                && status == ConvexTreeStatus::Optimal
+            {
                 ConvexTreeStatus::Exhausted
             } else {
                 status
@@ -2860,6 +2899,42 @@ mod tests {
         if let Some(inc) = res.incumbent {
             assert!(inc.is_finite(), "incumbent reported as {inc}");
         }
+    }
+
+    #[test]
+    fn an_unsolved_popped_node_keeps_its_bound_in_the_report() {
+        // #1597: max x0 + x1, x0 + x1 <= 2.5, true optimum 2.5. With max_nodes = 0
+        // the root is popped and the tree stops before solving it. The popped
+        // node is no longer on the heap, so the report used to fall through to
+        // "every node accounted for" and publish the seeded incumbent 2.0 as the
+        // dual bound — BELOW the optimum of a max problem, a false bound.
+        let spec = ConvexKernelSpec {
+            n: 2,
+            c: vec![1.0, 1.0],
+            sense_max: true,
+            integrality: vec![false, true],
+            lb: vec![0.0, 0.0],
+            ub: vec![3.0, 1.0],
+            le_rows: vec![LinRow {
+                cols: vec![0, 1],
+                coeffs: vec![1.0, 1.0],
+                rhs: 2.5,
+            }],
+            eq_rows: vec![],
+            nl_rows: vec![],
+        };
+        let config = ConvexTreeConfig {
+            max_nodes: 0,
+            initial_incumbent: Some(2.0),
+            ..Default::default()
+        };
+        let res = spec.solve_tree(&config, &SimplexOptions::default());
+        assert_eq!(res.status, ConvexTreeStatus::NodeLimit);
+        assert!(
+            res.bound >= 2.5 - 1e-9,
+            "max-sense bound {} is below the true optimum 2.5",
+            res.bound
+        );
     }
 
     #[test]

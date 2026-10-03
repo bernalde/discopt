@@ -413,6 +413,27 @@ counters!(
     UnboundedRejectRowResidual,
     UnboundedRejectObjective,
     UnboundedRejectBox,
+    // #1597: an uncertified ray resolved by the exact ratio test — a basic column
+    // moving toward a finite bound at a sub-`tol` rate is taken as the blocker and
+    // pivoted on, instead of refusing the LP as `Numerical`.
+    RayRescuePivots,
+    // #1595: a phase-2 vertex the absolute `tol` pricing called optimal, but at
+    // which a nonbasic column's wrong-signed, sub-`tol` reduced cost could still
+    // decrease the objective by more than `subtol_impact_floor` in one pivot.
+    // `SubtolStepTests` counts the ratio tests run to measure that decrease (one
+    // FTRAN each — the check's cost); `SubtolPivots` the pivots taken on such a
+    // column instead of returning `Optimal`; `SubtolCapNumerical` the loops that
+    // ran out of the budget for them and refused (`Numerical`) rather than claim
+    // optimality. `WarmSubtolRepair` counts warm DUAL optima with a candidate
+    // handed to the primal; `WarmSubtolRepairNoop` the hand-offs whose primal
+    // made no pivot (the dual's own result is returned untouched);
+    // `WarmSubtolRepairFailed` the ones that hand-off could not finish.
+    SubtolStepTests,
+    SubtolPivots,
+    SubtolCapNumerical,
+    WarmSubtolRepair,
+    WarmSubtolRepairNoop,
+    WarmSubtolRepairFailed,
     // #1008 R1: the warm dual's unstable- (near-zero-) pivot exit, split by which
     // way it went. `Recoveries` counts in-place refactorize+recompute+re-select,
     // which keeps the monotone dual loop alive; `Bails` counts the hand-off to the

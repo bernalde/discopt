@@ -24,6 +24,12 @@ families, each row scaled by its own seeded log-uniform factor in 10^[-3,3] and
   was tried and withdrawn in the PR #1594 review: it lands the row's largest entry
   in [5e9, 1e10), where the in-house simplex returns false LP bounds (#1595) on
   rows that main drops. A lost certificate is acceptable; a false bound is not.
+
+  Since #1595 (PR #1597) the end-to-end witness certifies again, but *not* through
+  the sanitizer: the in-house simplex now solves the scaled root LP soundly, so the
+  fallback that drops the row is never reached (measured: zero sanitizer calls,
+  bound -1.47e-7 against the ``minlplib.solu`` optimum 0). The sanitizer still drops
+  over-cap rows when it does run; that is pinned by the unit tests below.
 """
 
 from __future__ import annotations
@@ -140,15 +146,12 @@ def test_sanitizer_leaves_rows_under_the_cap_untouched():
     assert np.array_equal(out._b_ub, [5.0, 7.0])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1595: the fallback sanitizer drops the scaled over-cap row; keeping it "
-    "needs the in-house simplex to be sound on entries >= ~1e9 first",
-)
 def test_row_scaled_ex14_1_9_keeps_its_certificate():
     """The end-to-end witness: ex14_1_9 with its two rows scaled by 8.14 and 3.66
-    (the probe's seeded per-row factors) reports ``feasible``, bound -1.07e6, while
-    the unscaled model certifies 0.0 -- the fallback root bound loses the scaled row."""
+    (the probe's seeded per-row factors). Before #1595 it reported ``feasible`` with
+    bound -1.07e6 (the root LP failed, and the fallback root bound lost the scaled
+    row); the unscaled model certifies 0.0. It must certify, with a bound that does
+    not cross the known optimum 0 (``minlplib.solu``)."""
     path = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl", "ex14_1_9.nl")
     base_model = dm.from_nl(path)
     scaled = _rebuild(base_model, lambda v: np.zeros(v.lb.shape), 1.0, "ex14_rows")
@@ -163,3 +166,4 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
     assert base.gap_certified
     assert other.gap_certified, (other.status, other.bound)
     assert other.objective == pytest.approx(base.objective, abs=1e-6)
+    assert other.bound <= 0.0 + 1e-6, other.bound
