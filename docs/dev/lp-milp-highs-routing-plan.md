@@ -1417,3 +1417,52 @@ MILP solve per model from the weaker engine, where these LPs caught every case m
   `1e-6 + 1e-9*|bound|`. Node counts cannot move by construction -- the check runs after
   HiGHS returns. Total wall 5.05 s -> 5.50 s on the 240 (the extra LPs; single run, load
   not gated, indicative only).
+
+**2026-10-03 — why the MILP route is slower than Pyomo+HiGHS on the same model (#1600).
+Recorded so the trade-off is not rediscovered; nothing changed.** On ReLU big-M
+embeddings (`discopt_benchmarks/scripts/omlt_scaling_panel.py`) discopt and
+OMLT+`SolverFactory("highs")` hit the same HiGHS 1.15.1 binary with the same options
+(only `time_limit` set), certify the same instances and agree on every certified
+objective, yet discopt is up to ~1.9x slower on some instances. Measured on `main`
+`b7178ea`; scripts on branch `claude/omlt-benchmark`.
+
+- *The extra HiGHS calls are not it.* discopt calls `Highs.run` 5 times per MILP
+  solve (Pyomo: 1). Instrumented on 10x3 seed 0, the four non-MILP calls (root /
+  fixed-integer LPs for `_refutation_check`, dual recovery for
+  `_mip_recover_relaxation_duals`) cost **7 ms** of a 1.87 s solve. They are the
+  certificate work this route exists for.
+- *Fixed overhead.* `relu_timing_split.py` (84 solves, fresh process per solve after
+  an untimed warm-up, interleaved, 6 reps): wall outside HiGHS is **0.11–0.30 s**
+  per solve for discopt (extraction, standard form, checks) vs **0.02–0.06 s** for
+  Pyomo; 0.6–1.0 s at a 30 s limit.
+- *The model shape.* The MILP is passed as `StdForm`, `A x = b` with one logical
+  column per inequality, so HiGHS gets ~2x the columns (10x3: 210 cols / 534 B&B
+  nodes / 1.83 s vs Pyomo's 100 / 367 / 0.95 s). HiGHS-only time on the same
+  network as `StdForm` / discopt native rows / OMLT: 10x3 1.66 / 1.37 / 0.99 s,
+  100x1 1.39 / 0.89 / 0.83 s, 25x2 22.1 / 25.9 / 17.3 s (3 reps, sd <= 0.6 s).
+- *Not lost budget.* At the time limit OMLT's bound is tighter on 50x3 (-13.06 vs
+  -13.75, identical on every rep) while discopt's overhead there is 0.6 s of 30 s.
+  An earlier statement in this investigation that the gap was "consistent with
+  discopt losing part of its budget to overhead" is **retracted**: the gap is the
+  model and HiGHS's search path, not time.
+
+Why `StdForm` is used, and why it should stay for LPs: §3.1 / the 2026-09-15 entry —
+the LP certificates (NS bound, Farkas ray incl. over the FBBT box, phase-1 proof,
+exact rational correction) are stated for `A x = b, l <= x <= u`, and solving
+exactly that form means HiGHS's duals and rays index the rows/columns being
+verified, with no mapping layer. For a MILP the certificate is `mip_dual_bound`
+cross-checked against the NS-safe root LP (on `StdForm`) plus incumbent
+verification against `StdForm` (slacks = `b - A x`), so the branch-and-cut itself
+need not see the logicals.
+
+Entry experiment for changing it (`milp_slack_vs_native_rows.py`, same `StdForm`
+with logicals folded into row bounds, 59 instances finished in both forms, 354 HiGHS
+runs, load <= 1.15): native/std median ratio **0.805**, geomean 0.876, faster on
+37/59 (sign test p = 0.067), total **168.6 s -> 112.1 s**. By family (geomean /
+total ratio): set cover 0.54 / 0.54, facility location 0.69 / 0.55, ReLU depth 2
+0.91 / 0.71, ReLU depth 1 0.94 / 0.77, knapsack 0.82 / 0.91, lot sizing 1.04 / 0.99,
+ReLU depth 3 1.30 / 1.11 (n = 5). **What would change the route:** implement native
+rows for the MILP `run` only, behind a default-off flag, keep `StdForm` for every
+LP and check, and graduate on a §5 panel over a broader MILP set than these
+generated families (the in-repo `.nl` corpus has no pure MILP; MIPLIB is not
+reachable from the benchmark host).
