@@ -4063,13 +4063,24 @@ class SolveResult:
         tested), and below unit objective scale the disagreement ran the other
         way and understated it.
 
+        **One formula on every exit** (#1585): an optimal exit, a
+        ``node_limit``/``time_limit`` stop that kept an incumbent
+        (``status="feasible"``), and every post-solve repair all report this
+        number, through :func:`discopt.solvers._gap.reported_gap`. Before #1585 a
+        limit exit reported ``|objective - bound| / max(1, |objective|)``, so the
+        same pair had two gaps depending on why the search stopped.
+
         The convergence test is a disjunction -- absolute gap
-        ``<= 1e-6`` OR relative gap ``<= gap_tolerance`` -- and a closed gap is
-        reported as ``0.0`` whichever arm closed it, so below unit objective
-        scale ``gap == 0.0`` can stand for a relative gap far above
-        ``gap_tolerance`` (e.g. ``5.5e-7`` absolute on a ``2e-3`` objective,
-        #1352). ``solver_stats["gap_criterion"]`` names the arm when the
-        branch-and-bound path recorded it.
+        ``<= abs_gap_tolerance`` (default ``1e-6``) OR relative gap ``<=
+        gap_tolerance`` -- and a gap within the absolute tolerance is reported
+        as ``0.0``, because the relative number degenerates near a zero optimum.
+        So below unit objective scale ``gap == 0.0`` can stand for a relative
+        gap far above ``gap_tolerance`` (e.g. ``5.5e-7`` absolute on a ``2e-3``
+        objective, #1352). ``solver_stats["gap_criterion"]`` names the arm when
+        a criterion was met. ``None`` when there is no incumbent or no finite
+        bound, or when a route declined to define a relative gap (AMP at a zero
+        incumbent). ``root_gap`` is a separate root statistic with its own
+        documented formula.
     x : dict of str to numpy.ndarray, or None
         Variable values keyed by name. None if no feasible solution found.
 
@@ -4173,7 +4184,9 @@ class SolveResult:
           ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
           ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
           ``"R"`` marks restoration; see below) and ``ls_trials``. The final
-          barrier parameter is ``report["iterations"][-1]["mu"]``.
+          barrier parameter is ``report["iterations"][-1]["mu"]``. Always
+          present: ``[]`` when the solve stopped before its first iteration
+          (#1585).
         * ``report["solution"]``, ``report["problem"]``,
           ``report["fair_metadata"]`` (solver version, timestamps).
 
@@ -4406,6 +4419,40 @@ class SolveResult:
     # populated it is a human-readable reason, e.g.
     # ``"mip-nlp/oa: minlp certified convex at the root (DISCOPT_CONVEX_MINLP_ROUTE)"``.
     algorithm_route: Optional[str] = None
+
+    # Why the search stopped (#1585) -- orthogonal to ``status``, which says what
+    # was PROVEN. One of ``discopt.status.TERMINATION_REASONS``:
+    #
+    # - ``"gap"``: the optimality gap closed within ``gap_tolerance`` /
+    #   ``abs_gap_tolerance`` (status usually ``optimal``);
+    # - ``"exhausted"``: the tree drained -- every node was pruned or solved
+    #   (status usually ``optimal`` with an incumbent, ``infeasible`` without);
+    # - ``"node_limit"`` / ``"time_limit"`` / ``"iteration_limit"``: a budget ran
+    #   out first. Depending on the route the status of such an exit is either the
+    #   budget name or ``feasible`` (an incumbent plus a certified bound with an
+    #   open gap -- the #933 vocabulary, unchanged), so ``status="feasible"``
+    #   alone does not say WHETHER a budget stopped the search, nor which; this
+    #   field does, on every branch-and-bound / MILP route;
+    # - ``"interrupted"``: a user/debugger stop.
+    #
+    # ``None`` means the route records no reason (a direct NLP/LP solve that is not
+    # a search, or a route that has not been taught the field).
+    #
+    # The field records why the LOOP stopped; ``status`` is decided afterwards and
+    # can disagree with the "usually" above (#1590 review N3). Known cases:
+    #
+    # - a tree that drains at exactly ``max_nodes`` with no incumbent reports
+    #   ``status="node_limit"`` (the no-incumbent branch tests the node budget
+    #   first) with ``termination="exhausted"``;
+    # - a ``"gap"`` exit the solve-level chokepoint later downgrades
+    #   (``_refuse_unclosed_published_pair`` / the #1285 polish recheck) reports
+    #   ``status="feasible"`` with ``termination="gap"``;
+    # - a drained tree whose bound is held below the incumbent by an unresolved
+    #   floor reports ``status="feasible"`` with ``termination="exhausted"``.
+    #
+    # Read ``status`` / ``gap_certified`` for what is proven; never infer a
+    # certificate from this field.
+    termination: Optional[str] = None
 
     # Examiner-style validation report (populated if validate=True).
     validation_report: Optional[object] = None
@@ -5106,6 +5153,20 @@ def _counts_solve_depth(fn):
             _SOLVE_DEPTH.reset(token)
 
     return wrapper
+
+
+def _post_solve_abs_gap_tol(result: "SolveResult", abs_gap_tolerance: Optional[float]) -> float:
+    """The absolute gap tolerance a post-solve gap recomputation reports at (#1585).
+
+    The one the certificate was judged at when the solver wrapper recorded it
+    (``SolveResult._judged_gap_tolerances``), else the caller's.
+    """
+    judged = getattr(result, "_judged_gap_tolerances", None)
+    if judged is not None:
+        return float(judged[1])
+    from discopt.solver import _resolve_abs_gap_tolerance
+
+    return float(_resolve_abs_gap_tolerance(abs_gap_tolerance))
 
 
 class Model:
@@ -7686,8 +7747,10 @@ class Model:
             Engine for a pure LP or MILP model. The default ``None`` defers to
             the ``DISCOPT_LP_MILP_BACKEND`` environment variable, which itself
             defaults to HiGHS. ``"highs"`` names HiGHS with discopt-verified
-            certificates, by far the faster choice; it reports
-            ``node_count == 0``. ``"native"`` forces discopt's own branch and
+            certificates, by far the faster choice; its ``node_count`` is
+            HiGHS's own ``mip_node_count``, which counts the root: ``0`` when
+            HiGHS presolve settles the model, ``1`` when the root node closes
+            it, more once HiGHS branches. ``"native"`` forces discopt's own branch and
             bound so the search can be studied: the in-house LP solve (Rust
             simplex, POUNCE if it declines) for an LP, discopt's MILP tree for
             a MILP. On the
@@ -8514,9 +8577,8 @@ class Model:
                 return
             if not has_bound:
                 return
-            from discopt.solvers._gap import optimality_gap as _optimality_gap
+            from discopt.solvers._gap import reported_gap as _reported_gap
 
-            _s = -1.0 if is_max else 1.0
             # Re-judge at the tolerances the certificate was granted at: the solver
             # wrapper records them (AMP meets ``rel_gap``, not ``gap_tolerance``).
             _judged = getattr(res, "_judged_gap_tolerances", None)
@@ -8526,7 +8588,8 @@ class Model:
                 gtol = float(gap_tolerance)
                 atol = _resolve_abs_gap_tolerance(abs_gap_tolerance)
             was_certified = bool(res.gap_certified)
-            res.gap = _optimality_gap(_s * float(bnd), _s * new_obj)
+            # #1585: the one SolveResult.gap formula, at the judged abs tolerance.
+            res.gap = _reported_gap(new_obj, float(bnd), abs_tol=atol)
             if not was_certified:
                 return
             if _recertify_gap_closed(old_obj, float(bnd), is_max, gtol, atol):
@@ -9147,7 +9210,7 @@ class Model:
             from discopt.solvers._gap import (
                 bound_inversion_tolerance as _ci_inv_tol_fn,
             )
-            from discopt.solvers._gap import optimality_gap as _ci_gap_fn
+            from discopt.solvers._gap import reported_gap as _ci_gap_fn
 
             _ci_obj, _ci_x = _ck_declined_incumbent
             # Minimization space for either sense, as in the bound merge below:
@@ -9211,7 +9274,11 @@ class Model:
                 # numbers that are no longer both there. Recompute it when a valid
                 # bound exists and drop it otherwise, rather than leave a stale one.
                 if result.bound is not None and result.bound_valid:
-                    result.gap = _ci_gap_fn(_s * float(result.bound), _ci_cand)
+                    result.gap = _ci_gap_fn(
+                        float(_ci_obj),
+                        float(result.bound),
+                        abs_tol=_post_solve_abs_gap_tol(result, abs_gap_tolerance),
+                    )
                 else:
                     result.gap = None
                 _ci_log.debug(
@@ -9261,7 +9328,7 @@ class Model:
             from discopt.solvers._gap import (
                 bound_inversion_tolerance as _bound_inversion_tolerance,
             )
-            from discopt.solvers._gap import optimality_gap as _optimality_gap
+            from discopt.solvers._gap import reported_gap as _reported_gap
 
             _s = objective_sense_sign(self)
             _cand = _s * float(_ck_declined_bound)
@@ -9296,9 +9363,13 @@ class Model:
                 # routes report under that provenance.
                 result._set_bound(float(_ck_declined_bound), valid=True, source="bnb_tree")
                 if _obj is not None:
-                    # ``optimality_gap`` takes (lb, ub) in MINIMIZATION sense, which
-                    # is exactly the space the comparisons above work in.
-                    result.gap = _optimality_gap(_cand, _s * float(_obj))
+                    # #1585: the one SolveResult.gap formula (symmetric in the
+                    # pair, so the reported-sense values go in directly).
+                    result.gap = _reported_gap(
+                        float(_obj),
+                        float(_ck_declined_bound),
+                        abs_tol=_post_solve_abs_gap_tol(result, abs_gap_tolerance),
+                    )
 
         # Attach model reference and auto-generate LLM explanation
         result._model = self
