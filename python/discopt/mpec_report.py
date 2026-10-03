@@ -1048,6 +1048,7 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
     * ``_IndicatorConstraint`` — the wrapped row when its binary indicator is
       active, zero when inactive. Selector integrality is reported separately;
       a fractional selector cannot make the complete source report pass.
+      Non-binary selectors are refused because that gate does not cover them.
     * ``_DisjunctiveConstraint`` — ``min`` over disjuncts of the ``max``
       violation inside that disjunct: zero exactly when *some* disjunct holds,
       which is what the disjunction asserts.
@@ -1058,6 +1059,8 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
     """
     from discopt.modeling.core import (
         Constraint,
+        Variable,
+        VarType,
         _DisjunctiveConstraint,
         _IndicatorConstraint,
         _SOSConstraint,
@@ -1079,6 +1082,10 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
         return float(np.max(viol)) if viol.size else 0.0
 
     if isinstance(con, _IndicatorConstraint):
+        # Only binary variables participate in _integrality_residual. Refuse
+        # other selectors before a fractional value can skip the wrapped row.
+        if not isinstance(con.indicator, Variable) or con.indicator.var_type is not VarType.BINARY:
+            raise ValueError(f"indicator row {con.name!r} requires a binary variable selector")
         values = evaluate_at_point(model, con.indicator, point).ravel()
         if values.size != 1 or not np.all(np.isfinite(values)):
             raise ValueError(
@@ -1091,9 +1098,20 @@ def _one_row_violation(model: "Model", con, point: dict[int, np.ndarray]) -> flo
                 "only Boolean active values 0 and 1 have a residual definition"
             )
         selector = float(values[0])
-        if abs(selector - float(con.active_value)) <= _INTEGRALITY_TOL:
+        # Use the same effective-integrality predicate as
+        # ``_integrality_residual`` below. A distance-to-nearest-integer check
+        # is not equivalent at the tolerance boundary: for
+        # y = 1 - 1.000005e-5, y(1-y) is just below 1e-5 while |1-y| is just
+        # above it. The old split let the integrality residual pass while this
+        # dispatch treated the indicator as fractional and skipped an active,
+        # violated row.
+        in_tolerated_box = -_INTEGRALITY_TOL <= selector <= 1.0 + _INTEGRALITY_TOL
+        effectively_integral = selector * (1.0 - selector) <= _INTEGRALITY_TOL
+        boolean_value = int(selector >= 0.5)
+        if in_tolerated_box and effectively_integral and boolean_value == con.active_value:
             return _one_row_violation(model, con.constraint, point)
-        # At a fractional selector the Boolean implication has no arithmetic
+        # An effectively integral inactive selector contributes zero. At a
+        # genuinely fractional selector the Boolean implication has no arithmetic
         # row residual of its own. The dedicated selector-integrality residual
         # remains nonzero, so SourceResidualReport.source_satisfied is false.
         return 0.0

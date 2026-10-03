@@ -452,6 +452,8 @@ def _eval_function_call(
     name = expr.func_name
     if name.startswith("norm"):
         return _norm_interval(name, arg)
+    if name == "prod":
+        return _prod_interval(arg)
     if name == "exp":
         return iv.exp(arg)
     if name == "log":
@@ -511,6 +513,29 @@ def _eval_function_call(
     # will refuse to prove convexity for expressions that hit this
     # path, preserving soundness.
     return _unbounded(arg.lo.shape)
+
+
+def _prod_interval(arg: Interval) -> Interval:
+    """Sound SCALAR enclosure of ``prod(arg)`` (#1582).
+
+    A one-argument ``prod`` is a full reduction -- ``jnp.prod`` over the flattened
+    operand, the tape's ``*`` fold over elements -- so its enclosure is 0-d. It is
+    the product of the per-element intervals, folded left in C order, each step
+    widened one ULP outward (the binary-operation convention of ``_eval_matmul``).
+    Before #1582 this fell through to the generic "unsupported" arm, which
+    returned an unbounded enclosure of the ARGUMENT's shape: sound, but
+    array-shaped, which the relaxation layer then rejected as an invariant
+    violation, leaving every node of a ``dm.prod`` model without an LP bound.
+    """
+    lo_arr = np.ravel(np.asarray(arg.lo, dtype=np.float64))
+    hi_arr = np.ravel(np.asarray(arg.hi, dtype=np.float64))
+    if lo_arr.size == 0:
+        return Interval.point(1.0)
+    acc = Interval(lo_arr[0], hi_arr[0])
+    for k in range(1, lo_arr.size):
+        acc = acc * Interval(lo_arr[k], hi_arr[k])
+        acc = Interval(np.nextafter(acc.lo, -np.inf), np.nextafter(acc.hi, np.inf))
+    return acc
 
 
 def _norm_interval(name: str, arg: Interval) -> Interval:

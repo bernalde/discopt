@@ -123,17 +123,22 @@ def test_a_gap_closed_on_the_absolute_arm_reports_zero():
 
 
 @pytest.mark.smoke
-def test_an_open_exit_keeps_the_933_floored_gap():
-    """Scope control: an exit that met no criterion claims nothing about a
-    tolerance, so there is nothing for its gap to be consistent with. #933
-    defines and tests the floored ``|obj-bound| / max(1, |obj|)`` there, and
-    this fix must not reach it."""
+def test_an_open_exit_reports_the_one_documented_gap():
+    """An exit that met no criterion reports the SAME formula as a converged one.
+
+    This test used to pin the opposite: #1386 scoped its fix to converged exits
+    and left an open exit on #933's floored ``|obj-bound| / max(1, |obj|)``. #1585
+    reversed that -- ``SolveResult.gap`` documents one formula, and a caller
+    comparing a node-limit exit against an optimal one was comparing two
+    different quantities (0.0052140 floored vs 0.0051870 documented, on the
+    #1585 knapsack)."""
     r = camel().solve(time_limit=0.05)
     if r.objective is None or r.bound is None:
         pytest.skip("the budget was too short to produce a pair to check")
 
     assert (r.solver_stats or {}).get("gap_criterion") is None
-    assert r.gap == pytest.approx(abs(r.objective - r.bound) / max(1.0, abs(r.objective)), rel=1e-9)
+    o, b = r.objective, r.bound
+    assert r.gap == pytest.approx(abs(o - b) / max(abs(o), abs(b), 1e-10), rel=1e-9)
 
 
 # --------------------------------------------------------------------------

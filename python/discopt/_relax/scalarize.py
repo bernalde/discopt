@@ -210,6 +210,9 @@ def _static_shape_uncached(expr: Expression) -> Optional[tuple[int, ...]]:
         if expr.func_name.startswith("norm") and len(expr.args) == 1:
             # ``dm.norm`` is a reduction: scalar whatever its argument's shape (#1493).
             return ()
+        if expr.func_name == "prod" and len(expr.args) == 1:
+            # A one-argument ``prod`` is a full reduction: scalar (#1582).
+            return ()
         if expr.func_name not in _ELEMENTWISE_FUNCS:
             return None
         shape: Optional[tuple[int, ...]] = ()

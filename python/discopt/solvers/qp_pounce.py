@@ -111,6 +111,7 @@ def solve_qp(
     x0: Optional[np.ndarray] = None,
     options: Optional[dict] = None,
     certificate: bool = False,
+    solve_report: bool = False,
 ) -> QPResult:
     """Solve ``min 0.5 x^T Q x + c^T x`` s.t. linear constraints via POUNCE.
 
@@ -120,6 +121,10 @@ def solve_qp(
     ``certificate`` is retained for contract compatibility but no longer gates
     anything: since #1319 the elastic Phase-1 cross-check is **mandatory** before
     any ``INFEASIBLE`` is returned, so every infeasible exit carries its witness.
+
+    ``solve_report=True`` attaches POUNCE's ``pounce.solve-report/v1`` document for
+    the main QP solve as ``QPResult.solve_report`` (#1534). The elastic Phase-1 and
+    recession-ray probes are separate problems and are not part of it.
 
     Raises:
         ImportError: If POUNCE is not installed.
@@ -174,7 +179,7 @@ def solve_qp(
     if time_limit is not None:
         opts.setdefault("max_wall_time", float(time_limit))
 
-    result = _solve_qp_core(Q_arr, c_arr, A, cl, cu, lb, ub, x0, opts)
+    result = _solve_qp_core(Q_arr, c_arr, A, cl, cu, lb, ub, x0, opts, solve_report=solve_report)
 
     # ---- infeasibility certificate (roadmap P0.2; same logic as lp_pounce) ---
     # Constraints are linear, so the elastic Phase-1 LP is a Farkas disambiguation
@@ -213,6 +218,7 @@ def solve_qp(
                 status=SolveStatus.INFEASIBLE,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
                 infeasibility_certificate=(
                     _build_certificate(phase1.slacks, n_ineq) if phase1 is not None else None
                 ),
@@ -231,6 +237,7 @@ def solve_qp(
                 status=SolveStatus.ERROR,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
             )
         if result.status == SolveStatus.INFEASIBLE:
             # POUNCE's own code-2 verdict did NOT survive the Phase-1 check, so the
@@ -248,6 +255,7 @@ def solve_qp(
                 status=SolveStatus.ERROR,
                 iterations=result.iterations,
                 wall_time=result.wall_time,
+                solve_report=result.solve_report,
             )
 
     # Same reasoning as the LP path (see lp_pounce._certify_unbounded_ray): Ipopt
@@ -262,7 +270,10 @@ def solve_qp(
         c_arr, A, cl, cu, lb, ub, opts, Q=Q_arr
     ):
         return QPResult(
-            status=SolveStatus.ERROR, iterations=result.iterations, wall_time=result.wall_time
+            status=SolveStatus.ERROR,
+            iterations=result.iterations,
+            wall_time=result.wall_time,
+            solve_report=result.solve_report,
         )
 
     return result
@@ -365,6 +376,7 @@ def _solve_qp_core(
     ub: np.ndarray,
     x0: np.ndarray,
     opts: dict,
+    solve_report: bool = False,
 ) -> QPResult:
     """Single POUNCE entry point for the QP; mirrors lp_pounce._solve_core."""
     import pounce
@@ -386,15 +398,21 @@ def _solve_qp_core(
             pass
 
     t0 = time.perf_counter()
+    report = None
     with _timing.charge("pounce"):
-        x, info = problem.solve(x0)
+        if solve_report:
+            from discopt.solvers._pounce_report import solve_with_report
+
+            x, info, report = solve_with_report(problem, x0)
+        else:
+            x, info = problem.solve(x0)
     wall_time = time.perf_counter() - t0
 
     status = _LP_STATUS_MAP.get(info.get("status", -100), SolveStatus.ERROR)
     iters = int(info.get("iter_count", 0))
 
     if status != SolveStatus.OPTIMAL:
-        return QPResult(status=status, iterations=iters, wall_time=wall_time)
+        return QPResult(status=status, iterations=iters, wall_time=wall_time, solve_report=report)
 
     x_arr = np.asarray(x, dtype=np.float64)
     obj = float(info.get("obj_val", 0.5 * x_arr @ Q @ x_arr + c @ x_arr))
@@ -423,4 +441,5 @@ def _solve_qp_core(
         iterations=iters,
         wall_time=wall_time,
         kkt_error=kkt_error,
+        solve_report=report,
     )

@@ -78,6 +78,44 @@ LOCAL_LIMIT = "local_limit"
 #: proof — a stalled MPEC continuation lands here, never on :data:`INFEASIBLE`.
 LOCAL_INFEASIBLE = "local_infeasible"
 
+# ── termination reasons (``SolveResult.termination``), added by #1585 ──
+#
+# Orthogonal to the status. The status says what was PROVED about the answer;
+# the termination reason says why the SEARCH stopped. They differ exactly where
+# a caller needs both: a branch-and-bound that hit ``max_nodes`` holding an
+# incumbent and a valid bound is ``status="feasible"`` (certified bound +
+# incumbent, gap > 0 -- the documented meaning, which existing callers rely on)
+# with ``termination="node_limit"``. ``None`` means the route that answered does
+# not record a reason (a single local NLP/LP/QP solve, a decomposition loop).
+# The pairing below ("gap" -> optimal, "exhausted" -> optimal/infeasible) is the
+# usual one, not an invariant: see the ``SolveResult.termination`` comment for
+# the known exits where the two disagree.
+#: The convergence test (absolute OR relative gap) was met.
+TERMINATION_GAP = "gap"
+#: Every node of the tree was fathomed or proved; the search ran to completion.
+TERMINATION_EXHAUSTED = "exhausted"
+#: ``max_nodes`` was reached with nodes still open.
+TERMINATION_NODE_LIMIT = "node_limit"
+#: ``time_limit`` was reached (including the tail reserved for the root-relaxation
+#: bound fallback).
+TERMINATION_TIME_LIMIT = "time_limit"
+#: An iteration cap stopped the solve.
+TERMINATION_ITERATION_LIMIT = "iteration_limit"
+#: The user stopped the search (the interactive debugger's ``quit``).
+TERMINATION_INTERRUPTED = "interrupted"
+
+#: Every value ``SolveResult.termination`` may take besides ``None``.
+TERMINATION_REASONS = frozenset(
+    {
+        TERMINATION_GAP,
+        TERMINATION_EXHAUSTED,
+        TERMINATION_NODE_LIMIT,
+        TERMINATION_TIME_LIMIT,
+        TERMINATION_ITERATION_LIMIT,
+        TERMINATION_INTERRUPTED,
+    }
+)
+
 #: Statuses that make no global claim. A result carrying one of these is never
 #: certified and never contributes a dual bound.
 LOCAL_STATUSES = frozenset({LOCAL_OPTIMAL, LOCAL_LIMIT, LOCAL_INFEASIBLE})

@@ -377,10 +377,10 @@ def test_solve_reports_a_pass_abandoned_mid_traversal(monkeypatch, caplog):
     real = fr._find_clearable_denominator
     seen = {"n": 0}
 
-    def slow_denominator_check(expr, model):
+    def slow_denominator_check(expr, model, *args):
         seen["n"] += 1
         time.sleep(0.05)  # ~1 s over the probe model's constraints
-        return real(expr, model)
+        return real(expr, model, *args)
 
     monkeypatch.setattr(fr, "_find_clearable_denominator", slow_denominator_check)
 

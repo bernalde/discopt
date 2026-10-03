@@ -282,6 +282,21 @@ def test_entropy_objective_certifies_to_an_absolute_gap_of_1e_9():
     criterion at ~9e-7, because ``_DEFAULT_ABS_GAP_TOL = 1e-6`` used to be a
     module constant with no caller control. Tightening ``gap_tolerance`` alone
     does nothing — the absolute arm is what binds here.
+
+    It also needs two later fixes, each necessary on its own (measured):
+
+    * the root McCormick LP must be BOUNDED. ``xlogx(1 - y)`` sees the argument
+      interval ``[-2.2e-16, 1 + 2.2e-16]`` (``-1 * [0, 1]`` rounds outward), so the
+      atom got no envelope and a free aux column; the root LP was ``unbounded``
+      and the solver dropped the LP relaxer for the whole tree. Node bounds then
+      converged only first-order (gap ~2.7 x box width), and the solve passed only
+      while tight boxes were silently dropped from the dual bound -- an unproven
+      certificate #1492/#1510 removed (7607 nodes, gap 2.66e-6, ``feasible``).
+      The closed-edge envelope (``_CLOSED_LOWER_EDGE["entropy"]``) fixes it.
+    * the search must obey a tolerance below 1e-8. ``TreeManager::is_finished``
+      also fires at a hard-coded tree gap of 1e-8, and the loop took that as
+      "exhausted": 79 nodes, 4 still open, gap 3.8e-9, ``optimal`` withdrawn to
+      ``feasible`` by #1383. ``_tree_drained`` fixes it.
     """
     res = _acceptance_model().solve(
         solver="bb", time_limit=300, gap_tolerance=1e-9, abs_gap_tolerance=1e-9
@@ -290,3 +305,50 @@ def test_entropy_objective_certifies_to_an_absolute_gap_of_1e_9():
     assert res.bound is not None and math.isfinite(res.bound)
     assert abs(res.objective - res.bound) <= 1e-9
     assert res.bound <= res.objective + 1e-12
+    # Never above the true optimum.
+    assert res.bound <= _ENTROPY_ACCEPTANCE_OPT + 1e-12
+
+
+#: The global optimum of :func:`_acceptance_model`, from a 1-D root solve of
+#: ``f'(y) = ln(y / (1 - y)) + 3 (1 - 2y) = 0`` at ``y = 0.0707202...`` (and, by
+#: symmetry, ``0.9292798...``).
+_ENTROPY_ACCEPTANCE_OPT = -0.05834134944143926
+
+
+class _FakeTree:
+    """Just the observations ``_tree_drained`` reads from a ``PyTreeManager``."""
+
+    def __init__(self, finished: bool, open_nodes: int):
+        self._finished, self._open = finished, open_nodes
+
+    def is_finished(self) -> bool:
+        return self._finished
+
+    def stats(self) -> dict:
+        return {"open_nodes": self._open, "bound_unresolved": False, "unresolved_floor": math.inf}
+
+
+@pytest.mark.parametrize(
+    "finished,open_nodes,drained",
+    [(True, 0, True), (True, 4, False), (False, 4, False), (False, 0, False)],
+)
+def test_a_tree_stopped_on_its_own_1e_8_gap_is_not_exhausted(finished, open_nodes, drained):
+    """``is_finished()`` is true at a tree gap below a hard-coded 1e-8 with nodes
+    still OPEN; that is neither the caller's tolerance nor an exhausted tree, so
+    it must not stop the loop or certify as exhaustion."""
+    from discopt.solver import _tree_drained, _tree_exhausted_with_proof
+
+    tree = _FakeTree(finished, open_nodes)
+    assert _tree_drained(tree) is drained
+    assert _tree_exhausted_with_proof(tree) is drained
+
+
+def test_finished_with_open_nodes_is_not_an_exhaustion_proof():
+    """The discriminating case on its own, with no dependency on ``_tree_drained``
+    existing: before #1242, ``_tree_exhausted_with_proof`` trusted
+    ``is_finished()`` alone and returned True for a tree that stopped at its own
+    1e-8 gap with 4 nodes still open."""
+    from discopt.solver import _tree_exhausted_with_proof
+
+    assert _tree_exhausted_with_proof(_FakeTree(finished=True, open_nodes=4)) is False
+    assert _tree_exhausted_with_proof(_FakeTree(finished=True, open_nodes=0)) is True

@@ -7,6 +7,17 @@ from typing import Optional
 import numpy as np
 
 
+class PounceOptionError(ValueError):
+    """POUNCE refused a solver option the caller passed (#1585).
+
+    A ``ValueError`` (the caller's input is wrong), given its own type so that the
+    branch-and-bound node handlers -- which keep a node alive through an ordinary
+    POUNCE failure by reporting it as ``ERROR`` -- can let THIS one through. A bad
+    option is not a node outcome: every node would fail the same way, and
+    swallowing it silently drops the option the caller asked for (CLAUDE.md §3).
+    """
+
+
 class SolveStatus(Enum):
     """Terminal status of a solve (optimal, infeasible, unbounded, ...)."""
 
@@ -72,6 +83,10 @@ class LPResult:
     # exactly (``lp_milp_highs.primal_ray_verified``). ``None`` when the engine
     # did not check; ``False`` means the verdict is not a certificate (#1286).
     ray_verified: Optional[bool] = None
+    #: POUNCE's structured ``pounce.solve-report/v1`` document for this solve
+    #: (#1534), or ``None`` when it was not requested or the backend is not
+    #: POUNCE. See :mod:`discopt.solvers._pounce_report` for its contents.
+    solve_report: Optional[dict] = None
 
 
 @dataclass
@@ -130,6 +145,10 @@ class QPResult:
     wall_time: float = 0.0
     infeasibility_certificate: Optional[InfeasibilityCertificate] = None
     kkt_error: Optional[float] = None
+    #: POUNCE's structured ``pounce.solve-report/v1`` document for this solve
+    #: (#1534), or ``None`` when it was not requested or the backend is not
+    #: POUNCE. See :mod:`discopt.solvers._pounce_report` for its contents.
+    solve_report: Optional[dict] = None
 
 
 @dataclass
@@ -181,6 +200,10 @@ class NLPResult:
     #: is how a caller tells "the labels were used" from "the labels were
     #: validated, handed over, and quietly declined".
     linear_solver: Optional[dict] = None
+    #: POUNCE's structured ``pounce.solve-report/v1`` document for this solve
+    #: (#1534), or ``None`` when it was not requested or the backend is not
+    #: POUNCE. See :mod:`discopt.solvers._pounce_report` for its contents.
+    solve_report: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

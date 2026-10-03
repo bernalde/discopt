@@ -1018,13 +1018,22 @@ def _relax_huge_box(sf: StdForm, huge_lo: np.ndarray, huge_hi: np.ndarray) -> St
     )
 
 
-def _pass_model(h, highspy, sf: StdForm, integer: bool) -> tuple[Any, str]:
+def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> tuple[Any, str]:
     """Hand ``sf`` to HiGHS; returns ``(passModel status, reason)``, ``reason`` empty on kOk.
 
     kWarning means HiGHS changed the model on the way in -- it drops every matrix entry
     with ``|a| <= small_matrix_value`` -- so the caller decides whether its certificates
     survive that. kError means HiGHS holds no model. Neither is raised: both are
     properties of the input, not defects, and the route reports them as ``error``.
+
+    ``offset`` is HiGHS's objective constant. Every HiGHS objective value and bound
+    then includes it (``objective_function_value`` and ``mip_dual_bound`` both do,
+    measured), so a caller that passes ``sf.obj_const`` must not add it again. The
+    MILP route passes it because ``mip_rel_gap`` is measured on HiGHS's objective:
+    with a constant-free one, a change of variables ``x = y - 1e6`` makes ``c . y``
+    ~1e6 at every feasible point and HiGHS stops on a gap that is 3.6e-5 of that
+    but 35 units of the objective discopt publishes (#1536). The LP callers keep
+    the default -- they read no HiGHS objective value.
     """
     from discopt.solvers.milp_highs import _to_highs_inf
 
@@ -1038,8 +1047,7 @@ def _pass_model(h, highspy, sf: StdForm, integer: bool) -> tuple[Any, str]:
     lp.col_upper_ = _to_highs_inf(sf.xu, highspy)
     lp.row_lower_ = sf.b
     lp.row_upper_ = sf.b
-    # obj_const is added by discopt, so every HiGHS objective/bound is constant-free.
-    lp.offset_ = 0.0
+    lp.offset_ = float(offset)
     lp.sense_ = highspy.ObjSense.kMinimize
     lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
     lp.a_matrix_.num_col_ = sf.n
@@ -1440,7 +1448,125 @@ def _fixed_integer_lp(sf: "StdForm", x: np.ndarray, time_limit: Optional[float])
     return solve_lp_std(dataclasses.replace(sf, xl=xl, xu=xu), time_limit=time_limit)
 
 
+def logical_column_scales(sf: StdForm, n_struct: Optional[int]) -> Optional[np.ndarray]:
+    """Power-of-two factors that equilibrate the route's own logical columns, or ``None``.
+
+    #1537: the standard form ends every inequality row with a unit logical
+    ``a x + s = b, s >= 0``. Multiply that row by 1e6 -- the same model -- and the
+    logical is 2.5e-7 of its row's largest entry, below :data:`UNSCALABLE_OPEN_RATIO`.
+    That is not a false alarm: on the #1295-class panel HiGHS then pruned the true
+    optimum on 3/9 such models (caught only by the #1509 refutation), and with the
+    logical's coefficient raised to its row's magnitude it certified all of them
+    correctly. Before this, ×1e6 rows on clean MILPs withdrew 12/12 correct
+    certificates.
+
+    So the logical is rescaled rather than excused: ``s = f s'`` with ``f`` a power of
+    two is exact in floating point, changes no other row and (``c_s = 0``) not the
+    objective, and puts the column's entry within a factor 2 below its row's largest. Only
+    columns at index ``>= n_struct`` (the route's own, never published), with one
+    nonzero, zero cost, continuous, and *below* the cap are touched, so a model this
+    route certifies today is handed to HiGHS unchanged. A user's own tiny-coefficient
+    column is not touched and still decertifies: that class was measured wrong
+    (#1295) and is the user's scaling, not the route's.
+    """
+    if n_struct is None or n_struct >= sf.n or sf.A.nnz == 0:
+        return None
+    A = sp.csc_matrix(sf.A)  # noqa: N806
+    absA = abs(A).tocoo()  # noqa: N806
+    row_max = np.zeros(sf.m)
+    np.maximum.at(row_max, absA.row, absA.data)
+    scales = np.ones(sf.n)
+    cand = _logical_columns(sf)
+    cand[:n_struct] = False
+    lo_open, hi_open = sf.xl <= -INF, sf.xu >= INF
+    for j in np.flatnonzero(cand):
+        i, a = int(A.indices[A.indptr[j]]), abs(float(A.data[A.indptr[j]]))
+        if row_max[i] <= 0.0 or a / row_max[i] >= UNSCALABLE_OPEN_RATIO:
+            continue
+        # floor, not round: the rescaled entry lands in (row_max / 2, row_max], so it
+        # never becomes its row's new largest and lowers every other entry's ratio.
+        f = float(2.0 ** np.floor(np.log2(row_max[i] / a)))
+        if f * a > row_max[i]:
+            f /= 2.0
+        # A finite side must stay an ordinary finite side after ``/ f``; a sentinel
+        # side stays the sentinel. Anything else would change what "open" means.
+        new_lo, new_hi = sf.xl[j] / f, sf.xu[j] / f
+        if not lo_open[j] and (abs(sf.xl[j]) >= READBACK_LIMIT or new_lo * f != sf.xl[j]):
+            continue
+        if not hi_open[j] and (abs(sf.xu[j]) >= READBACK_LIMIT or new_hi * f != sf.xu[j]):
+            continue
+        scales[j] = f
+    return scales if np.any(scales != 1.0) else None
+
+
+def _scale_logicals(sf: StdForm, f: np.ndarray) -> StdForm:
+    """``sf`` in the variables ``x'_j = x_j / f_j`` (sentinel sides kept)."""
+    A = sp.csc_matrix(sf.A) @ sp.diags(f, format="csc")  # noqa: N806
+    xl = np.where(sf.xl <= -INF, sf.xl, sf.xl / f)
+    xu = np.where(sf.xu >= INF, sf.xu, sf.xu / f)
+    return StdForm.from_arrays(sf.c * f, A, sf.b, xl, xu, sf.obj_const, sf.int_idx)
+
+
 def solve_milp_std(
+    sf: StdForm,
+    *,
+    time_limit: Optional[float],
+    gap_tolerance: float,
+    abs_gap_tolerance: Optional[float] = None,
+    max_nodes: int,
+    initial_point: Optional[np.ndarray] = None,
+    n_struct: Optional[int] = None,
+    root_check: bool = True,
+) -> HighsOutcome:
+    """Solve the MILP ``sf`` under the §3.2 contract, with the route's own
+    under-scaled logical columns rescaled exactly first (#1537,
+    :func:`logical_column_scales`); see :func:`_solve_milp_std`."""
+    f = logical_column_scales(sf, n_struct)
+    kw: dict[str, Any] = dict(
+        time_limit=time_limit,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tolerance=abs_gap_tolerance,
+        max_nodes=max_nodes,
+        initial_point=initial_point,
+        n_struct=n_struct,
+        root_check=root_check,
+    )
+    if f is None:
+        return _solve_milp_std(sf, **kw)
+    t0 = time.perf_counter()
+    out = _solve_milp_std(_scale_logicals(sf, f), **kw)
+    # Back to ``sf``'s variables: x = f x'; a reduced cost is per unit of the column,
+    # d = d' / f; a primal ray is a direction in column space. Row duals and a Farkas
+    # ray live in row space, and the rows were not touched.
+    if out.x is not None:
+        out.x = np.asarray(out.x, dtype=np.float64) * f
+    if out.col_dual is not None:
+        out.col_dual = np.asarray(out.col_dual, dtype=np.float64) / f
+    if out.ray is not None and out.status == "unbounded" and np.size(out.ray) == sf.n:
+        out.ray = np.asarray(out.ray, dtype=np.float64) * f
+    # The rescaling is exact for the MODEL, not for its tolerances: the slack's bound
+    # ``s' >= -tol`` is ``s >= -f tol`` in ``sf``'s variables, so a point can be
+    # feasible in the scaled form and violate a row of ``sf`` by up to ``f tol``. On
+    # ``min -x + 3z, x <= M z`` (M = 1e8, #1414's class) that let x = ub, z = 0 -- a
+    # 10-unit violation, 1.5e-7 in the scaled slack -- be certified at -10 against a
+    # true -7. So the mapped point is re-verified on ``sf`` itself, with the same
+    # checks the route applies to every HiGHS point; if it fails, the rescaled answer
+    # is discarded and ``sf`` is solved as given (the pre-#1537 path, whose #1295
+    # guard then decides what may be certified).
+    if out.x is not None:
+        why = readback_problem(out.x, sf) or feasibility_problem(out.x, sf, check_integrality=True)
+        if why:
+            if kw["time_limit"] is not None:
+                kw["time_limit"] = max(0.0, float(kw["time_limit"]) - (time.perf_counter() - t0))
+            plain = _solve_milp_std(sf, **kw)
+            plain.stats["milp/logicals_rescale_refused"] = 1.0
+            plain.labels["milp/logicals_rescale_refused"] = why
+            return plain
+    out.stats["milp/logicals_rescaled"] = float(np.count_nonzero(f != 1.0))
+    return out
+
+
+def _solve_milp_std(
     sf: StdForm,
     *,
     time_limit: Optional[float],
@@ -1540,7 +1666,11 @@ def solve_milp_std(
     huge_lo, huge_hi = _huge_box(sf)
     if huge_lo.any() or huge_hi.any():
         stats["milp/huge_box_relaxed"] = 1.0
-    pass_st, pass_why = _pass_model(h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True)
+    # HiGHS gets ``obj_const`` so ``mip_rel_gap`` is measured on the objective this
+    # route publishes (#1536); both values read back below therefore include it.
+    pass_st, pass_why = _pass_model(
+        h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True, offset=sf.obj_const
+    )
     if pass_why:
         # No MILP certificate is re-derivable from ``sf`` (HiGHS's infeasible label and
         # tree bound are trusted as-is), so a model HiGHS changed on the way in -- or
@@ -1599,7 +1729,7 @@ def solve_milp_std(
                 )
             )  # fmt: skip
         obj = float(sf.c @ x) + sf.obj_const
-        h_obj = float(info.objective_function_value) + sf.obj_const
+        h_obj = float(info.objective_function_value)  # includes the passed offset
         mismatch = abs(obj - h_obj)
         stats["milp/objective_mismatch"] = mismatch
         if mismatch > 1e-6 * (1.0 + abs(obj)):
@@ -1607,8 +1737,8 @@ def solve_milp_std(
                 "HiGHS MILP objective %.12g differs from the recomputed %.12g", h_obj, obj
             )
 
-    raw = float(info.mip_dual_bound)
-    bound = raw + sf.obj_const if np.isfinite(raw) else None
+    raw = float(info.mip_dual_bound)  # includes the passed offset
+    bound = raw if np.isfinite(raw) else None
     out = HighsOutcome("error", x=x, objective=obj, highs_status=name, node_count=nodes)
     out.iterations = int(info.simplex_iteration_count)
 

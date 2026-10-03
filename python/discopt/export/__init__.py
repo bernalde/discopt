@@ -23,6 +23,6 @@ Examples
 from discopt.export.gams import to_gams
 from discopt.export.lp import to_lp
 from discopt.export.mps import to_mps
-from discopt.export.nl import to_nl
+from discopt.export.nl import nl_row_order, to_nl
 
-__all__ = ["to_mps", "to_lp", "to_gams", "to_nl"]
+__all__ = ["to_mps", "to_lp", "to_gams", "to_nl", "nl_row_order"]

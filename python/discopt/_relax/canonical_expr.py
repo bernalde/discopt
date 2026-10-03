@@ -41,7 +41,8 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
-from typing import Any, Optional
+import operator
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -571,6 +572,16 @@ class _Canonicalizer:
             spelled = _norm_scalar_spelling(name, args[0])
             if spelled is not None:
                 return self.canon(spelled)
+        if name == "prod" and len(args) == 1:
+            # ``prod`` of an array is the product of its ELEMENTS (``jnp.prod``;
+            # the tape's ``*`` fold in ``_nl_expr_compiler``), so it is spelled
+            # out exactly as the user's ``x[0] * x[1] * ...`` would be and relaxes
+            # through the existing bilinear/multilinear envelopes (#1582). Before,
+            # the call stayed opaque with an array-shaped enclosure and the
+            # relaxation build refused it, so no ``dm.prod`` model had a bound.
+            spelled = _prod_scalar_spelling(args[0])
+            if spelled is not None:
+                return self.canon(spelled)
         if any(_array_valued(a) for a in args):
             # A call over an array-valued argument has no scalar canonical form
             # (a 2-D ``norm`` is jnp's MATRIX norm, not a fold over elements).
@@ -603,6 +614,30 @@ def _norm_order(name: str) -> Optional[float]:
     except ValueError:
         return None
     return p if p >= 1.0 else None
+
+
+def _prod_scalar_spelling(arg: Expression) -> Optional[Expression]:
+    """Value-preserving scalar spelling of a one-argument ``prod(arg)`` (#1582).
+
+    The left ``*`` fold over ``arg``'s C-order elements, matching
+    ``_nl_expr_compiler``'s lowering. An empty argument is the empty product
+    ``1``. ``None`` (unknown shape, or too large to scalarize) keeps the call
+    opaque; its interval enclosure is then the scalar ``_prod_interval``.
+    """
+    shape = static_shape(arg)
+    if shape is None:
+        return None
+    if shape == ():
+        return arg
+    if int(np.prod(shape)) == 0:
+        return Constant(1.0)
+    elems = scalar_elements(arg)
+    if elems is None:
+        return None
+    out: Expression = elems[0]
+    for e in elems[1:]:
+        out = BinaryOp("*", out, e)
+    return out
 
 
 def _norm_scalar_spelling(name: str, arg: Expression) -> Optional[Expression]:
@@ -752,6 +787,34 @@ def _flat_var_expr(model: Model) -> list[Expression]:
     return out
 
 
+# A canonical ``sum``/``prod`` node is n-ary, but ``Expression`` is binary, so
+# reconstruct has to fold it. A left fold is ``n`` deep, and every consumer of the
+# reconstructed tree (``evaluate_interval``, ``classify_expr``,
+# ``compile_expression``) recurses a frame or two per level. A model whose own
+# expressions are shallow can still canonicalize to a very wide node -- the
+# product of ten shifted binomials distributes to a 1024-term sum -- and its left
+# fold then overran CPython's recursion limit inside the relaxation build
+# (#1544). Wide nodes are therefore folded as a balanced tree (``log2 n`` deep).
+# Up to this width the legacy left fold is kept, so every node that already
+# reconstructed keeps its exact operator tree and floating-point evaluation order
+# (interval arithmetic is outward-rounded, so either order is sound).
+_RECONSTRUCT_FOLD_WIDTH = 128
+
+
+def _balanced_fold(
+    items: list[Expression], op: Callable[[Expression, Expression], Expression]
+) -> Expression:
+    """Fold ``items`` with the binary ``op`` as a balanced tree, ``ceil(log2 n)``
+    deep. Iterative (pairwise rounds), so it cannot itself recurse deeply."""
+    level = list(items)
+    while len(level) > 1:
+        nxt = [op(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    return level[0]
+
+
 def reconstruct(node: CNode, model: Model, _flat: Optional[list[Expression]] = None) -> Expression:
     """Rebuild an :class:`Expression` from a canonical node.
 
@@ -779,18 +842,29 @@ def reconstruct(node: CNode, model: Model, _flat: Optional[list[Expression]] = N
             return powed
         if n.kind == "sum":
             coeffs, const = n.payload
+            terms = [
+                rec(child) if coef == 1.0 else Constant(coef) * rec(child)
+                for coef, child in zip(coeffs, n.children)
+            ]
+            if len(terms) > _RECONSTRUCT_FOLD_WIDTH:
+                wide_sum: Expression = Constant(const) + _balanced_fold(terms, operator.add)
+                return wide_sum
             sum_acc: Expression = Constant(const)
-            for coef, child in zip(coeffs, n.children):
-                term = rec(child) if coef == 1.0 else Constant(coef) * rec(child)
+            for term in terms:
                 sum_acc = sum_acc + term
             return sum_acc
         if n.kind == "prod":
             (exps,) = n.payload
-            prod_acc: Optional[Expression] = None
-            for exp, child in zip(exps, n.children):
-                factor = rec(child) if exp == 1.0 else rec(child) ** exp
-                prod_acc = factor if prod_acc is None else prod_acc * factor
-            assert prod_acc is not None
+            factors = [
+                rec(child) if exp == 1.0 else rec(child) ** exp
+                for exp, child in zip(exps, n.children)
+            ]
+            assert factors
+            if len(factors) > _RECONSTRUCT_FOLD_WIDTH:
+                return _balanced_fold(factors, operator.mul)
+            prod_acc = factors[0]
+            for factor in factors[1:]:
+                prod_acc = prod_acc * factor
             return prod_acc
         raise ValueError(f"cannot reconstruct CNode kind {n.kind!r}")
 

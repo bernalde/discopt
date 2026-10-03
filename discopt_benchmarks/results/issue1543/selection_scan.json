@@ -1,0 +1,5242 @@
+{
+"alan.nl@1000": {
+"bb": 1,
+"shift_cols": 8,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/alan.nl",
+"off": 1000.0
+},
+"alan.nl@100000": {
+"bb": 1,
+"shift_cols": 8,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/alan.nl",
+"off": 100000.0
+},
+"alan.nl@1e+06": {
+"bb": 1,
+"shift_cols": 8,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/alan.nl",
+"off": 1000000.0
+},
+"dispatch.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.6,
+"path": "python/tests/data/minlplib/dispatch.nl",
+"off": 1000.0
+},
+"dispatch.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/dispatch.nl",
+"off": 100000.0
+},
+"dispatch.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.0,
+"path": "python/tests/data/minlplib/dispatch.nl",
+"off": 1000000.0
+},
+"ex1223a.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/ex1223a.nl",
+"off": 1000.0
+},
+"ex1223a.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/ex1223a.nl",
+"off": 100000.0
+},
+"ex1223a.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/ex1223a.nl",
+"off": 1000000.0
+},
+"ex1233.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 3.9,
+"path": "python/tests/data/minlplib/ex1233.nl",
+"off": 1000.0
+},
+"ex1233.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 3.5,
+"path": "python/tests/data/minlplib/ex1233.nl",
+"off": 100000.0
+},
+"ex1233.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 3.3,
+"path": "python/tests/data/minlplib/ex1233.nl",
+"off": 1000000.0
+},
+"ex1263.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.7,
+"path": "python/tests/data/minlplib/ex1263.nl",
+"off": 1000.0
+},
+"ex1263.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/ex1263.nl",
+"off": 100000.0
+},
+"ex1263.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.4,
+"path": "python/tests/data/minlplib/ex1263.nl",
+"off": 1000000.0
+},
+"ex1266.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/ex1266.nl",
+"off": 1000.0
+},
+"ex1266.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/ex1266.nl",
+"off": 100000.0
+},
+"ex1266.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/ex1266.nl",
+"off": 1000000.0
+},
+"fuel.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/fuel.nl",
+"off": 1000.0
+},
+"fuel.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/fuel.nl",
+"off": 100000.0
+},
+"fuel.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/fuel.nl",
+"off": 1000000.0
+},
+"gear2.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.1,
+"path": "python/tests/data/minlplib/gear2.nl",
+"off": 1000.0
+},
+"gear2.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 8.3,
+"path": "python/tests/data/minlplib/gear2.nl",
+"off": 100000.0
+},
+"gear2.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 8.3,
+"path": "python/tests/data/minlplib/gear2.nl",
+"off": 1000000.0
+},
+"hda.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.7,
+"path": "python/tests/data/minlplib/hda.nl",
+"off": 1000.0
+},
+"hda.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.9,
+"path": "python/tests/data/minlplib/hda.nl",
+"off": 100000.0
+},
+"hda.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 24.2,
+"path": "python/tests/data/minlplib/hda.nl",
+"off": 1000000.0
+},
+"mathopt5_2.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/mathopt5_2.nl",
+"off": 1000.0
+},
+"mathopt5_2.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.8,
+"path": "python/tests/data/minlplib/mathopt5_2.nl",
+"off": 100000.0
+},
+"mathopt5_2.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.3,
+"path": "python/tests/data/minlplib/mathopt5_2.nl",
+"off": 1000000.0
+},
+"meanvarx.nl@1000": {
+"bb": 1,
+"shift_cols": 35,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib/meanvarx.nl",
+"off": 1000.0
+},
+"meanvarx.nl@100000": {
+"bb": 1,
+"shift_cols": 35,
+"status": "optimal",
+"wall": 1.3,
+"path": "python/tests/data/minlplib/meanvarx.nl",
+"off": 100000.0
+},
+"meanvarx.nl@1e+06": {
+"bb": 1,
+"shift_cols": 35,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib/meanvarx.nl",
+"off": 1000000.0
+},
+"nvs03.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/nvs03.nl",
+"off": 1000.0
+},
+"nvs03.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs03.nl",
+"off": 100000.0
+},
+"nvs03.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs03.nl",
+"off": 1000000.0
+},
+"nvs06.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.9,
+"path": "python/tests/data/minlplib/nvs06.nl",
+"off": 1000.0
+},
+"nvs06.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 3.3,
+"path": "python/tests/data/minlplib/nvs06.nl",
+"off": 100000.0
+},
+"nvs06.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.3,
+"path": "python/tests/data/minlplib/nvs06.nl",
+"off": 1000000.0
+},
+"nvs10.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs10.nl",
+"off": 1000.0
+},
+"nvs10.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs10.nl",
+"off": 100000.0
+},
+"nvs10.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs10.nl",
+"off": 1000000.0
+},
+"nvs13.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.0,
+"path": "python/tests/data/minlplib/nvs13.nl",
+"off": 1000.0
+},
+"nvs13.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.7,
+"path": "python/tests/data/minlplib/nvs13.nl",
+"off": 100000.0
+},
+"nvs13.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.8,
+"path": "python/tests/data/minlplib/nvs13.nl",
+"off": 1000000.0
+},
+"nvs16.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 1.7,
+"path": "python/tests/data/minlplib/nvs16.nl",
+"off": 1000.0
+},
+"nvs16.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs16.nl",
+"off": 100000.0
+},
+"nvs16.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs16.nl",
+"off": 1000000.0
+},
+"nvs19.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/nvs19.nl",
+"off": 1000.0
+},
+"nvs19.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/nvs19.nl",
+"off": 100000.0
+},
+"nvs19.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/nvs19.nl",
+"off": 1000000.0
+},
+"nvs22.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 25.1,
+"path": "python/tests/data/minlplib/nvs22.nl",
+"off": 1000.0
+},
+"nvs22.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs22.nl",
+"off": 100000.0
+},
+"nvs22.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.7,
+"path": "python/tests/data/minlplib/nvs22.nl",
+"off": 1000000.0
+},
+"portfol_roundlot.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/portfol_roundlot.nl",
+"off": 1000.0
+},
+"portfol_roundlot.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 5.8,
+"path": "python/tests/data/minlplib/portfol_roundlot.nl",
+"off": 100000.0
+},
+"portfol_roundlot.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 5.8,
+"path": "python/tests/data/minlplib/portfol_roundlot.nl",
+"off": 1000000.0
+},
+"prob06.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/prob06.nl",
+"off": 1000.0
+},
+"prob06.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/prob06.nl",
+"off": 100000.0
+},
+"prob06.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/prob06.nl",
+"off": 1000000.0
+},
+"st_e02.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/st_e02.nl",
+"off": 1000.0
+},
+"st_e02.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.5,
+"path": "python/tests/data/minlplib/st_e02.nl",
+"off": 100000.0
+},
+"st_e02.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/st_e02.nl",
+"off": 1000000.0
+},
+"st_e05.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.3,
+"path": "python/tests/data/minlplib/st_e05.nl",
+"off": 1000.0
+},
+"st_e05.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.5,
+"path": "python/tests/data/minlplib/st_e05.nl",
+"off": 100000.0
+},
+"st_e05.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.5,
+"path": "python/tests/data/minlplib/st_e05.nl",
+"off": 1000000.0
+},
+"st_e08.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/st_e08.nl",
+"off": 1000.0
+},
+"st_e08.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/st_e08.nl",
+"off": 100000.0
+},
+"st_e08.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib/st_e08.nl",
+"off": 1000000.0
+},
+"st_e13.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e13.nl",
+"off": 1000.0
+},
+"st_e13.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e13.nl",
+"off": 100000.0
+},
+"st_e13.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e13.nl",
+"off": 1000000.0
+},
+"st_e18.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e18.nl",
+"off": 1000.0
+},
+"st_e18.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e18.nl",
+"off": 100000.0
+},
+"st_e18.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e18.nl",
+"off": 1000000.0
+},
+"st_e35.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 18.2,
+"path": "python/tests/data/minlplib/st_e35.nl",
+"off": 1000.0
+},
+"st_e35.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 2.6,
+"path": "python/tests/data/minlplib/st_e35.nl",
+"off": 100000.0
+},
+"st_e35.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 2.8,
+"path": "python/tests/data/minlplib/st_e35.nl",
+"off": 1000000.0
+},
+"st_e40.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/st_e40.nl",
+"off": 1000.0
+},
+"st_e40.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/st_e40.nl",
+"off": 100000.0
+},
+"st_e40.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/st_e40.nl",
+"off": 1000000.0
+},
+"syn05m.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/syn05m.nl",
+"off": 1000.0
+},
+"syn05m.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/syn05m.nl",
+"off": 100000.0
+},
+"syn05m.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/syn05m.nl",
+"off": 1000000.0
+},
+"4stufen.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/4stufen.nl",
+"off": 1000.0
+},
+"4stufen.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/4stufen.nl",
+"off": 100000.0
+},
+"4stufen.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/4stufen.nl",
+"off": 1000000.0
+},
+"bchoco08.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.8,
+"path": "python/tests/data/minlplib_nl/bchoco08.nl",
+"off": 1000.0
+},
+"bchoco08.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.5,
+"path": "python/tests/data/minlplib_nl/bchoco08.nl",
+"off": 100000.0
+},
+"bchoco08.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.8,
+"path": "python/tests/data/minlplib_nl/bchoco08.nl",
+"off": 1000000.0
+},
+"clay0303hfsg.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/clay0303hfsg.nl",
+"off": 1000.0
+},
+"clay0303hfsg.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/clay0303hfsg.nl",
+"off": 100000.0
+},
+"clay0303hfsg.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 19.2,
+"path": "python/tests/data/minlplib_nl/clay0303hfsg.nl",
+"off": 1000000.0
+},
+"cvxnonsep_psig30.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 11.3,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig30.nl",
+"off": 1000.0
+},
+"cvxnonsep_psig30.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 12.9,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig30.nl",
+"off": 100000.0
+},
+"cvxnonsep_psig30.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 11.7,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig30.nl",
+"off": 1000000.0
+},
+"ex14_1_9.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/ex14_1_9.nl",
+"off": 1000.0
+},
+"ex14_1_9.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/ex14_1_9.nl",
+"off": 100000.0
+},
+"ex14_1_9.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/ex14_1_9.nl",
+"off": 1000000.0
+},
+"flay03m.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib_nl/flay03m.nl",
+"off": 1000.0
+},
+"flay03m.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 1.1,
+"path": "python/tests/data/minlplib_nl/flay03m.nl",
+"off": 100000.0
+},
+"flay03m.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 1.5,
+"path": "python/tests/data/minlplib_nl/flay03m.nl",
+"off": 1000000.0
+},
+"heatexch_gen2.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib_nl/heatexch_gen2.nl",
+"off": 1000.0
+},
+"heatexch_gen2.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/heatexch_gen2.nl",
+"off": 100000.0
+},
+"heatexch_gen2.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/heatexch_gen2.nl",
+"off": 1000000.0
+},
+"nvs09.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "RAISE RecursionError: maximum recursion depth exceeded",
+"wall": 10.9,
+"path": "python/tests/data/minlplib_nl/nvs09.nl",
+"off": 1000.0
+},
+"nvs09.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "RAISE RecursionError: maximum recursion depth exceeded",
+"wall": 15.6,
+"path": "python/tests/data/minlplib_nl/nvs09.nl",
+"off": 100000.0
+},
+"nvs09.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "RAISE RecursionError: maximum recursion depth exceeded",
+"wall": 13.1,
+"path": "python/tests/data/minlplib_nl/nvs09.nl",
+"off": 1000000.0
+},
+"st_miqp1.nl@1000": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp1.nl",
+"off": 1000.0
+},
+"st_miqp1.nl@100000": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp1.nl",
+"off": 100000.0
+},
+"st_miqp1.nl@1e+06": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp1.nl",
+"off": 1000000.0
+},
+"st_miqp4.nl@1000": {
+"bb": 1,
+"shift_cols": 6,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp4.nl",
+"off": 1000.0
+},
+"st_miqp4.nl@100000": {
+"bb": 1,
+"shift_cols": 6,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp4.nl",
+"off": 100000.0
+},
+"st_miqp4.nl@1e+06": {
+"bb": 1,
+"shift_cols": 6,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp4.nl",
+"off": 1000000.0
+},
+"st_testgr3.nl@1000": {
+"bb": 1,
+"shift_cols": 20,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib_nl/st_testgr3.nl",
+"off": 1000.0
+},
+"st_testgr3.nl@100000": {
+"bb": 1,
+"shift_cols": 20,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib_nl/st_testgr3.nl",
+"off": 100000.0
+},
+"st_testgr3.nl@1e+06": {
+"bb": 1,
+"shift_cols": 20,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib_nl/st_testgr3.nl",
+"off": 1000000.0
+},
+"tls2.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib_nl/tls2.nl",
+"off": 1000.0
+},
+"tls2.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/tls2.nl",
+"off": 100000.0
+},
+"tls2.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/tls2.nl",
+"off": 1000000.0
+},
+"tspn10.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.9,
+"path": "python/tests/data/minlplib_nl/tspn10.nl",
+"off": 1000.0
+},
+"tspn10.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 23.6,
+"path": "python/tests/data/minlplib_nl/tspn10.nl",
+"off": 100000.0
+},
+"tspn10.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/tspn10.nl",
+"off": 1000000.0
+},
+"QPLIB_2967.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_2967.qplib",
+"off": 1000.0
+},
+"QPLIB_2967.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_2967.qplib",
+"off": 100000.0
+},
+"QPLIB_2967.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_2967.qplib",
+"off": 1000000.0
+},
+"QPLIB_3562.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 13.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3562.qplib",
+"off": 1000.0
+},
+"QPLIB_3562.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 13.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_3562.qplib",
+"off": 100000.0
+},
+"QPLIB_3562.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 13.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_3562.qplib",
+"off": 1000000.0
+},
+"QPLIB_3852.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3852.qplib",
+"off": 1000.0
+},
+"QPLIB_3852.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3852.qplib",
+"off": 100000.0
+},
+"QPLIB_3852.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/qplib/qplib/QPLIB_3852.qplib",
+"off": 1000000.0
+},
+"carton7.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/carton7.nl",
+"off": 1000.0
+},
+"carton7.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.4,
+"path": "python/tests/data/minlplib/carton7.nl",
+"off": 100000.0
+},
+"carton7.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/minlplib/carton7.nl",
+"off": 1000000.0
+},
+"ex1221.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.6,
+"path": "python/tests/data/minlplib/ex1221.nl",
+"off": 1000.0
+},
+"ex1221.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.0,
+"path": "python/tests/data/minlplib/ex1221.nl",
+"off": 100000.0
+},
+"ex1221.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/ex1221.nl",
+"off": 1000000.0
+},
+"ex1225.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 13.6,
+"path": "python/tests/data/minlplib/ex1225.nl",
+"off": 1000.0
+},
+"ex1225.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/ex1225.nl",
+"off": 100000.0
+},
+"ex1225.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/ex1225.nl",
+"off": 1000000.0
+},
+"ex1252.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.2,
+"path": "python/tests/data/minlplib/ex1252.nl",
+"off": 1000.0
+},
+"ex1252.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.2,
+"path": "python/tests/data/minlplib/ex1252.nl",
+"off": 100000.0
+},
+"ex1252.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/ex1252.nl",
+"off": 1000000.0
+},
+"ex1264.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.8,
+"path": "python/tests/data/minlplib/ex1264.nl",
+"off": 1000.0
+},
+"ex1264.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/ex1264.nl",
+"off": 100000.0
+},
+"ex1264.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 10.2,
+"path": "python/tests/data/minlplib/ex1264.nl",
+"off": 1000000.0
+},
+"ex8_1_1.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.7,
+"path": "python/tests/data/minlplib/ex8_1_1.nl",
+"off": 1000.0
+},
+"ex8_1_1.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/ex8_1_1.nl",
+"off": 100000.0
+},
+"ex8_1_1.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/ex8_1_1.nl",
+"off": 1000000.0
+},
+"gbd.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gbd.nl",
+"off": 1000.0
+},
+"gbd.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/gbd.nl",
+"off": 100000.0
+},
+"gbd.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/gbd.nl",
+"off": 1000000.0
+},
+"gear3.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.9,
+"path": "python/tests/data/minlplib/gear3.nl",
+"off": 1000.0
+},
+"gear3.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/gear3.nl",
+"off": 100000.0
+},
+"gear3.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/gear3.nl",
+"off": 1000000.0
+},
+"kall_circles_c8a.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/kall_circles_c8a.nl",
+"off": 1000.0
+},
+"kall_circles_c8a.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/kall_circles_c8a.nl",
+"off": 100000.0
+},
+"kall_circles_c8a.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/kall_circles_c8a.nl",
+"off": 1000000.0
+},
+"mathopt5_8.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/mathopt5_8.nl",
+"off": 1000.0
+},
+"mathopt5_8.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/mathopt5_8.nl",
+"off": 100000.0
+},
+"mathopt5_8.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.0,
+"path": "python/tests/data/minlplib/mathopt5_8.nl",
+"off": 1000000.0
+},
+"nvs01.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs01.nl",
+"off": 1000.0
+},
+"nvs01.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs01.nl",
+"off": 100000.0
+},
+"nvs01.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 26.6,
+"path": "python/tests/data/minlplib/nvs01.nl",
+"off": 1000000.0
+},
+"nvs04.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/nvs04.nl",
+"off": 1000.0
+},
+"nvs04.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/nvs04.nl",
+"off": 100000.0
+},
+"nvs04.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/nvs04.nl",
+"off": 1000000.0
+},
+"nvs07.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.8,
+"path": "python/tests/data/minlplib/nvs07.nl",
+"off": 1000.0
+},
+"nvs07.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 6.6,
+"path": "python/tests/data/minlplib/nvs07.nl",
+"off": 100000.0
+},
+"nvs07.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs07.nl",
+"off": 1000000.0
+},
+"nvs11.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.6,
+"path": "python/tests/data/minlplib/nvs11.nl",
+"off": 1000.0
+},
+"nvs11.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 31.2,
+"path": "python/tests/data/minlplib/nvs11.nl",
+"off": 100000.0
+},
+"nvs11.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 37.6,
+"path": "python/tests/data/minlplib/nvs11.nl",
+"off": 1000000.0
+},
+"nvs14.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.9,
+"path": "python/tests/data/minlplib/nvs14.nl",
+"off": 1000.0
+},
+"nvs14.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/nvs14.nl",
+"off": 100000.0
+},
+"nvs14.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.8,
+"path": "python/tests/data/minlplib/nvs14.nl",
+"off": 1000000.0
+},
+"nvs17.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.1,
+"path": "python/tests/data/minlplib/nvs17.nl",
+"off": 1000.0
+},
+"nvs17.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs17.nl",
+"off": 100000.0
+},
+"nvs17.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/nvs17.nl",
+"off": 1000000.0
+},
+"nvs20.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 7.7,
+"path": "python/tests/data/minlplib/nvs20.nl",
+"off": 1000.0
+},
+"nvs20.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.0,
+"path": "python/tests/data/minlplib/nvs20.nl",
+"off": 100000.0
+},
+"nvs20.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs20.nl",
+"off": 1000000.0
+},
+"nvs23.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/minlplib/nvs23.nl",
+"off": 1000.0
+},
+"nvs23.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/nvs23.nl",
+"off": 100000.0
+},
+"nvs23.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/nvs23.nl",
+"off": 1000000.0
+},
+"prob02.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/prob02.nl",
+"off": 1000.0
+},
+"prob02.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/prob02.nl",
+"off": 100000.0
+},
+"prob02.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/prob02.nl",
+"off": 1000000.0
+},
+"prob10.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.1,
+"path": "python/tests/data/minlplib/prob10.nl",
+"off": 1000.0
+},
+"prob10.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/prob10.nl",
+"off": 100000.0
+},
+"prob10.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.6,
+"path": "python/tests/data/minlplib/prob10.nl",
+"off": 1000000.0
+},
+"st_e03.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e03.nl",
+"off": 1000.0
+},
+"st_e03.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e03.nl",
+"off": 100000.0
+},
+"st_e03.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/st_e03.nl",
+"off": 1000000.0
+},
+"st_e06.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/st_e06.nl",
+"off": 1000.0
+},
+"st_e06.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_e06.nl",
+"off": 100000.0
+},
+"st_e06.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.6,
+"path": "python/tests/data/minlplib/st_e06.nl",
+"off": 1000000.0
+},
+"st_e09.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/st_e09.nl",
+"off": 1000.0
+},
+"st_e09.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/st_e09.nl",
+"off": 100000.0
+},
+"st_e09.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.0,
+"path": "python/tests/data/minlplib/st_e09.nl",
+"off": 1000000.0
+},
+"st_e15.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.9,
+"path": "python/tests/data/minlplib/st_e15.nl",
+"off": 1000.0
+},
+"st_e15.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.5,
+"path": "python/tests/data/minlplib/st_e15.nl",
+"off": 100000.0
+},
+"st_e15.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e15.nl",
+"off": 1000000.0
+},
+"st_e27.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e27.nl",
+"off": 1000.0
+},
+"st_e27.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e27.nl",
+"off": 100000.0
+},
+"st_e27.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib/st_e27.nl",
+"off": 1000000.0
+},
+"st_e36.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e36.nl",
+"off": 1000.0
+},
+"st_e36.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/st_e36.nl",
+"off": 100000.0
+},
+"st_e36.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e36.nl",
+"off": 1000000.0
+},
+"st_ph10.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_ph10.nl",
+"off": 1000.0
+},
+"st_ph10.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_ph10.nl",
+"off": 100000.0
+},
+"st_ph10.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_ph10.nl",
+"off": 1000000.0
+},
+"trig.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.8,
+"path": "python/tests/data/minlplib/trig.nl",
+"off": 1000.0
+},
+"trig.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.9,
+"path": "python/tests/data/minlplib/trig.nl",
+"off": 100000.0
+},
+"trig.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib/trig.nl",
+"off": 1000000.0
+},
+"bchoco06.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib_nl/bchoco06.nl",
+"off": 1000.0
+},
+"bchoco06.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.8,
+"path": "python/tests/data/minlplib_nl/bchoco06.nl",
+"off": 100000.0
+},
+"bchoco06.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.8,
+"path": "python/tests/data/minlplib_nl/bchoco06.nl",
+"off": 1000000.0
+},
+"beuster.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/beuster.nl",
+"off": 1000.0
+},
+"beuster.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib_nl/beuster.nl",
+"off": 100000.0
+},
+"beuster.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib_nl/beuster.nl",
+"off": 1000000.0
+},
+"contvar.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 25.5,
+"path": "python/tests/data/minlplib_nl/contvar.nl",
+"off": 1000.0
+},
+"contvar.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.3,
+"path": "python/tests/data/minlplib_nl/contvar.nl",
+"off": 100000.0
+},
+"contvar.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.5,
+"path": "python/tests/data/minlplib_nl/contvar.nl",
+"off": 1000000.0
+},
+"cvxnonsep_psig40r.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig40r.nl",
+"off": 1000.0
+},
+"cvxnonsep_psig40r.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig40r.nl",
+"off": 100000.0
+},
+"cvxnonsep_psig40r.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig40r.nl",
+"off": 1000000.0
+},
+"fac2.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.4,
+"path": "python/tests/data/minlplib_nl/fac2.nl",
+"off": 1000.0
+},
+"fac2.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 6.4,
+"path": "python/tests/data/minlplib_nl/fac2.nl",
+"off": 100000.0
+},
+"fac2.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 5.9,
+"path": "python/tests/data/minlplib_nl/fac2.nl",
+"off": 1000000.0
+},
+"gkocis.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.6,
+"path": "python/tests/data/minlplib_nl/gkocis.nl",
+"off": 1000.0
+},
+"gkocis.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib_nl/gkocis.nl",
+"off": 100000.0
+},
+"gkocis.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 1.9,
+"path": "python/tests/data/minlplib_nl/gkocis.nl",
+"off": 1000000.0
+},
+"heatexch_gen3.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/heatexch_gen3.nl",
+"off": 1000.0
+},
+"heatexch_gen3.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.0,
+"path": "python/tests/data/minlplib_nl/heatexch_gen3.nl",
+"off": 100000.0
+},
+"heatexch_gen3.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.3,
+"path": "python/tests/data/minlplib_nl/heatexch_gen3.nl",
+"off": 1000000.0
+},
+"oaer.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib_nl/oaer.nl",
+"off": 1000.0
+},
+"oaer.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.6,
+"path": "python/tests/data/minlplib_nl/oaer.nl",
+"off": 100000.0
+},
+"oaer.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.6,
+"path": "python/tests/data/minlplib_nl/oaer.nl",
+"off": 1000000.0
+},
+"st_miqp2.nl@1000": {
+"bb": 1,
+"shift_cols": 4,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp2.nl",
+"off": 1000.0
+},
+"st_miqp2.nl@100000": {
+"bb": 1,
+"shift_cols": 4,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp2.nl",
+"off": 100000.0
+},
+"st_miqp2.nl@1e+06": {
+"bb": 1,
+"shift_cols": 4,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp2.nl",
+"off": 1000000.0
+},
+"st_miqp5.nl@1000": {
+"bb": 1,
+"shift_cols": 7,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp5.nl",
+"off": 1000.0
+},
+"st_miqp5.nl@100000": {
+"bb": 1,
+"shift_cols": 7,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp5.nl",
+"off": 100000.0
+},
+"st_miqp5.nl@1e+06": {
+"bb": 1,
+"shift_cols": 7,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp5.nl",
+"off": 1000000.0
+},
+"syn05hfsg.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/syn05hfsg.nl",
+"off": 1000.0
+},
+"syn05hfsg.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.4,
+"path": "python/tests/data/minlplib_nl/syn05hfsg.nl",
+"off": 100000.0
+},
+"syn05hfsg.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.1,
+"path": "python/tests/data/minlplib_nl/syn05hfsg.nl",
+"off": 1000000.0
+},
+"tspn05.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 16.8,
+"path": "python/tests/data/minlplib_nl/tspn05.nl",
+"off": 1000.0
+},
+"tspn05.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 15.8,
+"path": "python/tests/data/minlplib_nl/tspn05.nl",
+"off": 100000.0
+},
+"tspn05.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/tspn05.nl",
+"off": 1000000.0
+},
+"tspn12.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.5,
+"path": "python/tests/data/minlplib_nl/tspn12.nl",
+"off": 1000.0
+},
+"tspn12.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 23.3,
+"path": "python/tests/data/minlplib_nl/tspn12.nl",
+"off": 100000.0
+},
+"tspn12.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 24.3,
+"path": "python/tests/data/minlplib_nl/tspn12.nl",
+"off": 1000000.0
+},
+"QPLIB_3385.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/qplib/qplib/QPLIB_3385.qplib",
+"off": 1000.0
+},
+"QPLIB_3385.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/qplib/qplib/QPLIB_3385.qplib",
+"off": 100000.0
+},
+"QPLIB_3385.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.9,
+"path": "python/tests/data/qplib/qplib/QPLIB_3385.qplib",
+"off": 1000000.0
+},
+"QPLIB_3814.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3814.qplib",
+"off": 1000.0
+},
+"QPLIB_3814.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3814.qplib",
+"off": 100000.0
+},
+"QPLIB_3814.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3814.qplib",
+"off": 1000000.0
+},
+"QPLIB_3871.qplib@1000": {
+"bb": 1,
+"shift_cols": 1025,
+"status": "feasible",
+"wall": 23.9,
+"path": "python/tests/data/qplib/qplib/QPLIB_3871.qplib",
+"off": 1000.0
+},
+"QPLIB_3871.qplib@100000": {
+"bb": 1,
+"shift_cols": 1025,
+"status": "feasible",
+"wall": 23.9,
+"path": "python/tests/data/qplib/qplib/QPLIB_3871.qplib",
+"off": 100000.0
+},
+"QPLIB_3871.qplib@1e+06": {
+"bb": 1,
+"shift_cols": 1025,
+"status": "feasible",
+"wall": 24.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3871.qplib",
+"off": 1000000.0
+},
+"chance.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/chance.nl",
+"off": 1000.0
+},
+"chance.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/chance.nl",
+"off": 100000.0
+},
+"chance.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/chance.nl",
+"off": 1000000.0
+},
+"ex1222.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib/ex1222.nl",
+"off": 1000.0
+},
+"ex1222.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/ex1222.nl",
+"off": 100000.0
+},
+"ex1222.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/ex1222.nl",
+"off": 1000000.0
+},
+"ex1226.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/ex1226.nl",
+"off": 1000.0
+},
+"ex1226.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 11.5,
+"path": "python/tests/data/minlplib/ex1226.nl",
+"off": 100000.0
+},
+"ex1226.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 10.4,
+"path": "python/tests/data/minlplib/ex1226.nl",
+"off": 1000000.0
+},
+"ex1252a.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 23.5,
+"path": "python/tests/data/minlplib/ex1252a.nl",
+"off": 1000.0
+},
+"ex1252a.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/ex1252a.nl",
+"off": 100000.0
+},
+"ex1252a.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/ex1252a.nl",
+"off": 1000000.0
+},
+"ex1265.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/ex1265.nl",
+"off": 1000.0
+},
+"ex1265.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.6,
+"path": "python/tests/data/minlplib/ex1265.nl",
+"off": 100000.0
+},
+"ex1265.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.0,
+"path": "python/tests/data/minlplib/ex1265.nl",
+"off": 1000000.0
+},
+"ex8_5_4.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/ex8_5_4.nl",
+"off": 1000.0
+},
+"ex8_5_4.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/ex8_5_4.nl",
+"off": 100000.0
+},
+"ex8_5_4.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/ex8_5_4.nl",
+"off": 1000000.0
+},
+"gear.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/gear.nl",
+"off": 1000.0
+},
+"gear.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear.nl",
+"off": 100000.0
+},
+"gear.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear.nl",
+"off": 1000000.0
+},
+"gear4.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear4.nl",
+"off": 1000.0
+},
+"gear4.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear4.nl",
+"off": 100000.0
+},
+"gear4.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear4.nl",
+"off": 1000000.0
+},
+"mathopt3.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 11.8,
+"path": "python/tests/data/minlplib/mathopt3.nl",
+"off": 1000.0
+},
+"mathopt3.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 16.1,
+"path": "python/tests/data/minlplib/mathopt3.nl",
+"off": 100000.0
+},
+"mathopt3.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 29.9,
+"path": "python/tests/data/minlplib/mathopt3.nl",
+"off": 1000000.0
+},
+"meanvar.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/meanvar.nl",
+"off": 1000.0
+},
+"meanvar.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/meanvar.nl",
+"off": 100000.0
+},
+"meanvar.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/meanvar.nl",
+"off": 1000000.0
+},
+"nvs02.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.0,
+"path": "python/tests/data/minlplib/nvs02.nl",
+"off": 1000.0
+},
+"nvs02.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.7,
+"path": "python/tests/data/minlplib/nvs02.nl",
+"off": 100000.0
+},
+"nvs02.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.2,
+"path": "python/tests/data/minlplib/nvs02.nl",
+"off": 1000000.0
+},
+"nvs05.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 26.9,
+"path": "python/tests/data/minlplib/nvs05.nl",
+"off": 1000.0
+},
+"nvs05.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs05.nl",
+"off": 100000.0
+},
+"nvs05.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs05.nl",
+"off": 1000000.0
+},
+"nvs08.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.9,
+"path": "python/tests/data/minlplib/nvs08.nl",
+"off": 1000.0
+},
+"nvs08.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.0,
+"path": "python/tests/data/minlplib/nvs08.nl",
+"off": 100000.0
+},
+"nvs08.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/nvs08.nl",
+"off": 1000000.0
+},
+"nvs12.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 29.6,
+"path": "python/tests/data/minlplib/nvs12.nl",
+"off": 1000.0
+},
+"nvs12.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 30.5,
+"path": "python/tests/data/minlplib/nvs12.nl",
+"off": 100000.0
+},
+"nvs12.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 27.7,
+"path": "python/tests/data/minlplib/nvs12.nl",
+"off": 1000000.0
+},
+"nvs15.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs15.nl",
+"off": 1000.0
+},
+"nvs15.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs15.nl",
+"off": 100000.0
+},
+"nvs15.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs15.nl",
+"off": 1000000.0
+},
+"nvs18.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs18.nl",
+"off": 1000.0
+},
+"nvs18.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs18.nl",
+"off": 100000.0
+},
+"nvs18.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 19.9,
+"path": "python/tests/data/minlplib/nvs18.nl",
+"off": 1000000.0
+},
+"nvs21.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs21.nl",
+"off": 1000.0
+},
+"nvs21.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs21.nl",
+"off": 100000.0
+},
+"nvs21.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "error",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs21.nl",
+"off": 1000000.0
+},
+"nvs24.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.0,
+"path": "python/tests/data/minlplib/nvs24.nl",
+"off": 1000.0
+},
+"nvs24.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/minlplib/nvs24.nl",
+"off": 100000.0
+},
+"nvs24.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/nvs24.nl",
+"off": 1000000.0
+},
+"prob03.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/prob03.nl",
+"off": 1000.0
+},
+"prob03.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/prob03.nl",
+"off": 100000.0
+},
+"prob03.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/prob03.nl",
+"off": 1000000.0
+},
+"st_e01.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e01.nl",
+"off": 1000.0
+},
+"st_e01.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e01.nl",
+"off": 100000.0
+},
+"st_e01.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e01.nl",
+"off": 1000000.0
+},
+"st_e04.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.5,
+"path": "python/tests/data/minlplib/st_e04.nl",
+"off": 1000.0
+},
+"st_e04.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.0,
+"path": "python/tests/data/minlplib/st_e04.nl",
+"off": 100000.0
+},
+"st_e04.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 15.0,
+"path": "python/tests/data/minlplib/st_e04.nl",
+"off": 1000000.0
+},
+"st_e07.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/st_e07.nl",
+"off": 1000.0
+},
+"st_e07.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/st_e07.nl",
+"off": 100000.0
+},
+"st_e07.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/st_e07.nl",
+"off": 1000000.0
+},
+"st_e11.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.0,
+"path": "python/tests/data/minlplib/st_e11.nl",
+"off": 1000.0
+},
+"st_e11.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/st_e11.nl",
+"off": 100000.0
+},
+"st_e11.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/st_e11.nl",
+"off": 1000000.0
+},
+"st_e17.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e17.nl",
+"off": 1000.0
+},
+"st_e17.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e17.nl",
+"off": 100000.0
+},
+"st_e17.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e17.nl",
+"off": 1000000.0
+},
+"st_e31.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.9,
+"path": "python/tests/data/minlplib/st_e31.nl",
+"off": 1000.0
+},
+"st_e31.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/st_e31.nl",
+"off": 100000.0
+},
+"st_e31.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.9,
+"path": "python/tests/data/minlplib/st_e31.nl",
+"off": 1000000.0
+},
+"st_e38.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/st_e38.nl",
+"off": 1000.0
+},
+"st_e38.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e38.nl",
+"off": 100000.0
+},
+"st_e38.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/st_e38.nl",
+"off": 1000000.0
+},
+"st_z.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_z.nl",
+"off": 1000.0
+},
+"st_z.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_z.nl",
+"off": 100000.0
+},
+"st_z.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_z.nl",
+"off": 1000000.0
+},
+"util.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 8.5,
+"path": "python/tests/data/minlplib/util.nl",
+"off": 1000.0
+},
+"util.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.9,
+"path": "python/tests/data/minlplib/util.nl",
+"off": 100000.0
+},
+"util.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/util.nl",
+"off": 1000000.0
+},
+"bchoco07.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib_nl/bchoco07.nl",
+"off": 1000.0
+},
+"bchoco07.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib_nl/bchoco07.nl",
+"off": 100000.0
+},
+"bchoco07.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib_nl/bchoco07.nl",
+"off": 1000000.0
+},
+"casctanks.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib_nl/casctanks.nl",
+"off": 1000.0
+},
+"casctanks.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/casctanks.nl",
+"off": 100000.0
+},
+"casctanks.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/casctanks.nl",
+"off": 1000000.0
+},
+"cvxnonsep_nsig30.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.5,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_nsig30.nl",
+"off": 1000.0
+},
+"cvxnonsep_nsig30.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.9,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_nsig30.nl",
+"off": 100000.0
+},
+"cvxnonsep_nsig30.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_nsig30.nl",
+"off": 1000000.0
+},
+"ex1224.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.8,
+"path": "python/tests/data/minlplib_nl/ex1224.nl",
+"off": 1000.0
+},
+"ex1224.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.6,
+"path": "python/tests/data/minlplib_nl/ex1224.nl",
+"off": 100000.0
+},
+"ex1224.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 8.7,
+"path": "python/tests/data/minlplib_nl/ex1224.nl",
+"off": 1000000.0
+},
+"flay02m.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/flay02m.nl",
+"off": 1000.0
+},
+"flay02m.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 3.8,
+"path": "python/tests/data/minlplib_nl/flay02m.nl",
+"off": 100000.0
+},
+"flay02m.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 1.1,
+"path": "python/tests/data/minlplib_nl/flay02m.nl",
+"off": 1000000.0
+},
+"heatexch_gen1.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.1,
+"path": "python/tests/data/minlplib_nl/heatexch_gen1.nl",
+"off": 1000.0
+},
+"heatexch_gen1.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/heatexch_gen1.nl",
+"off": 100000.0
+},
+"heatexch_gen1.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/heatexch_gen1.nl",
+"off": 1000000.0
+},
+"m3.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/m3.nl",
+"off": 1000.0
+},
+"m3.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.8,
+"path": "python/tests/data/minlplib_nl/m3.nl",
+"off": 100000.0
+},
+"m3.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 9.3,
+"path": "python/tests/data/minlplib_nl/m3.nl",
+"off": 1000000.0
+},
+"st_e29.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.5,
+"path": "python/tests/data/minlplib_nl/st_e29.nl",
+"off": 1000.0
+},
+"st_e29.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.9,
+"path": "python/tests/data/minlplib_nl/st_e29.nl",
+"off": 100000.0
+},
+"st_e29.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 9.0,
+"path": "python/tests/data/minlplib_nl/st_e29.nl",
+"off": 1000000.0
+},
+"st_miqp3.nl@1000": {
+"bb": 1,
+"shift_cols": 2,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp3.nl",
+"off": 1000.0
+},
+"st_miqp3.nl@100000": {
+"bb": 1,
+"shift_cols": 2,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp3.nl",
+"off": 100000.0
+},
+"st_miqp3.nl@1e+06": {
+"bb": 1,
+"shift_cols": 2,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp3.nl",
+"off": 1000000.0
+},
+"st_test1.nl@1000": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_test1.nl",
+"off": 1000.0
+},
+"st_test1.nl@100000": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_test1.nl",
+"off": 100000.0
+},
+"st_test1.nl@1e+06": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_test1.nl",
+"off": 1000000.0
+},
+"tanksize.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/tanksize.nl",
+"off": 1000.0
+},
+"tanksize.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/tanksize.nl",
+"off": 100000.0
+},
+"tanksize.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 41.6,
+"path": "python/tests/data/minlplib_nl/tanksize.nl",
+"off": 1000000.0
+},
+"tspn08.nl@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.7,
+"path": "python/tests/data/minlplib_nl/tspn08.nl",
+"off": 1000.0
+},
+"tspn08.nl@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.5,
+"path": "python/tests/data/minlplib_nl/tspn08.nl",
+"off": 100000.0
+},
+"tspn08.nl@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.6,
+"path": "python/tests/data/minlplib_nl/tspn08.nl",
+"off": 1000000.0
+},
+"QPLIB_0031.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/qplib/qplib/QPLIB_0031.qplib",
+"off": 1000.0
+},
+"QPLIB_0031.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_0031.qplib",
+"off": 100000.0
+},
+"QPLIB_0031.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_0031.qplib",
+"off": 1000000.0
+},
+"QPLIB_3496.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3496.qplib",
+"off": 1000.0
+},
+"QPLIB_3496.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/qplib/qplib/QPLIB_3496.qplib",
+"off": 100000.0
+},
+"QPLIB_3496.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 19.9,
+"path": "python/tests/data/qplib/qplib/QPLIB_3496.qplib",
+"off": 1000000.0
+},
+"QPLIB_3815.qplib@1000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3815.qplib",
+"off": 1000.0
+},
+"QPLIB_3815.qplib@100000": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3815.qplib",
+"off": 100000.0
+},
+"QPLIB_3815.qplib@1e+06": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/qplib/qplib/QPLIB_3815.qplib",
+"off": 1000000.0
+},
+"alan.nl@10": {
+"bb": 1,
+"shift_cols": 8,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/alan.nl",
+"off": 10.0
+},
+"alan.nl@100": {
+"bb": 1,
+"shift_cols": 8,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/alan.nl",
+"off": 100.0
+},
+"dispatch.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/dispatch.nl",
+"off": 10.0
+},
+"dispatch.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.8,
+"path": "python/tests/data/minlplib/dispatch.nl",
+"off": 100.0
+},
+"ex1223a.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/ex1223a.nl",
+"off": 10.0
+},
+"ex1223a.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/ex1223a.nl",
+"off": 100.0
+},
+"ex1233.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.1,
+"path": "python/tests/data/minlplib/ex1233.nl",
+"off": 10.0
+},
+"ex1233.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 17.7,
+"path": "python/tests/data/minlplib/ex1233.nl",
+"off": 100.0
+},
+"ex1263.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib/ex1263.nl",
+"off": 10.0
+},
+"ex1263.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.2,
+"path": "python/tests/data/minlplib/ex1263.nl",
+"off": 100.0
+},
+"ex1266.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.9,
+"path": "python/tests/data/minlplib/ex1266.nl",
+"off": 10.0
+},
+"ex1266.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/ex1266.nl",
+"off": 100.0
+},
+"fuel.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/fuel.nl",
+"off": 10.0
+},
+"fuel.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/fuel.nl",
+"off": 100.0
+},
+"gear2.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.2,
+"path": "python/tests/data/minlplib/gear2.nl",
+"off": 10.0
+},
+"gear2.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.2,
+"path": "python/tests/data/minlplib/gear2.nl",
+"off": 100.0
+},
+"hda.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.8,
+"path": "python/tests/data/minlplib/hda.nl",
+"off": 10.0
+},
+"hda.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.8,
+"path": "python/tests/data/minlplib/hda.nl",
+"off": 100.0
+},
+"mathopt5_2.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/mathopt5_2.nl",
+"off": 10.0
+},
+"mathopt5_2.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/mathopt5_2.nl",
+"off": 100.0
+},
+"meanvarx.nl@10": {
+"bb": 1,
+"shift_cols": 35,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/meanvarx.nl",
+"off": 10.0
+},
+"meanvarx.nl@100": {
+"bb": 1,
+"shift_cols": 35,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/meanvarx.nl",
+"off": 100.0
+},
+"nvs03.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/nvs03.nl",
+"off": 10.0
+},
+"nvs03.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/nvs03.nl",
+"off": 100.0
+},
+"nvs06.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.1,
+"path": "python/tests/data/minlplib/nvs06.nl",
+"off": 10.0
+},
+"nvs06.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.2,
+"path": "python/tests/data/minlplib/nvs06.nl",
+"off": 100.0
+},
+"nvs10.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs10.nl",
+"off": 10.0
+},
+"nvs10.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs10.nl",
+"off": 100.0
+},
+"nvs13.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.5,
+"path": "python/tests/data/minlplib/nvs13.nl",
+"off": 10.0
+},
+"nvs13.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.7,
+"path": "python/tests/data/minlplib/nvs13.nl",
+"off": 100.0
+},
+"nvs16.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.2,
+"path": "python/tests/data/minlplib/nvs16.nl",
+"off": 10.0
+},
+"nvs16.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/nvs16.nl",
+"off": 100.0
+},
+"nvs19.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.3,
+"path": "python/tests/data/minlplib/nvs19.nl",
+"off": 10.0
+},
+"nvs19.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs19.nl",
+"off": 100.0
+},
+"nvs22.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs22.nl",
+"off": 10.0
+},
+"nvs22.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.7,
+"path": "python/tests/data/minlplib/nvs22.nl",
+"off": 100.0
+},
+"portfol_roundlot.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.0,
+"path": "python/tests/data/minlplib/portfol_roundlot.nl",
+"off": 10.0
+},
+"portfol_roundlot.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.4,
+"path": "python/tests/data/minlplib/portfol_roundlot.nl",
+"off": 100.0
+},
+"prob06.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/prob06.nl",
+"off": 10.0
+},
+"prob06.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/prob06.nl",
+"off": 100.0
+},
+"st_e02.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e02.nl",
+"off": 10.0
+},
+"st_e02.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e02.nl",
+"off": 100.0
+},
+"st_e05.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.5,
+"path": "python/tests/data/minlplib/st_e05.nl",
+"off": 10.0
+},
+"st_e05.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.4,
+"path": "python/tests/data/minlplib/st_e05.nl",
+"off": 100.0
+},
+"st_e08.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib/st_e08.nl",
+"off": 10.0
+},
+"st_e08.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/st_e08.nl",
+"off": 100.0
+},
+"st_e13.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e13.nl",
+"off": 10.0
+},
+"st_e13.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e13.nl",
+"off": 100.0
+},
+"st_e18.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e18.nl",
+"off": 10.0
+},
+"st_e18.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e18.nl",
+"off": 100.0
+},
+"st_e35.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 10.1,
+"path": "python/tests/data/minlplib/st_e35.nl",
+"off": 10.0
+},
+"st_e35.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "unknown",
+"wall": 4.1,
+"path": "python/tests/data/minlplib/st_e35.nl",
+"off": 100.0
+},
+"st_e40.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/st_e40.nl",
+"off": 10.0
+},
+"st_e40.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/st_e40.nl",
+"off": 100.0
+},
+"syn05m.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/syn05m.nl",
+"off": 10.0
+},
+"syn05m.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/syn05m.nl",
+"off": 100.0
+},
+"4stufen.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 30.9,
+"path": "python/tests/data/minlplib_nl/4stufen.nl",
+"off": 10.0
+},
+"4stufen.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/4stufen.nl",
+"off": 100.0
+},
+"bchoco08.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.7,
+"path": "python/tests/data/minlplib_nl/bchoco08.nl",
+"off": 10.0
+},
+"bchoco08.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.8,
+"path": "python/tests/data/minlplib_nl/bchoco08.nl",
+"off": 100.0
+},
+"clay0303hfsg.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.0,
+"path": "python/tests/data/minlplib_nl/clay0303hfsg.nl",
+"off": 10.0
+},
+"clay0303hfsg.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib_nl/clay0303hfsg.nl",
+"off": 100.0
+},
+"cvxnonsep_psig30.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 11.6,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig30.nl",
+"off": 10.0
+},
+"cvxnonsep_psig30.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 11.3,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig30.nl",
+"off": 100.0
+},
+"ex14_1_9.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/ex14_1_9.nl",
+"off": 10.0
+},
+"ex14_1_9.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/ex14_1_9.nl",
+"off": 100.0
+},
+"flay03m.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib_nl/flay03m.nl",
+"off": 10.0
+},
+"flay03m.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.5,
+"path": "python/tests/data/minlplib_nl/flay03m.nl",
+"off": 100.0
+},
+"heatexch_gen2.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.6,
+"path": "python/tests/data/minlplib_nl/heatexch_gen2.nl",
+"off": 10.0
+},
+"heatexch_gen2.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.6,
+"path": "python/tests/data/minlplib_nl/heatexch_gen2.nl",
+"off": 100.0
+},
+"nvs09.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "RAISE RecursionError: maximum recursion depth exceeded",
+"wall": 16.7,
+"path": "python/tests/data/minlplib_nl/nvs09.nl",
+"off": 10.0
+},
+"nvs09.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "RAISE RecursionError: maximum recursion depth exceeded",
+"wall": 12.4,
+"path": "python/tests/data/minlplib_nl/nvs09.nl",
+"off": 100.0
+},
+"st_miqp1.nl@10": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp1.nl",
+"off": 10.0
+},
+"st_miqp1.nl@100": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp1.nl",
+"off": 100.0
+},
+"st_miqp4.nl@10": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp4.nl",
+"off": 10.0
+},
+"st_miqp4.nl@100": {
+"bb": 1,
+"shift_cols": 6,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp4.nl",
+"off": 100.0
+},
+"st_testgr3.nl@10": {
+"bb": 1,
+"shift_cols": 11,
+"status": "optimal",
+"wall": 1.0,
+"path": "python/tests/data/minlplib_nl/st_testgr3.nl",
+"off": 10.0
+},
+"st_testgr3.nl@100": {
+"bb": 1,
+"shift_cols": 20,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib_nl/st_testgr3.nl",
+"off": 100.0
+},
+"tls2.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib_nl/tls2.nl",
+"off": 10.0
+},
+"tls2.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.9,
+"path": "python/tests/data/minlplib_nl/tls2.nl",
+"off": 100.0
+},
+"tspn10.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 29.1,
+"path": "python/tests/data/minlplib_nl/tspn10.nl",
+"off": 10.0
+},
+"tspn10.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.3,
+"path": "python/tests/data/minlplib_nl/tspn10.nl",
+"off": 100.0
+},
+"QPLIB_2967.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/qplib/qplib/QPLIB_2967.qplib",
+"off": 10.0
+},
+"QPLIB_2967.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_2967.qplib",
+"off": 100.0
+},
+"QPLIB_3562.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 13.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_3562.qplib",
+"off": 10.0
+},
+"QPLIB_3562.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 13.1,
+"path": "python/tests/data/qplib/qplib/QPLIB_3562.qplib",
+"off": 100.0
+},
+"QPLIB_3852.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3852.qplib",
+"off": 10.0
+},
+"QPLIB_3852.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3852.qplib",
+"off": 100.0
+},
+"carton7.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/carton7.nl",
+"off": 10.0
+},
+"carton7.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/carton7.nl",
+"off": 100.0
+},
+"ex1221.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.7,
+"path": "python/tests/data/minlplib/ex1221.nl",
+"off": 10.0
+},
+"ex1221.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/ex1221.nl",
+"off": 100.0
+},
+"ex1225.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 17.8,
+"path": "python/tests/data/minlplib/ex1225.nl",
+"off": 10.0
+},
+"ex1225.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 9.5,
+"path": "python/tests/data/minlplib/ex1225.nl",
+"off": 100.0
+},
+"ex1252.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/ex1252.nl",
+"off": 10.0
+},
+"ex1252.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/ex1252.nl",
+"off": 100.0
+},
+"ex1264.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.1,
+"path": "python/tests/data/minlplib/ex1264.nl",
+"off": 10.0
+},
+"ex1264.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.3,
+"path": "python/tests/data/minlplib/ex1264.nl",
+"off": 100.0
+},
+"ex8_1_1.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.6,
+"path": "python/tests/data/minlplib/ex8_1_1.nl",
+"off": 10.0
+},
+"ex8_1_1.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/ex8_1_1.nl",
+"off": 100.0
+},
+"gbd.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gbd.nl",
+"off": 10.0
+},
+"gbd.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gbd.nl",
+"off": 100.0
+},
+"gear3.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.9,
+"path": "python/tests/data/minlplib/gear3.nl",
+"off": 10.0
+},
+"gear3.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/gear3.nl",
+"off": 100.0
+},
+"kall_circles_c8a.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/kall_circles_c8a.nl",
+"off": 10.0
+},
+"kall_circles_c8a.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/kall_circles_c8a.nl",
+"off": 100.0
+},
+"mathopt5_8.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/mathopt5_8.nl",
+"off": 10.0
+},
+"mathopt5_8.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/mathopt5_8.nl",
+"off": 100.0
+},
+"nvs01.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.3,
+"path": "python/tests/data/minlplib/nvs01.nl",
+"off": 10.0
+},
+"nvs01.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs01.nl",
+"off": 100.0
+},
+"nvs04.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs04.nl",
+"off": 10.0
+},
+"nvs04.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/nvs04.nl",
+"off": 100.0
+},
+"nvs07.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs07.nl",
+"off": 10.0
+},
+"nvs07.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/nvs07.nl",
+"off": 100.0
+},
+"nvs11.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.2,
+"path": "python/tests/data/minlplib/nvs11.nl",
+"off": 10.0
+},
+"nvs11.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.3,
+"path": "python/tests/data/minlplib/nvs11.nl",
+"off": 100.0
+},
+"nvs14.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/nvs14.nl",
+"off": 10.0
+},
+"nvs14.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.8,
+"path": "python/tests/data/minlplib/nvs14.nl",
+"off": 100.0
+},
+"nvs17.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/nvs17.nl",
+"off": 10.0
+},
+"nvs17.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs17.nl",
+"off": 100.0
+},
+"nvs20.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.3,
+"path": "python/tests/data/minlplib/nvs20.nl",
+"off": 10.0
+},
+"nvs20.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 22.9,
+"path": "python/tests/data/minlplib/nvs20.nl",
+"off": 100.0
+},
+"nvs23.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/minlplib/nvs23.nl",
+"off": 10.0
+},
+"nvs23.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.7,
+"path": "python/tests/data/minlplib/nvs23.nl",
+"off": 100.0
+},
+"prob02.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/prob02.nl",
+"off": 10.0
+},
+"prob02.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/prob02.nl",
+"off": 100.0
+},
+"prob10.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/prob10.nl",
+"off": 10.0
+},
+"prob10.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.3,
+"path": "python/tests/data/minlplib/prob10.nl",
+"off": 100.0
+},
+"st_e03.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e03.nl",
+"off": 10.0
+},
+"st_e03.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/st_e03.nl",
+"off": 100.0
+},
+"st_e06.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/st_e06.nl",
+"off": 10.0
+},
+"st_e06.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e06.nl",
+"off": 100.0
+},
+"st_e09.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.7,
+"path": "python/tests/data/minlplib/st_e09.nl",
+"off": 10.0
+},
+"st_e09.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib/st_e09.nl",
+"off": 100.0
+},
+"st_e15.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/st_e15.nl",
+"off": 10.0
+},
+"st_e15.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.1,
+"path": "python/tests/data/minlplib/st_e15.nl",
+"off": 100.0
+},
+"st_e27.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e27.nl",
+"off": 10.0
+},
+"st_e27.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e27.nl",
+"off": 100.0
+},
+"st_e36.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/st_e36.nl",
+"off": 10.0
+},
+"st_e36.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/st_e36.nl",
+"off": 100.0
+},
+"st_ph10.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_ph10.nl",
+"off": 10.0
+},
+"st_ph10.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_ph10.nl",
+"off": 100.0
+},
+"trig.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.0,
+"path": "python/tests/data/minlplib/trig.nl",
+"off": 10.0
+},
+"trig.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.8,
+"path": "python/tests/data/minlplib/trig.nl",
+"off": 100.0
+},
+"bchoco06.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/bchoco06.nl",
+"off": 10.0
+},
+"bchoco06.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib_nl/bchoco06.nl",
+"off": 100.0
+},
+"beuster.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/beuster.nl",
+"off": 10.0
+},
+"beuster.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 25.2,
+"path": "python/tests/data/minlplib_nl/beuster.nl",
+"off": 100.0
+},
+"contvar.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.6,
+"path": "python/tests/data/minlplib_nl/contvar.nl",
+"off": 10.0
+},
+"contvar.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.6,
+"path": "python/tests/data/minlplib_nl/contvar.nl",
+"off": 100.0
+},
+"cvxnonsep_psig40r.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig40r.nl",
+"off": 10.0
+},
+"cvxnonsep_psig40r.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_psig40r.nl",
+"off": 100.0
+},
+"fac2.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.8,
+"path": "python/tests/data/minlplib_nl/fac2.nl",
+"off": 10.0
+},
+"fac2.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.3,
+"path": "python/tests/data/minlplib_nl/fac2.nl",
+"off": 100.0
+},
+"gkocis.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.9,
+"path": "python/tests/data/minlplib_nl/gkocis.nl",
+"off": 10.0
+},
+"gkocis.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.7,
+"path": "python/tests/data/minlplib_nl/gkocis.nl",
+"off": 100.0
+},
+"heatexch_gen3.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib_nl/heatexch_gen3.nl",
+"off": 10.0
+},
+"heatexch_gen3.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib_nl/heatexch_gen3.nl",
+"off": 100.0
+},
+"oaer.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.3,
+"path": "python/tests/data/minlplib_nl/oaer.nl",
+"off": 10.0
+},
+"oaer.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.6,
+"path": "python/tests/data/minlplib_nl/oaer.nl",
+"off": 100.0
+},
+"st_miqp2.nl@10": {
+"bb": 1,
+"shift_cols": 4,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp2.nl",
+"off": 10.0
+},
+"st_miqp2.nl@100": {
+"bb": 1,
+"shift_cols": 4,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp2.nl",
+"off": 100.0
+},
+"st_miqp5.nl@10": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp5.nl",
+"off": 10.0
+},
+"st_miqp5.nl@100": {
+"bb": 1,
+"shift_cols": 7,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_miqp5.nl",
+"off": 100.0
+},
+"syn05hfsg.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/syn05hfsg.nl",
+"off": 10.0
+},
+"syn05hfsg.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/syn05hfsg.nl",
+"off": 100.0
+},
+"tspn05.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 18.4,
+"path": "python/tests/data/minlplib_nl/tspn05.nl",
+"off": 10.0
+},
+"tspn05.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/tspn05.nl",
+"off": 100.0
+},
+"tspn12.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 23.0,
+"path": "python/tests/data/minlplib_nl/tspn12.nl",
+"off": 10.0
+},
+"tspn12.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 23.2,
+"path": "python/tests/data/minlplib_nl/tspn12.nl",
+"off": 100.0
+},
+"QPLIB_3385.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/qplib/qplib/QPLIB_3385.qplib",
+"off": 10.0
+},
+"QPLIB_3385.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/qplib/qplib/QPLIB_3385.qplib",
+"off": 100.0
+},
+"QPLIB_3814.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3814.qplib",
+"off": 10.0
+},
+"QPLIB_3814.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_3814.qplib",
+"off": 100.0
+},
+"QPLIB_3871.qplib@10": {
+"bb": 1,
+"shift_cols": 1025,
+"status": "feasible",
+"wall": 24.6,
+"path": "python/tests/data/qplib/qplib/QPLIB_3871.qplib",
+"off": 10.0
+},
+"QPLIB_3871.qplib@100": {
+"bb": 1,
+"shift_cols": 1025,
+"status": "feasible",
+"wall": 23.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3871.qplib",
+"off": 100.0
+},
+"chance.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.4,
+"path": "python/tests/data/minlplib/chance.nl",
+"off": 10.0
+},
+"chance.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/chance.nl",
+"off": 100.0
+},
+"ex1222.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/ex1222.nl",
+"off": 10.0
+},
+"ex1222.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/ex1222.nl",
+"off": 100.0
+},
+"ex1226.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.0,
+"path": "python/tests/data/minlplib/ex1226.nl",
+"off": 10.0
+},
+"ex1226.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.9,
+"path": "python/tests/data/minlplib/ex1226.nl",
+"off": 100.0
+},
+"ex1252a.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/ex1252a.nl",
+"off": 10.0
+},
+"ex1252a.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 21.5,
+"path": "python/tests/data/minlplib/ex1252a.nl",
+"off": 100.0
+},
+"ex1265.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.3,
+"path": "python/tests/data/minlplib/ex1265.nl",
+"off": 10.0
+},
+"ex1265.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 4.3,
+"path": "python/tests/data/minlplib/ex1265.nl",
+"off": 100.0
+},
+"ex8_5_4.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.6,
+"path": "python/tests/data/minlplib/ex8_5_4.nl",
+"off": 10.0
+},
+"ex8_5_4.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/ex8_5_4.nl",
+"off": 100.0
+},
+"gear.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear.nl",
+"off": 10.0
+},
+"gear.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/gear.nl",
+"off": 100.0
+},
+"gear4.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/gear4.nl",
+"off": 10.0
+},
+"gear4.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.0,
+"path": "python/tests/data/minlplib/gear4.nl",
+"off": 100.0
+},
+"mathopt3.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/mathopt3.nl",
+"off": 10.0
+},
+"mathopt3.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 17.4,
+"path": "python/tests/data/minlplib/mathopt3.nl",
+"off": 100.0
+},
+"meanvar.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/meanvar.nl",
+"off": 10.0
+},
+"meanvar.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/meanvar.nl",
+"off": 100.0
+},
+"nvs02.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.7,
+"path": "python/tests/data/minlplib/nvs02.nl",
+"off": 10.0
+},
+"nvs02.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.6,
+"path": "python/tests/data/minlplib/nvs02.nl",
+"off": 100.0
+},
+"nvs05.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/nvs05.nl",
+"off": 10.0
+},
+"nvs05.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/nvs05.nl",
+"off": 100.0
+},
+"nvs08.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.2,
+"path": "python/tests/data/minlplib/nvs08.nl",
+"off": 10.0
+},
+"nvs08.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.5,
+"path": "python/tests/data/minlplib/nvs08.nl",
+"off": 100.0
+},
+"nvs12.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 22.1,
+"path": "python/tests/data/minlplib/nvs12.nl",
+"off": 10.0
+},
+"nvs12.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 23.3,
+"path": "python/tests/data/minlplib/nvs12.nl",
+"off": 100.0
+},
+"nvs15.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib/nvs15.nl",
+"off": 10.0
+},
+"nvs15.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/nvs15.nl",
+"off": 100.0
+},
+"nvs18.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 14.9,
+"path": "python/tests/data/minlplib/nvs18.nl",
+"off": 10.0
+},
+"nvs18.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 15.8,
+"path": "python/tests/data/minlplib/nvs18.nl",
+"off": 100.0
+},
+"nvs21.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib/nvs21.nl",
+"off": 10.0
+},
+"nvs21.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.1,
+"path": "python/tests/data/minlplib/nvs21.nl",
+"off": 100.0
+},
+"nvs24.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib/nvs24.nl",
+"off": 10.0
+},
+"nvs24.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/nvs24.nl",
+"off": 100.0
+},
+"prob03.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/prob03.nl",
+"off": 10.0
+},
+"prob03.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/prob03.nl",
+"off": 100.0
+},
+"st_e01.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e01.nl",
+"off": 10.0
+},
+"st_e01.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib/st_e01.nl",
+"off": 100.0
+},
+"st_e04.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.7,
+"path": "python/tests/data/minlplib/st_e04.nl",
+"off": 10.0
+},
+"st_e04.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 7.5,
+"path": "python/tests/data/minlplib/st_e04.nl",
+"off": 100.0
+},
+"st_e07.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/st_e07.nl",
+"off": 10.0
+},
+"st_e07.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.4,
+"path": "python/tests/data/minlplib/st_e07.nl",
+"off": 100.0
+},
+"st_e11.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.2,
+"path": "python/tests/data/minlplib/st_e11.nl",
+"off": 10.0
+},
+"st_e11.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 3.8,
+"path": "python/tests/data/minlplib/st_e11.nl",
+"off": 100.0
+},
+"st_e17.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e17.nl",
+"off": 10.0
+},
+"st_e17.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib/st_e17.nl",
+"off": 100.0
+},
+"st_e31.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib/st_e31.nl",
+"off": 10.0
+},
+"st_e31.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib/st_e31.nl",
+"off": 100.0
+},
+"st_e38.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 1.6,
+"path": "python/tests/data/minlplib/st_e38.nl",
+"off": 10.0
+},
+"st_e38.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 2.5,
+"path": "python/tests/data/minlplib/st_e38.nl",
+"off": 100.0
+},
+"st_z.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_z.nl",
+"off": 10.0
+},
+"st_z.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 0.3,
+"path": "python/tests/data/minlplib/st_z.nl",
+"off": 100.0
+},
+"util.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 11.5,
+"path": "python/tests/data/minlplib/util.nl",
+"off": 10.0
+},
+"util.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.3,
+"path": "python/tests/data/minlplib/util.nl",
+"off": 100.0
+},
+"bchoco07.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.5,
+"path": "python/tests/data/minlplib_nl/bchoco07.nl",
+"off": 10.0
+},
+"bchoco07.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.8,
+"path": "python/tests/data/minlplib_nl/bchoco07.nl",
+"off": 100.0
+},
+"casctanks.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/casctanks.nl",
+"off": 10.0
+},
+"casctanks.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 21.0,
+"path": "python/tests/data/minlplib_nl/casctanks.nl",
+"off": 100.0
+},
+"cvxnonsep_nsig30.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.4,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_nsig30.nl",
+"off": 10.0
+},
+"cvxnonsep_nsig30.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 20.3,
+"path": "python/tests/data/minlplib_nl/cvxnonsep_nsig30.nl",
+"off": 100.0
+},
+"ex1224.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 6.1,
+"path": "python/tests/data/minlplib_nl/ex1224.nl",
+"off": 10.0
+},
+"ex1224.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.6,
+"path": "python/tests/data/minlplib_nl/ex1224.nl",
+"off": 100.0
+},
+"flay02m.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/flay02m.nl",
+"off": 10.0
+},
+"flay02m.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/flay02m.nl",
+"off": 100.0
+},
+"heatexch_gen1.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.1,
+"path": "python/tests/data/minlplib_nl/heatexch_gen1.nl",
+"off": 10.0
+},
+"heatexch_gen1.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/minlplib_nl/heatexch_gen1.nl",
+"off": 100.0
+},
+"m3.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/m3.nl",
+"off": 10.0
+},
+"m3.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 0.2,
+"path": "python/tests/data/minlplib_nl/m3.nl",
+"off": 100.0
+},
+"st_e29.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.8,
+"path": "python/tests/data/minlplib_nl/st_e29.nl",
+"off": 10.0
+},
+"st_e29.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "optimal",
+"wall": 5.1,
+"path": "python/tests/data/minlplib_nl/st_e29.nl",
+"off": 100.0
+},
+"st_miqp3.nl@10": {
+"bb": 1,
+"shift_cols": 2,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp3.nl",
+"off": 10.0
+},
+"st_miqp3.nl@100": {
+"bb": 1,
+"shift_cols": 2,
+"status": "optimal",
+"wall": 0.0,
+"path": "python/tests/data/minlplib_nl/st_miqp3.nl",
+"off": 100.0
+},
+"st_test1.nl@10": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_test1.nl",
+"off": 10.0
+},
+"st_test1.nl@100": {
+"bb": 1,
+"shift_cols": 5,
+"status": "optimal",
+"wall": 0.1,
+"path": "python/tests/data/minlplib_nl/st_test1.nl",
+"off": 100.0
+},
+"tanksize.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/minlplib_nl/tanksize.nl",
+"off": 10.0
+},
+"tanksize.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.0,
+"path": "python/tests/data/minlplib_nl/tanksize.nl",
+"off": 100.0
+},
+"tspn08.nl@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 27.7,
+"path": "python/tests/data/minlplib_nl/tspn08.nl",
+"off": 10.0
+},
+"tspn08.nl@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "feasible",
+"wall": 32.6,
+"path": "python/tests/data/minlplib_nl/tspn08.nl",
+"off": 100.0
+},
+"QPLIB_0031.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_0031.qplib",
+"off": 10.0
+},
+"QPLIB_0031.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.2,
+"path": "python/tests/data/qplib/qplib/QPLIB_0031.qplib",
+"off": 100.0
+},
+"QPLIB_3496.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3496.qplib",
+"off": 10.0
+},
+"QPLIB_3496.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.3,
+"path": "python/tests/data/qplib/qplib/QPLIB_3496.qplib",
+"off": 100.0
+},
+"QPLIB_3815.qplib@10": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.4,
+"path": "python/tests/data/qplib/qplib/QPLIB_3815.qplib",
+"off": 10.0
+},
+"QPLIB_3815.qplib@100": {
+"bb": 0,
+"shift_cols": 0,
+"status": "time_limit",
+"wall": 20.6,
+"path": "python/tests/data/qplib/qplib/QPLIB_3815.qplib",
+"off": 100.0
+}
+}
