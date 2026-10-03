@@ -28500,6 +28500,47 @@ def _cut_loop_relaxation_x(lp_data, prefer_pounce: bool):
     return None
 
 
+def _verified_cut_screen_points(
+    model: Model,
+    candidates,
+    n_vars: int,
+    n_orig: int,
+    int_offsets,
+    int_sizes,
+) -> list[np.ndarray]:
+    """The candidates VERIFIED feasible for ``model`` (#1603 cut-screen backstop).
+
+    A candidate (``None`` is skipped) qualifies only if it is finite, integral on
+    every integer column (1e-5), inside the declared variable box, and satisfies
+    every constraint (1e-6) -- the checks the MILP warm-start injection applies.
+    Only such a point may reject a cut. Returns the structural slices
+    ``x[:n_orig]``.
+    """
+    from discopt._relax.primal_heuristics import _check_constraint_feasibility
+
+    out: list[np.ndarray] = []
+    ev = None
+    for cand in candidates:
+        if cand is None:
+            continue
+        x = np.asarray(cand, dtype=np.float64).ravel()
+        if x.shape[0] < n_vars or not np.all(np.isfinite(x[:n_vars])):
+            continue
+        if any(
+            np.any(np.abs(x[o : o + s] - np.round(x[o : o + s])) > 1e-5)
+            for o, s in zip(int_offsets, int_sizes)
+        ):
+            continue
+        if ev is None:
+            ev = _make_evaluator(model)
+        if not _point_within_variable_box(ev, x[:n_vars]):
+            continue
+        if not _check_constraint_feasibility(ev, x[:n_vars], tol=1e-6):
+            continue
+        out.append(x[:n_orig].copy())
+    return out
+
+
 def _root_cover_cut_loop(
     lp_data,
     n_orig: int,
@@ -28513,6 +28554,7 @@ def _root_cover_cut_loop(
     prefer_pounce: bool = False,
     max_rounds: int = 5,
     max_total_cuts: int = 500,
+    screen_points=(),
 ):
     """Round-based root cut separation: cover + clique + Gomory cuts (Phase 2/3).
 
@@ -28524,18 +28566,50 @@ def _root_cover_cut_loop(
     augmented) ``lp_data``, the total number of cuts added, and a per-source
     count dict (``cover_clique``/``gomory``/``mir``/``aggregation``) for
     instrumentation. A no-op when there are no binary-knapsack rows, clique
-    edges, or integer variables."""
+    edges, or integer variables.
+
+    ``screen_points`` (#1603 backstop) are verified-feasible structural points
+    (:func:`_verified_cut_screen_points`). Every separated cut is checked against
+    each of them, at the rhs it would be installed with, before it is installed;
+    a cut one of them violates beyond ``1e-6 * (1 + |rhs| + sum |a_j x_j|)`` is
+    REJECTED and counted under ``rejected_by_incumbent`` (with a WARNING). A valid
+    cut keeps every feasible point, so a rejection is a separator defect (or a
+    point at its own feasibility tolerance); dropping a cut only weakens the
+    relaxation, so the screen is sound either way. It is a backstop, not the
+    validity argument: with no incumbent at the root there is nothing to screen
+    against, which is why the #1603 derivation defects are fixed at source."""
     from discopt._relax.cover_cuts import (
         has_binary_knapsack_rows,
         separate_clique_cuts,
         separate_cover_cuts,
     )
 
-    has_cover = A_ub_orig is not None and has_binary_knapsack_rows(A_ub_orig, b_ub_orig, is_binary)
+    # #1603: the DECLARED column box of the original variables, for the cover
+    # separator's accounting of a row's tiny nonzeros (``_knapsack_support``).
+    # Captured before any cut columns are appended; ``[:n_orig]`` is unchanged by
+    # augmentation anyway.
+    _col_lb = np.asarray(lp_data.x_l, dtype=np.float64)[:n_orig].copy()
+    _col_ub = np.asarray(lp_data.x_u, dtype=np.float64)[:n_orig].copy()
+    has_cover = A_ub_orig is not None and has_binary_knapsack_rows(
+        A_ub_orig, b_ub_orig, is_binary, lb=_col_lb, ub=_col_ub
+    )
     has_clique = bool(clique_edges)
     has_gomory = bool(len(int_idx))
     if not has_cover and not has_clique and not has_gomory:
         return lp_data, 0, {"cover_clique": 0, "gomory": 0, "mir": 0}
+    _screen = [np.asarray(p, dtype=np.float64)[:n_orig] for p in screen_points]
+    _rejected = {"cover_clique": 0, "gomory": 0, "mir": 0}
+
+    def _keep(a_struct: np.ndarray, rhs: float, sense: str, family: str) -> bool:
+        """False (and counted) if a screen point violates ``a . x (sense) rhs``."""
+        for _p in _screen:
+            _terms = a_struct * _p
+            _act = float(_terms.sum())
+            _viol = (_act - rhs) if sense == "<=" else (rhs - _act)
+            if _viol > 1e-6 * (1.0 + abs(rhs) + float(np.abs(_terms).sum())):
+                _rejected[family] += 1
+                return False
+        return True
 
     total = 0
     # Per-source cut counts (cert:P3.1b instrumentation). Surfaced on the MILP
@@ -28580,13 +28654,20 @@ def _root_cover_cut_loop(
         seen: set[frozenset] = set()
         sources = []
         if has_cover:
-            sources.append(separate_cover_cuts(A_ub_orig, b_ub_orig, x_star, is_binary))
+            sources.append(
+                separate_cover_cuts(A_ub_orig, b_ub_orig, x_star, is_binary, lb=_col_lb, ub=_col_ub)
+            )
         if has_clique:
             sources.append(separate_clique_cuts(clique_edges, x_star))
         for found in sources:
             for cover, rhs in found:
                 if cover not in seen:
                     seen.add(cover)
+                    if _screen:
+                        _a = np.zeros(n_orig, dtype=np.float64)
+                        _a[sorted(cover)] = 1.0
+                        if not _keep(_a, float(rhs), "<=", "cover_clique"):
+                            continue
                     cuts.append((cover, rhs))
 
         round_added = 0
@@ -28613,6 +28694,20 @@ def _root_cover_cut_loop(
             # #1514: no ``except``. The separator declines by returning ``None``
             # (no Rust kernel, no basis, nothing fractional); a raise is a defect.
             gom = _separate_gomory_cuts(lp_data, x_vertex, n_orig, int_idx)
+            if gom is not None and _screen:
+                # Installed as ``g . x >= r - margin`` (slack entries are zero after
+                # projection), so screen at exactly that rhs.
+                _gk = [
+                    _i
+                    for _i in range(gom[0].shape[0])
+                    if _keep(
+                        gom[0][_i, :n_orig],
+                        float(gom[1][_i]) - 1e-7 * (1.0 + float(np.abs(gom[0][_i]).sum())),
+                        ">=",
+                        "gomory",
+                    )
+                ]
+                gom = (gom[0][_gk], gom[1][_gk]) if _gk else None
             if gom is not None:
                 gc, gr = gom
                 lp_data = _augment_lpdata_with_gomory_cuts(lp_data, gc, gr)
@@ -28624,6 +28719,19 @@ def _root_cover_cut_loop(
             # #1514: no ``except``. The separator declines by returning ``None``
             # (no Rust kernel, an infinite lower bound, no violated cut).
             mir = _separate_mir_cuts(lp_data, x_vertex, n_orig, int_idx, A_ub_orig, b_ub_orig)
+            if mir is not None and _screen:
+                # Installed as ``m . x <= r + margin``; screen at exactly that rhs.
+                _mk = [
+                    _i
+                    for _i in range(mir[0].shape[0])
+                    if _keep(
+                        mir[0][_i, :n_orig],
+                        float(mir[1][_i]) + 1e-7 * (1.0 + float(np.abs(mir[0][_i]).sum())),
+                        "<=",
+                        "mir",
+                    )
+                ]
+                mir = (mir[0][_mk], mir[1][_mk]) if _mk else None
             if mir is not None:
                 mc, mr = mir
                 lp_data = _augment_lpdata_with_mir_cuts(lp_data, mc, mr)
@@ -28643,6 +28751,19 @@ def _root_cover_cut_loop(
         # rounds would just re-solve the LP for nothing.
         if not has_cover and not has_clique:
             break
+    _n_rej = sum(_rejected.values())
+    if _n_rej:
+        by_source["rejected_by_incumbent"] = _n_rej
+        logger.warning(
+            "root cut loop rejected %d cut(s) violated by a verified-feasible point "
+            "(cover/clique=%d gomory=%d mir=%d). A valid cut keeps every feasible "
+            "point, so this indicates a separator defect; the cuts were dropped "
+            "(#1603 backstop).",
+            _n_rej,
+            _rejected["cover_clique"],
+            _rejected["gomory"],
+            _rejected["mir"],
+        )
     return lp_data, total, by_source
 
 
@@ -30221,6 +30342,26 @@ def _solve_milp_bb(
     _is_bin = _binary_mask(model, n_orig)
     # Conflict-graph clique edges (only worth extracting if binaries exist).
     _clique_edges = _extract_clique_edges(model) if bool(_is_bin.any()) else []
+    # #1603: every edge must name two BINARY flat columns. The clique pass used to
+    # report variable-BLOCK indices, which this loop read as columns, so an array
+    # variable declared before the binaries put ``sum x_C <= 1`` on continuous
+    # columns and cut the optimum off. A mismatch here is a defect, not a decline.
+    for _ei, _ej in _clique_edges:
+        if not (0 <= _ei < n_orig and 0 <= _ej < n_orig and _is_bin[_ei] and _is_bin[_ej]):
+            raise RuntimeError(
+                f"clique edge ({_ei}, {_ej}) does not name two binary flat columns "
+                f"(n_orig={n_orig}); refusing to separate clique cuts from it (#1603)"
+            )
+    # #1603 backstop: verified-feasible points the root cut loop screens every cut
+    # against (see ``_root_cover_cut_loop``).
+    _screen_points = _verified_cut_screen_points(
+        model,
+        [None if _root_incumbent is None else _root_incumbent[1], initial_point],
+        n_vars,
+        n_orig,
+        int_offsets,
+        int_sizes,
+    )
     # Gomory cuts gated on the relaxation engine (see _gomory_enabled):
     # passing no integer indices disables the GMI branch, so under the JAX
     # IPM the loop runs exactly as before GMI (cover/clique only, no
@@ -30242,6 +30383,7 @@ def _solve_milp_bb(
         clique_edges=_clique_edges,
         int_idx=_cut_int_idx,
         prefer_pounce=prefer_pounce,
+        screen_points=_screen_points,
         # ``root_cuts=False`` (#1535, ``milp_cuts=False``): zero rounds leaves
         # ``lp_data`` untouched -- the plain LP relaxation, which is always valid.
         max_rounds=5 if root_cuts else 0,

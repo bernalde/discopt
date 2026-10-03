@@ -19,31 +19,80 @@ from __future__ import annotations
 
 import numpy as np
 
+#: The unbounded sentinel of the LP layer (CLAUDE.md, INF note). A bound at or
+#: beyond it is "no bound"; the test is on the BOUND, never on a product.
+_COVER_INF = 1e20
 
-def has_binary_knapsack_rows(A_ub, b_ub, is_binary, tol: float = 1e-9) -> bool:
-    """Cheap precheck: is any inequality row a pure positive binary knapsack?"""
+
+def has_binary_knapsack_rows(A_ub, b_ub, is_binary, tol: float = 1e-6, lb=None, ub=None) -> bool:
+    """Cheap precheck: does any inequality row admit a binary-knapsack cover?
+
+    Uses exactly the row test :func:`separate_cover_cuts` applies (same ``tol``
+    default, same bound accounting), so the precheck and the separator can never
+    disagree about which rows qualify.
+    """
     if A_ub is None or b_ub is None:
         return False
     A = np.asarray(A_ub, dtype=np.float64)
     b = np.asarray(b_ub, dtype=np.float64).ravel()
     is_binary = np.asarray(is_binary, dtype=bool)
     for i in range(A.shape[0]):
-        if _knapsack_support(A[i], b[i], is_binary, tol) is not None:
+        if _knapsack_support(A[i], b[i], is_binary, tol, lb, ub) is not None:
             return True
     return False
 
 
-def _knapsack_support(a: np.ndarray, b: float, is_binary: np.ndarray, tol: float):
-    """Return the nonzero support if row ``a^T x <= b`` is a positive binary
-    knapsack (all nonzeros on binary columns, positive, and ``b > 0``), else
-    ``None``."""
-    nz = np.where(np.abs(a) > tol)[0]
-    if nz.size == 0 or b <= tol:
+def _column_box(j: int, is_binary: np.ndarray, lb, ub) -> tuple[float, float]:
+    """The box of column ``j``: the caller's ``lb``/``ub`` when given, else
+    ``[0, 1]`` for a binary and unbounded for anything else."""
+    lo = float(lb[j]) if lb is not None else (0.0 if is_binary[j] else -np.inf)
+    hi = float(ub[j]) if ub is not None else (1.0 if is_binary[j] else np.inf)
+    return lo, hi
+
+
+def _knapsack_support(a: np.ndarray, b: float, is_binary: np.ndarray, tol: float, lb=None, ub=None):
+    """Return ``(items, cap)`` if row ``a^T x <= b`` yields a binary knapsack, else
+    ``None``.
+
+    ``items`` are the binary columns with a coefficient above ``tol`` (the cover
+    candidates). Every other nonzero must be accounted for, not ignored: the cover
+    argument is "every item at 1 pushes the row over ``cap``", which holds only
+    against ``cap = b - min(contribution of the rest)``. So
+
+    * a non-binary column, or a negative binary coefficient, above ``tol`` refuses
+      the row (the row is not a knapsack -- unchanged behaviour);
+    * a nonzero at or below ``tol`` (previously dropped silently) has its MINIMUM
+      contribution over its box charged to the capacity, and refuses the row if
+      that minimum is unbounded.
+
+    #1603 (the Python twin of #1236 in ``crates/discopt-core/src/lp/cover.rs``):
+    ``x0 + x1 - 1e-7 y <= 1.5`` with ``y in [0, 1e9]`` admits ``(1, 1, 5e6)``, but
+    the tiny ``y`` term fell under ``tol`` and was dropped, so the separator
+    emitted ``x0 + x1 <= 1`` -- an invalid cut, measured to return a wrong
+    ``optimal`` (2.0 vs 3.0) through ``milp_backend="native"`` and an unsound root
+    LP bound from the NLP-BB root-cut stage.
+    """
+    nz_all = np.flatnonzero(a)
+    if nz_all.size == 0:
         return None
-    for j in nz:
-        if not is_binary[j] or a[j] <= tol:
+    items = []
+    cap = float(b)
+    for j in nz_all:
+        aj = float(a[j])
+        if abs(aj) > tol:
+            if not is_binary[j] or aj <= tol:
+                return None
+            items.append(int(j))
+            continue
+        # A tiny nonzero: charge its minimum over the box to the capacity.
+        lo, hi = _column_box(int(j), is_binary, lb, ub)
+        pin = lo if aj > 0.0 else hi
+        if not np.isfinite(pin) or abs(pin) >= _COVER_INF:
             return None
-    return nz
+        cap -= aj * pin
+    if not items or not np.isfinite(cap) or cap <= tol:
+        return None
+    return np.asarray(items, dtype=np.int64), cap
 
 
 def separate_cover_cuts(
@@ -53,12 +102,19 @@ def separate_cover_cuts(
     is_binary,
     tol: float = 1e-6,
     max_cuts: int = 64,
+    lb=None,
+    ub=None,
 ) -> list[tuple[frozenset[int], float]]:
     """Find violated minimal cover cuts for the binary-knapsack rows.
 
     Returns a list of ``(C, rhs)`` where the cut is
     ``sum_{j in C} x_j <= rhs`` with ``rhs = |C| - 1``. Every returned cut is
     valid; each is also violated by ``x_star`` (``sum_{j in C} x*_j > rhs``).
+
+    ``lb``/``ub`` are the column bounds. A row's nonzeros at or below ``tol`` are
+    charged to its capacity at their worst case over this box (see
+    :func:`_knapsack_support`); without bounds a non-binary column is unbounded
+    and such a row is refused.
     """
     if A_ub is None or b_ub is None:
         return []
@@ -70,10 +126,11 @@ def separate_cover_cuts(
     cuts: list[tuple[frozenset[int], float]] = []
     seen: set[frozenset[int]] = set()
     for i in range(A.shape[0]):
-        nz = _knapsack_support(A[i], b[i], is_binary, tol)
-        if nz is None:
+        support = _knapsack_support(A[i], b[i], is_binary, tol, lb, ub)
+        if support is None:
             continue
-        cut = _separate_row(A[i], float(b[i]), x, nz, tol)
+        nz, cap = support
+        cut = _separate_row(A[i], cap, x, nz, tol)
         if cut is not None and cut[0] not in seen:
             seen.add(cut[0])
             cuts.append(cut)
