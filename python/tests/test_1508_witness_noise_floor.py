@@ -108,6 +108,32 @@ def test_ulp_noise_does_not_manufacture_a_witness(rho):
     )
 
 
+def _internals(ev, x, lam, cl, cu, f_x, cert):
+    """What the bound computation saw, for a failure seen only under CI xdist."""
+    import discopt.solver as S
+
+    cons = np.asarray(ev.evaluate_constraints(x), dtype=np.float64)
+    grad = np.asarray(ev.evaluate_gradient(x), dtype=np.float64)
+    parts = S._rigorous_bound_parts(ev, x, lam, cons, grad, _LB, _UB, cl, cu, f_x, [])
+    fns = {
+        n: getattr(getattr(S, n), "__module__", "?")
+        for n in (
+            "_rigorous_bound_parts",
+            "_outward_tangent_bound",
+            "_tangent_box_bound",
+            "_gap_values_converged",
+            "_no_witness_certificate",
+            "_certificate_box",
+        )
+    }
+    return (
+        f"cert={cert} f_x={f_x!r} parts={parts} cl={cl} cu={cu} cons={cons} grad={grad} "
+        f"lam={lam} CONSTRAINT_INF={S._CONSTRAINT_INF} abs_gap={S._DEFAULT_ABS_GAP_TOL} "
+        f"eps={np.finfo(np.float64).eps} fns={fns} np={np.__version__} "
+        f"env={sorted((k, v) for k, v in os.environ.items() if k.startswith('DISCOPT_'))}"
+    )
+
+
 def test_exact_optimum_still_certifies_exactly():
     from discopt.solver import _convex_nlp_certificate, _make_evaluator
     from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
@@ -122,6 +148,8 @@ def test_exact_optimum_still_certifies_exactly():
     # now means "not certified"); at an exact KKT point it equals the objective to
     # rounding and never exceeds it, and no better point is reported.
     f_x = float(ev.evaluate_objective(x))
-    assert cert is not None and cert.bound is not None and cert.better_x is None
+    assert cert is not None and cert.bound is not None and cert.better_x is None, _internals(
+        ev, x, lam, cl, cu, f_x, cert
+    )
     assert cert.bound <= f_x
     assert cert.bound == pytest.approx(f_x, rel=1e-9, abs=1e-9)
