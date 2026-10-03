@@ -3415,8 +3415,21 @@ def _fix_single_var_equalities(
         # Only collapse within the existing box; leave any infeasibility (val
         # outside [lb, ub]) to the equality's own rows so we never empty the box.
         if lb[j] - 1e-9 <= val <= ub[j] + 1e-9:
-            lb[j] = max(lb[j], val)
-            ub[j] = min(ub[j], val)
+            new_lo = max(lb[j], val)
+            new_hi = min(ub[j], val)
+            # #1537: the tolerance admits a ``val`` up to 1e-9 OUTSIDE the box, and
+            # then the plain intersection above is crossed (``val > ub`` gives
+            # ``new_lo = val > new_hi = ub``). A crossed box is not a box: every
+            # ``Interval`` over it raises, so the whole relaxation build failed.
+            # The two candidates are the same pin up to roundoff -- a row-scaled
+            # copy of a model computes ``(s*rhs - s*c)/(s*a)``, one ulp off the
+            # unscaled ``val`` -- so collapse to their hull, which contains both
+            # and is still a width-roundoff box (sound: it removes no point the
+            # existing box and the pin agree on).
+            if new_lo > new_hi:
+                new_lo, new_hi = new_hi, new_lo
+            lb[j] = new_lo
+            ub[j] = new_hi
     return lb, ub
 
 

@@ -1161,7 +1161,13 @@ def sanitize_relaxation_for_conditioning(
 
     1. Drop any constraint row whose coefficient or RHS is non-finite or has
        magnitude >= ``_RELAX_NUMERIC_CAP``. Removing a constraint enlarges the
-       feasible set.
+       feasible set. (The drop depends on how a row was scaled: ex14_1_9 with its
+       rows multiplied by 8.14 and 3.66 loses a row and its certificate. An exact
+       power-of-two "rescue" of over-cap rows was tried for #1537 and withdrawn in
+       the PR #1594 review: it lands the row's largest entry in [cap/2, cap), where
+       the in-house simplex returns false LP bounds (#1595) -- see
+       ``test_sanitizer_drops_over_cap_rows_the_simplex_mishandles``. Losing a
+       certificate is acceptable; feeding a known-unsound engine is not.)
     2. Clamp any variable bound of magnitude >= ``_RELAX_NUMERIC_CAP`` to +/-inf.
        Widening a variable's box enlarges the feasible set. (A clamped objective
        variable can make the LP unbounded -> bound becomes -inf/None, still sound.)

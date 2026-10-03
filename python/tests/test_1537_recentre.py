@@ -2,9 +2,9 @@
 
 The pass rebuilds a model whose boxes sit far from the origin in coordinates
 ``x = z + c`` with every scalar affine subtree constant-folded, solves that, and
-maps the result back (``discopt/modeling/_recentre.py``). Default OFF (CLAUDE.md
-§5); these tests pin its mechanics and its fixes with the flag ON, and that the
-flag OFF changes nothing.
+maps the result back (``discopt/modeling/_recentre.py``). Default ON since the
+2026-10-03 graduation panel (CLAUDE.md §5); these tests pin its mechanics and its
+fixes with the flag ON, that it is on by default, and that ``=0`` changes nothing.
 """
 
 from __future__ import annotations
@@ -76,6 +76,28 @@ def test_constant_folding_removes_the_cancelling_constant():
         assert np.allclose(ev_rc.evaluate_constraints(zpt), ev.evaluate_constraints(x), atol=1e-6)
 
 
+@pytest.mark.parametrize("lb", [1e6, 3e3])
+def test_shared_square_keeps_its_verdict(lb):
+    """The rewrite preserves the DAG's sharing. ``x * x`` is ONE node on both
+    sides, and the square rule reads that identity (``left is right``). Folding
+    each use of ``x`` into a fresh ``z + c`` sum made the two sides distinct
+    objects, so ``min x*x + w`` was convex as written and not convex once
+    recentred: the solve left the convex route on a model it had proven."""
+    from discopt._relax.convexity import classify_model
+
+    m = dm.Model("share")
+    x = m.continuous("x", lb=lb, ub=lb + 10)
+    w = m.continuous("w", lb=0, ub=1)
+    m.minimize(x * x + w)
+    m.subject_to(x * x - w <= (lb + 5) ** 2)
+    rc = recentre(m)
+    assert rc is not None and rc.model is not m
+    sq = rc.model._objective.expression.left
+    assert sq.left is sq.right
+    assert classify_model(m) == (True, [True])
+    assert classify_model(rc.model) == classify_model(m)
+
+
 def test_parameters_are_not_folded_and_stay_live(flag_on):
     m = dm.Model("par")
     y = m.continuous("y", lb=1e6, ub=1e6 + 10)
@@ -145,26 +167,35 @@ def _shifted_qp():
     return m
 
 
+def test_flag_is_on_by_default(monkeypatch):
+    """Graduated (#1537): with ``DISCOPT_RECENTRE`` unset the pass runs and moves
+    the far-offset variables, exactly as with ``=1``."""
+    monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
+    r = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert _moved(r) == 2.0
+    monkeypatch.setenv("DISCOPT_RECENTRE", "1")
+    r1 = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert (r.status, r.objective, r.bound, r.node_count, r.gap_certified) == (
+        r1.status,
+        r1.objective,
+        r1.bound,
+        r1.node_count,
+        r1.gap_certified,
+    )
+
+
 def test_flag_off_is_untouched(monkeypatch):
-    """Flag OFF the pass is never entered and the solve is bound-neutral: unset
-    and ``=0`` give identical node count, objective and bound, and a ``recentre``
-    that raises if called changes nothing either."""
+    """``DISCOPT_RECENTRE=0`` (the opt-out) never enters the pass: a ``recentre``
+    that raises if called changes nothing, and nothing is reported as moved."""
     import discopt.modeling._recentre as rmod
 
     def unreachable(*a, **k):
         raise AssertionError("recentre() was called with the flag OFF")
 
     monkeypatch.setattr(rmod, "recentre", unreachable)
-    runs = []
-    for value in (None, "0"):
-        if value is None:
-            monkeypatch.delenv("DISCOPT_RECENTRE", raising=False)
-        else:
-            monkeypatch.setenv("DISCOPT_RECENTRE", value)
-        r = _shifted_qp().solve(time_limit=20, deterministic=True)
-        assert _moved(r) is None and "recentre/skipped" not in r.solver_stats
-        runs.append((r.status, r.objective, r.bound, r.node_count, r.gap_certified))
-    assert runs[0] == runs[1]
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
+    r = _shifted_qp().solve(time_limit=20, deterministic=True)
+    assert _moved(r) is None and "recentre/skipped" not in r.solver_stats
 
 
 # ── the fixes (flag ON). Each was a false certificate or a crash on the main of
@@ -383,3 +414,47 @@ def test_inner_only_columns_are_not_returned(flag_on):
     r = m.solve(time_limit=20)
     assert _moved(r) == 2.0
     assert set(r.x) == {v.name for v in m._variables}
+
+
+def _affine_product_model(kind: str, c: float) -> dm.Model:
+    m = dm.Model(kind)
+    if kind == "int_sq":
+        y = m.integer("y", lb=c, ub=c + 20)
+        m.minimize((6 * y) * y - 12 * (c + 7.3) * y)
+    elif kind == "cont_sq_loop":
+        y = m.continuous("y", lb=c, ub=c + 20)
+        f = (6 * y) * y - 12 * (c + 7.3) * y
+        for i in range(200):
+            f = f + 1e-3 * m.continuous(f"z{i}", lb=0, ub=1)
+        m.minimize(f)
+    elif kind == "bilin_cross":
+        x = m.continuous("x", lb=c, ub=c + 10)
+        y = m.continuous("y", lb=c, ub=c + 10)
+        m.minimize((2 * x) * x + (3 * y) * y - x * y - 4 * c * x - 5 * c * y)
+    else:  # miqp_con
+        x = m.continuous("x", lb=c, ub=c + 10)
+        k = m.integer("k", lb=0, ub=5)
+        m.subject_to((x * 1.0) * (x * 1.0) <= (c + 7) ** 2)
+        m.minimize((2 * x) * x - 4 * (c + 9) * x + k)
+    return m
+
+
+@pytest.mark.parametrize("c", [3000.5, 1e5 + 0.5])
+@pytest.mark.parametrize("kind", ["int_sq", "cont_sq_loop", "bilin_cross", "miqp_con"])
+def test_recentred_affine_products_keep_their_certificate(monkeypatch, kind, c):
+    """Recentring turns ``(a*y)*y`` into ``(a*z + a*s)*(z + s)``, a product of two
+    affine expressions, which the quadratic extractor does not expand (#1537,
+    review round 2). Measured on this class: no certificate is lost, because the
+    solve still certifies by another route. This pins that, and cross-checks each
+    arm's bound against the other arm's objective."""
+    out = {}
+    for arm in ("0", "1"):
+        monkeypatch.setenv("DISCOPT_RECENTRE", arm)
+        out[arm] = _affine_product_model(kind, c).solve(time_limit=60)
+    r0, r1 = out["0"], out["1"]
+    assert _moved(r1) and _moved(r1) > 0
+    assert r0.gap_certified and r1.gap_certified
+    tol = 1e-4 * max(1.0, abs(r0.objective))
+    assert abs(r1.objective - r0.objective) <= tol
+    assert r1.bound <= r0.objective + 1e-9 * abs(r0.objective)
+    assert r0.bound <= r1.objective + 1e-9 * abs(r1.objective)

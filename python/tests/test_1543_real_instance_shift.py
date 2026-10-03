@@ -115,7 +115,14 @@ def _path(name: str) -> Path:
 
 @pytest.fixture
 def route_spy(monkeypatch):
-    """Prove the run exercised the change: the route ran AND the shift was nonzero."""
+    """Prove the run exercised the change: the route ran AND the shift was nonzero.
+
+    Pins ``DISCOPT_RECENTRE=0``: this file measures ``_miqp_origin_shift`` on the
+    model AS TRANSLATED. Recentring (default ON since #1537) moves these boxes back
+    to the origin before the MIQP route sees them, so the origin shift has nothing
+    left to do and the spy's premise fails. The recentred arm is pinned separately
+    by ``test_translated_real_instance_certifies_under_recentring`` below."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     seen = {"bb": 0, "shift_cols": 0}
     real_bb, real_sh = solver_mod._solve_miqp_bb, solver_mod._miqp_origin_shift
 
@@ -163,6 +170,32 @@ def test_translated_real_instance_keeps_its_certificate(name, offset, route_spy)
     r = _translate(base, offset).solve(time_limit=60)
     assert route_spy["bb"] >= 1, "did not reach _solve_miqp_bb: the change was not exercised"
     assert route_spy["shift_cols"] > 0, "zero shift: the change was not exercised"
+
+    tol = max(1e-6, 1e-4 * max(1.0, abs(ref.objective)))
+    assert r.status == "optimal" and r.gap_certified, (r.status, r.objective, r.bound)
+    assert abs(r.objective - ref.objective) <= tol, (r.objective, ref.objective)
+    assert r.bound <= ref.objective + tol, (r.bound, ref.objective)
+
+
+# ``st_testgr3`` at 1e3 is excluded because recentring moves none of its columns:
+# its boxes are wider than 1e3 / ratio, so the solve equals the OFF arm above and
+# would test nothing new (measured: ``recentre/variables_moved`` absent).
+_ON_CASES = [case for case in _CASES if case != ("st_testgr3.nl", 1e3)]
+
+
+@pytest.mark.parametrize("name, offset", _ON_CASES)
+def test_translated_real_instance_certifies_under_recentring(name, offset, monkeypatch):
+    """The same 27 translated instances with recentring ON (the default): the
+    pass moves the offset columns and the solve still certifies the reference
+    optimum. Measured 26/26 certified, 0 false (PR #1594, round 2)."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "1")
+    base = from_nl(str(_path(name)))
+    ref = base.solve(time_limit=60)
+    assert ref.status == "optimal" and ref.gap_certified, (name, ref.status)
+
+    r = _translate(base, offset).solve(time_limit=60)
+    moved = (r.solver_stats or {}).get("recentre/variables_moved")
+    assert moved is not None and moved > 0, "recentring did not move anything: not exercised"
 
     tol = max(1e-6, 1e-4 * max(1.0, abs(ref.objective)))
     assert r.status == "optimal" and r.gap_certified, (r.status, r.objective, r.bound)
