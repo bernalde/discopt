@@ -171,7 +171,7 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
 
 
 # --------------------------------------------------------------------------- #
-# Rust MILP equilibration under DISCOPT_LP_ROW_PRESCALE (#1537).
+# Rust MILP equilibration under per-row scaling (#1537; row pre-pass retired).
 # --------------------------------------------------------------------------- #
 
 
@@ -194,91 +194,26 @@ def _per_row_scaled(name: str, span: float):
     return new
 
 
-def test_row_scaled_m3_certifies_with_row_prescale(monkeypatch):
+def test_row_scaled_m3_loses_its_certificate_soundly(monkeypatch):
     """m3 with rows scaled in 10^[-6,6]. An OA-master column for a variable that
     appears in a row scaled by ~1e5 and one scaled by ~1e-6 holds a 1e-11 ratio,
-    which the column-first equilibration read as noise. The #1296 guard then
-    (correctly) withdrew every master certificate and the solve ended uncertified.
-    The pow2 row pre-pass judges the column on row-normalised entries."""
+    which the column-first equilibration reads as noise, so the #1296 guard
+    withdraws the master certificates and the solve ends uncertified.
+
+    A pow2 row pre-pass (``DISCOPT_LP_ROW_PRESCALE``) restored this certificate but
+    was retired after its §5 panel: clay0303hfsg (rows scaled in 10^[-3,3]) lost its
+    certificate at 20 s, with 15x the Numerical LP verdicts of the legacy factors
+    (see ``docs/dev/flag-retirement-audit.md``). This pins what main keeps: the
+    certificate is lost, never replaced by a bound above the optimum. A future
+    row-scale-invariant fix flips the ``gap_certified`` assertion and must pass the
+    panel to do so."""
     from discopt._rust import profile_counters_py, profile_reset_py
 
     monkeypatch.setenv("DISCOPT_PROFILE", "1")
-    # OFF arm, anti-vacuity: the shape still reaches the guard and loses the cert.
-    monkeypatch.setenv("DISCOPT_LP_ROW_PRESCALE", "0")
     profile_reset_py()
-    off = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    # Anti-vacuity (CLAUDE.md §6): the shape still reaches the guard.
     assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
-    assert not off.gap_certified, (off.status, off.bound)
-
-    monkeypatch.setenv("DISCOPT_LP_ROW_PRESCALE", "1")
-    profile_reset_py()
-    on = _per_row_scaled("m3.nl", 6.0).solve(time_limit=60)
-    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) == 0
-    assert on.gap_certified, (on.status, on.bound)
-    # minlplib.solu: m3 =opt= 37.8 (minimize).
-    assert on.bound <= 37.8 + 1e-6
-    assert on.objective == pytest.approx(37.8, abs=1e-4)
-
-    # Default (#1537): the flag is default OFF (the re-panel lost a certificate),
-    # so with the variable unset the legacy factors run and the guard fires.
-    monkeypatch.delenv("DISCOPT_LP_ROW_PRESCALE")
-    profile_reset_py()
-    _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
-    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
-
-
-_HDA_ROOT_PROBE = """
-import sys
-import numpy as np
-from discopt._relax.mccormick_lp import MccormickLPRelaxer
-from discopt._rust import profile_counters_py, profile_reset_py
-from discopt.modeling.core import from_nl
-
-model = from_nl(sys.argv[1])
-lb = np.concatenate([np.asarray(v.lb, float).ravel() for v in model._variables])
-ub = np.concatenate([np.asarray(v.ub, float).ravel() for v in model._variables])
-profile_reset_py()
-res = MccormickLPRelaxer(model).solve_at_node(lb, ub)
-c = dict(profile_counters_py())
-print("RESULT", res.lower_bound, c.get("PrescaleLegacyRetries", 0),
-      c.get("PrescaleLegacyRescues", 0))
-"""
-
-
-def _hda_root(arm: str):
-    """hda's raw-box root bound in a fresh interpreter, so the two arms share no
-    relaxer state."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    path = Path(__file__).parent / "data" / "minlplib_nl" / "hda.nl"
-    env = dict(os.environ, DISCOPT_LP_ROW_PRESCALE=arm, DISCOPT_PROFILE="1")
-    out = subprocess.run(
-        [sys.executable, "-c", _HDA_ROOT_PROBE, str(path)],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    line = [ln for ln in out.splitlines() if ln.startswith("RESULT ")]
-    assert len(line) == 1, out
-    _, bound, retries, rescues = line[0].split()
-    return float(bound), int(retries), int(rescues)
-
-
-def test_hda_root_bound_does_not_regress_under_row_prescale():
-    """PR #1604 CI: the pre-passed factors make hda's row-filtered root LP
-    (m=2906) end ``Numerical``. The scaled range matches the legacy factors
-    (1e5.8), but the pivot path's Forrest-Tomlin updates fail, and the root
-    bound fell from -64675.25 to -2.9e14. Neither factor set dominates: under
-    pow2 row rescalings of hda the legacy factors fail as often. So a pre-pass
-    failure is retried once on the legacy factors. The ON bound must match OFF,
-    and the retry must have fired."""
-    off, off_retries, _ = _hda_root("0")
-    on, on_retries, on_rescues = _hda_root("1")
-    assert off_retries == 0  # OFF never builds pre-passed factors
-    assert on_retries >= 1 and on_rescues >= 1, (on_retries, on_rescues)
-    # minlplib.solu: hda =opt= -5964.534084 (minimize) -- both bounds sound.
-    assert off <= -5964.534084 and on <= -5964.534084
-    assert on == pytest.approx(off, rel=1e-6), (on, off)
+    assert not res.gap_certified, (res.status, res.bound)
+    # minlplib.solu: m3 =opt= 37.8 (minimize). No false bound.
+    assert res.bound is None or res.bound <= 37.8 + 1e-6, res.bound

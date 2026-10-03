@@ -1,16 +1,17 @@
-//! #1537: `DISCOPT_LP_ROW_PRESCALE` makes the MILP driver's certificate row-scale
-//! invariant on the witness shape found in the m3 / flay03m OA masters.
+//! #1537: the MILP driver's certificate on the row-scaled witness shape found in
+//! the m3 / flay03m OA masters.
 //!
 //! The LP is `min x + 2y` s.t. `x + y >= 3.5`, `x - y <= 1`, `x` integer in
 //! [0, 10], `y` in [0, 100]: the optimum is 5 at `(2, 1.5)`. Written with row 0
 //! multiplied by 1e5 and row 1 by 1e-6 it is the same model, but column `x` then
-//! holds 1e5 and 1e-6, and the legacy equilibration reads the 1e-6 as noise. The
-//! #1296 guard correctly withdraws the certificate on that arm. With the pre-pass
-//! the guard does not fire and the scaled model certifies the same bound as the
-//! unscaled one.
+//! holds 1e5 and 1e-6, and the equilibration reads the 1e-6 as noise. The #1296
+//! guard correctly withdraws the certificate: a lost certificate, never a false
+//! bound. A geometric-mean pow2 row pre-pass (`DISCOPT_LP_ROW_PRESCALE`) restored
+//! it here but was retired after its §5 panel (clay0303hfsg lost its certificate;
+//! see `docs/dev/flag-retirement-audit.md`). This pins the behaviour main keeps;
+//! a future row-scale-invariant fix flips the scaled arm and must pass the panel.
 //!
-//! One test in its own binary: the flag is process-wide, and this test flips it
-//! between arms, so no other test may run concurrently in this process.
+//! One test in its own binary: it reads the process-wide profile counters.
 
 use discopt_core::bnb::milp_driver::{solve_milp, MilpOptions, MilpResult, MilpStatus};
 use discopt_core::lp::crossover::LpView;
@@ -87,46 +88,24 @@ fn assert_certified(res: &MilpResult, label: &str) {
 }
 
 #[test]
-fn row_prescale_restores_the_row_scaled_certificate() {
+fn row_scaled_witness_loses_its_certificate_soundly() {
     std::env::set_var("DISCOPT_PROFILE", "1");
 
-    // OFF arm. Anti-vacuity (CLAUDE.md §6): the guard must fire on the scaled
-    // fixture here, or the ON assertions below are about a shape that no longer
-    // reaches the code under test.
-    std::env::set_var("DISCOPT_LP_ROW_PRESCALE", "0");
-    let (unit_off, d0) = solve(1.0, 1.0);
+    // Unit rows: the guard stays quiet and the model certifies the optimum.
+    let (unit, d0) = solve(1.0, 1.0);
     assert_eq!(d0, 0);
-    assert_certified(&unit_off, "unit rows, OFF");
-    let (scaled_off, d1) = solve(1e5, 1e-6);
-    assert_eq!(d1, 1, "the legacy guard no longer fires on the witness");
-    assert_eq!(scaled_off.bound, f64::NEG_INFINITY, "{scaled_off:?}");
-    assert_ne!(scaled_off.status, MilpStatus::Optimal);
+    assert_certified(&unit, "unit rows");
+    // The point is reported in original units.
+    assert!((unit.x[0] - 2.0).abs() < 1e-6 && (unit.x[1] - 1.5).abs() < 1e-6);
 
-    // ON arm: the same scaled model now certifies, with the unscaled bound.
-    std::env::set_var("DISCOPT_LP_ROW_PRESCALE", "1");
-    let (unit_on, d2) = solve(1.0, 1.0);
-    assert_eq!(d2, 0);
-    assert_certified(&unit_on, "unit rows, ON");
-    let (scaled_on, d3) = solve(1e5, 1e-6);
-    assert_eq!(d3, 0, "the pre-pass did not clear the guard");
-    assert_certified(&scaled_on, "scaled rows, ON");
-    assert!(
-        (scaled_on.bound - unit_off.bound).abs() <= 1e-6,
-        "row scaling moved the certified bound: {} vs {}",
-        scaled_on.bound,
-        unit_off.bound
-    );
-    // The point is reported in original units on both spellings.
-    assert!((scaled_on.x[0] - 2.0).abs() < 1e-6 && (scaled_on.x[1] - 1.5).abs() < 1e-6);
-
-    // Default arm (#1537): unset means OFF -- the re-panel of the shipped factor
-    // lost a certificate, so the pre-pass is opt-in -- and the guard fires again.
-    std::env::remove_var("DISCOPT_LP_ROW_PRESCALE");
-    let (scaled_default, d4) = solve(1e5, 1e-6);
-    assert_eq!(d4, 1, "the default arm is not the legacy factors");
+    // Rows scaled by 1e5 / 1e-6. Anti-vacuity (CLAUDE.md §6): the guard must fire
+    // here, or this test no longer reaches the code it pins. The certificate is
+    // withdrawn -- never replaced by a bound above the optimum.
+    let (scaled, d1) = solve(1e5, 1e-6);
     assert_eq!(
-        scaled_default.bound,
-        f64::NEG_INFINITY,
-        "{scaled_default:?}"
+        d1, 1,
+        "the #1296 guard no longer fires on the row-scaled witness"
     );
+    assert_eq!(scaled.bound, f64::NEG_INFINITY, "{scaled:?}");
+    assert_ne!(scaled.status, MilpStatus::Optimal);
 }

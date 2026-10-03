@@ -359,11 +359,6 @@ counters!(
     // existing fallback chain exactly as before the retry existed.
     LpDenseRetries,
     LpDenseRetryRescues,
-    // #1537: a warm-CSC LP that failed (Numerical/IterLimit) under the row
-    // pre-passed equilibration and was re-solved once on the legacy factors
-    // (Retries), and how many of those reached a terminal verdict (Rescues).
-    PrescaleLegacyRetries,
-    PrescaleLegacyRescues,
     // #956 follow-through: the TERMINAL verdict histogram of the cold primal
     // simplex, counted once per solve at its single exit point (`assemble`, after
     // the feasibility audit has had its say). This is the instrument that decides

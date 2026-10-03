@@ -473,43 +473,6 @@ fn solve_lp_warm_csc_inner(
             // scaling lost. No allocation on the success path (the common case).
             if matches!(sol.status, LpStatus::Numerical | LpStatus::IterLimit) {
                 scaling.unscale_cols(&mut sp); // exact pow2 → original matrix
-
-                // #1537: the row pre-pass is the same kind of heuristic. On hda's
-                // row-filtered root LP (m=2906) the pre-passed factors have the
-                // same scaled range (1e5.8) as the legacy ones, yet walk a pivot
-                // path whose Forrest-Tomlin updates fail (growth / tiny pivot) and
-                // end `Numerical`, while the legacy factors solve it in 2472 pivots
-                // to HiGHS's optimum; under power-of-two row rescalings of hda the
-                // reverse happens just as often. Neither factor set dominates, so
-                // a pre-pass failure is retried once on the legacy factors before
-                // the unscaled retry -- with the same soundness argument: only a
-                // terminal verdict that passed its own audit replaces a failure.
-                if let Some(legacy) = scaling.legacy_alternative(&sp) {
-                    crate::profile::incr(crate::profile::Ctr::PrescaleLegacyRetries);
-                    legacy.scale_cols(&mut sp);
-                    let mut alt = solve_csc_core(
-                        &sp,
-                        m,
-                        n,
-                        &legacy.scale_c(c),
-                        &legacy.scale_lower(l),
-                        &legacy.scale_upper(u),
-                        &legacy.scale_b(b),
-                        start,
-                        opts,
-                    );
-                    legacy.unscale_cols(&mut sp); // exact pow2 → original matrix
-                    if matches!(
-                        alt.status,
-                        LpStatus::Optimal | LpStatus::Infeasible | LpStatus::Unbounded
-                    ) {
-                        crate::profile::incr(crate::profile::Ctr::PrescaleLegacyRescues);
-                        legacy.unscale_x(&mut alt.x);
-                        legacy.unscale_dual(&mut alt.dual);
-                        legacy.unscale_ray(&mut alt.ray);
-                        return alt;
-                    }
-                }
                 let alt = solve_csc_core(&sp, m, n, c, l, u, b, start, opts);
                 if matches!(
                     alt.status,
@@ -3063,9 +3026,6 @@ mod tests {
     #[test]
     fn unstable_pivot_recovery_is_not_gated_on_a_deadline() {
         let _guard = crate::profile::test_guard();
-        // Fixture captured under the pre-#1537 equilibration factors; the row
-        // pre-pass changes the path it walks (see `scaling::force_row_prescale`).
-        let _rp = super::super::scaling::force_row_prescale(false);
         use crate::profile::{counter, reset, set_enabled, Ctr};
 
         let json = include_str!("testdata/bchoco06_unstable_pivot_lp.json");
@@ -3769,9 +3729,6 @@ mod tests {
     #[test]
     fn cold_primal_refuses_a_subtol_dual_infeasible_vertex() {
         let _guard = crate::profile::test_guard();
-        // Fixture captured under the pre-#1537 equilibration factors; the row
-        // pre-pass changes the path it walks (see `scaling::force_row_prescale`).
-        let _rp = super::super::scaling::force_row_prescale(false);
         crate::profile::reset();
         crate::profile::set_enabled(true);
         let mut checked = 0;
@@ -3798,9 +3755,6 @@ mod tests {
     #[test]
     fn warm_dual_hands_a_subtol_dual_infeasible_optimum_to_the_primal() {
         let _guard = crate::profile::test_guard();
-        // Fixture captured under the pre-#1537 equilibration factors; the row
-        // pre-pass changes the path it walks (see `scaling::force_row_prescale`).
-        let _rp = super::super::scaling::force_row_prescale(false);
         crate::profile::reset();
         crate::profile::set_enabled(true);
         let mut checked = 0;
@@ -3836,56 +3790,6 @@ mod tests {
         assert_eq!(failed, 0);
     }
 
-    // #1537: the #1595 witnesses (single-row and mixed-cost, cold and warm) under
-    // the opt-in row pre-pass. The pre-pass rescales them so the sub-tol path is
-    // no longer needed; the answer must still be the true minimum.
-    #[test]
-    fn subtol_witnesses_are_solved_correctly_under_row_prescale() {
-        let _rp = super::super::scaling::force_row_prescale(true);
-        let opts = SimplexOptions::default();
-        let mut checked = 0;
-        for &(a, e) in &SUBTOL_WITNESSES {
-            let (sp, c, l, u, b) = subtol_witness(a, e);
-            let start = Basis {
-                col_status: vec![BASIC, AT_LOWER, AT_LOWER],
-                basic_vars: vec![0],
-            };
-            for warm in [None, Some(&start)] {
-                let sol = solve_lp_warm_csc(sp.clone(), 1, 3, &c, &l, &u, &b, warm, &opts);
-                assert_eq!(sol.status, LpStatus::Optimal, "a={a} e={e}");
-                assert!((sol.obj + 1.0).abs() < 1e-9, "a={a} e={e}: obj {}", sol.obj);
-                checked += 1;
-            }
-        }
-        for &a in &[1e9, 3e9, 7.5e9] {
-            for &e in &[1.0, 1e-6] {
-                for &cx in &[1e-3, 1.0, 1e3] {
-                    for &cz in &[1.0, 1e-3, 1e3] {
-                        let (sp, c, l, u, b) = mixed_subtol_witness(a, e, cx, cz);
-                        let start = Basis {
-                            col_status: vec![BASIC, AT_LOWER, AT_LOWER, AT_LOWER, BASIC],
-                            basic_vars: vec![0, 4],
-                        };
-                        for warm in [None, Some(&start)] {
-                            let sol =
-                                solve_lp_warm_csc(sp.clone(), 2, 5, &c, &l, &u, &b, warm, &opts);
-                            let tag =
-                                format!("a={a} e={e} cx={cx} cz={cz} warm={}", warm.is_some());
-                            assert_eq!(sol.status, LpStatus::Optimal, "{tag}");
-                            assert!(
-                                (sol.obj + cx).abs() <= 1e-7 * (1.0 + cx),
-                                "{tag}: obj {}",
-                                sol.obj
-                            );
-                            checked += 1;
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(checked, 2 * SUBTOL_WITNESSES.len() + 108);
-    }
-
     /// #1597 review (B1) mixed-cost witness in standard form: the #1595 row plus an
     /// unrelated column `z` with an O(1)-scale cost in its own row,
     /// `min −cx·x + cz·z` s.t. `a·x − e·y + s₁ = 0`, `z + s₂ = 1`,
@@ -3914,9 +3818,6 @@ mod tests {
     #[test]
     fn mixed_cost_subtol_vertex_is_refused_cold_and_warm() {
         let _guard = crate::profile::test_guard();
-        // Fixture captured under the pre-#1537 equilibration factors; the row
-        // pre-pass changes the path it walks (see `scaling::force_row_prescale`).
-        let _rp = super::super::scaling::force_row_prescale(false);
         crate::profile::reset();
         crate::profile::set_enabled(true);
         let mut checked = 0;
