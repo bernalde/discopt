@@ -71,6 +71,8 @@ from .gdp_reformulate import (
     bound_expression_error,
 )
 from .term_classifier import (
+    _affine_atom_key,
+    _affine_walk,
     _get_flat_index,
     distribute_products,
     distribution_exceeds_budget,
@@ -503,6 +505,12 @@ class _Lifter:
         # ``_lift_zero_spanning_factors_enabled``). Populated only when the flag
         # is on, so the default reform is byte-identical.
         self.zero_spanning_factor_auxes: set[str] = set()
+        # Auxes created with ``integer=True`` (an exact integer-valued affine
+        # definition): integral because of the columns they are defined by, see
+        # ``Model._implied_integer_auxes``. Populated only with
+        # ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, so ``=0`` reproduces main exactly
+        # (#1588 review: the default-path behaviour change has no panel of its own).
+        self.implied_integer_auxes: set[str] = set()
 
     def tick(self, *, force: bool = False) -> None:
         """Charge one walker visit; raise :class:`_LiftAbandoned` once the clock
@@ -591,6 +599,8 @@ class _Lifter:
         self._counter += 1
         vtype = VarType.INTEGER if integer else VarType.CONTINUOUS
         w = Variable(name, vtype, (), lo, hi, self.model)
+        if integer and _lift_affine_monomials_enabled():
+            self.implied_integer_auxes.add(name)
         self.model._variables.append(w)
         self._expr_cache[key] = w
         # Clear any sign-definite division in the defining equality ``w == expr``
@@ -725,6 +735,10 @@ def _is_integer_valued_affine(expr: Expression) -> bool:
         )
     if isinstance(expr, UnaryOp) and expr.op == "neg":
         return _is_integer_valued_affine(expr.operand)
+    if isinstance(expr, SumOverExpression) and _lift_affine_monomials_enabled():
+        # Recentring writes ``y + c`` this way (#1537). Gated with the lift that
+        # introduced it, so ``=0`` is the pre-#1537 rule exactly.
+        return bool(expr.terms) and all(_is_integer_valued_affine(t) for t in expr.terms)
     if isinstance(expr, BinaryOp):
         if expr.op in ("+", "-"):
             return _is_integer_valued_affine(expr.left) and _is_integer_valued_affine(expr.right)
@@ -742,7 +756,136 @@ def _collect_mul_factors(expr: Expression) -> list[Expression]:
     return [expr]
 
 
-def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") -> Expression:
+def _lift_affine_monomials_enabled() -> bool:
+    """``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1537): lift the translated factors of a
+    multilinear monomial instead of multiplying them out. See
+    :func:`_is_translated_monomial` for the rule and its measurement.
+
+    Default ON since its graduation panel (2026-10-02, on top of the #1586 OBBT
+    cascade fix; 206 interleaved comparisons over the in-repo corpus as written,
+    under 1e3/1e6 translations and the generated families;
+    ``recentre_graduation_panel.py --flag``): 0 false, 0 lost, 0 neutrality drift;
+    certificates 166 -> 168 (nvs05 as written, nvs01 at the 1e3 shift). Re-run
+    2026-10-03 after the #1588 review fixes (maximal-chain rule, reach, implied-
+    integer auxes): same verdict, certificates 167 -> 169. ``=0`` restores the
+    distribute-then-cap path."""
+    import os
+
+    return os.environ.get("DISCOPT_LIFT_AFFINE_MONOMIALS", "1") != "0"
+
+
+def _univariate_affine_key(expr: Expression) -> Optional[tuple[tuple, bool]]:
+    """``(variable key, has_offset)`` when *expr* is ``a * v + b`` with ``v`` ONE
+    scalar variable (or a scalar element of one) and ``a != 0``, else ``None``.
+
+    ``has_offset`` is ``b != 0`` -- the factor is a translated copy of ``v``, which
+    distributes into two terms. Coefficients are folded exactly (``Fraction``).
+    """
+    coef: dict[tuple, object] = {}
+    const = [0]
+    ok = [True]
+
+    def visit(kind: str, node: Expression, scale) -> None:
+        if kind == "const":
+            const[0] = const[0] + scale
+            return
+        if isinstance(node, SumOverExpression):  # recentring writes ``y + c`` this way
+            for t in node.terms:
+                _affine_walk(t, None, lambda k, n, s: visit(k, n, s * scale))
+            return
+        key = _affine_atom_key(node)
+        if key[0] == "n" or (isinstance(node, Variable) and int(np.prod(node.shape)) != 1):
+            ok[0] = False
+            return
+        coef[key] = coef.get(key, 0) + scale
+
+    _affine_walk(expr, None, visit)
+    if not ok[0]:
+        return None
+    live = [k for k, a in coef.items() if a != 0]
+    if len(live) != 1:
+        return None
+    return live[0], const[0] != 0
+
+
+def _is_translated_monomial(factors: list[Expression]) -> bool:
+    """True when the product of *factors* is a multilinear monomial written in
+    translated coordinates: every factor is a constant or ``a_k v_k + b_k`` over
+    pairwise-distinct scalar variables, at least three factors are non-constant,
+    and at least one carries an offset ``b_k != 0``.
+
+    #1537: such a product is ``prod_k (a_k v_k + b_k)``. Multiplying it out gives
+    ``2**n`` multilinear terms whose term-wise relaxation depends on the offsets;
+    lifting each translated factor to an exact aux ``w_k == a_k v_k + b_k`` gives
+    the monomial ``prod_k w_k``, whose relaxation is the one the model would get in
+    the coordinates where the offsets are zero. So the relaxation no longer depends
+    on where the user put the origin. Measured on nvs09 (``- (prod_k x_k)**0.2``,
+    ten integers on [3, 9]) moved by ``x = y - 3`` / ``x = y + 3``: the 1024-term
+    expansion sits exactly AT :data:`_DISTRIBUTE_TERM_LIMIT` (so was not lifted)
+    and its McCormick LP (10,177 x 42,518) exceeded the dense cap, leaving
+    interval/alphaBB bounds of -48.0 / -81.0 and no certificate in 30 s; lifted,
+    both certify -43.1343 in 39 nodes (unshifted: 31).
+
+    Bilinear products are excluded: McCormick is exact under translation of
+    either factor, so lifting changes nothing there. A repeated variable is
+    excluded: ``(x - 1)(x - 2)(x - 3)`` is a univariate polynomial, which the
+    expanded form relaxes better than three independent auxes would.
+
+    Reach (#1588 review): the rule is applied to maximal ``*`` chains found by the
+    prelift's walk -- through ``+``/``-``, unary nodes and ``dm.sum`` terms, and a
+    product found this way counts as factorable work on its own
+    (:func:`_scan_for_translated_monomial`). Not reached: a product inside a call
+    argument (``exp((x-1)(y-1)(z-1))``; the call-argument lift handles the call),
+    and ``dm.prod(X - 3)`` over an ARRAY, which is one ``prod`` reduction node
+    that is never distributed, so the ``2**n``-term expansion this rule prevents
+    does not arise for it (``dm.prod([...])`` over a list builds a ``*`` chain and
+    is lifted).
+    """
+    seen: set[tuple] = set()
+    nonconst = 0
+    offset = False
+    for f in factors:
+        if isinstance(f, Constant):
+            continue
+        hit = _univariate_affine_key(f)
+        if hit is None:
+            return False
+        key, has_offset = hit
+        if key in seen:
+            return False
+        seen.add(key)
+        nonconst += 1
+        offset = offset or has_offset
+    return nonconst >= 3 and offset
+
+
+def _scan_for_translated_monomial(expr: Expression, *, _in_chain: bool = False) -> bool:
+    """True if *expr* holds a maximal ``*`` chain that :func:`_is_translated_monomial`
+    accepts, found by exactly the walk :func:`_prelift_blowup_products` makes
+    (``BinaryOp`` / ``UnaryOp`` nodes, each maximal chain tested once).
+
+    #1588 review: this is what makes a translated monomial count as factorable
+    work on its own. Without it ``min (x-3)(y-1)(z-2)(u-4)`` was returned
+    unchanged, because the lift only ran when some *other* lift opened the pass.
+    """
+    if isinstance(expr, BinaryOp):
+        if expr.op == "*" and not _in_chain:
+            if _is_translated_monomial(_collect_mul_factors(expr)):
+                return True
+        sub = expr.op == "*"
+        return _scan_for_translated_monomial(
+            expr.left, _in_chain=sub
+        ) or _scan_for_translated_monomial(expr.right, _in_chain=sub)
+    if isinstance(expr, UnaryOp):
+        return _scan_for_translated_monomial(expr.operand)
+    if isinstance(expr, SumOverExpression):  # ``dm.sum([...])`` (see the prelift)
+        return any(_scan_for_translated_monomial(t) for t in expr.terms)
+    return False
+
+
+def _prelift_blowup_products(
+    expr: Expression, model: Model, lifter: "_Lifter", *, _in_chain: bool = False
+) -> Expression:
     """Lift the factors of any product whose naive distribution would explode.
 
     Walks *expr*; at each ``*``-rooted product whose estimated distributed term
@@ -752,15 +895,30 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
     product over the auxes, so the relaxation sees a bilinear/multilinear product
     of bounded variables instead of a high-degree expanded polynomial.  Sound:
     each ``w == f`` is exact and the lifted product is McCormick-relaxable.
-    Identity-preserving for every node under the limits, so non-blowup
-    constraints/objectives are byte-for-byte unchanged. A lifted factor that is
+    A ``*`` node that passes none of these tests is returned as the same
+    object when nothing beneath it is lifted; the pass as a whole still returns
+    new ``BinaryOp`` parents above any lifted node. A lifted factor that is
     integer-valued (``y - c`` with ``y`` integer, ``c`` integral) gets an
     ``INTEGER`` aux, so the lift keeps the integrality the factor had.
+
+    With ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, a product that
+    :func:`_is_translated_monomial` accepts is lifted too. That rule is applied
+    to the MAXIMAL ``*`` chain only (``_in_chain`` marks the inner ``*`` nodes of
+    a chain already tested): re-testing every sub-chain made the answer depend
+    on how the product was parenthesised -- ``(y-1)(z-2)(u-3)(y-4)`` lifted three
+    factors while ``(y-4)(y-1)(z-2)(u-3)`` lifted none (#1588 review).
     """
     lifter.tick()
     if isinstance(expr, BinaryOp):
+        translated = (
+            expr.op == "*"
+            and not _in_chain
+            and _lift_affine_monomials_enabled()
+            and _is_translated_monomial(_collect_mul_factors(expr))
+        )
         if expr.op == "*" and (
-            _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
+            translated
+            or _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
             or _distribution_cancellation(_collect_mul_factors(expr), model)
             > _DISTRIBUTE_CANCELLATION_LIMIT
         ):
@@ -769,11 +927,16 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
             for f in _collect_mul_factors(expr):
                 # Only a genuine multi-term sum drives the blowup; a constant,
                 # variable, or monomial power distributes to one term and is left
-                # for the normal monomial/bilinear path.
+                # for the normal monomial/bilinear path. A translated monomial's
+                # offset factors are lifted whatever node type spells them.
                 if (
                     isinstance(f, BinaryOp)
                     and f.op in ("+", "-")
                     and _estimate_distributed_terms(f) >= 2
+                ) or (
+                    translated
+                    and not isinstance(f, Constant)
+                    and (_univariate_affine_key(f) or (None, False))[1]
                 ):
                     # Recurse first so a factor that is *itself* a blowup product
                     # has its inner factors lifted before this one is bounded.
@@ -802,8 +965,9 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
             # Couldn't bound any factor (unbounded box): leave the product to the
             # existing distribute/monomial path rather than alter it.
             return expr
-        left = _prelift_blowup_products(expr.left, model, lifter)
-        right = _prelift_blowup_products(expr.right, model, lifter)
+        sub = expr.op == "*"
+        left = _prelift_blowup_products(expr.left, model, lifter, _in_chain=sub)
+        right = _prelift_blowup_products(expr.right, model, lifter, _in_chain=sub)
         if left is expr.left and right is expr.right:
             return expr
         return BinaryOp(expr.op, left, right)
@@ -812,6 +976,15 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
         if operand is expr.operand:
             return expr
         return UnaryOp(expr.op, operand)
+    if isinstance(expr, SumOverExpression) and _lift_affine_monomials_enabled():
+        # ``dm.sum([...])`` is a sum node like ``+``; without this descent a
+        # translated monomial written inside one was never lifted (#1588 review,
+        # reach). Flag-gated with the lift so ``=0`` keeps the pre-#1537 walk,
+        # which stopped here for the blowup/cancellation lifts too.
+        terms = [_prelift_blowup_products(t, model, lifter) for t in expr.terms]
+        if all(a is b for a, b in zip(terms, expr.terms)):
+            return expr
+        return SumOverExpression(terms)
     return expr
 
 
@@ -1335,6 +1508,10 @@ def _has_factorable_work_inner(
         # TD-A: scan for ``g(x)**n`` on the *pre-distribute* tree — distribution
         # would collapse it into the ``g·g`` product that hides the structure.
         if _lift_loose_products_enabled() and _scan_for_liftable_call_power(expr, model):
+            return True
+        # #1537 / #1588 review: a translated monomial is factorable work in its
+        # own right (pre-distribute, the same walk the prelift makes).
+        if _lift_affine_monomials_enabled() and _scan_for_translated_monomial(expr):
             return True
         dist = distribute_products(expr)
         if _scan_for_mixed_product(dist, model):
@@ -1998,6 +2175,9 @@ def _factorable_reformulate_inner(
     # under the flag) so the solver can keep them branchable. Always set the
     # attribute (empty by default) for a stable, easy-to-read contract.
     new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
+    new_model._implied_integer_auxes = set(getattr(model, "_implied_integer_auxes", ())) | set(
+        lifter.implied_integer_auxes
+    )
     # Complementarity provenance (#1147). The lifts rewrite constraint
     # *bodies*; the relation's source operands are untouched and still read
     # the shared Variable objects, so the relation set forwards intact.

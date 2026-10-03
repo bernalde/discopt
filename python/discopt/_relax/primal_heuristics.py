@@ -216,11 +216,45 @@ class MultiStartResult:
     all_objectives: list[float] = field(default_factory=list)
 
 
+def _is_free_integer(v, model: Model) -> bool:
+    """True when *v* is an integer/binary column a heuristic may round, fix or
+    move on its own -- i.e. not an implied-integer lifted aux (see
+    :func:`_get_integer_mask`). The one predicate every integer-fixing site here
+    uses, so the mask and the bound pinning cannot disagree.
+
+    Gated with ``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1588 review): with ``=0`` every
+    INTEGER column is free, exactly as on main. An ungated A/B on main's #1544
+    path (28 rows) was mixed -- nvs09 faster, nvs06/st_e38/beuster at the 1e6 shift
+    worse -- and has not passed a panel of its own."""
+    if v.var_type not in (VarType.BINARY, VarType.INTEGER):
+        return False
+    from discopt._relax.factorable_reform import _lift_affine_monomials_enabled
+
+    if not _lift_affine_monomials_enabled():
+        return True
+    implied = getattr(model, "_implied_integer_auxes", None)
+    return not (implied and v.name in implied)
+
+
 def _get_integer_mask(model: Model) -> np.ndarray:
-    """Return a boolean mask over the flat variable vector: True where integer/binary."""
+    """Return a boolean mask over the flat variable vector: True where integer/binary.
+
+    A lifted aux in ``model._implied_integer_auxes`` is excluded. It is typed
+    INTEGER only because its exact defining equality ``w == a*x + b`` (integral
+    ``a``, ``b`` over integer ``x``) makes it integral, so its value is implied by
+    the integer columns it is defined by. Treated as a free integer, every
+    heuristic here breaks on it: rounding or fixing ``x`` and ``w`` separately
+    violates the equality, and a unit lattice move on either one alone leaves
+    the row violated by ``|a|``. Measured on nvs22 under a 1e3 translation with
+    ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on (three such auxes): no incumbent in 20 s,
+    integer local search spending 13,946 evaluations for 25 sub-NLP solves; with
+    the auxes left to the continuous repair it finds 7.40348 (#1588 review). The
+    point a heuristic returns is still checked against every constraint, including
+    the defining equality, so the aux is integral to the feasibility tolerance.
+    """
     parts: list[np.ndarray] = []
     for v in model._variables:
-        is_int = v.var_type in (VarType.BINARY, VarType.INTEGER)
+        is_int = _is_free_integer(v, model)
         parts.append(np.full(v.size, is_int, dtype=bool))
     return np.concatenate(parts) if parts else np.array([], dtype=bool)
 
@@ -483,7 +517,7 @@ def feasibility_pump(
             offset = 0
             for v in model._variables:
                 sz = v.size
-                if v.var_type in (VarType.BINARY, VarType.INTEGER):
+                if _is_free_integer(v, model):
                     fixed = x0[offset : offset + sz].reshape(v.lb.shape)
                     v.lb = fixed.copy()
                     v.ub = fixed.copy()
@@ -1054,7 +1088,7 @@ def subnlp(
             offset = 0
             for v in model._variables:
                 sz = v.size
-                if v.var_type in (VarType.BINARY, VarType.INTEGER):
+                if _is_free_integer(v, model):
                     fixed = x0[offset : offset + sz].reshape(v.lb.shape)
                     v.lb = fixed.copy()
                     v.ub = fixed.copy()
