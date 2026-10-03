@@ -20377,6 +20377,7 @@ def _outward_tangent_bound(
     lo,
     hi,
     eval_mag: float = 0.0,
+    slope_err: Optional[np.ndarray] = None,
 ) -> float:
     """:func:`_tangent_box_bound` rounded DOWN by its own floating-point error (#1605).
 
@@ -20400,29 +20401,110 @@ def _outward_tangent_bound(
     a model of the evaluation, not an interval enclosure; the multiplier
     ``2 (N + 4)`` leaves it a wide margin (the measured crossing is ~1/600 of the
     charge on that instance).
+
+    ``slope_err`` bounds the error of each computed slope component ``g_j`` (from
+    :func:`_lagrangian_slope`), and is charged times the distance it multiplies.
+    Where ``|g_j| > err_j`` the sign is certain and the term pays
+    ``err_j |t_j - s_j|``; otherwise the minimizing side is unknown and it pays
+    ``(|g_j| + err_j) reach_j`` with ``reach_j`` the farther side (``-inf`` when
+    that side is unbounded). On a 1e12-wide box a slope error of one ulp is worth
+    ~1e-4 of bound; uncharged, a 2-row linear program at its KKT point certified
+    or not depending on whether the CPU's FMA/BLAS kernels rounded ``grad + J^T
+    lam`` to exactly 0 (#1508's test failed on some CI runners only).
     """
     b = _tangent_box_bound(value, grad, s, lo, hi)
     if not np.isfinite(b):
         return b
     g = np.asarray(grad, dtype=np.float64)
+    s_a = np.asarray(s, dtype=np.float64)
+    lo_a = np.asarray(lo, dtype=np.float64)
+    hi_a = np.asarray(hi, dtype=np.float64)
+    eps = np.finfo(np.float64).eps
     nz = g != 0.0
-    target = np.where(g > 0.0, np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64))
-    terms = g[nz] * (target[nz] - np.asarray(s, dtype=np.float64)[nz])
+    target = np.where(g > 0.0, lo_a, hi_a)
+    terms = g[nz] * (target[nz] - s_a[nz])
     mag = abs(float(value)) + float(value_mag) + float(np.sum(np.abs(terms))) + float(eval_mag)
     k = int(n_value_terms) + int(np.count_nonzero(nz)) + 4
-    return float(b - 2.0 * k * np.finfo(np.float64).eps * mag)
+    out = b - 2.0 * k * eps * mag
+    if slope_err is not None:
+        err = np.asarray(slope_err, dtype=np.float64).ravel()
+        charged = err > 0.0
+        certain = charged & (np.abs(g) > err)
+        uncertain = charged & ~certain
+        if np.any(certain):
+            out -= float(np.sum(err[certain] * np.abs(target[certain] - s_a[certain])))
+        if np.any(uncertain):
+            reach = np.maximum(s_a[uncertain] - lo_a[uncertain], hi_a[uncertain] - s_a[uncertain])
+            if not np.all(np.isfinite(reach)):
+                return -np.inf
+            gu = np.abs(g[uncertain])
+            # the tangent already added -|g_j| |t_j - s_j| (0 where g_j == 0)
+            paid = np.where(gu > 0.0, gu * np.abs(target[uncertain] - s_a[uncertain]), 0.0)
+            out -= float(np.sum((gu + err[uncertain]) * reach - paid))
+    return float(out)
 
 
-def _evaluation_magnitude(
-    s: np.ndarray, grad_f: np.ndarray, jac, lam_r: Optional[np.ndarray]
-) -> float:
-    """``sum_j |s_j| (|df/dx_j| + sum_r |lam_r| |dc_r/dx_j|)`` for
-    :func:`_outward_tangent_bound`'s evaluation charge (#1605). ``jac`` may be
-    dense or sparse; ``None`` (with ``lam_r``) when there are no rows."""
-    a = np.abs(np.asarray(grad_f, dtype=np.float64)).ravel()
-    if jac is not None and lam_r is not None and lam_r.size > 0:
-        a = a + np.asarray(abs(jac).T @ np.abs(lam_r), dtype=np.float64).ravel()
-    return float(np.abs(np.asarray(s, dtype=np.float64)).ravel() @ a)
+def _two_product_err(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """The exact rounding error of ``p = a * b`` (Dekker's TwoProduct, with
+    Veltkamp's split), so that ``a * b == p + err`` exactly. Non-finite where the
+    split overflows (``|a|`` or ``|b|`` above ~1e300); callers check."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        ca = 134217729.0 * a
+        ah = ca - (ca - a)
+        al = a - ah
+        cb = 134217729.0 * b
+        bh = cb - (cb - b)
+        bl = b - bh
+        err: np.ndarray = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+    return err
+
+
+def _lagrangian_slope(
+    grad_f: np.ndarray, jac, lam_r: Optional[np.ndarray]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(g, err, mag)`` for the tangent bound's slope ``g = df/dx + J^T lam_r``.
+
+    ``mag_j = |df/dx_j| + sum_r |lam_r| |dc_r/dx_j|`` (the evaluation charge's
+    weights) and ``err_j`` bounds ``|g_j - exact_j|``, where ``exact_j`` is the
+    exact sum of the given float terms. A float sum of ``k`` products is within
+    ``2 (k + 4) eps mag_j``; where that does not settle the sign of ``g_j`` (a
+    cancellation, as at any KKT point), ``g_j`` is recomputed as the correctly
+    rounded exact sum -- error-free products, then :func:`math.fsum` -- whose error
+    is at most one ulp and which is exactly 0 only when the terms cancel exactly.
+    That makes the verdict independent of the summation order and FMA use of the
+    machine's BLAS (#1508). The terms themselves are evaluations, charged under the
+    backward-error model by the caller's ``eval_mag``, as before. ``jac`` may be
+    dense or sparse; ``None`` (with ``lam_r``) when there are no rows.
+    """
+    gf = np.asarray(grad_f, dtype=np.float64).ravel()
+    if jac is None or lam_r is None or lam_r.size == 0 or not np.any(lam_r != 0.0):
+        return gf.copy(), np.zeros_like(gf), np.abs(gf)
+    lam_r = np.asarray(lam_r, dtype=np.float64)
+    g = gf + np.asarray(jac.T @ lam_r, dtype=np.float64).ravel()
+    mag = np.abs(gf) + np.asarray(abs(jac).T @ np.abs(lam_r), dtype=np.float64).ravel()
+    k = int(np.count_nonzero(lam_r)) + 1
+    err = 2.0 * (k + 4) * np.finfo(np.float64).eps * mag
+    unsure = np.flatnonzero((err > 0.0) & ~(np.abs(g) > err))
+    if unsure.size == 0 or not (np.all(np.isfinite(g)) and np.all(np.isfinite(mag))):
+        return g, err, mag
+    rows = np.flatnonzero(lam_r != 0.0)
+    lam_nz = lam_r[rows]
+    if _sp_issparse(jac):
+        import scipy.sparse as _sps
+
+        cols = _sps.csc_matrix(jac)[rows][:, unsure].toarray()
+    else:
+        cols = np.asarray(jac, dtype=np.float64)[np.ix_(rows, unsure)]
+    for t, j in enumerate(unsure):
+        a = cols[:, t]
+        p = a * lam_nz
+        e = _two_product_err(a, lam_nz, p)
+        if not (np.all(np.isfinite(p)) and np.all(np.isfinite(e))):
+            continue  # keep the a-priori bound for this component
+        gj = math.fsum([float(gf[j]), *p.tolist(), *e.tolist()])
+        g[j] = gj
+        err[j] = float(np.spacing(abs(gj))) if gj != 0.0 else 0.0
+    return g, err, mag
 
 
 def _certificate_box(
@@ -21023,29 +21105,26 @@ def _rigorous_bound_parts(
             j_s = _cert_jacobian(evaluator, s, m, n)
             val = f_s + float(lam_r @ c_s) - shift
             mag = abs(f_s) + float(np.abs(lam_r) @ np.abs(c_s)) + shift_mag
-            e_mag = _evaluation_magnitude(s, g_s, j_s, lam_r)
-            g_s = g_s + np.asarray(j_s.T @ lam_r, dtype=np.float64).ravel()
+            g_s, s_err, s_mag = _lagrangian_slope(g_s, j_s, lam_r)
         else:
             c_s = None
             val = f_s
             mag = abs(f_s)
-            e_mag = _evaluation_magnitude(s, g_s, None, None)
-        return _outward_tangent_bound(val, mag, n_val, g_s, s, lo, hi, e_mag), f_s, c_s
+            g_s, s_err, s_mag = _lagrangian_slope(g_s, None, None)
+        e_mag = float(np.abs(s).ravel() @ s_mag)
+        b_s = _outward_tangent_bound(val, mag, n_val, g_s, s, lo, hi, e_mag, s_err)
+        return b_s, f_s, c_s
 
     if m > 0:
         val_x = f_x + float(lam_r @ cons) - shift
         mag_x = abs(f_x) + float(np.abs(lam_r) @ np.abs(cons)) + shift_mag
         jac_x = _cert_jacobian(evaluator, x, m, n)
-        g_x = (
-            np.asarray(grad, dtype=np.float64)
-            + np.asarray(jac_x.T @ lam_r, dtype=np.float64).ravel()
-        )
-        e_mag_x = _evaluation_magnitude(x, grad, jac_x, lam_r)
+        g_x, s_err_x, s_mag_x = _lagrangian_slope(grad, jac_x, lam_r)
     else:
         val_x, mag_x = f_x, abs(f_x)
-        g_x = np.asarray(grad, dtype=np.float64)
-        e_mag_x = _evaluation_magnitude(x, grad, None, None)
-    bound = _outward_tangent_bound(val_x, mag_x, n_val, g_x, x, lo, hi, e_mag_x)
+        g_x, s_err_x, s_mag_x = _lagrangian_slope(grad, None, None)
+    e_mag_x = float(np.abs(np.asarray(x, dtype=np.float64)).ravel() @ s_mag_x)
+    bound = _outward_tangent_bound(val_x, mag_x, n_val, g_x, x, lo, hi, e_mag_x, s_err_x)
     best_x: Optional[np.ndarray] = None
     best_f = f_x
     for pts, tol in ((witnesses, viol_tol), (supports, viol_x)):

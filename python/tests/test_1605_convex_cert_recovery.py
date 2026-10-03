@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -144,6 +145,66 @@ def test_outward_tangent_bound_charges_evaluation_magnitude():
     eps = np.finfo(np.float64).eps
     k = 2 + 2 + 4
     assert own - charged == pytest.approx(2 * k * eps * 3e3, rel=1e-6)
+
+
+def test_outward_tangent_bound_charges_slope_error_times_reach():
+    """#1508 on CI: a slope error of one ulp is worth ~1e-4 of bound on a 1e12 box.
+    It is charged against the farther side when the sign is unknown, and against
+    the target side alone when it is certain."""
+    from discopt.solver import _outward_tangent_bound
+
+    s = np.array([0.0])
+    lo, hi = np.array([-1e12]), np.array([2e12])
+    base = _outward_tangent_bound(1.0, 1.0, 2, np.array([0.0]), s, lo, hi)
+    unsure = _outward_tangent_bound(
+        1.0, 1.0, 2, np.array([0.0]), s, lo, hi, slope_err=np.array([1e-16])
+    )
+    assert base - unsure == pytest.approx(1e-16 * 2e12, rel=1e-9)  # the farther side
+    # An unknown sign next to an unbounded side is no bound at all.
+    inf_hi = np.array([np.inf])
+    assert (
+        _outward_tangent_bound(
+            1.0, 1.0, 2, np.array([0.0]), s, lo, inf_hi, slope_err=np.array([1e-16])
+        )
+        == -np.inf
+    )
+    # A certain sign pays only along its own target side.
+    g = np.array([1e-3])
+    plain = _outward_tangent_bound(1.0, 1.0, 2, g, s, lo, hi)
+    sure = _outward_tangent_bound(1.0, 1.0, 2, g, s, lo, hi, slope_err=np.array([1e-16]))
+    # (both sit near -1e9, whose ulp is ~1e-7: compare to that precision)
+    assert plain - sure == pytest.approx(1e-16 * 1e12, rel=1e-3)
+    # An exact zero slope is not charged, even next to an unbounded side.
+    exact = _outward_tangent_bound(
+        1.0, 1.0, 2, np.array([0.0]), s, lo, inf_hi, slope_err=np.array([0.0])
+    )
+    assert exact == base
+
+
+def test_lagrangian_slope_is_exact_where_it_cancels():
+    """The slope's verdict must not depend on summation order or FMA (#1508): where
+    the a-priori error bound leaves the sign open, the component is the correctly
+    rounded exact sum, exactly 0 only for an exact cancellation."""
+    import scipy.sparse as sps
+    from discopt.solver import _lagrangian_slope
+
+    # Exact cancellation: 1 - 1 * 1 (the epigraph column of #853's test).
+    g, err, mag = _lagrangian_slope(np.array([1.0]), np.array([[-1.0]]), np.array([1.0]))
+    assert g[0] == 0.0 and err[0] == 0.0 and mag[0] == 2.0
+    # 0.1 * 3 - 0.3 is 2.78e-17 exactly (in the given floats), not 0: the residue
+    # is real and signed.
+    for jac in (np.array([[3.0]]), sps.csr_matrix([[3.0]])):
+        g, err, _ = _lagrangian_slope(np.array([-0.3]), jac, np.array([0.1]))
+        exact = float(Fraction(0.1) * 3 - Fraction(0.3))
+        assert g[0] == exact != 0.0
+        assert 0.0 < err[0] < abs(g[0])
+    # A component whose sign the a-priori bound settles is left alone.
+    g, err, _ = _lagrangian_slope(np.array([1.0]), np.array([[1.0]]), np.array([1.0]))
+    assert g[0] == 2.0 and 0.0 < err[0] < 1e-14
+    # No rows: the objective gradient, exact.
+    g, err, mag = _lagrangian_slope(np.array([2.0, -1.0]), None, None)
+    np.testing.assert_array_equal(g, [2.0, -1.0])
+    np.testing.assert_array_equal(err, [0.0, 0.0])
 
 
 def test_qp_reduced_costs_at_follow_the_highs_convention():

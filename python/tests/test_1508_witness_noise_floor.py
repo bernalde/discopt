@@ -13,11 +13,16 @@ The floor now also scales with the cancellation magnitude of the linearized gap,
 ``sum_j |d_j| (|grad_j| + (|J|^T |lam|)_j)``, i.e. the gain a 1e-12 relative error
 in ``(x, lam)`` could produce. Real witnesses (#853, #1499) stay far above it --
 those suites are the kill criterion for this change.
+
+Since #1596 the no-witness path also publishes a rigorous tangent bound, and that
+bound charges any error in its own slope times the box width (#1508 on CI): on
+the +-1e12 box one ulp of slope is worth ~1e-4 of bound, so whether the 1e-6 gap
+closes there depends on an exact cancellation. The solver hands the certificate
+its FBBT box (``_fbbt_implied_box``), on which the same points certify to ~1e-13;
+the bound claims below are made on that box, the witness claims on the 1e12 one.
 """
 
 from __future__ import annotations
-
-import os
 
 import discopt.modeling as dm
 import numpy as np
@@ -57,99 +62,85 @@ def _exact_kkt(ev, cl, cu):
     return x, lam
 
 
-@pytest.mark.parametrize("rho", [1e-15, 1e-13])
-def test_ulp_noise_does_not_manufacture_a_witness(rho):
-    from discopt.solver import _convex_nlp_certificate, _make_evaluator
+def _setup():
+    from discopt.solver import _fbbt_implied_box, _make_evaluator
     from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
 
-    ev = _make_evaluator(_model())
+    m = _model()
+    ev = _make_evaluator(m)
     cl, cu = _infer_constraint_bounds(ev)
+    box = _fbbt_implied_box(m, 2)
+    assert box is not None
+    assert np.all(box[1] - box[0] < 20.0)  # the polygon's box, not the 1e12 one
+    return ev, cl, cu, box
+
+
+@pytest.mark.parametrize("rho", [1e-15, 1e-13])
+def test_ulp_noise_does_not_manufacture_a_witness(rho):
+    from discopt.solver import _convex_nlp_certificate
+
+    ev, cl, cu, box = _setup()
     x0, lam0 = _exact_kkt(ev, cl, cu)
 
     executed = 0
-    withheld = []
-    why: list = []
+    witnessed = []
+    uncertified = []
     for seed in range(20):
         rng = np.random.default_rng(seed)
         x = x0 * (1.0 + rho * rng.standard_normal(2))
         lam = lam0 * (1.0 + rho * rng.standard_normal(5))
         obj = float(ev.evaluate_objective(x))
-        cert = _convex_nlp_certificate(ev, x, lam, _LB, _UB, cl, cu, obj, gap_tolerance=1e-6)
-        executed += 1
-        # Since #1596 a certified point carries an explicit dual bound; ``bound is
-        # None`` is the withheld verdict.
-        if cert is None or cert.bound is None or cert.better_x is not None:
-            withheld.append(seed)
-            # Enough to tell a state leak from a numerical one when this fails only
-            # under xdist (CLAUDE.md sec. 7: an instrument must say why).
-            why.append(
-                (
-                    seed,
-                    type(ev).__name__,
-                    None
-                    if cert is None
-                    else (
-                        cert.bound if cert.bound is None else cert.bound - obj,
-                        cert.better_obj,
-                        cert.stationarity_rel,
-                        cert.complementarity_rel,
-                    ),
-                )
-            )
+        # The #1508 claim, on the huge box: noise is no witness.
+        bare = _convex_nlp_certificate(ev, x, lam, _LB, _UB, cl, cu, obj, gap_tolerance=1e-6)
+        if bare is None or bare.better_x is not None:
+            witnessed.append(seed)
         else:
-            assert cert.stationarity_rel < 1e-4 and cert.complementarity_rel < 1e-6
+            assert bare.stationarity_rel < 1e-4 and bare.complementarity_rel < 1e-6
+        # The bound, on the box the solver passes.
+        cert = _convex_nlp_certificate(
+            ev, x, lam, _LB, _UB, cl, cu, obj, gap_tolerance=1e-6, implied_box=box
+        )
+        executed += 1
+        if cert is None or cert.bound is None or cert.better_x is not None:
+            uncertified.append((seed, cert))
+        else:
             assert cert.bound <= obj
             assert cert.bound == pytest.approx(obj, rel=1e-6, abs=1e-6)
     assert executed == 20  # the probe fired (CLAUDE.md sec. 6)
-    assert withheld == [], (
-        f"noise-level perturbation withheld/altered seeds {withheld}; "
-        f"(seed, evaluator, (bound - obj, better_obj, stat, comp)): {why[:4]}; "
-        f"env: {sorted((k, v) for k, v in os.environ.items() if k.startswith('DISCOPT_'))}"
-    )
-
-
-def _internals(ev, x, lam, cl, cu, f_x, cert):
-    """What the bound computation saw, for a failure seen only under CI xdist."""
-    import discopt.solver as S
-
-    cons = np.asarray(ev.evaluate_constraints(x), dtype=np.float64)
-    grad = np.asarray(ev.evaluate_gradient(x), dtype=np.float64)
-    parts = S._rigorous_bound_parts(ev, x, lam, cons, grad, _LB, _UB, cl, cu, f_x, [])
-    fns = {
-        n: getattr(getattr(S, n), "__module__", "?")
-        for n in (
-            "_rigorous_bound_parts",
-            "_outward_tangent_bound",
-            "_tangent_box_bound",
-            "_gap_values_converged",
-            "_no_witness_certificate",
-            "_certificate_box",
-        )
-    }
-    return (
-        f"cert={cert} f_x={f_x!r} parts={parts} cl={cl} cu={cu} cons={cons} grad={grad} "
-        f"lam={lam} CONSTRAINT_INF={S._CONSTRAINT_INF} abs_gap={S._DEFAULT_ABS_GAP_TOL} "
-        f"eps={np.finfo(np.float64).eps} fns={fns} np={np.__version__} "
-        f"env={sorted((k, v) for k, v in os.environ.items() if k.startswith('DISCOPT_'))}"
-    )
+    assert witnessed == [], f"noise-level perturbation produced a witness: seeds {witnessed}"
+    assert uncertified == [], f"withheld on the FBBT box: {uncertified[:3]}"
 
 
 def test_exact_optimum_still_certifies_exactly():
-    from discopt.solver import _convex_nlp_certificate, _make_evaluator
-    from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
+    from discopt.solver import _convex_nlp_certificate
 
-    ev = _make_evaluator(_model())
-    cl, cu = _infer_constraint_bounds(ev)
+    ev, cl, cu, box = _setup()
     x, lam = _exact_kkt(ev, cl, cu)
+    f_x = float(ev.evaluate_objective(x))
     cert = _convex_nlp_certificate(
-        ev, x, lam, _LB, _UB, cl, cu, float(ev.evaluate_objective(x)), gap_tolerance=1e-6
+        ev, x, lam, _LB, _UB, cl, cu, f_x, gap_tolerance=1e-6, implied_box=box
     )
     # Since #1596 a point with no witness carries an explicit dual bound (``None``
     # now means "not certified"); at an exact KKT point it equals the objective to
     # rounding and never exceeds it, and no better point is reported.
-    f_x = float(ev.evaluate_objective(x))
-    assert cert is not None and cert.bound is not None and cert.better_x is None, _internals(
-        ev, x, lam, cl, cu, f_x, cert
-    )
+    assert cert is not None and cert.bound is not None and cert.better_x is None
     assert cert.bound <= f_x
     assert cert.bound == pytest.approx(f_x, rel=1e-9, abs=1e-9)
+
+
+def test_exact_optimum_on_the_huge_box_is_never_a_witness_or_a_crossing():
+    """On the +-1e12 box one ulp of slope is worth ~1e-4 of bound, so whether a 1e-6
+    gap closes there turns on whether the multipliers cancel the slope EXACTLY --
+    a property of the LAPACK that produced them. Before the slope was summed
+    exactly it also turned on the summation order and FMA use of the machine's
+    BLAS, and #1508's test failed on some CI runners only, with different seeds per
+    runner. What must hold everywhere: no witness, and a published bound never
+    above the objective."""
+    from discopt.solver import _convex_nlp_certificate
+
+    ev, cl, cu, _box = _setup()
+    x, lam = _exact_kkt(ev, cl, cu)
+    f_x = float(ev.evaluate_objective(x))
+    cert = _convex_nlp_certificate(ev, x, lam, _LB, _UB, cl, cu, f_x, gap_tolerance=1e-6)
+    assert cert is not None and cert.better_x is None
+    assert cert.bound is None or cert.bound <= f_x
