@@ -42,36 +42,17 @@ from _invariance import certified_answer_changed, translate  # noqa: E402
 from discopt.validation.feasibility import verify_point  # noqa: E402
 from test_1537_invariance import FAMILIES  # noqa: E402
 
-
 FLAG = "DISCOPT_RECENTRE"
 
 
 def _affine_monomial_fires(model) -> bool:
-    """Static detector for ``DISCOPT_LIFT_AFFINE_MONOMIALS``: does any product in
-    the model's objective or rows match ``_is_translated_monomial``?"""
+    """Static detector for ``DISCOPT_LIFT_AFFINE_MONOMIALS``: does the reform's own
+    scan (maximal ``*`` chains, the walk the prelift makes) find a translated
+    monomial in the objective or a row?"""
     from discopt._relax import factorable_reform as fr
-    from discopt.modeling.core import BinaryOp, SumOverExpression, UnaryOp
-
-    def walk(e) -> bool:
-        if isinstance(e, BinaryOp):
-            if e.op == "*" and fr._is_translated_monomial(fr._collect_mul_factors(e)):
-                return True
-            return walk(e.left) or walk(e.right)
-        if isinstance(e, UnaryOp):
-            return walk(e.operand)
-        if isinstance(e, SumOverExpression):
-            return any(walk(t) for t in e.terms)
-        for attr in ("args", "operand"):
-            sub = getattr(e, attr, None)
-            if isinstance(sub, (list, tuple)):
-                if any(walk(t) for t in sub):
-                    return True
-            elif sub is not None and walk(sub):
-                return True
-        return False
 
     exprs = [model._objective.expression] + [c.body for c in model._constraints]
-    return any(walk(e) for e in exprs)
+    return any(fr._scan_for_translated_monomial(e) for e in exprs)
 
 
 def _solve(model, flag: str, tl: float):  # model: freshly built by the caller

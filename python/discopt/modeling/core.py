@@ -5181,6 +5181,12 @@ class Model:
         # ``factorable_reform._lift_zero_spanning_factors_enabled``). Empty by
         # default, so it never changes behaviour with the flag off.
         self._zero_spanning_factor_auxes: set[str] = set()
+        # Names of lifted auxes typed INTEGER only because their defining equality
+        # ``w == a*x + b`` (integral a, b over integer x) makes them integral: their
+        # value is implied by other integer columns, so a primal heuristic must not
+        # round, fix or move them independently (#1588 review, nvs22). Set by the
+        # factorable reform; empty by default.
+        self._implied_integer_auxes: set[str] = set()
         self._builder = None  # Optional PyModelBuilder, lazy-initialized
         # Starting point for the model's variables, keyed ``(var name, element)``
         # -> value (#1225). A *partial* map: only elements someone actually gave
