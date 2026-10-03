@@ -163,6 +163,18 @@ The release procedure that produces these entries is documented in
 
 ### Changed
 
+- **In-tree FBBT now tightens through array-valued rows by default** (#1568).
+  `DISCOPT_IN_TREE_ARRAY_ROWS` is graduated to default-ON. Each array-valued
+  constraint row (every `discopt.ml` layer and any vectorised `A @ x` or
+  elementwise row) is now one scalar FBBT row per element at each node, so
+  branching on network inputs narrows the activations. Before this change those
+  rows were read through a hull proxy that was never tightened. Graduation panel:
+  58 array instances plus the 66 in-repo `.nl` files, 30 s each, 0 violations over
+  282 checks. Certificates went +5 / −0 (`discopt.ml` full_space 10x1 s0/s1,
+  reduced_space 10x1 s1, reduced_space 25x1 s0/s1), the final bound was tighter on 28 of the
+  29 instances neither arm certified, and total wall fell from 1350 s to 1244 s.
+  In-tree FBBT cost went from 1.8% to 3.2% of wall. Scalar-layout models are
+  unchanged. `DISCOPT_IN_TREE_ARRAY_ROWS=0` restores the previous behaviour.
 - **`import discopt` no longer pulls the `_multiprocessing` C extension.**
   `discopt.modeling` re-exports `solve_batch`, so `discopt.batch` is imported by
   every `import discopt`, and it imported `multiprocessing` at module level —
