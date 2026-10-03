@@ -18,7 +18,7 @@ import numpy as np
 
 from discopt import _timing
 from discopt.modeling.core import Model
-from discopt.solvers import NLPResult, SolveStatus
+from discopt.solvers import NLPResult, PounceOptionError, SolveStatus
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # #75: importing this at module scope pulls jax on every solve, because
@@ -126,6 +126,130 @@ def _linear_solver_from_info(info: dict) -> Optional[dict]:
     if isinstance(raw, dict):
         return dict(raw)
     return {"report": raw}
+
+
+#: Ipopt/POUNCE ``Invalid_Option``: an option VALUE (or a name/value pairing)
+#: the solver refused at solve time. pounce-solver 0.12.0 returns it in
+#: ``info["status"]`` with ``status_msg="Invalid_Option"`` and writes the reason
+#: only to the process's stderr (fd 2) -- ``info`` carries no message text.
+_INVALID_OPTION = -12
+
+
+class _ProbeProblem:
+    """``min (x - 1)^2`` on ``[-1, 3]``: the smallest problem an option can refuse."""
+
+    def objective(self, x):
+        return float((x[0] - 1.0) ** 2)
+
+    def gradient(self, x):
+        return np.array([2.0 * (x[0] - 1.0)])
+
+    def constraints(self, x):
+        return np.zeros(0)
+
+    def jacobian(self, x):
+        return np.zeros(0)
+
+    def jacobianstructure(self):
+        return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+
+    def hessianstructure(self):
+        return (np.array([0], dtype=np.int64), np.array([0], dtype=np.int64))
+
+    def hessian(self, x, lagrange, obj_factor):
+        return np.array([2.0 * obj_factor])
+
+
+def _probe_one_option(key: str, value: object) -> tuple[bool, str]:
+    """Solve :class:`_ProbeProblem` under ``{key: value}`` alone.
+
+    Returns ``(refused, text)``: whether POUNCE refused it as ``Invalid_Option``
+    (or ``OPTION_INVALID``), and what it wrote to stdout/stderr while doing so --
+    the only place pounce 0.12.0 puts the reason. Any other exception propagates.
+    """
+    import os
+    import sys
+    import tempfile
+
+    import pounce
+
+    problem = pounce.Problem(
+        n=1,
+        m=0,
+        problem_obj=_ProbeProblem(),
+        lb=[-1.0],
+        ub=[3.0],
+        cl=[],
+        cu=[],
+    )
+    if isinstance(value, (np.floating, float)):
+        value = float(value)
+    elif isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+        value = int(value)
+    with tempfile.TemporaryFile(mode="w+b") as sink:
+        # #1590 review N4: flush Python's buffers first, so nothing already
+        # written lands in the sink instead of on the caller's terminal.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        saved = [os.dup(1), os.dup(2)]
+        refused = False
+        try:
+            os.dup2(sink.fileno(), 1)
+            os.dup2(sink.fileno(), 2)
+            try:
+                problem.add_option(key, value)
+                _x, info = problem.solve(np.array([0.0]))
+                refused = int(info.get("status", 0)) == _INVALID_OPTION
+            except (TypeError, ValueError, RuntimeError) as exc:
+                text = str(exc)
+                if "OPTION_INVALID" not in text and "Unknown option" not in text:
+                    raise
+                refused = True
+        finally:
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            os.close(saved[0])
+            os.close(saved[1])
+        sink.seek(0)
+        captured = sink.read().decode("utf-8", errors="replace")
+    return refused, captured.strip()
+
+
+def _invalid_option_error(opts: dict) -> PounceOptionError:
+    """The ``ValueError`` for a solve POUNCE stopped with ``Invalid_Option`` (#1585).
+
+    Before #1585 the code fell through the status map to ``status="error"`` with
+    no reason, and the caller saw a downstream note ("objective differs by nan")
+    instead of the refused option. discopt's own option validation raises; a
+    refusal by the solver is the same event and now raises the same way.
+
+    pounce 0.12.0 does not say *which* option it refused (``info`` has only the
+    status code; the reason goes to fd 2), so each key is re-tried alone on a
+    one-variable problem and the ones that reproduce the refusal are named, with
+    the text POUNCE printed for them.
+    """
+    offenders: list[str] = []
+    texts: list[str] = []
+    for key, value in opts.items():
+        refused, text = _probe_one_option(key, value)
+        if refused:
+            offenders.append(key)
+            if text:
+                texts.append(f"{key}: {text}")
+    if offenders:
+        detail = f"the offending option(s): {offenders}"
+        if texts:
+            detail += ". POUNCE says: " + " | ".join(texts)
+    else:
+        detail = (
+            "no single option reproduces the refusal on its own, so it is a "
+            f"combination of {sorted(opts)}; POUNCE printed its reason to stderr"
+        )
+    return PounceOptionError(
+        f"POUNCE rejected a solver option (Invalid_Option, status {_INVALID_OPTION}): "
+        f"{detail}. Options reaching the NLP backend on this solve: {sorted(opts)}. "
+        "Fix or drop the offending key (Model.solve(pounce_options={...}))."
+    )
 
 
 def solve_nlp(
@@ -349,7 +473,7 @@ def solve_nlp(
         # something to drop and carry on with (CLAUDE.md §3).
         msg = str(exc)
         if "OPTION_INVALID" in msg or "Unknown option" in msg:
-            raise ValueError(
+            raise PounceOptionError(
                 f"POUNCE rejected a solver option: {msg.splitlines()[0]}. Options reaching the "
                 f"NLP backend on this solve: {sorted(opts)}. Fix or drop the offending key "
                 "(Model.solve(ipopt_options={...}))."
@@ -358,6 +482,10 @@ def solve_nlp(
     wall_time = time.perf_counter() - t0
 
     status_code = info.get("status", -100)
+    if status_code == _INVALID_OPTION:
+        # #1585: a refused option VALUE stops the solve before iteration 0. It is
+        # the caller's error, not a solver outcome -- raise with the reason.
+        raise _invalid_option_error(opts)
     status = _IPOPT_STATUS_MAP.get(status_code, SolveStatus.ERROR)
 
     # (The interim cyipopt-retry-on-UNBOUNDED guard was removed once pounce#258 fixed

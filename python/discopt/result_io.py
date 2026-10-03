@@ -150,6 +150,8 @@ _SCALAR_FIELDS = (
     # reload a batch's error result as a bare ``status="error"`` with no reason,
     # which is exactly what the field exists to prevent.
     "error",
+    # #1585: why the search stopped (``discopt.status.TERMINATION_REASONS``).
+    "termination",
 )
 #: ``{str: float}`` fields. Written through the same float tagging as the
 #: scalars, so a non-finite residual is a tagged string rather than a bare
@@ -173,7 +175,9 @@ _DICT_ARRAY_FIELDS = (
 #: ``test_every_string_scalar_field_is_excluded_from_float_decoding`` now derives
 #: the set from the dataclass annotations, so the next string field added to
 #: ``_SCALAR_FIELDS`` cannot repeat it.
-_STRING_SCALAR_FIELDS = frozenset({"status", "algorithm_route", "bound_source", "error"})
+_STRING_SCALAR_FIELDS = frozenset(
+    {"status", "algorithm_route", "bound_source", "error", "termination"}
+)
 
 
 def _jsonify_arrays(d: Optional[dict]) -> Optional[dict]:

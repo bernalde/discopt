@@ -233,7 +233,10 @@ def test_the_guard_withdraws_a_certificate_the_pair_does_not_support():
     )
     assert certified is False, "the guard kept a certificate the pair contradicts"
     assert status == "feasible", f"status stayed {status!r}"
-    assert gap == pytest.approx(7.561798792954377e-05, rel=1e-6), (
+    # #1585: the one SolveResult.gap formula, |o-b| / max(|o|, |b|, 1e-10). The
+    # absolute gap is 7.561798792954377e-05 (this test's original, floored pin).
+    o, b = -0.7432619320556588, -0.7433375500435884
+    assert gap == pytest.approx(abs(o - b) / max(abs(o), abs(b)), rel=1e-6), (
         f"the stale gap=0.0 was not replaced with the honest one (got {gap})"
     )
 
@@ -343,7 +346,8 @@ def test_the_guard_handles_the_maximize_sense():
         "unit",
     )
     assert cert is False and status == "feasible", "a stale maximize certificate stood"
-    assert gap == pytest.approx(1e-4, rel=1e-6)
+    # #1585: |o-b| / max(|o|, |b|, 1e-10) = 1e-3 / 10.001.
+    assert gap == pytest.approx(1e-3 / 10.001, rel=1e-6)
 
 
 # ── the oracle itself, so the pinned constant cannot rot ───────────────────

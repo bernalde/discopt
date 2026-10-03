@@ -64,6 +64,7 @@ from discopt.modeling.core import (
     Model,
     SolveResult,
     VarType,
+    objective_sense_sign,
 )
 from discopt.modeling.core import repr_space_cutoff as _repr_space_cutoff
 from discopt.solver_tuning import current as _tuning
@@ -74,10 +75,12 @@ from discopt.solver_tuning import saturate_role2 as _role2_saturate
 from discopt.solver_tuning import set_current as _set_tuning
 from discopt.solvers import (
     POUNCE_BOUND_RELAX_FACTOR,
+    PounceOptionError,
     SolveStatus,
     pounce_incumbent_options,
     pounce_option_defaults,
 )
+from discopt.solvers import _gap as _gap_mod
 from discopt.validation.feasibility import (
     SMALL_ROW_ABS_FLOOR as _validation_small_row_abs_floor,
 )
@@ -2124,7 +2127,7 @@ def _try_native_spatial_kernel(
 
     x_dict = _unpack_solution(model, x_flat) if x_flat is not None else None
     wall_time = time.perf_counter() - t_start
-    gap_val = abs(obj_val - bound_val) / (abs(obj_val) + 1e-10) if obj_val is not None else None
+    gap_val = _gap_mod.reported_gap(obj_val, bound_val)
     # #902: the caller's counters carry the pre-handoff work (presolve); the kernel's
     # own phases are added here so ``python_time`` — the residual — means what it says.
     # Reported, never gated on: nothing in the solver branches on these fields.
@@ -2191,9 +2194,10 @@ def _try_native_spatial_kernel(
     # minimize convention with the same ``sign * (value + offset)`` the incumbent
     # and the final bound use. ``-inf`` is the kernel's "no root bound proven"
     # sentinel (it exited before node 1 finished), which maps to ``None`` rather
-    # than to a number no search established. ``root_gap`` uses the same
-    # ``|obj - bound| / max(1, |obj|)`` form as every other driver in this file so
-    # the panels compare like with like.
+    # than to a number no search established. ``root_gap`` keeps #1236's
+    # ``|obj - bound| / max(1, |obj|)`` form, the same in every driver so the
+    # panels compare like with like. It is a root statistic, documented as such on
+    # ``SolveResult.root_gap``; ``SolveResult.gap`` is ``_gap.reported_gap`` (#1585).
     # #1236 review finding 8: `root_bound=None` is three different facts -- root
     # region certified empty, root LP decided nothing, search never reached node 1.
     # The kernel now names the arm; carry it so the caller can tell them apart.
@@ -2241,6 +2245,9 @@ def _try_native_spatial_kernel(
         root_gap=root_gap_val,
         root_time=root_time_val,
         solver_stats=_native_stats,
+        # #1585: the kernel's exit IS its termination reason; ``optimal`` means
+        # the gap closed (the kernel reports a drained tree as optimal too).
+        termination=("gap" if native_status == "optimal" else native_status),
     )
 
 
@@ -5019,8 +5026,9 @@ def _finalize_reported_bound(
 
     Returns ``(bound, gap, source)`` in the REPORTED objective sense (negated
     for a MAXIMIZE, where a lower bound on the internal ``-obj`` is an upper
-    bound on ``obj``); the gap is ``|obj - bound| / max(1, |obj|)`` or ``None``
-    without a finite incumbent. Never raises; never certifies — callers own
+    bound on ``obj``); the gap is :func:`discopt.solvers._gap.reported_gap`
+    (``|obj - bound| / max(|obj|, |bound|, 1e-10)``, #1585) or ``None`` without
+    a finite incumbent. Never raises; never certifies — callers own
     ``gap_certified`` and any re-certification logic.
 
     ``source`` (#1244) names which machinery proved the value that survived:
@@ -5065,7 +5073,7 @@ def _finalize_reported_bound(
     bound_val = -best if is_maximize else best
     gap_val: Optional[float] = None
     if obj_val is not None and np.isfinite(obj_val):
-        gap_val = abs(float(obj_val) - bound_val) / max(1.0, abs(float(obj_val)))
+        gap_val = _gap_mod.reported_gap(obj_val, bound_val)
     return bound_val, gap_val, source
 
 
@@ -5975,14 +5983,12 @@ def _relative_gap_from_objective_bound(
     objective: Optional[float],
     bound: Optional[float],
 ) -> Optional[float]:
-    """Return the public relative gap between a mapped incumbent and bound."""
-    if objective is None or bound is None:
-        return None
-    obj = float(objective)
-    bnd = float(bound)
-    if not np.isfinite(obj) or not np.isfinite(bnd):
-        return None
-    return abs(obj - bnd) / max(abs(obj), abs(bnd), 1e-10)
+    """Return the public relative gap between a mapped incumbent and bound.
+
+    Delegates to :func:`discopt.solvers._gap.reported_gap`, the one formula for
+    ``SolveResult.gap`` (#1585).
+    """
+    return _gap_mod.reported_gap(objective, bound)
 
 
 # Absolute B&B gap tolerance, decoupled from the relative ``gap_tolerance``.
@@ -6126,6 +6132,46 @@ def _tree_exhausted_with_proof(tree) -> bool:
         return False
     # ``inf`` is the "no floor" value; -inf or NaN is a removal with no bound.
     return float(stats.get("unresolved_floor", float("inf"))) == float("inf")
+
+
+def _search_termination(
+    tree,
+    *,
+    gap_tolerance: float,
+    abs_gap_tol: float,
+    max_nodes: int,
+    elapsed: float,
+    time_limit: float,
+    debug_quit: bool = False,
+    time_yield: bool = False,
+) -> Optional[str]:
+    """Why a Python-tree B&B loop stopped, for ``SolveResult.termination`` (#1585).
+
+    Called IMMEDIATELY after the loop exits, before any terminal polish or
+    re-certification can move the incumbent, so it reads the tree in the state
+    the loop's own ``break`` saw. The precedence mirrors the loops: a user stop
+    and the root-relaxation time yield are flags the loop set at the break; then
+    the bottom-of-iteration checks in their loop order (drained, gap, node cap);
+    then the top-of-iteration wall-clock check.
+
+    Returns one of :data:`discopt.status.TERMINATION_REASONS`, or ``None`` when
+    the state matches none of them (an empty export batch over an undrained tree).
+    """
+    from discopt import status as _st
+
+    if debug_quit:
+        return _st.TERMINATION_INTERRUPTED
+    if time_yield:
+        return _st.TERMINATION_TIME_LIMIT
+    if _tree_drained(tree):
+        return _st.TERMINATION_EXHAUSTED
+    if _gap_converged(tree, gap_tolerance, abs_gap_tol):
+        return _st.TERMINATION_GAP
+    if int(tree.stats()["total_nodes"]) >= max_nodes:
+        return _st.TERMINATION_NODE_LIMIT
+    if elapsed >= time_limit:
+        return _st.TERMINATION_TIME_LIMIT
+    return None
 
 
 def _gap_values_converged(
@@ -6330,7 +6376,6 @@ def _withhold_stale_certificate(
     # what belongs HERE is refusing to certify a pair that contradicts itself,
     # whatever produced it, so this guard is kept as the backstop it is.
     if _bound_crosses_objective(float(bound_val), float(obj_val), is_maximize):
-        crossed_gap = abs(float(obj_val) - float(bound_val)) / max(1.0, abs(float(obj_val)))
         logger.warning(
             "%s: withdrawing the optimality certificate - the reported dual "
             "bound %.12g CROSSES the incumbent %.12g it is reported against "
@@ -6350,7 +6395,6 @@ def _withhold_stale_certificate(
         # ``(objective - bound) / |objective|``; with no bound there is no gap, and
         # publishing the crossed value beside ``bound=None`` would be a third
         # number contradicting the other two.
-        del crossed_gap
         return ("feasible" if status == "optimal" else status), None, False, None
 
     if _recertify_gap_closed(
@@ -6358,11 +6402,11 @@ def _withhold_stale_certificate(
     ):
         return status, gap_val, gap_certified, bound_val
 
-    honest_gap = abs(float(obj_val) - float(bound_val)) / max(1.0, abs(float(obj_val)))
+    honest_gap = _gap_mod.reported_gap(obj_val, bound_val, abs_tol=abs_gap_tol)
     logger.warning(
         "%s: withdrawing the optimality certificate (#1383) - the reported "
         "incumbent %.12g and bound %.12g do not close the gap at the requested "
-        "tolerances (rel=%g, abs=%g); reporting gap=%.3e and status=%s instead of "
+        "tolerances (rel=%g, abs=%g); reporting gap=%s and status=%s instead of "
         "a certificate the pair does not support.",
         where,
         float(obj_val),
@@ -6685,15 +6729,26 @@ def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
     return val
 
 
-def _stamp_converged_gap(result, objective: float, bound: float, criterion: str) -> None:
-    """Report a CONVERGED solve's gap on the convergence test's own arithmetic.
+#: Statuses that literally name the budget that stopped the solve (#1585): the
+#: chokepoint copies one into ``SolveResult.termination`` when the route set none.
+_TERMINATION_FROM_LIMIT_STATUS = frozenset({"time_limit", "node_limit", "iteration_limit"})
+
+
+def _stamp_reported_gap(
+    result,
+    objective: float,
+    bound: float,
+    abs_gap_tol: float,
+    is_maximize: Optional[bool] = None,
+) -> None:
+    """Report a solve's gap on the convergence test's own arithmetic, on EVERY exit.
 
     #1243 already derives ``solver_stats["gap_criterion"]`` from the returned
     ``(objective, bound)`` pair "with the SAME arithmetic the convergence test
     uses, so the two can never disagree". That reasoning applies to the NUMBER
-    as much as to the arm's name, and it was not being applied: the B&B routes
-    forwarded the tree's hybrid gap, whose denominator is floored at 1.0, while
-    the convergence test divides by ``max(|ub|, |lb|, 1e-10)``.
+    as much as to the arm's name. The B&B routes forwarded the tree's hybrid
+    gap, whose denominator is floored at 1.0, while the convergence test divides
+    by ``max(|ub|, |lb|, 1e-10)``.
 
     Measured on the six-hump camel (#1386), every row of which converged exactly
     as documented:
@@ -6711,38 +6766,58 @@ def _stamp_converged_gap(result, objective: float, bound: float, criterion: str)
     scale the disagreement runs the other way and the forwarded gap UNDERSTATES
     the criterion's, which is the worse direction.
 
-    Three deliberate limits on the scope, each of them a measurement:
+    Scope, after #1585:
 
-    * Only where a criterion actually fired. An exit that stopped on a budget or
-      an exhausted tree claims nothing about a tolerance, so there is nothing for
-      its gap to be consistent WITH; those keep the floored
-      ``|obj - bound| / max(1, |obj|)`` that #933 defines and tests.
-    * A gap closed by the ABSOLUTE arm reports ``0.0``. That arm exists precisely
-      because the relative gap degenerates near a zero optimum: ``min x`` over
-      ``(x<=3) or (x>=7)`` on ``[0,10]`` converges at objective 2.46e-09 against
-      a bound of 0.0 -- an absolute gap of 2.46e-09 and a relative gap of exactly
-      1.0. Reporting 1.0 for a solve 2.5e-09 from the true optimum would be
-      arithmetically honest and practically useless. Only the relative arm yields
-      a relative number.
+    * **Every exit**, converged or not. #1386 applied this only where a criterion
+      fired and left budget/exhausted exits on #933's floored
+      ``|obj - bound| / max(1, |obj|)``, reasoning that such an exit "claims
+      nothing about a tolerance". #1585 reversed that: the same pair then had two
+      gaps depending on why the solve stopped (measured on a 30-item knapsack,
+      ``max_nodes=5``: 0.0052140 floored vs 0.0051870 on this formula), and the
+      SolveResult docstring promised this formula for all of them. A caller
+      comparing ``r.gap`` against ``gap_tolerance`` on a limit exit must see the
+      number the solver would have compared. Every route's own gap arithmetic
+      also delegates to :func:`discopt.solvers._gap.reported_gap`; this
+      chokepoint is the backstop that makes it true of the published pair.
+    * A gap within the ABSOLUTE tolerance reports ``0.0``. That arm exists
+      precisely because the relative gap degenerates near a zero optimum: ``min
+      x`` over ``(x<=3) or (x>=7)`` on ``[0,10]`` converges at objective 2.46e-09
+      against a bound of 0.0 -- an absolute gap of 2.46e-09 and a relative gap of
+      exactly 1.0. Reporting 1.0 for a solve 2.5e-09 from the true optimum would
+      be arithmetically honest and practically useless.
     * A route that reported ``gap=None`` keeps ``None``. This RECONCILES a gap a
       route computed; it does not manufacture one where the route declined. AMP
       deliberately withholds the relative gap when the incumbent objective is
       near zero (``min x**2`` over ``[-1,1]`` -> ``objective=0.0``, ``gap=None``),
       and ``None`` is the stronger statement: "a relative gap is not defined for
-      this pair", not "it is zero". Overwriting it with a number the route never
-      reported is the same failure ``_kkt_from_info`` avoids by omitting a
-      missing residual rather than filling in a sentinel. Caught by
+      this pair", not "it is zero". Caught by
       test_amp_integration.py::test_zero_upper_bound_reports_no_relative_gap,
       which an earlier version of this function regressed.
+
+    * A materially INVERTED pair keeps the route's own value (#1590 review N2).
+      The formula is symmetric in the pair, so a bound that crosses the
+      incumbent by 1% would read ``0.01`` -- indistinguishable from an honest
+      open gap -- and would overwrite the ``1.0`` OA/GDPopt deliberately report
+      for "nothing proved" (``_gap.optimality_gap``). Crossing is judged on the
+      shared scale-aware slack (:func:`discopt.solvers._gap.bound_inversion_tolerance`
+      at the judged absolute tolerance), in the model's sense, so rounding noise
+      is still reconciled. With the sense unknown (``is_maximize=None``) no
+      crossing can be judged and the pair is left as the route reported it.
+
+    Pure reporting: the gap never feeds certification, which runs
+    :func:`_gap_values_converged` on the pair itself.
     """
     if result.gap is None:
         return
-    if criterion == "absolute":
-        result.gap = 0.0
+    if is_maximize is None:
         return
-    relative = _relative_gap_from_objective_bound(objective, bound)
-    if relative is not None:
-        result.gap = relative
+    slack = _gap_mod.bound_inversion_tolerance(float(bound), float(objective), abs_gap_tol)
+    crossing = float(objective) - float(bound) if is_maximize else float(bound) - float(objective)
+    if crossing > slack:
+        return
+    gap = _gap_mod.reported_gap(objective, bound, abs_tol=abs_gap_tol)
+    if gap is not None:
+        result.gap = gap
 
 
 def _validate_solve_budgets(gap_tolerance: float, time_limit: float) -> None:
@@ -8528,7 +8603,7 @@ def _merge_route_and_fallback(route, fallback, is_maximize: bool):
             winner.gap = None
             winner.gap_certified = False
         else:
-            winner.gap = abs(bnd - obj) / max(abs(obj), 1e-10)
+            winner.gap = _gap_mod.reported_gap(obj, bnd)
     # ``node_count`` is a WORK statistic, not part of the answer, so it belongs to
     # the solve rather than to whichever side won it. Reporting only the winner's
     # made a routed ``squfl025-040`` say ``nodes=0`` after 61 s in which the
@@ -10067,7 +10142,22 @@ def _stamp_layer_timing(fn: _F) -> _F:
                     stats = {}
                     result.solver_stats = stats
                 stats["gap_criterion"] = _crit
-                _stamp_converged_gap(result, _o, _b, _crit)
+            # #1585: one gap formula on every exit (see _stamp_reported_gap).
+            _stamp_model = args[0] if args else kwargs.get("model")
+            _stamp_max: Optional[bool] = None
+            if isinstance(_stamp_model, Model):
+                _stamp_max = objective_sense_sign(_stamp_model) < 0
+            _stamp_reported_gap(result, _o, _b, _gap_tols[1], is_maximize=_stamp_max)
+        # #1585: a route that has not recorded why it stopped but whose STATUS
+        # names a budget stopped on that budget -- the status IS the reason. A
+        # driver-set reason is never overridden, and nothing else is inferred
+        # (``feasible``/``optimal`` do not say which test fired).
+        if (
+            isinstance(result, SolveResult)
+            and result.termination is None
+            and result.status in _TERMINATION_FROM_LIMIT_STATUS
+        ):
+            result.termination = result.status
         # #1236 review finding 6: `node_count` is the WINNING arm's tree. When a
         # cheap-first probe ran and lost, its nodes are real work this call did and
         # are reported here rather than vanishing.
@@ -19202,6 +19292,17 @@ def solve_model(
 
     # --- Build result ---
     wall_time = time.perf_counter() - t_start
+    # #1585: why the loop stopped, read before anything below can move the pair.
+    _termination = _search_termination(
+        tree,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tol=abs_gap_tol,
+        max_nodes=max_nodes,
+        elapsed=wall_time,
+        time_limit=time_limit,
+        debug_quit=_debug_quit,
+        time_yield=_rr_reserve_yield,
+    )
     python_time = wall_time - rust_time - jax_time
 
     stats = tree.stats()
@@ -19694,7 +19795,7 @@ def solve_model(
         # Recompute the reported gap from the adopted floor-inclusive bound so
         # the surfaced gap matches the surfaced bound (the tree's ``gap`` was
         # computed from the bare frontier).
-        gap_val = abs(obj_val - bound_val) / max(1.0, abs(obj_val))
+        gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
     # A *feasible* exit never inherits the tree's validity flag as a certificate.
     # The flag means no node invalidated the tree bound — NOT that the gap is
@@ -19730,7 +19831,7 @@ def solve_model(
         # certification in the block further down.
         if _tree_bound_valid and bound_val is not None and np.isfinite(bound_val):
             if obj_val is not None and np.isfinite(obj_val):
-                gap_val = abs(obj_val - bound_val) / max(1.0, abs(obj_val))
+                gap_val = _gap_mod.reported_gap(obj_val, bound_val)
         else:
             bound_val = None
             # B2-FIX (task #89): decertify-and-discard repair. The tree bound was
@@ -19773,7 +19874,7 @@ def solve_model(
                     # of which was proved at a node.
                     _bound_source = "bnb_tree"
                     if obj_val is not None and np.isfinite(obj_val):
-                        gap_val = abs(obj_val - bound_val) / max(1.0, abs(obj_val))
+                        gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
     # #1401: refuse an EFFECTIVELY INFINITE frontier bound, the same way every
     # other consumer of a tree bound in this file already does.
@@ -19835,7 +19936,7 @@ def solve_model(
         _bound_from_taint_recovery = False
         _bound_source = "root_relaxation"
         if obj_val is not None and np.isfinite(obj_val):
-            gap_val = max(0.0, obj_val - bound_val) / max(1.0, abs(obj_val))
+            gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
     # When the tree produced no usable dual bound (uncertified exit, or a
     # relaxation the LP backend could not solve), fall back to a rigorous global
@@ -19910,7 +20011,7 @@ def solve_model(
                 _bound_from_taint_recovery = False
                 _bound_source = "root_relaxation"
             if obj_val is not None and np.isfinite(obj_val):
-                gap_val = abs(bound_val - obj_val) / max(1.0, abs(obj_val))
+                gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
     # Re-earn certification on a feasible exit iff a *rigorous* global bound (here
     # the root-relaxation fallback, itself only returned when the objective is
@@ -19971,7 +20072,7 @@ def solve_model(
         _capped = max(bound_val, obj_val) if _is_max else min(bound_val, obj_val)
         if _capped != bound_val:
             bound_val = _capped
-            gap_val = abs(bound_val - obj_val) / max(1.0, abs(obj_val))
+            gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
     # Root-node certification metrics (cert:T0.1). Convert the root snapshot to
     # the reported objective sense (mirroring ``bound_val``'s negation for
@@ -20112,6 +20213,7 @@ def solve_model(
         subnlp_calls=_subnlp_calls,
         subnlp_feasible=_subnlp_feasible,
         subnlp_incumbent_updates=_subnlp_incumbent_updates,
+        termination=_termination,
     )
 
 
@@ -21324,7 +21426,9 @@ def _solve_pounce_route(
     Raises:
         ValueError: integer/binary variables, GDP/logical/SOS constraints, a
             feasibility callback, ``nlp_solver`` other than POUNCE, or an option
-            the convex engine does not have.
+            the engine the model is routed to does not have. The route is
+            decided first: an indefinite QP's options are checked by the NLP
+            engine it runs on, not by the convex one it was not sent to (#1585).
     """
     import warnings
 
@@ -21380,9 +21484,15 @@ def _solve_pounce_route(
     if pclass in (ProblemClass.LP, ProblemClass.QP):
         from discopt.solvers import convex_ipm_pounce as _cvx
 
-        engine_opts = _cvx.convex_engine_options(options)  # refuse before solving
-        raw: dict[str, Any] = {}
         is_lp = pclass == ProblemClass.LP
+        # Options are validated against the engine that actually runs (#1585). An
+        # LP is always the convex engine, so refuse before solving. A QP is routed
+        # to qp-ipm only once ``solve_qp`` has proved its Hessian PSD; an indefinite
+        # one falls to the NLP arm below, whose engine accepts a different option
+        # set. ``solve_qp`` certifies PSD *before* it validates its options, so the
+        # raw options go through and the refusal follows the route decision.
+        engine_opts = _cvx.convex_engine_options(options) if is_lp else dict(options or {})
+        raw: dict[str, Any] = {}
         route = POUNCE_ROUTE_LP if is_lp else POUNCE_ROUTE_QP
 
         def _recorded(fn):
@@ -22782,6 +22892,16 @@ def _solve_nlp_bb(
 
     # --- Build result ---
     wall_time = time.perf_counter() - t_start
+    # #1585: why the loop stopped, read before anything below can move the pair.
+    _termination = _search_termination(
+        tree,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tol=abs_gap_tol,
+        max_nodes=max_nodes,
+        elapsed=wall_time,
+        time_limit=time_limit,
+        debug_quit=_debug_quit,
+    )
     python_time = wall_time - rust_time - jax_time
 
     stats = tree.stats()
@@ -23489,7 +23609,7 @@ def _solve_nlp_bb(
         if bound_val is None or _new_bound != bound_val:
             bound_val = _new_bound
             if obj_val is not None and np.isfinite(obj_val):
-                gap_val = abs(obj_val - bound_val) / max(1.0, abs(obj_val))
+                gap_val = _gap_mod.reported_gap(obj_val, bound_val)
         root_bound_val = _tighter(root_bound_val, _rcb)
         if obj_val is not None and np.isfinite(obj_val) and root_bound_val is not None:
             root_gap_val = abs(obj_val - root_bound_val) / max(1.0, abs(obj_val))
@@ -23559,6 +23679,7 @@ def _solve_nlp_bb(
         bound_duals_lower=bound_duals_lower,
         bound_duals_upper=bound_duals_upper,
         solver_stats=_ext_stats,
+        termination=_termination,
     )
 
 
@@ -23715,6 +23836,10 @@ def _solve_node_nlp_pounce(
                 constraint_bounds=constraint_bounds,
                 options=attempt_opts,
             )
+        except PounceOptionError:
+            # #1590 review N1: a refused caller option is not a node outcome --
+            # every node would fail the same way. Refuse the SOLVE, loudly.
+            raise
         except Exception as e:  # noqa: BLE001 - see below
             # #1520: kept as a sound fallback. POUNCE's native layer can raise
             # rather than return a status; ``ERROR`` leaves the node unsettled.
@@ -28700,7 +28825,7 @@ def _merge_engine_bound(
         return res
     gap = res.gap
     if res.objective is not None and math.isfinite(res.objective):
-        gap = abs(res.objective - merged) / max(1.0, abs(res.objective))
+        gap = _gap_mod.reported_gap(res.objective, merged)
     return dataclasses.replace(res, bound=merged, gap=gap)
 
 
@@ -28956,7 +29081,7 @@ def _solve_lp_highs(model: Model, t_start: float, time_limit: float | None = Non
         if out.status == "optimal":
             gap = _optimal_relative_gap(obj)
         else:
-            gap = None if bound is None else abs(obj - bound) / max(1.0, abs(obj))
+            gap = _gap_mod.reported_gap(obj, bound)
         cd, bdl, bdu = _highs_decomposed_duals(model, n_orig, sf, out.row_dual, out.col_dual)
         sr = SolveResult(
             status=out.status,
@@ -29001,6 +29126,34 @@ def _solve_lp_highs(model: Model, t_start: float, time_limit: float | None = Non
         solver_stats=stats,
         algorithm_route=route,
     )
+
+
+def _highs_termination(out) -> Optional[str]:
+    """``SolveResult.termination`` for a HiGHS MILP outcome (#1585).
+
+    Read off HiGHS's own model status, which is why the search stopped; the
+    route's ``status`` cannot be used because it folds every budgeted exit that
+    holds an incumbent into ``feasible``. ``kOptimal`` is HiGHS's gap test
+    (``mip_rel_gap``/``mip_abs_gap``), which a drained tree also satisfies.
+    ``kSolutionLimit`` is how HiGHS reports ``mip_max_nodes``, the only solution-
+    type limit this route sets. A budget spent before HiGHS ran leaves no HiGHS
+    status and the route's own ``time_limit``.
+    """
+    from discopt import status as _st
+
+    by_highs = {
+        "kOptimal": _st.TERMINATION_GAP,
+        "kInfeasible": _st.TERMINATION_EXHAUSTED,
+        "kTimeLimit": _st.TERMINATION_TIME_LIMIT,
+        "kSolutionLimit": _st.TERMINATION_NODE_LIMIT,
+        "kIterationLimit": _st.TERMINATION_ITERATION_LIMIT,
+        "kInterrupt": _st.TERMINATION_INTERRUPTED,
+    }
+    if out.highs_status:
+        return by_highs.get(out.highs_status)
+    if out.status == "time_limit":
+        return _st.TERMINATION_TIME_LIMIT
+    return None
 
 
 def _solve_milp_highs(
@@ -29058,7 +29211,7 @@ def _solve_milp_highs(
         assert out.objective is not None
         obj = _flip(out.objective)
         assert obj is not None
-        gap = None if bound is None else abs(obj - bound) / (abs(obj) + 1e-10)
+        gap = _gap_mod.reported_gap(obj, bound)
         root_gap = None if root_bound is None else abs(obj - root_bound) / max(1.0, abs(obj))
         xo = out.x[:n_orig]
         A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(
@@ -29116,6 +29269,7 @@ def _solve_milp_highs(
             bound_duals_upper=bdu,
             solver_stats=stats,
             algorithm_route=route,
+            termination=_highs_termination(out),
         )
     if out.status == "error":
         logger.warning("HiGHS MILP route: %s", out.message)
@@ -29141,6 +29295,7 @@ def _solve_milp_highs(
         ),
         solver_stats=stats,
         algorithm_route=route,
+        termination=_highs_termination(out),
     )
 
 
@@ -29640,7 +29795,7 @@ def _solve_milp_simplex(
         gap_val = None
         if np.isfinite(bound):
             bound_val = -bound if maximize else bound
-            gap_val = abs(obj_val - bound_val) / (abs(obj_val) + 1e-10)
+            gap_val = _gap_mod.reported_gap(obj_val, bound_val)
 
         # Root-node certification metrics (cert:T0.1/T0.5). The one-shot Rust MILP
         # driver runs the whole B&B internally, so there is no per-iteration root
@@ -29732,6 +29887,19 @@ def _solve_milp_simplex(
             bound_duals_lower=bound_duals_lower,
             bound_duals_upper=bound_duals_upper,
             solver_stats=_driver_stats(),
+            # #1585: the engine's ``Optimal`` IS its closed-gap test. Its
+            # ``Feasible`` does not say why it stopped (a spent budget, a withdrawn
+            # certificate, an unresolved-floor drain -- `decide_status` in
+            # milp_driver.rs), so only a spent clock is named; the rest stays None
+            # rather than guess. A ``node_limit`` exit never reaches here: it is a
+            # ``NodeLimit`` status, which defers below.
+            termination=(
+                "gap"
+                if status == "optimal"
+                else "time_limit"
+                if wall_time >= float(time_limit)
+                else None
+            ),
         )
     if status == "unbounded":
         return SolveResult(
@@ -29779,6 +29947,8 @@ def _solve_milp_simplex(
         wall_time=wall_time,
         node_count=nodes,
         solver_stats=_driver_stats(),
+        # #1585: ``Infeasible`` requires a finished, complete, resolved tree.
+        termination="exhausted",
     )
 
 
@@ -30627,6 +30797,16 @@ def _solve_milp_bb(
             break
 
     wall_time = time.perf_counter() - t_start
+    # #1585: why the loop stopped, read before anything below can move the pair.
+    _termination = _search_termination(
+        tree,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tol=abs_gap_tol,
+        max_nodes=max_nodes,
+        elapsed=wall_time,
+        time_limit=time_limit,
+        debug_quit=_debug_quit,
+    )
     python_time = wall_time - rust_time - jax_time
 
     stats = tree.stats()
@@ -31019,6 +31199,7 @@ def _solve_milp_bb(
         bound_valid=bound_val is not None,
         bound_source=_bound_source,
         solver_stats=_milp_solver_stats or None,
+        termination=_termination,
     )
 
 
@@ -31525,6 +31706,16 @@ def _solve_miqp_bb(
             break
 
     wall_time = time.perf_counter() - t_start
+    # #1585: why the loop stopped, read before anything below can move the pair.
+    _termination = _search_termination(
+        tree,
+        gap_tolerance=gap_tolerance,
+        abs_gap_tol=abs_gap_tol,
+        max_nodes=max_nodes,
+        elapsed=wall_time,
+        time_limit=time_limit,
+        debug_quit=_debug_quit,
+    )
     python_time = wall_time - rust_time - jax_time
 
     stats = tree.stats()
@@ -31926,6 +32117,7 @@ def _solve_miqp_bb(
         bound_valid=bound_val is not None,
         bound_source=_bound_source,
         solver_stats=_ext_stats,
+        termination=_termination,
     )
 
 
