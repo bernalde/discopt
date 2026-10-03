@@ -38,7 +38,7 @@ from typing import Any
 import numpy as np
 
 from discopt._flat_index import resolve_scalar_slot
-from discopt._relax.scalarize import scalar_elements
+from discopt._relax.scalarize import scalar_elements, scalar_matmul_contraction, static_shape
 from discopt.modeling.core import (
     BinaryOp,
     Constant,
@@ -47,6 +47,7 @@ from discopt.modeling.core import (
     IndexExpression,
     MatMulExpression,
     Model,
+    Parameter,
     SumExpression,
     SumOverExpression,
     UnaryOp,
@@ -251,6 +252,136 @@ def _get_flat_index(expr: Expression, model: Model) -> int | None:
     return resolve_scalar_slot(expr, model)
 
 
+def _structural_children(e: Expression) -> tuple[Expression, ...] | None:
+    """Every operand of ``e``; ``None`` for a node type this module does not know."""
+    if isinstance(e, (BinaryOp, MatMulExpression)):
+        return (e.left, e.right)
+    if isinstance(e, UnaryOp):
+        return (e.operand,)
+    if isinstance(e, FunctionCall):
+        return tuple(e.args)
+    if isinstance(e, IndexExpression):
+        return (e.base,)
+    if isinstance(e, SumExpression):
+        return (e.operand,)
+    if isinstance(e, SumOverExpression):
+        return tuple(e.terms)
+    if isinstance(e, (Constant, Parameter, Variable)):
+        return ()
+    return None
+
+
+def _is_variable_free(e: Expression, memo: dict[int, bool]) -> bool:
+    """True iff ``e`` references no decision variable.
+
+    Memoized on ``id`` (a pure structural predicate) and iterative, so a deep or
+    heavily shared DAG costs O(unique nodes) with no recursion-depth hazard. An
+    unknown node type counts as variable-bearing: the conservative answer, since
+    every caller uses ``False`` only to route a model to the thorough Python walk
+    or to expand a node element-wise.
+    """
+    stack: list[tuple[Expression, bool]] = [(e, False)]
+    while stack:
+        node, expanded = stack.pop()
+        nid = id(node)
+        if nid in memo:
+            continue
+        if isinstance(node, (Constant, Parameter)):
+            memo[nid] = True
+            continue
+        if isinstance(node, Variable):
+            memo[nid] = False
+            continue
+        kids = _structural_children(node)
+        if kids is None:
+            memo[nid] = False
+            continue
+        if expanded:
+            memo[nid] = all(memo[id(c)] for c in kids)
+            continue
+        stack.append((node, True))
+        stack.extend((c, False) for c in kids)
+    return memo[id(e)]
+
+
+def _is_array_nonlinear(expr: Expression, memo: dict[int, bool]) -> bool:
+    """A node that is nonlinear only *element-wise* over an array (#1591).
+
+    ``@`` with a variable on both sides (``x @ Q @ x`` -- scalar-valued but a
+    contraction of array operands), or an array-shaped ``*`` / ``**`` over
+    variables (``x * (Q @ x)``, ``x ** 3``). Neither classifier recognizes such a
+    node as a whole: its scalar terms only exist once it is expanded.
+    """
+    if isinstance(expr, MatMulExpression):
+        return not _is_variable_free(expr.left, memo) and not _is_variable_free(expr.right, memo)
+    if isinstance(expr, BinaryOp) and expr.op in ("*", "**"):
+        if static_shape(expr) == ():
+            return False
+        if expr.op == "**":
+            return not _is_variable_free(expr.left, memo)
+        return not _is_variable_free(expr.left, memo) and not _is_variable_free(expr.right, memo)
+    return False
+
+
+def _rebalance_additive(expr: Expression) -> Expression:
+    """Rewrite the additive skeleton of a scalarized element as a balanced ``+`` tree.
+
+    :mod:`_relax.scalarize` spells a contraction two ways -- a left-nested ``+``
+    chain (``_elem_matmul``) or a flat :class:`SumOverExpression` (a reduction,
+    a scalar ``@``). :func:`distribute_products` descends neither usefully: it
+    does not enter a ``SumOverExpression`` at all, so ``x[k] * Σ_i Q[k,i] x[i]``
+    stays one undistributable product, and it recurses once per link of a chain,
+    so an ``n``-term contraction costs ``n`` stack frames. Flattening every
+    ``+``/``-``/``neg``/``SumOver`` run (iteratively) and rebuilding it balanced
+    fixes both: the result is algebraically identical, distributes completely, and
+    is ``O(log n)`` deep. Used only on freshly scalarized elements (#1591), whose
+    nodes no ``id()``-keyed map refers to.
+    """
+
+    def leaf(node: Expression) -> Expression:
+        if isinstance(node, BinaryOp) and node.op in ("*", "/", "**"):
+            left = _rebalance_additive(node.left)
+            right = _rebalance_additive(node.right)
+            if left is node.left and right is node.right:
+                return node
+            return BinaryOp(node.op, left, right)
+        return node
+
+    def is_link(node: Expression) -> bool:
+        return (
+            isinstance(node, SumOverExpression)
+            or (isinstance(node, BinaryOp) and node.op in ("+", "-"))
+            or (isinstance(node, UnaryOp) and node.op == "neg")
+        )
+
+    if not is_link(expr):
+        return leaf(expr)
+    parts: list[Expression] = []
+    stack: list[tuple[Expression, bool]] = [(expr, False)]
+    while stack:
+        node, negated = stack.pop()
+        if isinstance(node, SumOverExpression):
+            stack.extend((t, negated) for t in reversed(node.terms))
+        elif isinstance(node, BinaryOp) and node.op in ("+", "-"):
+            stack.append((node.right, negated if node.op == "+" else not negated))
+            stack.append((node.left, negated))
+        elif isinstance(node, UnaryOp) and node.op == "neg":
+            stack.append((node.operand, not negated))
+        else:
+            term = leaf(node)
+            parts.append(UnaryOp("neg", term) if negated else term)
+    if not parts:
+        return Constant(0.0)
+    while len(parts) > 1:
+        paired: list[Expression] = [
+            BinaryOp("+", parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)
+        ]
+        if len(parts) % 2:
+            paired.append(parts[-1])
+        parts = paired
+    return parts[0]
+
+
 def _contains_expandable_square(model: Model) -> bool:
     """Return True if Python classification should distribute a non-leaf product.
 
@@ -269,6 +400,20 @@ def _contains_expandable_square(model: Model) -> bool:
     Routing such models to the Python classifier, which distributes via
     ``_distribute_mul``, recovers the full term set. Classification runs once per
     solve (not per node), so the cost of the Python path here is negligible.
+
+    #1591: it also covers **array-valued** nonlinear structure, which the Rust
+    arena classifier cannot scalarize and therefore catalogs as *nothing*:
+
+    * a ``@`` whose operands both carry a variable (``x @ Q @ x``, ``x @ y``,
+      ``(A @ x) @ (B @ y)``) -- the Rust ``MatMul`` arm only recurses; and
+    * an array-shaped ``*`` / ``**`` over variables (``x * (Q @ x)``,
+      ``x ** 3``) -- the Rust product/power arms resolve only *scalar*
+      variable factors, so an array factor makes the whole product vanish.
+
+    Silent in two ways: alone, such a model reached the Python walk only through
+    the "catalog empty but model nonlinear" cross-check; next to any scalar term,
+    the Rust route returned that term and nothing else -- an incomplete catalog
+    reported as a complete one.
     """
 
     def _is_additive_composite(e: Expression) -> bool:
@@ -283,9 +428,12 @@ def _contains_expandable_square(model: Model) -> bool:
     # visit(right)`` re-walks shared nodes combinatorially — minutes of wall /
     # RecursionError on qap. With the memo each unique node is visited once -> O(nodes).
     _seen: dict[int, bool] = {}
+    _vf_memo: dict[int, bool] = {}
 
     def _decide_here(expr: Expression) -> bool | None:
         """The node's own verdict, when it can be reached without its children."""
+        if _is_array_nonlinear(expr, _vf_memo):
+            return True
         if isinstance(expr, BinaryOp):
             if (
                 expr.op == "**"
@@ -1295,6 +1443,8 @@ def _classify_nonlinear_terms_python(model: Model) -> NonlinearTerms:
     seen_trilinear: set[tuple[int, int, int]] = set()
     seen_multilinear: set[tuple[int, ...]] = set()
     seen_monomial: set[tuple[int, int]] = set()
+    # #1591: variable-free memo for the array-nonlinear test (pure structural).
+    vf_memo: dict[int, bool] = {}
     seen_fractional: set[tuple[int, float]] = set()
     seen_bilinear_fp: set[tuple[int, tuple[int, float]]] = set()
 
@@ -1367,6 +1517,36 @@ def _classify_nonlinear_terms_python(model: Model) -> NonlinearTerms:
         elif len(unique) >= 4:
             _record_multilinear(unique)
 
+    def _classify_array_nonlinear(expr: Expression) -> None:
+        """Classify an element-wise-nonlinear array node by its scalar elements (#1591).
+
+        ``x @ Q @ x`` is the contraction ``sum_k (x @ Q)[k] * x[k]`` and
+        ``x * (Q @ x)`` is the vector of ``x[k] * sum_i Q[k, i] x[i]``; only once
+        expanded (and distributed) do their bilinear/monomial terms exist. Before
+        this the ``@`` arm recursed into its operands -- "A @ x is linear if A is
+        constant" -- and catalogued *nothing*, so the LP relaxer saw no relaxable
+        nonlinearity and the solve fell to the alphaBB route and stopped at the
+        root. The classification of a reduction is the union over its operand's
+        elements, so expanding the node itself covers every enclosing
+        ``sum``/index/function.
+        """
+        if isinstance(expr, MatMulExpression) and static_shape(expr) == ():
+            contraction = scalar_matmul_contraction(expr)
+            elems = None if contraction is None else [contraction]
+        else:
+            elems = scalar_elements(expr)
+            if elems is not None and len(elems) == 1 and elems[0] is expr:
+                elems = None  # identity: no static expansion of this node
+        if elems is None:
+            # No static expansion (unknown shape / over the cap): keep the node as
+            # one opaque nonlinear term, so nothing downstream reads it as linear.
+            result.general_nl.append(expr)
+            _classify_node(expr.left)  # type: ignore[attr-defined]
+            _classify_node(expr.right)  # type: ignore[attr-defined]
+            return
+        for elem in elems:
+            _classify_node(distribute_products(_rebalance_additive(elem)))
+
     def _classify_node(expr: Expression) -> None:
         """Recursively classify all nonlinear nodes in the expression tree."""
         if isinstance(expr, Constant):
@@ -1374,6 +1554,10 @@ def _classify_nonlinear_terms_python(model: Model) -> NonlinearTerms:
 
         if isinstance(expr, Variable):
             return  # bare variable — linear
+
+        if _is_array_nonlinear(expr, vf_memo):
+            _classify_array_nonlinear(expr)
+            return
 
         if isinstance(expr, IndexExpression):
             # x[i] — linear leaf; recurse into base only if it's something unusual
@@ -1555,7 +1739,9 @@ def _classify_nonlinear_terms_python(model: Model) -> NonlinearTerms:
             return
 
         if isinstance(expr, MatMulExpression):
-            # A @ x is linear if A is constant — recurse for safety
+            # One side is variable-free here (the both-sides case was expanded by
+            # ``_classify_array_nonlinear`` above), so ``A @ v`` is linear in ``v``
+            # -- unless ``v`` itself is nonlinear, which the recursion classifies.
             _classify_node(expr.left)
             _classify_node(expr.right)
             return
