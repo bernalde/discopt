@@ -112,7 +112,13 @@ def test_both_engines_agree_on_the_optimum():
 
     assert on is not None and off is not None
     assert on[0] == off[0] == "optimal"
-    assert on[1] == pytest.approx(off[1], rel=1e-6), f"{on[1]} vs {off[1]}"
+    # #1537: each arm now returns a RIGOROUS lower bound (not f at its point), so
+    # both must sit at or below the true optimum -0.75 and within the looser arm's
+    # slack of it: the callback arm has no multipliers and pays the HiGHS LP
+    # route's own 1e-6 certification slack.
+    for arm in (on, off):
+        assert arm[1] <= -0.75 + 1e-9, arm[1]
+        assert arm[1] == pytest.approx(-0.75, abs=3e-6), arm[1]
     np.testing.assert_allclose(on[2][:3], off[2][:3], atol=1e-5)
 
 

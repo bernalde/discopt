@@ -179,7 +179,8 @@ class TestRouteFallbackMerge:
         merged = _merge_route_and_fallback(route, fb, True)
         assert merged is fb
         assert merged.bound == pytest.approx(290.611)
-        assert merged.gap == pytest.approx((290.611 - 70.0) / 70.0)
+        # #1585: |o-b| / max(|o|, |b|, 1e-10).
+        assert merged.gap == pytest.approx((290.611 - 70.0) / 290.611)
 
     def test_a_looser_bound_never_replaces_a_tighter_one(self):
         route = _sr(obj=1.0, bound=1000.0, gap_certified=True)

@@ -19,6 +19,21 @@ from typing import Callable, NoReturn, Optional, Sequence, TypeVar
 import numpy as np
 
 from discopt._flat_index import flat_index_in_shape
+from discopt._relax._directed import (
+    add_down,
+    add_up,
+    affine_preimage,
+    div_down,
+    div_up,
+    lib_down,
+    lib_up,
+    mul_down,
+    mul_up,
+    sqrt_down,
+    sqrt_up,
+    sub_down,
+    sub_up,
+)
 from discopt._relax._numeric import (
     ROUNDOFF_OPS,
     roundoff_slack,
@@ -608,19 +623,22 @@ def _tighten_affine_argument_interval(
     new_lb = float(tightened_lb[flat_idx])
     new_ub = float(tightened_ub[flat_idx])
 
+    # #1537 D: the preimage is rounded OUTWARD. In round-to-nearest one ulp of a
+    # 4e8-magnitude quotient (6e-8) exceeds the 1e-9 integrality slack below, and
+    # the rounded bound cut the only feasible integer (certified false infeasible).
+    coeff = float(coeff)
+    offset = float(offset)
     if arg_lb is not None and np.isfinite(arg_lb):
-        bound = (float(arg_lb) - offset) / coeff
         if coeff > 0.0:
-            new_lb = max(new_lb, bound)
+            new_lb = max(new_lb, affine_preimage(coeff, offset, float(arg_lb), lower=True))
         else:
-            new_ub = min(new_ub, bound)
+            new_ub = min(new_ub, affine_preimage(coeff, offset, float(arg_lb), lower=False))
 
     if arg_ub is not None and np.isfinite(arg_ub):
-        bound = (float(arg_ub) - offset) / coeff
         if coeff > 0.0:
-            new_ub = min(new_ub, bound)
+            new_ub = min(new_ub, affine_preimage(coeff, offset, float(arg_ub), lower=False))
         else:
-            new_lb = max(new_lb, bound)
+            new_lb = max(new_lb, affine_preimage(coeff, offset, float(arg_ub), lower=True))
 
     new_lb, new_ub = _apply_integrality(
         new_lb,
@@ -746,17 +764,21 @@ def _tighten_affine_upper_bound(
         if abs(c) <= 1e-12:
             continue
 
+        # #1537 D: the other terms' minimum is a directed (downward) sum and the
+        # residual quotient is rounded outward, so a cancelling large-magnitude row
+        # cannot cut a feasible point.
         other_min = float(const)
         for j, c_j in enumerate(coeff):
             if j == idx:
                 continue
             cj = float(c_j)
             if cj >= 0.0:
-                other_min += cj * float(tightened_lb[j])
+                other_min = add_down(other_min, mul_down(cj, float(tightened_lb[j])))
             else:
-                other_min += cj * float(tightened_ub[j])
+                other_min = add_down(other_min, mul_down(cj, float(tightened_ub[j])))
 
-        bound = (float(rhs) - other_min) / c
+        resid = sub_up(float(rhs), other_min)
+        bound = div_up(resid, c) if c > 0.0 else div_down(resid, c)
         new_lb = float(tightened_lb[idx])
         new_ub = float(tightened_ub[idx])
         if c > 0.0:
@@ -1397,45 +1419,97 @@ def _monotone_function_value(func_name: str, value: float) -> float:
     raise ValueError(f"Unsupported monotone function: {func_name}")
 
 
+#: Points at which a monotone function's value is an exact float, by definition of
+#: the function (``exp(0) = 1``, ``log(1) = 0``, ...). The value is returned as the
+#: mathematical constant, never through libm, so it needs no outward widening -- the
+#: same "exact results stay exact" contract the ``_directed`` helpers keep for
+#: ``+ - * /`` (#1572).
+_MONOTONE_EXACT_VALUES: dict[str, dict[float, float]] = {
+    "exp": {0.0: 1.0},
+    "log": {1.0: 0.0},
+    "log2": {1.0: 0.0},
+    "log10": {1.0: 0.0},
+    "log1p": {0.0: 0.0},
+}
+
+
+def _monotone_value_directed(func_name: str, value: float, *, lower: bool) -> float:
+    """Directed enclosure of ``f(value)`` for an increasing monotone ``f`` (#1572).
+
+    A lower bound on the exact ``f(value)`` when ``lower`` is true, an upper bound
+    otherwise. ``sqrt`` is correctly rounded (IEEE 754), so it gets true directed
+    rounding; the libm functions are widened by :func:`lib_down` / :func:`lib_up`
+    (``LIB_ULPS + 1`` ulps), except at their exact points.
+    """
+    exact = _MONOTONE_EXACT_VALUES.get(func_name, {}).get(value)
+    if exact is not None:
+        return exact
+    if func_name == "sqrt":
+        if value < 0.0:
+            return float("nan")
+        return sqrt_down(value) if lower else sqrt_up(value)
+    raw = _monotone_function_value(func_name, value)
+    if not lower:
+        return lib_up(raw)
+    out = lib_down(raw)
+    # exp is positive everywhere: an underflowed ``exp(-800) = 0`` widened down to
+    # ``-5e-324`` is a valid but needlessly negative bound; 0 is exact and sound.
+    return max(out, 0.0) if func_name == "exp" else out
+
+
+def _affine_value_directed(coeff: float, offset: float, value: float, *, lower: bool) -> float:
+    """Directed enclosure of ``coeff * value + offset`` (#1572)."""
+    if lower:
+        return add_down(mul_down(coeff, value), offset)
+    return add_up(mul_up(coeff, value), offset)
+
+
 def _inverse_monotone_upper(func_name: str, rhs: float) -> Optional[float]:
-    """Return U such that f(arg) <= rhs implies arg <= U."""
+    """Return U such that f(arg) <= rhs implies arg <= U.
+
+    #1537 D: the inverse is rounded UP -- libm results widened by ``lib_up``, the
+    ``sqrt`` preimage by a directed multiply -- so ``U`` encloses the exact preimage.
+    """
     if func_name == "exp":
         if rhs <= 0.0:
             return None
-        return float(np.log(rhs))
+        return lib_up(float(np.log(rhs)))
     if func_name == "log":
-        return _safe_exp(rhs)
+        return lib_up(_safe_exp(rhs))
     if func_name == "log2":
-        return float("inf") if rhs > 1024.0 else float(2.0**rhs)
+        return float("inf") if rhs > 1024.0 else lib_up(float(2.0**rhs))
     if func_name == "log10":
-        return float("inf") if rhs > 308.0 else float(10.0**rhs)
+        return float("inf") if rhs > 308.0 else lib_up(float(10.0**rhs))
     if func_name == "log1p":
-        return _safe_exp(rhs) - 1.0
+        return sub_up(lib_up(_safe_exp(rhs)), 1.0)
     if func_name == "sqrt":
         if rhs < 0.0:
             return None
-        return rhs * rhs
+        return mul_up(rhs, rhs)
     return None
 
 
 def _inverse_monotone_lower(func_name: str, rhs: float) -> Optional[float]:
-    """Return L such that f(arg) >= rhs implies arg >= L."""
+    """Return L such that f(arg) >= rhs implies arg >= L.
+
+    #1537 D: rounded DOWN, mirroring :func:`_inverse_monotone_upper`.
+    """
     if func_name == "exp":
         if rhs <= 0.0:
             return None
-        return float(np.log(rhs))
+        return lib_down(float(np.log(rhs)))
     if func_name == "log":
-        return _safe_exp(rhs)
+        return lib_down(_safe_exp(rhs))
     if func_name == "log2":
-        return 0.0 if rhs < -1074.0 else float(2.0**rhs)
+        return 0.0 if rhs < -1074.0 else lib_down(float(2.0**rhs))
     if func_name == "log10":
-        return 0.0 if rhs < -324.0 else float(10.0**rhs)
+        return 0.0 if rhs < -324.0 else lib_down(float(10.0**rhs))
     if func_name == "log1p":
-        return _safe_exp(rhs) - 1.0
+        return sub_down(lib_down(_safe_exp(rhs)), 1.0)
     if func_name == "sqrt":
         if rhs <= 0.0:
             return None
-        return rhs * rhs
+        return mul_down(rhs, rhs)
     return None
 
 
@@ -1558,24 +1632,81 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
             arg_endpoint_b = arg_coeff * float(tightened_ub[arg_idx]) + arg_offset
             current_arg_lb = min(arg_endpoint_a, arg_endpoint_b)
             current_arg_ub = max(arg_endpoint_a, arg_endpoint_b)
+            # #1537: the argument endpoints are affine images of the box, rounded at
+            # the magnitude of what was summed -- ulp(1e6) ~ 1.2e-10 once the model is
+            # written in ``x = y - 1e6``. Every PROOF below is taken on outward-widened
+            # intervals and judged against the row's own feasibility tolerance (in
+            # function units), as #1397/#1415 do for the square rules; the bare 1e-12
+            # here certified hda infeasible after translation (a sqrt range touching
+            # its required range at one point read as empty).
+            arg_slack = _roundoff_slack(arg_endpoint_a, arg_endpoint_b, arg_offset)
             if domain_lb is not None:
                 current_arg_lb = max(current_arg_lb, domain_lb)
             if domain_ub is not None:
                 current_arg_ub = min(current_arg_ub, domain_ub)
-            if current_arg_lb > current_arg_ub + 1e-12:
+            if current_arg_lb > current_arg_ub + _EMPTY_INTERVAL_FEAS_TOL + arg_slack:
                 _prove_infeasible(
                     self.name,
                     constraint,
                     f"{func_name} argument domain is empty on the current box",
                 )
 
-            func_min = _monotone_function_value(func_name, current_arg_lb)
-            func_max = _monotone_function_value(func_name, current_arg_ub)
+            # Outward function range for the proof: f on the widened argument
+            # interval (clipped to the domain), plus the function's own rounding.
+            wide_arg_lb = current_arg_lb - arg_slack
+            wide_arg_ub = current_arg_ub + arg_slack
+            if domain_lb is not None:
+                wide_arg_lb = max(wide_arg_lb, domain_lb)
+            if domain_ub is not None:
+                wide_arg_ub = min(wide_arg_ub, domain_ub)
+            wide_func_min = _monotone_function_value(func_name, wide_arg_lb)
+            wide_func_max = _monotone_function_value(func_name, wide_arg_ub)
+            wide_func_min -= _roundoff_slack(wide_func_min)
+            wide_func_max += _roundoff_slack(wide_func_max)
 
-            linear_target_values = (
-                -constant_term - func_coeff * func_min,
-                -constant_term - func_coeff * func_max,
-            )
+            # #1572: the TIGHTENINGS take a directed enclosure of the function range,
+            # not the proof's widened one above. ``arg_slack`` is a tolerance-style
+            # bound (``8 eps`` times the SUM of both endpoint magnitudes, applied to
+            # each endpoint) and ``_roundoff_slack`` adds ``8 eps |f|`` more; fed to a
+            # tightening it moved an exact ``exp(0) = 1`` lower bound to
+            # ``1 - 8.4e-14`` -- ~380 ulps, scaled by the *other* endpoint (46) -- on
+            # top of the directed rounding below. The directed enclosure is exact
+            # where the arithmetic is exact and one rounding step outward where not.
+            if arg_coeff > 0.0:
+                dir_arg_lo_src = float(tightened_lb[arg_idx])
+                dir_arg_hi_src = float(tightened_ub[arg_idx])
+            else:
+                dir_arg_lo_src = float(tightened_ub[arg_idx])
+                dir_arg_hi_src = float(tightened_lb[arg_idx])
+            dir_arg_lo = _affine_value_directed(arg_coeff, arg_offset, dir_arg_lo_src, lower=True)
+            dir_arg_hi = _affine_value_directed(arg_coeff, arg_offset, dir_arg_hi_src, lower=False)
+            if domain_lb is not None:
+                dir_arg_lo = max(dir_arg_lo, domain_lb)
+            if domain_ub is not None:
+                dir_arg_hi = min(dir_arg_hi, domain_ub)
+            if dir_arg_lo <= dir_arg_hi:
+                tight_func_min = _monotone_value_directed(func_name, dir_arg_lo, lower=True)
+                tight_func_max = _monotone_value_directed(func_name, dir_arg_hi, lower=False)
+            else:
+                # The domain clip emptied the directed interval: the box is
+                # domain-infeasible by less than the proof tolerance accepted above.
+                # Keep the proof's widened range (the pre-#1572 behaviour) rather
+                # than tighten from an empty enclosure.
+                tight_func_min = wide_func_min
+                tight_func_max = wide_func_max
+
+            # #1537 D: the TIGHTENINGS below are outward enclosures too, not only the
+            # proofs. The linear side's target is ``-c0 - fc * f`` over the directed
+            # function range, each endpoint in directed rounding; the extracted
+            # coefficients and constant are model data, the arithmetic on them is
+            # what is enclosed.
+            neg_c0 = -constant_term
+            if func_coeff > 0.0:
+                target_lb = sub_down(neg_c0, mul_up(func_coeff, tight_func_max))
+                target_ub = sub_up(neg_c0, mul_down(func_coeff, tight_func_min))
+            else:
+                target_lb = sub_down(neg_c0, mul_up(func_coeff, tight_func_min))
+                target_ub = sub_up(neg_c0, mul_down(func_coeff, tight_func_max))
             _tighten_affine_argument_interval(
                 tightened_lb,
                 tightened_ub,
@@ -1583,8 +1714,8 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
                 linear_idx,
                 linear_coeff,
                 linear_offset,
-                arg_lb=min(linear_target_values),
-                arg_ub=max(linear_target_values),
+                arg_lb=target_lb,
+                arg_ub=target_ub,
             )
 
             linear_endpoint_a = linear_coeff * float(tightened_lb[linear_idx]) + linear_offset
@@ -1598,9 +1729,33 @@ class MonotoneFunctionEqualityRule(NonlinearBoundTighteningRule):
             required_func_lb = min(required_values)
             required_func_ub = max(required_values)
 
-            feasible_func_lb = max(required_func_lb, func_min)
-            feasible_func_ub = min(required_func_ub, func_max)
-            if feasible_func_lb > feasible_func_ub + 1e-12:
+            # Outward enclosure of the function values the linear side allows, for
+            # the argument tightening (#1537 D). The linear expression's range is
+            # rebuilt in directed rounding; the round-to-nearest values above stay
+            # what the infeasibility proof below has always used.
+            lin_t_lo = float(tightened_lb[linear_idx])
+            lin_t_hi = float(tightened_ub[linear_idx])
+            if linear_coeff > 0.0:
+                lin_lo = add_down(mul_down(linear_coeff, lin_t_lo), linear_offset)
+                lin_hi = add_up(mul_up(linear_coeff, lin_t_hi), linear_offset)
+            else:
+                lin_lo = add_down(mul_down(linear_coeff, lin_t_hi), linear_offset)
+                lin_hi = add_up(mul_up(linear_coeff, lin_t_lo), linear_offset)
+            if func_coeff > 0.0:
+                out_func_lb = div_down(sub_down(neg_c0, lin_hi), func_coeff)
+                out_func_ub = div_up(sub_up(neg_c0, lin_lo), func_coeff)
+            else:
+                out_func_lb = div_down(sub_up(neg_c0, lin_lo), func_coeff)
+                out_func_ub = div_up(sub_down(neg_c0, lin_hi), func_coeff)
+
+            feasible_func_lb = max(out_func_lb, tight_func_min)
+            feasible_func_ub = min(out_func_ub, tight_func_max)
+            required_slack = _roundoff_slack(
+                abs(constant_term), linear_expr_lb, linear_expr_ub
+            ) / abs(func_coeff)
+            if max(required_func_lb - required_slack, wide_func_min) > min(
+                required_func_ub + required_slack, wide_func_max
+            ) + _EMPTY_INTERVAL_FEAS_TOL / abs(func_coeff):
                 _prove_infeasible(
                     self.name,
                     constraint,
@@ -1726,38 +1881,51 @@ class MonotoneFunctionBoundsRule(NonlinearBoundTighteningRule):
             arg_endpoint_b = arg_coeff * float(tightened_ub[flat_idx]) + arg_offset
             current_arg_lb = min(arg_endpoint_a, arg_endpoint_b)
             current_arg_ub = max(arg_endpoint_a, arg_endpoint_b)
+            # #1537: proofs on outward-widened intervals; see the equality rule.
+            arg_slack = _roundoff_slack(arg_endpoint_a, arg_endpoint_b, arg_offset)
             if domain_lb is not None:
                 current_arg_lb = max(current_arg_lb, domain_lb)
             if domain_ub is not None:
                 current_arg_ub = min(current_arg_ub, domain_ub)
-            if current_arg_lb > current_arg_ub + 1e-12:
+            if current_arg_lb > current_arg_ub + _EMPTY_INTERVAL_FEAS_TOL + arg_slack:
                 _prove_infeasible(
                     self.name,
                     constraint,
                     f"{func_name} argument domain is empty on the current box",
                 )
 
-            func_min = _monotone_function_value(func_name, current_arg_lb)
-            func_max = _monotone_function_value(func_name, current_arg_ub)
+            wide_lo = current_arg_lb - arg_slack
+            wide_hi = current_arg_ub + arg_slack
+            if domain_lb is not None:
+                wide_lo = max(wide_lo, domain_lb)
+            if domain_ub is not None:
+                wide_hi = min(wide_hi, domain_ub)
+            wide_min = _monotone_function_value(func_name, wide_lo)
+            wide_max = _monotone_function_value(func_name, wide_hi)
             rhs = -constant_term / func_coeff
+            proof_tol = (_EMPTY_INTERVAL_FEAS_TOL + _roundoff_slack(constant_term)) / abs(
+                func_coeff
+            )
             if func_coeff > 0.0:
-                if rhs < func_min - 1e-12:
+                if rhs < wide_min - _roundoff_slack(wide_min) - proof_tol:
                     _prove_infeasible(
                         self.name,
                         constraint,
                         f"{func_name}(argument) cannot be <= {rhs}",
                     )
-                upper = _inverse_monotone_upper(func_name, rhs)
+                # #1537 D: invert an UPPER enclosure of the rhs quotient.
+                upper = _inverse_monotone_upper(func_name, div_up(-constant_term, func_coeff))
                 if upper is not None:
                     arg_ub = upper if arg_ub is None else min(arg_ub, upper)
             else:
-                if rhs > func_max + 1e-12:
+                if rhs > wide_max + _roundoff_slack(wide_max) + proof_tol:
                     _prove_infeasible(
                         self.name,
                         constraint,
                         f"{func_name}(argument) cannot be >= {rhs}",
                     )
-                lower = _inverse_monotone_lower(func_name, rhs)
+                # func_coeff < 0: f(arg) >= rhs; invert a LOWER enclosure (#1537 D).
+                lower = _inverse_monotone_lower(func_name, div_down(-constant_term, func_coeff))
                 if lower is not None:
                     arg_lb = lower if arg_lb is None else max(arg_lb, lower)
 
@@ -2356,7 +2524,9 @@ class PositiveAffineReciprocalBoundsRule(NonlinearBoundTighteningRule):
             rhs = -scaled_numerator / constant_term
             if not np.isfinite(rhs):
                 continue
-            if arg_lb > rhs + 1e-12:
+            # #1537: arg_lb is an affine image of the box (rounded at the magnitude of
+            # ``const`` and the box), rhs a quotient; prove only past both roundings.
+            if arg_lb > rhs + _EMPTY_INTERVAL_FEAS_TOL + _roundoff_slack(arg_lb, const, rhs):
                 _prove_infeasible(
                     self.name,
                     constraint,
@@ -2556,10 +2726,11 @@ class ReciprocalBoundsRule(NonlinearBoundTighteningRule):
         if rhs < min_val - 1e-12:
             return _RECIPROCAL_INTERVAL_INFEASIBLE
 
-        threshold = numerator / rhs
+        # numerator > 0 always yields a LOWER bound on the argument (either sign of a
+        # sign-definite argument), numerator < 0 an UPPER one; round outward (#1537 D).
         if numerator > 0.0:
-            return threshold, None
-        return None, threshold
+            return div_down(numerator, rhs), None
+        return None, div_up(numerator, rhs)
 
     def tighten(
         self,

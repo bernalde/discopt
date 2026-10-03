@@ -59,10 +59,13 @@ class CallbackContext:
         tainted tree or the failure sentinel) is meaningless (A2).
     elapsed_time : float
         Wall-clock seconds since solve started.
-    x_relaxation : numpy.ndarray
-        Current node's NLP relaxation solution (flat vector).
-    node_bound : float
-        Current node's lower bound from the NLP relaxation.
+    x_relaxation : numpy.ndarray or None
+        Current node's NLP relaxation solution (flat vector). ``None`` when no
+        node of the batch produced a relaxation (all infeasible or unsettled);
+        only the MILP tree reports that case so far.
+    node_bound : float or None
+        Current node's lower bound from the NLP relaxation; ``None`` in the same
+        case as ``x_relaxation``.
     """
 
     node_count: int
@@ -70,8 +73,8 @@ class CallbackContext:
     best_bound: float | None
     gap: float | None
     elapsed_time: float
-    x_relaxation: np.ndarray
-    node_bound: float
+    x_relaxation: np.ndarray | None
+    node_bound: float | None
 
 
 @dataclass

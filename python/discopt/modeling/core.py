@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import builtins as _builtins
 import contextlib as _contextlib
+import contextvars as _contextvars
 import copy as _copy
+import functools as _functools
 import gc
 import math
 import re
@@ -2826,14 +2828,21 @@ def xlogx(x: Union[Expression, float]) -> Expression:
       *symbolic* derivative (:func:`discopt.bilevel.symbolic_diff.diff`) is the
       exact ``log(x) + 1`` and is therefore unbounded at 0.
     - ``x < 0`` is outside the domain. The interval rule abstains (returns
-      ``[-inf, inf]``) rather than guessing, so a certificate over a box that
-      dips below zero is refused, not silently wrong.
+      ``[-inf, inf]``) rather than guessing. One case is not a genuine dip:
+      interval evaluation rounds OUTWARD, so an affine argument that reaches 0
+      exactly (``1 - y`` over ``y in [0, 1]``, ``K - K*y``) arrives with a lower
+      bound a rounding error below 0 (``-2.2e-16``; ``O(K * eps)`` in general).
+      The relaxation reads such a box as starting at the closed edge 0 and
+      envelopes it over ``[0, hi]`` (#1242; ``DISCOPT_CLOSED_EDGE_ENVELOPES=0``
+      opts out), which removes only argument values where the atom is
+      undefined. A box reaching further below 0 than the argument's own
+      rounding scale gets no envelope, only the interval floor.
 
     Parameters
     ----------
     x : Expression or float
         Input expression. The relaxation and interval rules require a
-        nonnegative, finite box on ``x``.
+        nonnegative (up to outward rounding, see above), finite box on ``x``.
 
     Returns
     -------
@@ -4054,13 +4063,24 @@ class SolveResult:
         tested), and below unit objective scale the disagreement ran the other
         way and understated it.
 
+        **One formula on every exit** (#1585): an optimal exit, a
+        ``node_limit``/``time_limit`` stop that kept an incumbent
+        (``status="feasible"``), and every post-solve repair all report this
+        number, through :func:`discopt.solvers._gap.reported_gap`. Before #1585 a
+        limit exit reported ``|objective - bound| / max(1, |objective|)``, so the
+        same pair had two gaps depending on why the search stopped.
+
         The convergence test is a disjunction -- absolute gap
-        ``<= 1e-6`` OR relative gap ``<= gap_tolerance`` -- and a closed gap is
-        reported as ``0.0`` whichever arm closed it, so below unit objective
-        scale ``gap == 0.0`` can stand for a relative gap far above
-        ``gap_tolerance`` (e.g. ``5.5e-7`` absolute on a ``2e-3`` objective,
-        #1352). ``solver_stats["gap_criterion"]`` names the arm when the
-        branch-and-bound path recorded it.
+        ``<= abs_gap_tolerance`` (default ``1e-6``) OR relative gap ``<=
+        gap_tolerance`` -- and a gap within the absolute tolerance is reported
+        as ``0.0``, because the relative number degenerates near a zero optimum.
+        So below unit objective scale ``gap == 0.0`` can stand for a relative
+        gap far above ``gap_tolerance`` (e.g. ``5.5e-7`` absolute on a ``2e-3``
+        objective, #1352). ``solver_stats["gap_criterion"]`` names the arm when
+        a criterion was met. ``None`` when there is no incumbent or no finite
+        bound, or when a route declined to define a relative gap (AMP at a zero
+        incumbent). ``root_gap`` is a separate root statistic with its own
+        documented formula.
     x : dict of str to numpy.ndarray, or None
         Variable values keyed by name. None if no feasible solution found.
 
@@ -4130,6 +4150,67 @@ class SolveResult:
         a certificate stated in problem units must be built from.
         ``barrier_parameter`` is the terminal interior-point ``mu``, forwarded by
         :meth:`solve`'s ``warm_start`` to seed the next solve.
+    solve_report : dict or None
+        POUNCE's structured solve report for the one POUNCE call that produced
+        this result -- the ``pounce.solve-report/v1`` document, the same data as
+        ``pounce --json-output <file> --json-detail full`` (#1534). Set on the
+        routes that make a single POUNCE call: the continuous single-NLP route
+        (convex fast path, and the local NLP on a convexity-unknown model), the
+        continuous QP route, the LP route when POUNCE answered it, and all three
+        arms of ``solver="pounce"`` (``pounce:lp-ipm``, ``pounce:qp-ipm``,
+        ``pounce:nlp``), on every status they return. ``None`` elsewhere: every
+        branch-and-bound route (no single NLP, as for ``kkt``), an LP answered by
+        the simplex or HiGHS, and the cyipopt backend.
+
+        On ``pounce:lp-ipm`` / ``pounce:qp-ipm`` the document is built by discopt
+        from POUNCE's ``QpResult`` (its Python convex entry point writes none),
+        with the same field mapping POUNCE's CLI uses for that engine
+        (:func:`discopt.solvers._pounce_report.convex_report`;
+        ``report["fair_metadata"]["generated_by"]`` says so). That engine has no
+        line search, regularization or restoration phase, so those columns are
+        zero there and its rows match the table printed at ``print_level > 0``
+        exactly.
+
+        Keys (the document's own; nothing is renamed):
+
+        * ``report["statistics"]`` -- ``iteration_count``, the ``final_*``
+          residuals, evaluation counts, ``total_wallclock_time_secs``, and the
+          restoration-phase counts ``restoration_calls``,
+          ``restoration_inner_iters``, ``restoration_outer_iters``,
+          ``restoration_wall_secs``.
+        * ``report["iterations"]`` -- the trajectory, one dict per printed
+          iteration row (see below for restoration rows) with ``iter``,
+          ``objective``, ``inf_pr``, ``inf_du``, ``mu``,
+          ``d_norm``, ``regularization``, ``alpha_dual``, ``alpha_primal``,
+          ``alpha_primal_char`` (the line-search flag printed after ``alpha_pr``;
+          ``"R"`` marks restoration; see below) and ``ls_trials``. The final
+          barrier parameter is ``report["iterations"][-1]["mu"]``. Always
+          present: ``[]`` when the solve stopped before its first iteration
+          (#1585).
+        * ``report["solution"]``, ``report["problem"]``,
+          ``report["fair_metadata"]`` (solver version, timestamps).
+
+        With a POUNCE that carries jkitchin/pounce#979 (``main``; not yet in a
+        release) the trajectory matches POUNCE's printed iteration table row for
+        row on every column: each row has ``phase`` (``"main"`` or
+        ``"restoration"``), the inner restoration rows (printed as ``24r``,
+        ``25r``, ...) are included in printed order, and the slack-form residual
+        is ``inf_pr_internal``. Select ``phase == "main"`` for the outer
+        trajectory. As in the printed table, one restoration call puts ``"R"``
+        on two rows -- the entry (a ``"restoration"`` row) and the return to the
+        main phase -- so count calls with ``statistics["restoration_calls"]`` or
+        the ``"main"`` -> ``"restoration"`` transitions, not the ``"R"`` rows.
+        On pounce-solver 0.12.0 rows carry no ``phase``, only the
+        main-phase rows are present -- restoration shows up as the ``"R"`` row and
+        the ``restoration_*`` counts -- and ``inf_pr`` is POUNCE's internal primal
+        infeasibility on its slack-reformulated, scaled problem rather than the
+        printed column's violation of the original constraints, so the two differ
+        wherever a slack sits off its constraint value (typically the first
+        iterations).
+
+        It describes the problem POUNCE was handed: for a maximization that is
+        the negated objective, and for an LP or QP the matrix form with slacks
+        eliminated. Diagnostic only; nothing in the solver reads it back.
     convex_fast_path : bool
         True if the problem was detected as convex and solved with a
         single NLP call (no Branch & Bound), guaranteeing global optimality.
@@ -4288,6 +4369,12 @@ class SolveResult:
     # so a backend that omits a key cannot change a verdict.
     kkt: Optional[dict[str, float]] = None
 
+    # POUNCE's ``pounce.solve-report/v1`` document for the single POUNCE call that
+    # produced this result (#1534): iteration trajectory, restoration statistics,
+    # timing. ``None`` on every route without exactly one POUNCE call. Diagnostic,
+    # never load-bearing, like ``kkt``.
+    solve_report: Optional[dict[str, Any]] = None
+
     # Witness for an infeasible result, when the backend computed one. An
     # ``InfeasibilityCertificate`` (per-row minimal constraint violations, in
     # LP-row order) for LPs solved via the POUNCE engine; None otherwise.
@@ -4332,6 +4419,40 @@ class SolveResult:
     # populated it is a human-readable reason, e.g.
     # ``"mip-nlp/oa: minlp certified convex at the root (DISCOPT_CONVEX_MINLP_ROUTE)"``.
     algorithm_route: Optional[str] = None
+
+    # Why the search stopped (#1585) -- orthogonal to ``status``, which says what
+    # was PROVEN. One of ``discopt.status.TERMINATION_REASONS``:
+    #
+    # - ``"gap"``: the optimality gap closed within ``gap_tolerance`` /
+    #   ``abs_gap_tolerance`` (status usually ``optimal``);
+    # - ``"exhausted"``: the tree drained -- every node was pruned or solved
+    #   (status usually ``optimal`` with an incumbent, ``infeasible`` without);
+    # - ``"node_limit"`` / ``"time_limit"`` / ``"iteration_limit"``: a budget ran
+    #   out first. Depending on the route the status of such an exit is either the
+    #   budget name or ``feasible`` (an incumbent plus a certified bound with an
+    #   open gap -- the #933 vocabulary, unchanged), so ``status="feasible"``
+    #   alone does not say WHETHER a budget stopped the search, nor which; this
+    #   field does, on every branch-and-bound / MILP route;
+    # - ``"interrupted"``: a user/debugger stop.
+    #
+    # ``None`` means the route records no reason (a direct NLP/LP solve that is not
+    # a search, or a route that has not been taught the field).
+    #
+    # The field records why the LOOP stopped; ``status`` is decided afterwards and
+    # can disagree with the "usually" above (#1590 review N3). Known cases:
+    #
+    # - a tree that drains at exactly ``max_nodes`` with no incumbent reports
+    #   ``status="node_limit"`` (the no-incumbent branch tests the node budget
+    #   first) with ``termination="exhausted"``;
+    # - a ``"gap"`` exit the solve-level chokepoint later downgrades
+    #   (``_refuse_unclosed_published_pair`` / the #1285 polish recheck) reports
+    #   ``status="feasible"`` with ``termination="gap"``;
+    # - a drained tree whose bound is held below the incumbent by an unresolved
+    #   floor reports ``status="feasible"`` with ``termination="exhausted"``.
+    #
+    # Read ``status`` / ``gap_certified`` for what is proven; never infer a
+    # certificate from this field.
+    termination: Optional[str] = None
 
     # Examiner-style validation report (populated if validate=True).
     validation_report: Optional[object] = None
@@ -4978,6 +5099,76 @@ def missing_validation_guards(src: "Model", dst: "Model") -> list[str]:
     return missing
 
 
+_FALSE_PRIMAL_ERROR = (
+    "the incumbent the solver returned is infeasible in the original "
+    "model (false-primal guard, #772); it was withheld"
+)
+
+
+def _withhold_false_primal(result: "SolveResult", error: str = _FALSE_PRIMAL_ERROR) -> None:
+    """The #772 false-primal response: withhold an incumbent the original model rejects.
+
+    Shared by ``Model.solve``'s final-incumbent guard and the #1537 C recentring
+    path, which re-verifies a point mapped back from the recentred model, so the
+    two cannot drift.
+    """
+    result.incumbent_verification_failed = True
+    result.gap_certified = False
+    result.x = None
+    result.objective = None
+    result.gap = None
+    # The status must stop asserting what the guard just withdrew. Clearing
+    # ``x``/``objective`` while leaving ``status="optimal"`` reports a PROVEN
+    # OPTIMUM WITH NO SOLUTION -- a caller that keys on the status (every gate and
+    # panel in this repo does) reads a certificate that the guard has already
+    # refused to stand behind. Observed under
+    # ``DISCOPT_PRESOLVE_BOUND_PROPAGATION=1`` on nvs05: ``status='optimal'``,
+    # ``objective=None``, 3/3 reps. This is not a limit termination -- an unsound
+    # result was detected -- so it reports as an error and refuses loudly
+    # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was shown to be
+    # invalid, and the dual bound remains rigorous.
+    result.status = "error"
+    result.error = error
+
+
+#: How many ``Model.solve`` calls are on the stack (#1537 C). A ContextVar, not a
+#: thread-local: ``_run_with_deep_recursion`` runs deep solves on a worker thread
+#: inside ``contextvars.copy_context()``, which carries this but not a
+#: ``threading.local``, so a sub-solve there still reads as nested.
+_SOLVE_DEPTH: _contextvars.ContextVar[int] = _contextvars.ContextVar(
+    "discopt_model_solve_depth", default=0
+)
+
+
+def _counts_solve_depth(fn):
+    """Track ``Model.solve`` nesting so a pass meant for the caller's own model
+    (recentring) can tell the user's top-level call from the solver's sub-solves."""
+
+    @_functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        token = _SOLVE_DEPTH.set(_SOLVE_DEPTH.get() + 1)
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            _SOLVE_DEPTH.reset(token)
+
+    return wrapper
+
+
+def _post_solve_abs_gap_tol(result: "SolveResult", abs_gap_tolerance: Optional[float]) -> float:
+    """The absolute gap tolerance a post-solve gap recomputation reports at (#1585).
+
+    The one the certificate was judged at when the solver wrapper recorded it
+    (``SolveResult._judged_gap_tolerances``), else the caller's.
+    """
+    judged = getattr(result, "_judged_gap_tolerances", None)
+    if judged is not None:
+        return float(judged[1])
+    from discopt.solver import _resolve_abs_gap_tolerance
+
+    return float(_resolve_abs_gap_tolerance(abs_gap_tolerance))
+
+
 class Model:
     """
     A Mixed-Integer Nonlinear Program.
@@ -5051,6 +5242,12 @@ class Model:
         # ``factorable_reform._lift_zero_spanning_factors_enabled``). Empty by
         # default, so it never changes behaviour with the flag off.
         self._zero_spanning_factor_auxes: set[str] = set()
+        # Names of lifted auxes typed INTEGER only because their defining equality
+        # ``w == a*x + b`` (integral a, b over integer x) makes them integral: their
+        # value is implied by other integer columns, so a primal heuristic must not
+        # round, fix or move them independently (#1588 review, nvs22). Set by the
+        # factorable reform; empty by default.
+        self._implied_integer_auxes: set[str] = set()
         self._builder = None  # Optional PyModelBuilder, lazy-initialized
         # Starting point for the model's variables, keyed ``(var name, element)``
         # -> value (#1225). A *partial* map: only elements someone actually gave
@@ -7439,6 +7636,7 @@ class Model:
 
     # ── Solve ──
 
+    @_counts_solve_depth
     def solve(
         self,
         time_limit: float = 3600,
@@ -7551,6 +7749,49 @@ class Model:
             legacy ``DISCOPT_RLT=1`` environment variable. Sound regardless of
             setting (a constraint×bound product never removes a feasible point).
             Passed through to :func:`discopt.solver.solve_model`.
+        milp_backend : {"highs", "native"}, optional
+            Engine for a pure LP or MILP model. The default ``None`` defers to
+            the ``DISCOPT_LP_MILP_BACKEND`` environment variable, which itself
+            defaults to HiGHS. ``"highs"`` names HiGHS with discopt-verified
+            certificates, by far the faster choice; its ``node_count`` is
+            HiGHS's own ``mip_node_count``, which counts the root: ``0`` when
+            HiGHS presolve settles the model, ``1`` when the root node closes
+            it, more once HiGHS branches. ``"native"`` forces discopt's own branch and
+            bound so the search can be studied: the in-house LP solve (Rust
+            simplex, POUNCE if it declines) for an LP, discopt's MILP tree for
+            a MILP. On the
+            MILP tree ``node_count`` is the tree's, ``strategy`` selects the
+            next node (``"best_first"``, ``"depth_first"``, ``"best_estimate"``),
+            ``batch_size=1`` evaluates one node at a time (default 16 per
+            batch), ``branching_rule`` picks the variable to branch on,
+            ``node_callback`` fires after every batch, ``max_nodes`` caps the
+            tree and ``milp_cuts`` switches the root cut loop.
+            ``algorithm_route`` names the engine that ran. Refused for a model
+            that is not an LP or MILP and with ``nlp_bb=True``; ``"highs"`` is
+            refused with any callback, since HiGHS runs none. ``lazy_constraints``,
+            ``incumbent_callback`` and ``cut_callback`` route a MILP to spatial
+            branch and bound, the engine that screens them. If presolve fixes
+            every integer the model is solved as an LP and ``branching_rule`` /
+            ``milp_cuts`` are unused (a warning says so). Overrides the
+            ``DISCOPT_LP_MILP_BACKEND`` environment variable. Passed through to
+            :func:`discopt.solver.solve_model`::
+
+                r = m.solve(milp_backend="native", strategy="depth_first",
+                            branching_rule="strong", batch_size=1, milp_cuts=False)
+                r.node_count, r.algorithm_route
+
+        milp_cuts : bool, optional
+            Only with ``milp_backend="native"`` on a MILP. ``False`` skips the
+            root cut loop (cover, clique and Gomory cuts), so the tree branches
+            on the plain LP relaxation; the default keeps it.
+        branching_rule : str, optional
+            Only with ``milp_backend="native"`` on a MILP: which fractional
+            integer variable a node branches on. ``"pseudocost"`` (default:
+            reliability pseudocosts, most-fractional until a variable has
+            observations), ``"most_fractional"``, ``"least_fractional"`` or
+            ``"strong"`` (solves both child LPs of every candidate; those probe
+            LPs are reported in ``solver_stats["branching/strong_probe_lps"]``,
+            not in ``node_count``). Changes the search order, never a bound.
         initial_solution : dict, optional
             Initial feasible solution mapping Variable objects to values
             (scalars, lists, or numpy arrays).  Used as a warm-start point
@@ -7603,7 +7844,10 @@ class Model:
             return ``True`` to accept or ``False`` to reject.
         node_callback : callable, optional
             Node callback. Called after each batch of nodes is processed.
-            Should accept ``(ctx, model)`` and return ``None``.
+            Should accept ``(ctx, model)`` and return ``None``. A MILP with a
+            node callback is solved by discopt's MILP tree rather than HiGHS
+            (which exposes no nodes), so the callback sees real nodes. An LP has
+            no tree; the callback is not called and a warning says so.
         cut_callback : callable, optional
             Cut callback, invoked at **every** node — spatial ones included,
             unlike ``lazy_constraints``, which fires only at integer-feasible
@@ -7611,6 +7855,9 @@ class Model:
             :class:`~discopt.callbacks.NodeCutContext` carrying the node's BOX,
             its relaxation solution and the incumbent, and returns a list of
             :class:`~discopt.callbacks.CutResult` (possibly empty).
+            Runs on discopt's spatial branch and bound: a MILP with a cut
+            callback leaves the HiGHS and MILP-tree routes, which have no cut
+            hook, and ``nlp_bb=True`` with a cut callback is refused.
 
             **Every returned cut is validated before it is accepted.** A cut the
             solver derives is a theorem; one you hand it is an assertion, and
@@ -7652,6 +7899,32 @@ class Model:
                 r.objective       # ~0.0 at the origin
                 r.bound           # None -- no dual information
                 r.gap_certified   # False -- by design
+
+            Use ``solver="pounce"`` for exactly one POUNCE interior-point solve of
+            the model as written, with no convexity classification, presolve,
+            spatial branch-and-bound or HiGHS fallback (#1533). An LP goes to
+            POUNCE's convex LP IPM (``lp-ipm``) and a QP whose Hessian discopt
+            proves positive semidefinite (an exact rational test) to its
+            ``qp-ipm``; both are convex, so they report ``"optimal"``. Every other
+            continuous model -- a QP not so proved, a QCQP, an NLP -- goes to the
+            filter line-search NLP IPM once and reports ``"local_optimal"`` with
+            no bound and ``gap_certified=False``, since nothing global was
+            proved. ``result.algorithm_route`` names the arm
+            (``"pounce:lp-ipm"``, ``"pounce:qp-ipm"``, ``"pounce:nlp"``) and
+            ``result.solver_stats["pounce/iterations"]`` the convex engine's
+            iteration count. A local infeasibility is ``"local_infeasible"``.
+            Integer/binary variables, and an ``nlp_solver`` other than
+            ``"pounce"``, raise ``ValueError``; any other option left at a
+            non-default value is ignored with a warning naming it.
+            Options go in ``pounce_options`` (an alias of ``ipopt_options``)::
+
+                r = m.solve(solver="pounce",
+                            pounce_options={"print_level": 5, "tol": 1e-9})
+
+            The convex LP/QP engine accepts ``tol``, ``max_iter``,
+            ``max_wall_time``, ``print_level`` (any positive value prints its
+            iteration trace), ``tau`` and ``tau_max``; an NLP-engine option such
+            as ``mu_strategy`` on an LP raises rather than being ignored.
 
             Use ``solver="amp"`` to select
             Adaptive Multivariate Partitioning. AMP-specific keyword
@@ -7777,6 +8050,119 @@ class Model:
             If *initial_solution* contains non-Variable keys.
         """
         self.validate()
+
+        # --- #1537 C: exact recentring of large-offset variables (default OFF) ---
+        # A box far from the origin is the same model in coordinates ``x = z + c``
+        # but not the same numerics (23/69 certificates lost and 4 false ones under
+        # a 1e6 shift, measured by the invariance harness). The recentred twin is
+        # solved through this same method -- every route, the convex kernel
+        # included -- and the result is mapped back and re-verified against THIS
+        # model. Callbacks see solver coordinates, so a solve with any callback, or
+        # a streaming one, is left unrecentred.
+        from discopt.modeling import _recentre
+
+        if (
+            _recentre.recentre_enabled()
+            # Only the caller's own top-level solve. A sub-solve the solver runs on
+            # a tightened model of its own (RENS, a relaxation probe...) is a nested
+            # ``Model.solve``; recentring those broke bound neutrality on unshifted
+            # models (graduation panel: 4stufen, hda, heatexch_gen* reported moved
+            # variables although the user's model has nothing to move).
+            and _SOLVE_DEPTH.get() == 1
+            and not getattr(self, "_recentre_inner", False)
+            and not stream
+            and lazy_constraints is None
+            and incumbent_callback is None
+            and node_callback is None
+            and cut_callback is None
+        ):
+            _solve_args = dict(
+                time_limit=time_limit,
+                gap_tolerance=gap_tolerance,
+                abs_gap_tolerance=abs_gap_tolerance,
+                threads=threads,
+                llm=llm,
+                sensitivity=sensitivity,
+                deterministic=deterministic,
+                partitions=partitions,
+                initial_solution=initial_solution,
+                warm_start=warm_start,
+                skip_convex_check=skip_convex_check,
+                nlp_bb=nlp_bb,
+                solver=solver,
+                validate=validate,
+                verify_incumbent=verify_incumbent,
+                gauss_newton=gauss_newton,
+                tuning=tuning,
+                debug=debug,
+                **kwargs,
+            )
+            try:
+                _rc = _recentre.recentre(self)
+            except _recentre.RecentreUnsupported as exc:
+                import logging as _logging
+
+                # WARNING, not INFO: the user set the flag and it did nothing. The
+                # model is solved unrecentred -- as a nested solve, so the pass
+                # does not retry -- and the reason is stamped on the result.
+                _logging.getLogger(__name__).warning(
+                    "%s is set but recentring was skipped (%s); solving %r unrecentred",
+                    _recentre.FLAG,
+                    exc,
+                    self.name,
+                )
+                _unrecentred = cast(
+                    Union[SolveResult, Iterator[SolveUpdate]], self.solve(**_solve_args)
+                )
+                if isinstance(_unrecentred, SolveResult):
+                    if _unrecentred.solver_stats is None:
+                        _unrecentred.solver_stats = {}
+                    _unrecentred.solver_stats["recentre/skipped"] = str(exc)
+                return _unrecentred
+            if _rc is not None:
+                result = _recentre.solve_recentred(self, _rc, _solve_args)
+                # The same tail the unrecentred path runs, on THIS model: the
+                # objective recomputed from the mapped point in the original
+                # coordinates, the #1313/#1322 solved-point stamp, and the derived
+                # reports (switched off for the inner solve, so none of them can
+                # describe the recentred model).
+                if result.objective is not None and result.x is not None:
+                    self._reconcile_objective_with_model(result)
+                if result.x is not None:
+                    from discopt._evaluator_cache import solution_state_fingerprint
+
+                    setattr(result, "_problem_fingerprint", solution_state_fingerprint(self))
+                    self._last_solve_result = result
+                if llm:
+                    try:
+                        result._explanation = result._explain_with_llm()
+                    except Exception as _exp_exc:  # noqa: BLE001 - advisory, as below
+                        import logging as _logging
+
+                        _logging.getLogger("discopt.llm").debug(
+                            "post-solve LLM explanation skipped: %s: %s",
+                            type(_exp_exc).__name__,
+                            _exp_exc,
+                        )
+                if sensitivity:
+                    result._ensure_sensitivity()
+                if validate and result.x:
+                    from discopt.validation.examiner import examine
+
+                    try:
+                        result.validation_report = examine(result, self)
+                    except Exception as _val_exc:
+                        # Same outcome as the unrecentred path (report None), but
+                        # said out loud rather than silently.
+                        import logging as _logging
+
+                        _logging.getLogger(__name__).warning(
+                            "validation report not produced: %s: %s",
+                            type(_val_exc).__name__,
+                            _val_exc,
+                        )
+                        result.validation_report = None
+                return result
 
         # Reject misspelled / unknown solve() keyword arguments loudly (M6).
         # ``**kwargs`` is forwarded verbatim to ``solve_model`` and its backends,
@@ -7941,6 +8327,308 @@ class Model:
         # ``last_attempt_seconds()`` is EXACTLY 0.0 whenever DISCOPT_CONVEX_KERNEL is
         # off (it is reset on entry and the clock starts after the flag check), so the
         # default path subtracts a literal zero and every deadline below is unchanged.
+        def _guard_unresolved_objective(res: "SolveResult") -> None:
+            """#1551 guard at this method's tolerances (see ``solver``)."""
+            from discopt.solver import (
+                _resolve_abs_gap_tolerance,
+                _withhold_unresolved_objective_certificate,
+            )
+
+            _withhold_unresolved_objective_certificate(
+                res, self, float(gap_tolerance), _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            )
+
+        # #1561: the declared model, captured before any route can extend it.
+        # Structure cuts (``cut_recognizer``) append auxiliary columns and rows to
+        # ``self._variables``/``self._constraints`` during the solve, and presolve
+        # may tighten bounds in place; the backstop below judges the point the
+        # caller asked about, on the variables and bounds the caller declared.
+        from discopt.validation.feasibility import declared_variables as _declared_variables
+
+        _declared_vars_entry = _declared_variables(self)
+        _declared_cons_entry = list(self._constraints)
+        _declared_builder_rows_entry = self._num_builder_constraint_rows()
+
+        def _model_unchanged_since_entry() -> bool:
+            if len(self._variables) != len(_declared_vars_entry) or any(
+                v.name != d.name or int(getattr(v, "size", 1)) != d.size
+                for v, d in zip(self._variables, _declared_vars_entry)
+            ):
+                return False
+            if self._num_builder_constraint_rows() != _declared_builder_rows_entry:
+                return False
+            return len(self._constraints) == len(_declared_cons_entry) and all(
+                a is b for a, b in zip(self._constraints, _declared_cons_entry)
+            )
+
+        def _withhold_unverified_certificate(
+            res: "SolveResult", evaluator=None, declared=None
+        ) -> None:
+            """#1561 certified-incumbent backstop: no certificate on a point
+            ``verify_point`` rejects.
+
+            Every route has its own exit gate, and they do not agree with
+            :func:`~discopt.validation.feasibility.verify_point`, the repo's single
+            definition of a feasible incumbent: NLP-BB's gate judged the point as
+            computed, with integer columns up to 1e-5 off, while ``verify_point``
+            judges its integral realisation (#1380). On tls2 with every row scaled
+            by 1e6 that disagreement published ``optimal``/``gap_certified=True``
+            on a point whose snapped row 18 is violated by 6.67 where 1.0 is
+            allowed. The route-level gate is fixed too; this is the class-level
+            check at the one place every route's result passes, so a gate that
+            drifts again cannot certify what ``verify_point`` refuses.
+
+            The point is judged on the DECLARED model: ``evaluator`` and
+            ``declared`` (a ``declared_variables`` snapshot) are the pre-solve rows
+            and columns, and ``x`` is laid out over the declared names only.
+            Without a pre-solve evaluator the rows are compiled now, which is the
+            declared model only if the solve left ``_variables``/``_constraints``
+            untouched; when it did not, there is no declared evaluator to judge
+            against, and the post-solve model (declared rows plus the solver's
+            own additions, columns included) is judged instead -- stricter, never
+            looser.
+
+            Only a CERTIFIED result is judged, and the point is not withheld: the
+            loose #772 screen above decides that. A rejected point is reported
+            ``feasible``, uncertified, with ``solver_stats
+            ["certificate/incumbent_unverified"]`` set. ``bound`` is untouched; it
+            is a dual bound and does not depend on the incumbent.
+            """
+            if not res.x or not (res.status == "optimal" or res.gap_certified):
+                return
+            import logging as _vlogging
+
+            import numpy as _np
+
+            from discopt.validation.feasibility import verify_point
+
+            try:
+                if evaluator is None and _model_unchanged_since_entry():
+                    from discopt._tape_nlp_evaluator import make_evaluator
+
+                    evaluator = make_evaluator(self)
+                    declared = _declared_vars_entry
+                if evaluator is not None:
+                    if declared is None:
+                        raise ValueError("a pre-solve evaluator needs its declared variables")
+                    _cols = [d.name for d in declared]
+                else:
+                    _cols = [v.name for v in self._variables]
+                _flat = _np.concatenate(
+                    [
+                        _np.atleast_1d(_np.asarray(res.x[_n], dtype=_np.float64)).ravel()
+                        for _n in _cols
+                    ]
+                )
+                if evaluator is not None:
+                    _verdict = verify_point(self, _flat, evaluator=evaluator, variables=declared)
+                else:
+                    _verdict = verify_point(self, _flat)
+                _ok, _reason = bool(_verdict.ok), _verdict.reason
+            except Exception as _vexc:
+                # A check that cannot run cannot vouch for a certificate (§7):
+                # decertify rather than publish an unchecked one.
+                _ok, _reason = False, f"verification raised {type(_vexc).__name__}: {_vexc}"
+            if _ok:
+                return
+            _vlogging.getLogger("discopt.solver").error(
+                "UNVERIFIED CERTIFICATE (#1561): the incumbent reported as %s "
+                "(objective=%s) fails verify_point on the declared model (%s). "
+                "Reporting it as 'feasible', uncertified.",
+                res.status,
+                res.objective,
+                _reason,
+            )
+            if res.status == "optimal":
+                res.status = "feasible"
+            res.gap_certified = False
+            res.solver_stats = dict(res.solver_stats or {})
+            res.solver_stats["certificate/incumbent_unverified"] = 1.0
+
+        def _repair_published_incumbent(res: "SolveResult", evaluator=None, declared=None) -> None:
+            """#1537 E: publish the incumbent repaired to float noise, and re-judge
+            the certificate on the repaired objective.
+
+            :func:`~discopt.validation.feasibility.repair_point` has the measurement.
+            In short: ``verify_point``'s row allowance depends on the units a row is
+            written in, so a solver's working-accuracy residual (1e-9..7e-6 on the
+            three corpus cells) passes it in one set of coordinates and fails it in an
+            identical model in another, and the objective the solver reports is bought
+            with that residual -- ``ex14_1_9`` with rows x1e-3 certified ``-9.98e-6``
+            against a true minimum of ~0. Repairing the point removes the dependence
+            on the units: the result is feasible to float noise in every coordinate
+            system, and its objective is the honest one.
+
+            The repaired point is adopted only if ``verify_point`` accepts it on the
+            declared model. If its objective then crosses the published bound, the
+            bound is refuted (a verified point past it): the certificate is withdrawn
+            and the bound cleared with its validity flag (#1244's rule), loudly.
+            Otherwise the bound is never touched. The certificate is re-asked
+            of the new ``(objective, bound)`` pair by the same arbiter that grants it
+            (``_withhold_stale_certificate``): downgrade-only, so a solve whose
+            certified objective was bought with a residual loses the certificate,
+            and a solve whose was not keeps it.
+
+            Nested internal solves (the root-relaxation fallback in ``solver.py``,
+            ``solve_mpec``, ``estimate``, ``infeasibility``) run this too, by design
+            and harmlessly: those callers read ``x``/``objective``, or ``bound``
+            only behind ``status == "optimal"``. The repair is downgrade-only on
+            status/certificate and clears a bound only when a verified point refutes
+            it, so a nested caller can lose a bound that was invalid, never gain one.
+
+            Known staleness (diagnostic only, never a certificate input):
+            ``gap_criterion``, ``kkt`` and the duals still describe the solver's
+            pre-repair point; the repaired point is within the solver's own
+            feasibility tolerance of it.
+            """
+            from discopt.validation.feasibility import incumbent_repair_enabled
+
+            if not incumbent_repair_enabled() or not res.x or res.objective is None:
+                return
+            import logging as _rlogging
+
+            import numpy as _np
+
+            from discopt.validation.feasibility import repair_point, verify_point
+
+            _log = _rlogging.getLogger("discopt.solver")
+            stats = res.solver_stats = dict(res.solver_stats or {})
+            if evaluator is None:
+                if not _model_unchanged_since_entry():
+                    stats["certificate/repair_skipped"] = "model changed during the solve"
+                    return
+                from discopt._tape_nlp_evaluator import make_evaluator
+
+                evaluator = make_evaluator(self)
+                declared = _declared_vars_entry
+            if declared is None:
+                raise ValueError("a pre-solve evaluator needs its declared variables")
+            _names = [d.name for d in declared]
+            if not set(_names) <= set(res.x):
+                stats["certificate/repair_skipped"] = "result lacks a declared column"
+                return
+            if any(type(c) is not Constraint for c in _declared_cons_entry):
+                # A disjunction / indicator / SOS / logical row is not in the declared
+                # evaluator's rows, so a move judged on those rows alone could break it.
+                stats["certificate/repair_skipped"] = "non-algebraic rows"
+                return
+            # Any EXTRA column in ``res.x`` (a factorable-lift ``_fr_aux_*``, a
+            # structure-cut aux) is the solver's internal column, not part of the
+            # declared model; it is reported as the solver left it (see
+            # ``SolveResult.declared_x``). Only declared columns are the claim.
+            _shapes = [_np.shape(res.x[n]) for n in _names]
+            _flat = _np.concatenate(
+                [_np.atleast_1d(_np.asarray(res.x[n], dtype=_np.float64)).ravel() for n in _names]
+            )
+            rep = repair_point(self, _flat, evaluator=evaluator, variables=declared)
+            if rep.x is None:
+                if rep.excess_before > 0.0:
+                    stats["certificate/repair_declined"] = rep.reason
+                return
+            verdict = verify_point(
+                self, rep.x, with_objective=True, evaluator=evaluator, variables=declared
+            )
+            if not verdict.ok or verdict.objective is None:
+                stats["certificate/repair_declined"] = f"repaired point: {verdict.reason}"
+                return
+            from discopt.solver import (
+                _bound_crosses_objective,
+                _recertify_gap_closed,
+                _resolve_abs_gap_tolerance,
+                _withhold_stale_certificate,
+            )
+
+            is_max = self._objective is not None and (
+                self._objective.sense == ObjectiveSense.MAXIMIZE
+            )
+            old_obj, new_obj = float(res.objective), float(verdict.objective)
+            bnd = res.bound
+            has_bound = bnd is not None and _np.isfinite(float(bnd))
+            # A verified point past the published bound refutes the bound (CLAUDE.md
+            # §1): ``bound <= incumbent`` (min) is the certificate invariant. Decided
+            # here, before anything is written, and acted on after the write-back.
+            bound_refuted = has_bound and _bound_crosses_objective(float(bnd), new_obj, is_max)
+            off = 0
+            for n, shp in zip(_names, _shapes):
+                size = int(_np.prod(shp)) if shp else 1
+                vals = rep.x[off : off + size]
+                res.x[n] = vals.reshape(shp) if shp else _np.asarray(vals[0])
+                off += size
+            res.objective = new_obj
+            stats["certificate/incumbent_repaired"] = 1.0
+            stats["certificate/repair_excess_before"] = float(rep.excess_before)
+            # Magnitude only: the ``certificate/`` family is non-negative floats.
+            stats["certificate/repair_objective_shift"] = float(abs(new_obj - old_obj))
+            if bound_refuted:
+                # #1244's rule, as in ``_withhold_stale_certificate``'s crossing arm:
+                # the incumbent is verified and the bound is not, so the bound is the
+                # weaker claim -- clear it with its validity flag and its gap, and
+                # withdraw the certificate it supported. Never publish either.
+                _log.error(
+                    "incumbent repair (#1537 E): the repaired, verified point has objective "
+                    "%.12g beyond the published bound %.12g (%s sense) -- the bound is "
+                    "invalid. Withdrawing the certificate and the bound.",
+                    new_obj,
+                    float(bnd),
+                    "max" if is_max else "min",
+                )
+                if res.gap_certified:
+                    stats["certificate/repair_decertified"] = 1.0
+                res.gap_certified = False
+                if res.status == "optimal":
+                    res.status = "feasible"
+                res._set_bound(None, valid=False)
+                res.gap = None
+                stats["certificate/repair_bound_refuted"] = 1.0
+                return
+            if not has_bound:
+                return
+            from discopt.solvers._gap import reported_gap as _reported_gap
+
+            # Re-judge at the tolerances the certificate was granted at: the solver
+            # wrapper records them (AMP meets ``rel_gap``, not ``gap_tolerance``).
+            _judged = getattr(res, "_judged_gap_tolerances", None)
+            if _judged is not None:
+                gtol, atol = float(_judged[0]), float(_judged[1])
+            else:
+                gtol = float(gap_tolerance)
+                atol = _resolve_abs_gap_tolerance(abs_gap_tolerance)
+            was_certified = bool(res.gap_certified)
+            # #1585: the one SolveResult.gap formula, at the judged abs tolerance.
+            res.gap = _reported_gap(new_obj, float(bnd), abs_tol=atol)
+            if not was_certified:
+                return
+            if _recertify_gap_closed(old_obj, float(bnd), is_max, gtol, atol):
+                res.status, res.gap, res.gap_certified, _ = _withhold_stale_certificate(
+                    res.status,
+                    new_obj,
+                    float(bnd),
+                    res.gap,
+                    True,
+                    is_max,
+                    gtol,
+                    atol,
+                    "incumbent repair (#1537 E)",
+                )
+            elif abs(new_obj - float(bnd)) > abs(old_obj - float(bnd)):
+                # A certificate whose pair did not close even at the tolerances it
+                # was judged at (no recorded tolerances, or a pairless proof): only
+                # the repair's MARGINAL effect is judged -- a pair the repair moved
+                # further apart no longer supports the certificate.
+                _log.warning(
+                    "incumbent repair (#1537 E): the repaired objective %.12g is further "
+                    "from the bound %.12g than the certified %.12g; withdrawing the "
+                    "certificate.",
+                    new_obj,
+                    float(bnd),
+                    old_obj,
+                )
+                res.gap_certified = False
+                if res.status == "optimal":
+                    res.status = "feasible"
+            if was_certified and not res.gap_certified:
+                stats["certificate/repair_decertified"] = 1.0
+
         _ck_elapsed = 0.0
         # #1422: the native-tree share of ``_ck_elapsed``, so the attempt can be
         # billed to ``wall_time`` without breaking its rust/python partition.
@@ -8014,6 +8702,13 @@ class Model:
             except Exception:
                 _ck_res = None
             if _ck_res is not None:
+                # #1551: this return skips ``solve_model`` and everything below,
+                # so the evaluation-error guard has to run here too.
+                # #1561 judges the route's own point; the #1537 E repair then
+                # improves what is published (downgrade-only), and #1551 judges that.
+                _withhold_unverified_certificate(_ck_res)
+                _repair_published_incumbent(_ck_res)
+                _guard_unresolved_objective(_ck_res)
                 return _ck_res
 
         from discopt._relax.deadline import deadline_scope
@@ -8056,6 +8751,7 @@ class Model:
         # verification is effectively free and now always runs. ``verify_incumbent``
         # is retained for API compatibility but no longer suppresses the withhold.
         _verify_snap = None
+        _verify_snap_vars = None
         if self._constraints and not _is_fast_linear_quadratic_family(self):
             # #840: this model is genuinely nonlinear (an expression constraint plus a
             # nonlinear objective or constraint), so it routes to spatial B&B, which
@@ -8085,6 +8781,12 @@ class Model:
                 _verify_snap = (
                     build_evaluator(self, _jax_evaluator),
                     [v.name for v in self._variables],
+                )
+                # #1561: the same columns, frozen, for the certificate backstop.
+                _verify_snap_vars = (
+                    _declared_vars_entry
+                    if _model_unchanged_since_entry()
+                    else _declared_variables(self)
                 )
             except Exception as _snap_exc:
                 # Same §7 point as the verification handler below: without the
@@ -8494,7 +9196,7 @@ class Model:
         #
         # Measured on ``clay0303hfsg`` (kernel-eligible, declines at any budget below
         # ~16 s): at a 12 s limit the attempt holds a point with objective 47287.5613
-        # against a reference optimum of 26669.10955143 -- valid, not a false primal
+        # against a reference optimum of 26669.10957 -- valid, not a false primal
         # -- while proving a bound of 23239.60-25496.44. Today that solve returns an
         # incumbent of NONE with the kernel on; with the kernel off it returns an
         # incumbent but a bound of -0.0, a 100% gap. Adopting both halves reports a
@@ -8514,7 +9216,7 @@ class Model:
             from discopt.solvers._gap import (
                 bound_inversion_tolerance as _ci_inv_tol_fn,
             )
-            from discopt.solvers._gap import optimality_gap as _ci_gap_fn
+            from discopt.solvers._gap import reported_gap as _ci_gap_fn
 
             _ci_obj, _ci_x = _ck_declined_incumbent
             # Minimization space for either sense, as in the bound merge below:
@@ -8578,7 +9280,11 @@ class Model:
                 # numbers that are no longer both there. Recompute it when a valid
                 # bound exists and drop it otherwise, rather than leave a stale one.
                 if result.bound is not None and result.bound_valid:
-                    result.gap = _ci_gap_fn(_s * float(result.bound), _ci_cand)
+                    result.gap = _ci_gap_fn(
+                        float(_ci_obj),
+                        float(result.bound),
+                        abs_tol=_post_solve_abs_gap_tol(result, abs_gap_tolerance),
+                    )
                 else:
                     result.gap = None
                 _ci_log.debug(
@@ -8628,7 +9334,7 @@ class Model:
             from discopt.solvers._gap import (
                 bound_inversion_tolerance as _bound_inversion_tolerance,
             )
-            from discopt.solvers._gap import optimality_gap as _optimality_gap
+            from discopt.solvers._gap import reported_gap as _reported_gap
 
             _s = objective_sense_sign(self)
             _cand = _s * float(_ck_declined_bound)
@@ -8663,9 +9369,13 @@ class Model:
                 # routes report under that provenance.
                 result._set_bound(float(_ck_declined_bound), valid=True, source="bnb_tree")
                 if _obj is not None:
-                    # ``optimality_gap`` takes (lb, ub) in MINIMIZATION sense, which
-                    # is exactly the space the comparisons above work in.
-                    result.gap = _optimality_gap(_cand, _s * float(_obj))
+                    # #1585: the one SolveResult.gap formula (symmetric in the
+                    # pair, so the reported-sense values go in directly).
+                    result.gap = _reported_gap(
+                        float(_obj),
+                        float(_ck_declined_bound),
+                        abs_tol=_post_solve_abs_gap_tol(result, abs_gap_tolerance),
+                    )
 
         # Attach model reference and auto-generate LLM explanation
         result._model = self
@@ -8711,27 +9421,7 @@ class Model:
                         "— the result is NOT a valid solution.",
                         result.objective,
                     )
-                    result.incumbent_verification_failed = True
-                    result.gap_certified = False
-                    result.x = None
-                    result.objective = None
-                    result.gap = None
-                    # The status must stop asserting what the guard just withdrew.
-                    # Clearing ``x``/``objective`` while leaving ``status="optimal"``
-                    # reports a PROVEN OPTIMUM WITH NO SOLUTION -- a caller that keys
-                    # on the status (every gate and panel in this repo does) reads a
-                    # certificate that the guard has already refused to stand behind.
-                    # Observed under ``DISCOPT_PRESOLVE_BOUND_PROPAGATION=1`` on
-                    # nvs05: ``status='optimal'``, ``objective=None``, 3/3 reps.
-                    # This is not a limit termination -- an unsound mutation was
-                    # detected -- so it reports as an error and refuses loudly
-                    # (CLAUDE.md §1/§3). ``bound`` is untouched: only the PRIMAL was
-                    # shown to be invalid, and the dual bound remains rigorous.
-                    result.status = "error"
-                    result.error = (
-                        "the incumbent the solver returned is infeasible in the original "
-                        "model (false-primal guard, #772); it was withheld"
-                    )
+                    _withhold_false_primal(result)
             except Exception as _ver_exc:
                 # A swallowed exception here does not "skip verification" -- it
                 # DELETES the soundness guard while leaving every caller believing
@@ -8751,6 +9441,32 @@ class Model:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+        # --- #1551: a certificate finer than the objective's float resolution ---
+        # ``solve_model``'s wrapper runs the same check on every result it returns;
+        # repeated here for what this method does after that call (the #844
+        # fallback merge), and BEFORE the derived reports below so ``sensitivity``,
+        # ``validation_report`` and the no-bound diagnostic describe the result the
+        # caller is handed, not the pre-withdrawal one. Idempotent: a withdrawn
+        # certificate is not re-tested. The convex-kernel fast path returns early
+        # and calls the same guard at its own return.
+        if isinstance(result, SolveResult):
+            # #1561: after the #772 screen (which may already have withheld the
+            # point) and on the same pre-solve snapshot of the declared rows. It
+            # judges the point the ROUTE certified: a route whose gate accepted a
+            # point verify_point rejects loses its certificate whatever the repair
+            # below makes of the point.
+            if _verify_snap is not None and _verify_snap_vars is not None:
+                _withhold_unverified_certificate(result, _verify_snap[0], _verify_snap_vars)
+            else:
+                _withhold_unverified_certificate(result)
+            # #1537 E: publish the incumbent repaired to float noise and re-judge its
+            # certificate on the repaired objective (downgrade-only; bound untouched).
+            if _verify_snap is not None and _verify_snap_vars is not None:
+                _repair_published_incumbent(result, _verify_snap[0], _verify_snap_vars)
+            else:
+                _repair_published_incumbent(result)
+            _guard_unresolved_objective(result)
 
         if llm:
             try:
@@ -8814,6 +9530,17 @@ class Model:
         # limit silently. WARNING (not ``warnings.warn``) so it reaches a user who
         # has configured no logging at all, without turning into a test-visible
         # Python warning on a result that is otherwise correct.
+        # #1533: solver="pounce" never builds a relaxation, so "the relaxation layer
+        # could not bound this objective" would misdescribe it; its missing bound is
+        # the route's contract. Scoped to that route only: every other route keeps
+        # both diagnostics below exactly as before.
+        # #1551: a bound withdrawn because the objective is unresolvable at the
+        # incumbent was produced and then refused, with its own WARNING; "could not
+        # bound this objective" would misdescribe that too.
+        _no_bound_by_design = isinstance(result, SolveResult) and (
+            (result.algorithm_route or "").startswith("pounce:")
+            or bool((result.solver_stats or {}).get("certificate/objective_unresolved"))
+        )
         if isinstance(result, SolveResult) and result.bound is None and result.status == "error":
             # #1507: the envelope/epigraph advice below describes a relaxation that
             # could not bound the objective. On a failed solve that diagnosis is a
@@ -8829,6 +9556,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
             and (_poles := _objective_poles_or_none(self))
         ):
             # #1493: a POLE, not a missing envelope. ``min 1/x`` on ``[-5, 5]``
@@ -8857,6 +9585,7 @@ class Model:
             isinstance(result, SolveResult)
             and result.bound is None
             and result.status not in ("infeasible", "unbounded")
+            and not _no_bound_by_design
         ):
             _logging.getLogger("discopt.solver").warning(
                 "No valid dual bound was produced for model %r: the relaxation "

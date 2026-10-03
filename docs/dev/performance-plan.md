@@ -7269,6 +7269,14 @@ with its rows **permuted**. Row order is how a solver's `.sol` duals map back to
 constraints, so the Rust path refuses and the Python writer handles them.
 `dm.custom` likewise falls through to the Python writer's existing loud refusal.
 
+> **Superseded (#1562, 2026-10-02).** `.nl` row order is no longer the model's
+> order. The format requires the nonlinear rows first (header `nlc` names rows
+> `C0 .. C{nlc-1}`), so both writers now write `[nonlinear | linear]`, stable
+> within each group. Duals map back through `discopt.export.nl_row_order(model)`,
+> not by position. That map comes from the writer that actually ran.
+
+
+
 ### Standing against the original goal
 
 Construction was never the problem — discopt's vectorised construction is
@@ -7712,6 +7720,13 @@ rows after, so builder rows **lead the arena**. Every Python writer — `nl.py`,
 rows after. Emitting the arena's order would have written the same model with its
 rows permuted, and row order is how a solver's `.sol` duals map back to
 constraints.
+
+> **Superseded (#1562, 2026-10-02).** The builder reorder below still holds and
+> still runs first. Both writers then partition the rows `[nonlinear | linear]`,
+> because `.nl` requires it, so `.nl` row `i` is model row
+> `discopt.export.nl_row_order(model)[i]` and is generally not model row `i`.
+> That map is the dual map now; position is not. The `.lp`, `.mps` and `.gms`
+> writers are unchanged.
 
 Two ways to reconcile that, and the choice matters:
 

@@ -38,6 +38,25 @@ import numpy as np
 
 from discopt.symbolic import SymbolicTranslationError
 
+
+class RecognizerDeadline(Exception):
+    """The caller's deadline expired while the recognizer was still analysing (#1565).
+
+    Raised only between whole steps (one constraint translated, one equality
+    canonicalized, one objective term examined) and only from the *derivation*
+    half: :func:`recognize_and_inject` injects nothing until derivation has
+    returned, so this always leaves the model exactly as it was. Deliberately
+    not a :class:`SymbolicTranslationError`: a decline says "this model is outside
+    the recognizer", whereas this says "the clock ran out", and the solver logs
+    the two differently.
+    """
+
+
+def _check_deadline(deadline, where: str) -> None:
+    if deadline is not None and deadline():
+        raise RecognizerDeadline(f"structure-cut recognizer: time limit spent during {where}")
+
+
 if TYPE_CHECKING:
     import sympy as sp
 
@@ -131,54 +150,136 @@ def _var_key(node) -> Optional[str]:
     return None
 
 
-def _to_sympy(node, syms: dict):
+def _prod_to_sympy(node, syms: dict, memo: dict, opaque: dict) -> tuple:
+    """SymPy image of a ``prod`` node.
+
+    ``FunctionCall("prod", a)`` with ONE argument is a full reduction: the product
+    of every element of ``a`` (``jnp.prod`` over the flattened operand, and
+    ``expr.rs::reduction_values`` in Rust). Translating ``a`` to a single symbol and
+    calling ``sympy.prod`` on it fed a scalar where an iterable belongs and raised
+    ``TypeError: reduce() arg 2 must support iteration``. The elements are spelled
+    out instead, exactly as the hand-written ``x[0] * x[1] * ...`` would be. With
+    several arguments the call is a plain product of scalars.
+
+    Returns ``(image, children)``: *children* are the nodes actually translated
+    (the spelled-out elements, for a full reduction), so the caller's #1565
+    opaque check sees an opaque element and keeps the ``prod`` node unmemoised.
+    """
     from discopt.modeling import core
+
+    if len(node.args) != 1:
+        out = sp.Integer(1)
+        for a in node.args:
+            out = out * _to_sympy(a, syms, memo, opaque)
+        return out, tuple(node.args)
+    arg = node.args[0]
+    shape = core._known_shape(arg)
+    if shape is None:
+        raise SymbolicTranslationError("cut recognizer: prod over an expression of unknown shape")
+    if shape == ():
+        return _to_sympy(arg, syms, memo, opaque), (arg,)
+    if int(np.prod(shape)) == 0:
+        # The empty product is 1, matching the evaluator.
+        return sp.Integer(1), ()
+    elems = tuple(arg._flat_elements("prod"))
+    out = sp.Integer(1)
+    for elem in elems:
+        out = out * _to_sympy(elem, syms, memo, opaque)
+    return out, elems
+
+
+def _to_sympy(node, syms: dict, memo: dict | None = None, opaque: dict | None = None):
+    """Translate one model-graph expression to SymPy.
+
+    #1565: memoised by node identity, so a DAG with shared subexpressions (an
+    OMLT reduced-space network: 4,359 DAG nodes, 287,756 as a tree) is
+    translated once per distinct node instead of once per *path*. *memo* maps
+    ``id(node)`` to ``(node, image)`` -- the node is held so its address cannot be
+    recycled while the memo lives. An ``opaque`` leaf becomes a FRESH ``Dummy``
+    at every visit, so it and every ancestor of it are recorded in *opaque* and
+    never memoised: reusing one would make two occurrences the same symbol,
+    which the unmemoised walk never did. The translation is otherwise a pure
+    function of the node, so the memoised image is the one the tree walk built.
+
+    The memo check and store live in this one function so the recursion stays
+    one Python frame per expression level, as before.
+    """
+    from discopt.modeling import core
+
+    if memo is None:
+        memo = {}
+    if opaque is None:
+        opaque = {}
+    nid = id(node)
+    hit = memo.get(nid)
+    if hit is not None:
+        return hit[1]
+    children: tuple = ()
 
     if isinstance(node, core.Constant):
         if np.ndim(node.value) != 0 and np.size(node.value) != 1:
             # #1514: an array-valued constant has no scalar SymPy image; ``float()``
             # raised a bare TypeError for it.
             raise SymbolicTranslationError("cut recognizer: array-valued constant")
-        return sp.Float(float(np.asarray(node.value).reshape(-1)[0]))
-    if isinstance(node, (core.Variable, core.IndexExpression)):
+        res = sp.Float(float(np.asarray(node.value).reshape(-1)[0]))
+    elif isinstance(node, (core.Variable, core.IndexExpression)):
         key = _var_key(node)
         if key is None:
             # Compound/opaque indexed node (e.g. (x+y)[0]); represent as a fresh
             # dummy so translation continues — the recognizer treats it as an
             # unknown leaf and simply does not match patterns involving it.
+            opaque[nid] = node
             return sp.Dummy("opaque")
         if key not in syms:
             syms[key] = sp.Symbol(key.replace("[", "_").replace("]", ""), real=True)
-        return syms[key]
-    if isinstance(node, core.BinaryOp):
-        lo, hi = _to_sympy(node.left, syms), _to_sympy(node.right, syms)
+        res = syms[key]
+    elif isinstance(node, core.BinaryOp):
+        lo = _to_sympy(node.left, syms, memo, opaque)
+        hi = _to_sympy(node.right, syms, memo, opaque)
         if node.op == "**":
             # Rationalize integer-valued float exponents (2.0 -> 2) so SymPy treats
             # x**2 as polynomial; keep genuine fractional exponents (e.g. 0.2857).
             if hi.is_number and float(hi) == int(float(hi)):
                 hi = sp.Integer(int(float(hi)))
-            return lo**hi
-        if node.op not in ("+", "-", "*", "/"):
+            res = lo**hi
+        elif node.op not in ("+", "-", "*", "/"):
             raise SymbolicTranslationError(f"cut recognizer: binary op {node.op!r}")
-        return {"+": lo + hi, "-": lo - hi, "*": lo * hi, "/": lo / hi}[node.op]
-    if isinstance(node, core.UnaryOp):
-        x = _to_sympy(node.operand, syms)
+        else:
+            res = {"+": lo + hi, "-": lo - hi, "*": lo * hi, "/": lo / hi}[node.op]
+        children = (node.left, node.right)
+    elif isinstance(node, core.UnaryOp):
+        x = _to_sympy(node.operand, syms, memo, opaque)
         if node.op == "neg":
-            return -x
-        if node.op == "abs":
-            return sp.Abs(x)
-        raise SymbolicTranslationError(f"cut recognizer: unary op {node.op!r}")
-    if isinstance(node, core.FunctionCall):
-        args = [_to_sympy(a, syms) for a in node.args]
+            res = -x
+        elif node.op == "abs":
+            res = sp.Abs(x)
+        else:
+            raise SymbolicTranslationError(f"cut recognizer: unary op {node.op!r}")
+        children = (node.operand,)
+    elif isinstance(node, core.FunctionCall) and node.func_name == "prod":
+        res, children = _prod_to_sympy(node, syms, memo, opaque)
+    elif isinstance(node, core.FunctionCall):
+        args = [_to_sympy(a, syms, memo, opaque) for a in node.args]
         fn = getattr(sp, node.func_name, None)
         if fn is None:
             raise SymbolicTranslationError(f"cut recognizer: function {node.func_name!r}")
-        return fn(*args)
-    # #1514: the documented "this model is outside the recognizer" signal. It used to
-    # be a bare TypeError (and a KeyError/AttributeError for an op or function the
-    # tables above do not name), which the solver could only absorb with a catch-all
-    # that also hid real defects; a dedicated type lets the solver catch exactly this.
-    raise SymbolicTranslationError(f"cut recognizer: node type {type(node).__name__}")
+        res = fn(*args)
+        children = tuple(node.args)
+    else:
+        # #1514: the documented "this model is outside the recognizer" signal. It
+        # used to be a bare TypeError (and a KeyError/AttributeError for an op or
+        # function the tables above do not name), which the solver could only
+        # absorb with a catch-all that also hid real defects; a dedicated type
+        # lets the solver catch exactly this.
+        raise SymbolicTranslationError(f"cut recognizer: node type {type(node).__name__}")
+
+    if isinstance(node, (core.BinaryOp, core.UnaryOp, core.FunctionCall)) and any(
+        id(c) in opaque for c in children
+    ):
+        opaque[nid] = node  # carries a fresh Dummy: rebuild at every visit
+    else:
+        memo[nid] = (node, res)
+    return res
 
 
 @dataclass
@@ -191,26 +292,36 @@ class SympyModel:
     inequalities: list = field(default_factory=list)  # list of (name, expr) with expr <= 0
 
 
-def model_to_sympy(model) -> SympyModel:
-    """Translate a model's objective, ``==`` and ``<=``/``>=`` constraints to SymPy."""
+def model_to_sympy(model, deadline=None) -> SympyModel:
+    """Translate a model's objective, ``==`` and ``<=``/``>=`` constraints to SymPy.
+
+    ``deadline`` is an optional zero-argument callable checked once per
+    constraint; when it returns True, :class:`RecognizerDeadline` is raised.
+    """
     _ensure_sympy()
     from discopt.modeling import core
 
     syms: dict = {}
-    obj = _to_sympy(model._objective.expression, syms)
+    # #1565: one memo for the whole model -- constraint bodies share nodes with
+    # each other and with the objective, exactly as within one body.
+    memo: dict = {}
+    opaque: dict = {}
+    obj = _to_sympy(model._objective.expression, syms, memo, opaque)
     eqs = []
     ineqs = []
     for c in model._constraints:
+        _check_deadline(deadline, "model translation")
         if not isinstance(c, core.Constraint):
             # #1514: a non-algebraic row the recognizer cannot reason about; its
             # documented decline (formerly an AttributeError on ``c.sense``).
             raise SymbolicTranslationError(f"cut recognizer: non-algebraic row {type(c).__name__}")
         if c.sense == "==":
-            eqs.append((c.name, sp.Eq(_to_sympy(c.body, syms), sp.Float(c.rhs))))
+            body = _to_sympy(c.body, syms, memo, opaque)
+            eqs.append((c.name, sp.Eq(body, sp.Float(c.rhs))))
         elif c.sense == "<=":
-            ineqs.append((c.name, _to_sympy(c.body, syms) - sp.Float(c.rhs)))
+            ineqs.append((c.name, _to_sympy(c.body, syms, memo, opaque) - sp.Float(c.rhs)))
         elif c.sense == ">=":
-            ineqs.append((c.name, sp.Float(c.rhs) - _to_sympy(c.body, syms)))
+            ineqs.append((c.name, sp.Float(c.rhs) - _to_sympy(c.body, syms, memo, opaque)))
 
     # Variable bounds + binary set, keyed by the per-element symbol.
     import numpy as np
@@ -288,7 +399,7 @@ def _linear_terms(expr: sp.Expr):
     return coeffs, const
 
 
-def _canonicalize(eqs, symbols):
+def _canonicalize(eqs, symbols, deadline=None):
     parent = {s: s for s in symbols.values()}
 
     def find(x):
@@ -302,6 +413,7 @@ def _canonicalize(eqs, symbols):
 
     fixed: dict = {}
     for _, eq in eqs:
+        _check_deadline(deadline, "equality canonicalization")
         lt = _linear_terms(eq.lhs - eq.rhs)
         if lt is None:
             continue
@@ -450,9 +562,16 @@ def _expr_is_nonlinear(node) -> bool:
     """
     from discopt.modeling import core
 
+    # #1565: each distinct node once. The walk is a pure "any nonlinear node?"
+    # search, so revisiting a shared node can only repeat an answer already
+    # folded in; without this a shared DAG is walked as its expanded tree.
     stack = [node]
+    seen: dict[int, object] = {}  # id -> node, held so an id cannot be recycled
     while stack:
         n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen[id(n)] = n
         if isinstance(n, core.BinaryOp):
             if n.op == "**":
                 r = n.right
@@ -489,11 +608,14 @@ def has_square_difference_candidate(model) -> bool:
     )
 
 
-def recognize_and_derive_cuts(model, *, verify: bool = True) -> list[RecognizedCut]:
+def recognize_and_derive_cuts(model, *, verify: bool = True, deadline=None) -> list[RecognizedCut]:
     """Auto-derive structured underestimator cuts from a model's graph.
 
     Returns a list of :class:`RecognizedCut` (possibly empty if the model does not
-    match the square-difference-network pattern).
+    match the square-difference-network pattern). ``deadline`` is an optional
+    zero-argument callable, checked between whole steps; once it returns True
+    the derivation stops by raising :class:`RecognizerDeadline` (nothing is
+    returned, so :func:`recognize_and_inject` injects nothing).
     """
     # Cheap pre-check before the expensive SymPy translation: the pattern needs a
     # nonlinear equality constraint. Without one (e.g. a dense-objective MIQP) the
@@ -504,12 +626,22 @@ def recognize_and_derive_cuts(model, *, verify: bool = True) -> list[RecognizedC
     if not has_square_difference_candidate(model):
         return []
     _ensure_sympy()
-    sm = model_to_sympy(model)
-    classes, fixed = _canonicalize(sm.equalities, sm.symbols)
+    # #1565: every cut is derived from an objective product term (the loop
+    # below), so with none there is nothing to derive. Test that on the
+    # objective alone before translating -- and polynomial-canonicalizing -- every
+    # constraint: on an OMLT reduced-space network that whole-model pass ran
+    # ~190 s against a 30 s time limit only to find the objective ``x2`` has no
+    # such term. The outcome is the empty list the full pass would have reached
+    # (or the declined-model exception, which yields the same zero cuts).
+    if not find_product_terms(_to_sympy(model._objective.expression, {})):
+        return []
+    sm = model_to_sympy(model, deadline)
+    classes, fixed = _canonicalize(sm.equalities, sm.symbols, deadline)
     reverse = {sym: key for key, sym in sm.symbols.items()}
     cuts: list[RecognizedCut] = []
 
     for term in find_product_terms(sm.objective):
+        _check_deadline(deadline, "objective-term derivation")
         x, y = term.x, term.y
         # y's defining ratio equality: p_out - y*p_in == 0
         ratio = None

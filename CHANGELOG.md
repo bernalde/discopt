@@ -12,6 +12,22 @@ The release procedure that produces these entries is documented in
 
 ### Added
 
+- **`SolveResult.solve_report`: POUNCE's structured solve report** (#1534). On
+  the routes that make a single POUNCE call (the continuous single-NLP route, the
+  continuous QP route, and the LP route when POUNCE answered it) the result now
+  carries the `pounce.solve-report/v1` document, the same data as
+  `pounce --json-output <file> --json-detail full`: iteration count, the
+  per-iteration trajectory (objective, `inf_pr`, `inf_du`, `mu`, step sizes,
+  regularization, line-search flag), restoration counts, and timing. It is `None`
+  on branch-and-bound routes, as `kkt` is. Tested against the table POUNCE prints
+  on the same solve: the main-phase rows match column for column except `inf_pr`,
+  which in the report is POUNCE's internal slack-form residual. The inner
+  restoration rows (`24r`, ...) are not in the report; only the `"R"` entry row and
+  the counts are. Both gaps are on the POUNCE side (jkitchin/pounce#979). Costs about 1 ms per solve to
+  write and parse; branch-and-bound node solves do not request it. Also exposed
+  as `solve_report=True` on `solvers.nlp_pounce.solve_nlp`, `lp_pounce.solve_lp`
+  and `qp_pounce.solve_qp`.
+
 - **`Model.piecewise` / `dm.piecewise`: declared piecewise-linear functions**
   (#1482). `y = m.piecewise(x, breakpoints, values, method=..., name=...)`
   declares a tabulated univariate function (a pump curve, a tariff schedule, a
@@ -98,6 +114,12 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **`to_nl` writes the nonlinear rows first, as the `.nl` format requires** (`fix`, #1562).
+  - **The bug.** The header's `nlc` names rows `C0 .. C{nlc-1}` as nonlinear, but both writers emitted rows in declaration order. A linear row declared before a nonlinear one therefore produced a file whose header named the wrong rows, and pyscipopt's reader segfaulted on it. Both writers now write `[nonlinear | linear]`, stable within each group, as Pyomo does.
+  - **Header.** Line 2 now carries the true `neqns` count; it was always written as `0`.
+  - **New `discopt.export.nl_row_order(model)`.** **Behaviour change:** `.nl` row `i` is no longer model row `i`. Use this function to map a reader's per-row output (`.sol` duals, constraint activities) back to the model. The map comes from the writer `to_nl` actually used.
+  - **Parameters.** The Python writer now folds a scalar Parameter (or an element of one) as a constant, as the Rust writer always did. A row such as `p*x + y >= 1` is therefore linear in both writers, and the two stay byte-identical.
+- **Source residual reports now evaluate active indicator constraints** (`fix`, #1529). A Boolean-active implication reports its wrapped-row violation, an inactive implication reports zero, and fractional selectors remain a separate integrality failure; GDP/MPEC reports no longer become unmeasurable merely because their source model contains explicit one-way indicator rows. Non-binary indicator selectors are refused because the separate binary-integrality check does not cover them.
 - **Exact MPEC warm starts now lift generated operand auxiliaries** (`fix`, #1528). `solve_mpec(..., method="sos1"|"gdp", initial_solution=...)` evaluates every generated continuous operand auxiliary at the source point before handing the model to the exact solve, instead of midpoint-filling those columns and silently discarding a source-feasible incumbent. Failed lifts retain caller values and successful auxiliary lifts, and clamping/rounding warnings are emitted only once.
 
 - **`solver="amp"` now refuses an opaque body instead of failing internally.** AMP
@@ -141,6 +163,18 @@ The release procedure that produces these entries is documented in
 
 ### Changed
 
+- **In-tree FBBT now tightens through array-valued rows by default** (#1568).
+  `DISCOPT_IN_TREE_ARRAY_ROWS` is graduated to default-ON. Each array-valued
+  constraint row (every `discopt.ml` layer and any vectorised `A @ x` or
+  elementwise row) is now one scalar FBBT row per element at each node, so
+  branching on network inputs narrows the activations. Before this change those
+  rows were read through a hull proxy that was never tightened. Graduation panel:
+  58 array instances plus the 66 in-repo `.nl` files, 30 s each, 0 violations over
+  282 checks. Certificates went +5 / −0 (`discopt.ml` full_space 10x1 s0/s1,
+  reduced_space 10x1 s1, reduced_space 25x1 s0/s1), the final bound was tighter on 28 of the
+  29 instances neither arm certified, and total wall fell from 1350 s to 1244 s.
+  In-tree FBBT cost went from 1.8% to 3.2% of wall. Scalar-layout models are
+  unchanged. `DISCOPT_IN_TREE_ARRAY_ROWS=0` restores the previous behaviour.
 - **`import discopt` no longer pulls the `_multiprocessing` C extension.**
   `discopt.modeling` re-exports `solve_batch`, so `discopt.batch` is imported by
   every `import discopt`, and it imported `multiprocessing` at module level —

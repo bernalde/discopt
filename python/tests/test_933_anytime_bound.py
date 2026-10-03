@@ -180,7 +180,8 @@ def test_maximize_sense_mapping():
     )
     assert bound == 7.0
     assert bound >= 6.0
-    assert gap == pytest.approx(1.0 / 6.0)
+    # #1585: |o-b| / max(|o|, |b|, 1e-10) = 1/7 (was the floored 1/max(1, 6)).
+    assert gap == pytest.approx(1.0 / 7.0)
 
 
 def test_bound_never_crosses_the_incumbent():
@@ -289,8 +290,9 @@ def test_milp_budget_limited_exit_reports_live_tree_bound(monkeypatch):
         # MAXIMIZE: the dual bound is an upper bound, at/above the incumbent.
         assert r.bound >= r.objective - 1e-9
         assert r.gap is not None
+        # #1585: the one documented formula, on budgeted exits too.
         assert r.gap == pytest.approx(
-            abs(r.objective - r.bound) / max(1.0, abs(r.objective)), abs=1e-12
+            abs(r.objective - r.bound) / max(abs(r.objective), abs(r.bound), 1e-10), abs=1e-12
         )
 
     # The deeper search's reported bound must reflect its lifted frontier, not

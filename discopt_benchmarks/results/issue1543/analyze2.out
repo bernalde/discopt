@@ -1,0 +1,54 @@
+alan.nl                10 opt=2.925       | PR optimal         2.925 n=     9 C ok             | main optimal         2.925 n=    13 C ok
+alan.nl               100 opt=2.925       | PR optimal         2.925 n=     9 C ok             | main optimal         2.925 n=     9 C ok
+alan.nl              1000 opt=2.925       | PR optimal         2.925 n=     9 C ok             | main RAISE Run        None n=  None   raise
+alan.nl            100000 opt=2.925       | PR optimal         2.925 n=     9 C ok             | main RAISE Run        None n=  None   raise
+alan.nl             1e+06 opt=2.925       | PR optimal         2.925 n=     9 C ok             | main RAISE Run        None n=  None   raise
+meanvarx.nl            10 opt=14.3692     | PR optimal     14.369232 n=     9 C ok             | main optimal     14.369232 n=     9 C ok
+meanvarx.nl           100 opt=14.3692     | PR optimal     14.369232 n=     9 C ok             | main optimal     14.369232 n=     9 C ok
+meanvarx.nl          1000 opt=14.3692     | PR optimal     14.369232 n=     9 C ok             | main optimal      14.54898 n=     3 C false-optimum 14.548980103944379,bound>opt 14.548980176448822
+meanvarx.nl        100000 opt=14.3692     | PR optimal     14.369232 n=     9 C ok             | main feasible    19.167331 n=    31   incumbent-infeasible(variable 'x7' out of bounds)
+meanvarx.nl         1e+06 opt=14.3692     | PR optimal     14.369232 n=     9 C ok             | main feasible    14.404062 n=    81   bound>opt 14.375
+st_miqp1.nl            10 opt=281         | PR optimal         281.0 n=     9 C ok             | main optimal         281.0 n=     9 C ok
+st_miqp1.nl           100 opt=281         | PR optimal         281.0 n=     9 C ok             | main optimal         281.0 n=     9 C ok
+st_miqp1.nl          1000 opt=281         | PR optimal         281.0 n=     9 C ok             | main optimal         281.0 n=    19 C ok
+st_miqp1.nl        100000 opt=281         | PR optimal         281.0 n=     9 C ok             | main optimal         281.0 n=    19 C ok
+st_miqp1.nl         1e+06 opt=281         | PR optimal         281.0 n=     9 C ok             | main optimal         281.0 n=     7 C ok
+st_miqp2.nl            10 opt=2           | PR optimal           2.0 n=     7 C ok             | main optimal           2.0 n=     7 C ok
+st_miqp2.nl           100 opt=2           | PR optimal           2.0 n=     7 C ok             | main optimal           2.0 n=     7 C ok
+st_miqp2.nl          1000 opt=2           | PR optimal           2.0 n=     7 C ok             | main optimal           2.0 n=     7 C ok
+st_miqp2.nl        100000 opt=2           | PR optimal           2.0 n=     7 C ok             | main feasible         64.0 n= 66809   bound>opt 52.682735443115234
+st_miqp2.nl         1e+06 opt=2           | PR optimal           2.0 n=     7 C ok             | main feasible          5.0 n=    15   ok
+st_miqp3.nl            10 opt=-6          | PR optimal          -6.0 n=     1 C ok             | main optimal          -6.0 n=     1 C ok
+st_miqp3.nl           100 opt=-6          | PR optimal          -6.0 n=     1 C ok             | main optimal          -6.0 n=     1 C ok
+st_miqp3.nl          1000 opt=-6          | PR optimal          -6.0 n=     1 C ok             | main optimal          -6.0 n=     1 C ok
+st_miqp3.nl        100000 opt=-6          | PR optimal          -6.0 n=     1 C ok             | main optimal          12.0 n=     1 C false-optimum 12.0,bound>opt 12.0
+st_miqp3.nl         1e+06 opt=-6          | PR optimal          -6.0 n=     1 C ok             | main optimal           0.0 n=    13 C false-optimum 0.0,bound>opt 0.0
+st_miqp4.nl            10 opt=-4574       | PR optimal       -4574.0 n=     3 C ok             | main optimal       -4574.0 n=     3 C ok
+st_miqp4.nl           100 opt=-4574       | PR optimal       -4574.0 n=     3 C ok             | main optimal       -4574.0 n=     3 C ok
+st_miqp4.nl          1000 opt=-4574       | PR optimal       -4574.0 n=     3 C ok             | main optimal       -4574.0 n=     3 C ok
+st_miqp4.nl        100000 opt=-4574       | PR optimal       -4574.0 n=     3 C ok             | main time_limi        None n= 71995   bound>opt -3638.8085327148438
+st_miqp4.nl         1e+06 opt=-4574       | PR optimal       -4574.0 n=     3 C ok             | main RAISE Run        None n=  None   raise
+st_miqp5.nl            10 opt=-333.889    | PR optimal   -333.888889 n=     1 C ok             | main optimal   -333.888889 n=     1 C ok
+st_miqp5.nl           100 opt=-333.889    | PR optimal   -333.888889 n=     1 C ok             | main optimal   -333.888889 n=     1 C ok
+st_miqp5.nl          1000 opt=-333.889    | PR optimal   -333.888889 n=     1 C ok             | main optimal   -333.888889 n=     1 C ok
+st_miqp5.nl        100000 opt=-333.889    | PR optimal   -333.888889 n=     1 C ok             | main feasible  -131.946014 n=  2031   bound>opt -206.00439453125,incumbent-infeasible(row 3 violated by 6.742e-06 (allowed 1.000e-06))
+st_miqp5.nl         1e+06 opt=-333.889    | PR optimal   -333.888889 n=     1 C ok             | main RAISE Run        None n=  None   raise
+st_test1.nl            10 opt=0           | PR optimal           0.0 n=    15 C ok             | main optimal           0.0 n=    15 C ok
+st_test1.nl           100 opt=0           | PR optimal           0.0 n=    15 C ok             | main optimal           0.0 n=    15 C ok
+st_test1.nl          1000 opt=0           | PR optimal           0.0 n=    15 C ok             | main feasible          0.0 n=    15   ok
+st_test1.nl        100000 opt=0           | PR optimal           0.0 n=    15 C ok             | main time_limi        None n= 35775   bound>opt 61.68212890625
+st_test1.nl         1e+06 opt=0           | PR optimal           0.0 n=    15 C ok             | main optimal           0.0 n=     3 C ok
+st_testgr3.nl          10 opt=-20.59      | PR optimal        -20.59 n=   471 C ok             | main optimal        -20.59 n=   471 C ok
+st_testgr3.nl         100 opt=-20.59      | PR optimal        -20.59 n=   471 C ok             | main optimal        -20.59 n=   471 C ok
+st_testgr3.nl        1000 opt=-20.59      | PR optimal        -20.59 n=   471 C ok             | main optimal        -20.59 n=   471 C ok
+st_testgr3.nl      100000 opt=-20.59      | PR optimal        -20.59 n=   471 C ok             | main optimal     -20.16875 n=     1 C false-optimum -20.16875,bound>opt -20.168750047683716
+st_testgr3.nl       1e+06 opt=-20.59      | PR optimal        -20.59 n=   471 C ok             | main optimal     -19.99665 n=   641 C false-optimum -19.99665,bound>opt -19.996658325195312
+QPLIB_3871.qplib       10 opt=197.334     | PR feasible   1139.52853 n=   959   ok             | main feasible   1139.52853 n=   831   ok
+QPLIB_3871.qplib      100 opt=197.334     | PR feasible   1139.52853 n=   927   ok             | main feasible  1139.529398 n=   927   ok
+QPLIB_3871.qplib     1000 opt=197.334     | PR feasible   1139.52853 n=   895   ok             | main feasible  1147.546346 n=   831   incumbent-infeasible(row 1001 violated by 7.688e-06 (allowed 1.000e-06))
+QPLIB_3871.qplib   100000 opt=197.334     | PR feasible   1139.52853 n=   895   ok             | main infeasibl        None n=     3   ok
+QPLIB_3871.qplib    1e+06 opt=197.334     | PR feasible   1139.52853 n=   991   ok             | main feasible   1139.52853 n=    51   ok
+
+rows=50 (PR rows asserted bb>=1 & shift>0: 50)  executed comparisons=439
+incorrect_count: PR=0 main=12   RAISE: PR=0 main=5
+certified: PR=45 main=32   certificates lost (main sound+cert, PR not)=0   gained=13   rows identical=6

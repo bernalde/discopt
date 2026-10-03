@@ -91,6 +91,7 @@ def _solve_with_trajectory(name: str):
     # rounds. The two inert instances stop at iteration 1 and never approach it.
     handler = _Trajectory()
     logger = logging.getLogger("discopt")
+    prev_level = logger.level
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
     try:
@@ -99,6 +100,9 @@ def _solve_with_trajectory(name: str):
         )
     finally:
         logger.removeHandler(handler)
+        # Restore: a leaked INFO level on ``discopt`` filters DEBUG records for
+        # every later test in the same worker (it broke a #1568 caplog test).
+        logger.setLevel(prev_level)
     return result, handler
 
 

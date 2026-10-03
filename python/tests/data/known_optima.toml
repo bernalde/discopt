@@ -197,9 +197,31 @@ status = "certifies"
 # The reference value below is what re-admission is checked against, which is
 # precisely the check whose absence let the false certificate ship.
 
+#
+# CORRECTED 2026-10-02. This entry used to read 26669.10955143, which is NOT the
+# optimum: it is a discopt incumbent from the July panel, feasible only at the
+# 1e-6 verification tolerance, and it sits 2.1e-5 BELOW the exact optimum.
+# MINLPLib's own `=opt=` is 26669.10957 (10 significant figures), which this
+# value contradicted in the 8th. Evidence, all on the GAMS source from
+# minlplib.org (GAMS 53, Floating Network License):
+#   * BARON, optcr=0 optca=1e-9, AbsConFeasTol=1e-9 RelConFeasTol=0: incumbent
+#     26669.109572485904, proved lower bound 26669.109572486082 (default
+#     tolerances: 26669.109572486035 / 26669.109572485857).
+#   * IPOPT on the optimal binary configuration (unscaled, constr_viol_tol
+#     1e-13, bound_relax_factor 0): 26669.109572486086.
+#   * Every point above passes GAMS Examiner at primal tolerance 1e-9 AND
+#     `discopt.validation.feasibility.verify_point`.
+#   * CONOPT on the same configuration returns 26669.109568230273 with a 5.5e-8
+#     violation of e117: it passes `verify_point` (1e-6) but fails Examiner at
+#     1e-9. A 5.5e-8 violation buys 4.3e-6 of objective, so the old value needed
+#     ~3e-7 -- within 1e-6, never at a tight tolerance. Tolerance-feasible points
+#     below the exact optimum are expected; they are not evidence of a false bound.
+# The value below is the BARON point, rounded to the precision the evidence
+# supports (the tight-feasible points agree to ~2e-8; discopt's own certified
+# incumbent 26669.10957246911 is also Examiner-clean at 1e-9).
 [clay0303hfsg]
-optimum = 26669.10955143
-source = "MINLPLib (=opt= 26669.10957; discopt_benchmarks/results/issue764_native_kernel_graduation_panel_20260719T191450Z.txt)"
+optimum = 26669.1095724859
+source = "BARON via GAMS at 1e-9 feasibility (bound 26669.109572486082) on minlplib.org/gms/clay0303hfsg.gms; agrees with MINLPLib =opt= 26669.10957. Replaces 26669.10955143, a 1e-6-tolerance discopt incumbent (see comment above)."
 functions = ["sqr"]
 status = "certifies"
 note = """Minimization. Certified by the convex LP-OA kernel (#879) at 26669.1096 in 211 nodes with `DISCOPT_CONVEX_KERNEL=1`, and by the default NLP-BB path (python/tests/test_nlp_bb_lns_layer.py). Incumbents come from tolerance-feasible OA vertices, so compare with a relative tolerance rather than exactly."""

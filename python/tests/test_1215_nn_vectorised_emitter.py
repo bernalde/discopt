@@ -10,15 +10,17 @@ diff:
    solve path reads the arena and not the `.nl`.
 
 The second is not hypothetical. Writing the layer as `W.T @ prev_z + b` -- the
-obvious formulation -- produces a byte-identical `.nl` and turns the 1x1x1
-sigmoid net below from `optimal` in 1 node into `feasible` in 121, with an
-identical incumbent: `MatMulExpression` relaxes more weakly than the equivalent
-expanded sum. The emitter uses `dm.sum(W.T * prev_z, axis=1)` for that reason,
-and `test_the_matmul_form_would_lose_the_certificate` pins the difference so the
-formulation cannot drift back.
+obvious formulation -- produced a byte-identical `.nl` and turned the 1x1x1
+sigmoid net below from `optimal` in 1 node into `feasible`, with an identical
+incumbent. That was later traced to a silent relaxation-BUILD crash on the matmul
+node (fixed by #1493), not a weaker relaxation; both spellings now certify, and
+`test_the_matmul_form_certifies_like_the_reduction` pins that they keep doing so.
+The emitter still uses `dm.sum(W.T * prev_z, axis=1)`.
 """
 
 from __future__ import annotations
+
+import logging
 
 import discopt.modeling as dm
 import numpy as np
@@ -116,40 +118,65 @@ def test_the_embedded_net_still_certifies():
     assert r.objective == pytest.approx(0.353289693579, abs=1e-9)
 
 
-@pytest.mark.slow
-def test_the_matmul_form_would_lose_the_certificate():
-    """Pins WHY the emitter avoids `@`, so the formulation cannot drift back.
+#: The certified optimum of the 1x1x1 sigmoid net at ``inp = 0.09762701``, in
+#: closed form: ``1.2 * sigmoid(0.8 * inp + 0.1) - 0.3``.
+_SIGMOID_NET_OPT = 1.2 / (1.0 + np.exp(-(0.8 * 0.09762701 + 0.1))) - 0.3
 
-    Same mathematics, same incumbent, weaker relaxation: `A @ x` does not certify
-    where `dm.sum(A * x, axis=1)` does. If this ever starts passing as `optimal`,
-    the matmul relaxation was fixed and the emitter may use `@` again.
-    """
+
+def _build_sigmoid_net(matmul: bool) -> Model:
     W1, b1 = np.array([[0.8]]), np.array([0.1])
     W2, b2 = np.array([[1.2]]), np.array([-0.3])
+    m = Model("nn")
+    inp = m.continuous("inp", shape=(1,), lb=-1.0, ub=1.0)
+    zh0 = m.continuous("zh0", shape=(1,), lb=-1e20, ub=1e20)
+    z0 = m.continuous("z0", shape=(1,), lb=-1e20, ub=1e20)
+    zh1 = m.continuous("zh1", shape=(1,), lb=-1e20, ub=1e20)
+    if matmul:
+        m.subject_to(zh0 == W1.T @ inp + b1, name="a0")
+        m.subject_to(zh1 == W2.T @ z0 + b2, name="a1")
+    else:
+        m.subject_to(zh0 == dm.sum(W1.T * inp, axis=1) + b1, name="a0")
+        m.subject_to(zh1 == dm.sum(W2.T * z0, axis=1) + b2, name="a1")
+    m.subject_to(z0 == dm.sigmoid(zh0), name="act")
+    m.subject_to(inp[0] == 0.09762701, name="fix")
+    m.minimize(zh1[0])
+    return m
 
-    def build(matmul: bool):
-        m = Model("nn")
-        inp = m.continuous("inp", shape=(1,), lb=-1.0, ub=1.0)
-        zh0 = m.continuous("zh0", shape=(1,), lb=-1e20, ub=1e20)
-        z0 = m.continuous("z0", shape=(1,), lb=-1e20, ub=1e20)
-        zh1 = m.continuous("zh1", shape=(1,), lb=-1e20, ub=1e20)
-        if matmul:
-            m.subject_to(zh0 == W1.T @ inp + b1, name="a0")
-            m.subject_to(zh1 == W2.T @ z0 + b2, name="a1")
-        else:
-            m.subject_to(zh0 == dm.sum(W1.T * inp, axis=1) + b1, name="a0")
-            m.subject_to(zh1 == dm.sum(W2.T * z0, axis=1) + b2, name="a1")
-        m.subject_to(z0 == dm.sigmoid(zh0), name="act")
-        m.subject_to(inp[0] == 0.09762701, name="fix")
-        m.minimize(zh1[0])
-        return m.solve()
 
-    reduction, matmul = build(False), build(True)
-    assert reduction.objective == pytest.approx(matmul.objective, abs=1e-9), (
-        "the two forms disagree on the incumbent, which is a different bug"
-    )
-    assert reduction.status == "optimal"
-    assert matmul.status == "feasible", (
-        f"matmul now reports {matmul.status!r}; if the matmul relaxation was "
-        "tightened, this test and the emitter's formulation should be revisited"
-    )
+@pytest.mark.slow
+@pytest.mark.parametrize("matmul", [False, True], ids=["reduction", "matmul"])
+def test_the_matmul_form_certifies_like_the_reduction(matmul, caplog):
+    """Both spellings of the affine layer must certify the same optimum.
+
+    This used to pin the OPPOSITE: `W.T @ x` reported `feasible` where
+    `dm.sum(W.T * x, axis=1)` reported `optimal`, read as "`MatMulExpression`
+    relaxes more weakly". It did not relax at all. Its relaxation build crashed
+    (`TypeError: only 0-dimensional arrays can be converted to Python scalars`)
+    inside OBBT, the McCormick LP and objective gating, each catching it at DEBUG,
+    so the solve fell back to a relaxation-free search: `bound=None`,
+    `root_bound=-1e20`, 215 nodes to a 15 s limit (measured on 447eb35b). #1493
+    (b706ef3c) stopped that silent crash, after which the matmul form certifies at
+    the root -- the stale premise is what broke the old test, not the solver.
+
+    The control arm is the bug's own signature: no relaxation-build failure may be
+    logged, so a reinstated crash fails here even if a later fallback still
+    happened to certify. The bound is checked against the closed-form optimum.
+    """
+    caplog.set_level(logging.DEBUG, logger="discopt")
+    m = _build_sigmoid_net(matmul)
+    a0 = next(c for c in m._constraints if c.name == "a0")
+    assert ("@" in repr(a0.body)) == matmul, f"wrong spelling built: {a0.body!r}"
+
+    r = m.solve()
+
+    build_failures = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "build failed" in rec.getMessage() or "0-dimensional" in rec.getMessage()
+    ]
+    assert build_failures == [], f"relaxation build failed silently: {build_failures}"
+    assert r.status == "optimal", f"status {r.status!r}"
+    assert r.objective == pytest.approx(_SIGMOID_NET_OPT, abs=1e-9)
+    assert r.bound is not None and np.isfinite(r.bound)
+    assert r.bound <= _SIGMOID_NET_OPT + 1e-9, "dual bound above the known optimum"
+    assert r.objective - r.bound <= 1e-6

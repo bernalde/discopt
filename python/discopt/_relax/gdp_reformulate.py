@@ -653,32 +653,80 @@ def _sumover_terms(expr: Expression) -> list[Expression] | None:
     return list(expr.terms)
 
 
+class _BoundMemo:
+    """#1565: per-call memo for :func:`_bound_expression` and :func:`_bound_error`.
+
+    Both walks are pure functions of a node and the (unchanging, for the duration
+    of one call) variable bounds, so a node's interval and endpoint errors are
+    computed once and reused at every other parent that shares it. Without this,
+    a DAG with shared subexpressions -- an OMLT reduced-space network, where each
+    layer's activations feed every unit of the next layer -- is walked as its
+    expanded *tree*, and ``_bound_error`` re-walks each node's subtree with
+    ``_bound_expression`` several times on top. Measured on OMLT 2-input
+    sigmoid nets: 15.0 s for one ``bound_expression_error`` on a 2,889-node DAG
+    (148,206 tree nodes), and ``solve(time_limit=30)`` running 65 s on 25x3.
+
+    Keyed by ``id(node)`` **with the node held alongside the value**, so no key
+    can be recycled by a garbage-collected node while the memo is alive (the
+    #1283/#1555 ``id()``-aliasing hazard). A memo must not outlive a change to any
+    variable bound it read; every caller scopes one to a single pass over a fixed
+    box.
+    """
+
+    __slots__ = ("bounds", "errors")
+
+    def __init__(self) -> None:
+        self.bounds: dict[int, tuple[Expression, tuple[float, float]]] = {}
+        self.errors: dict[int, tuple[Expression, tuple[float, float]]] = {}
+
+    def put_bound(self, expr: Expression, res: tuple[float, float]) -> tuple[float, float]:
+        self.bounds[id(expr)] = (expr, res)
+        return res
+
+    def put_error(self, expr: Expression, res: tuple[float, float]) -> tuple[float, float]:
+        self.errors[id(expr)] = (expr, res)
+        return res
+
+
 def _bound_expression(
     expr: Expression,
     model: Model,
+    memo: _BoundMemo | None = None,
 ) -> tuple[float, float]:
     """Compute interval bounds [lo, hi] for an expression via interval arithmetic.
 
     Traverses the expression DAG and propagates bounds from variable
-    bounds through operations.
+    bounds through operations. Each distinct node is evaluated once per *memo*
+    (a fresh one per call when omitted), so the cost is linear in DAG size
+    (#1565). Pass a shared :class:`_BoundMemo` only across calls over the same
+    variable box.
 
     Returns
     -------
     tuple of (float, float)
         (lower_bound, upper_bound) of the expression.
     """
+    # The memo check and the ``memo.put_bound`` at every return live in this one
+    # function, not a wrapper, so the recursion stays one Python frame per
+    # expression level (a deep left-folded sum must not hit the recursion limit
+    # at half the depth it used to).
+    if memo is None:
+        memo = _BoundMemo()
+    hit = memo.bounds.get(id(expr))
+    if hit is not None:
+        return hit[1]
     if isinstance(expr, Variable):
         lo = float(np.min(expr.lb))
         hi = float(np.max(expr.ub))
-        return lo, hi
+        return memo.put_bound(expr, (lo, hi))
 
     if isinstance(expr, Constant):
         val = float(np.min(expr.value))
         val_max = float(np.max(expr.value))
-        return val, val_max
+        return memo.put_bound(expr, (val, val_max))
 
     if isinstance(expr, IndexExpression):
-        base_lo, base_hi = _bound_expression(expr.base, model)
+        base_lo, base_hi = _bound_expression(expr.base, model, memo)
         # For indexed expressions on variables, get tighter bounds
         if isinstance(expr.base, Variable):
             v = expr.base
@@ -687,8 +735,8 @@ def _bound_expression(
             ub_slice = v.ub[idx] if v.shape != () else v.ub
             lo = float(np.min(lb_slice))
             hi = float(np.max(ub_slice))
-            return lo, hi
-        return base_lo, base_hi
+            return memo.put_bound(expr, (lo, hi))
+        return memo.put_bound(expr, (base_lo, base_hi))
 
     terms = _sumover_terms(expr)
     if terms is not None:
@@ -701,19 +749,19 @@ def _bound_expression(
         lo_total = 0.0
         hi_total = 0.0
         for term in terms:
-            t_lo, t_hi = _bound_expression(term, model)
+            t_lo, t_hi = _bound_expression(term, model, memo)
             lo_total = -np.inf if (lo_total == -np.inf or t_lo == -np.inf) else lo_total + t_lo
             hi_total = np.inf if (hi_total == np.inf or t_hi == np.inf) else hi_total + t_hi
-        return float(lo_total), float(hi_total)
+        return memo.put_bound(expr, (float(lo_total), float(hi_total)))
 
     if isinstance(expr, BinaryOp):
-        left_lo, left_hi = _bound_expression(expr.left, model)
-        right_lo, right_hi = _bound_expression(expr.right, model)
+        left_lo, left_hi = _bound_expression(expr.left, model, memo)
+        right_lo, right_hi = _bound_expression(expr.right, model, memo)
 
         if expr.op == "+":
-            return left_lo + right_lo, left_hi + right_hi
+            return memo.put_bound(expr, (left_lo + right_lo, left_hi + right_hi))
         elif expr.op == "-":
-            return left_lo - right_hi, left_hi - right_lo
+            return memo.put_bound(expr, (left_lo - right_hi, left_hi - right_lo))
         elif expr.op == "*":
             products = [
                 left_lo * right_lo,
@@ -721,7 +769,7 @@ def _bound_expression(
                 left_hi * right_lo,
                 left_hi * right_hi,
             ]
-            return min(products), max(products)
+            return memo.put_bound(expr, (min(products), max(products)))
         elif expr.op == "/":
             if right_lo > 0 or right_hi < 0:
                 # Divisor doesn't cross zero
@@ -731,8 +779,8 @@ def _bound_expression(
                     left_hi / right_lo,
                     left_hi / right_hi,
                 ]
-                return min(quotients), max(quotients)
-            return -np.inf, np.inf
+                return memo.put_bound(expr, (min(quotients), max(quotients)))
+            return memo.put_bound(expr, (-np.inf, np.inf))
         elif expr.op == "**":
             # Conservative: could be tightened for integer exponents
             if isinstance(expr.right, Constant):
@@ -756,54 +804,56 @@ def _bound_expression(
                         # p>=4 formerly fell to the endpoint-only path below
                         # and under-approximated the range → invalid box →
                         # false certified optimum.
-                        return 0.0, max(vals)
+                        return memo.put_bound(expr, (0.0, max(vals)))
                     # Odd power (monotone on any interval) or one-signed even
                     # power (monotone on that interval): the range is spanned
                     # by the endpoints.
-                    return min(vals), max(vals)
-            return -np.inf, np.inf
+                    return memo.put_bound(expr, (min(vals), max(vals)))
+            return memo.put_bound(expr, (-np.inf, np.inf))
 
     if isinstance(expr, UnaryOp):
-        arg_lo, arg_hi = _bound_expression(expr.operand, model)
+        arg_lo, arg_hi = _bound_expression(expr.operand, model, memo)
         if expr.op == "neg":
-            return -arg_hi, -arg_lo
+            return memo.put_bound(expr, (-arg_hi, -arg_lo))
         elif expr.op == "abs":
             vals = [abs(arg_lo), abs(arg_hi)]
             if arg_lo <= 0 <= arg_hi:
-                return 0.0, max(vals)
-            return min(vals), max(vals)
-        return -np.inf, np.inf
+                return memo.put_bound(expr, (0.0, max(vals)))
+            return memo.put_bound(expr, (min(vals), max(vals)))
+        return memo.put_bound(expr, (-np.inf, np.inf))
 
     if isinstance(expr, FunctionCall):
-        arg_lo, arg_hi = _bound_expression(expr.args[0], model)
+        arg_lo, arg_hi = _bound_expression(expr.args[0], model, memo)
         if expr.func_name == "exp":
             lo = np.exp(arg_lo) if np.isfinite(arg_lo) else 0.0
             hi = np.exp(arg_hi) if np.isfinite(arg_hi) else np.inf
-            return lo, hi
+            return memo.put_bound(expr, (lo, hi))
         elif expr.func_name == "log":
             lo = np.log(max(arg_lo, 1e-300)) if arg_lo > 0 else -np.inf
             hi = np.log(max(arg_hi, 1e-300)) if arg_hi > 0 else -np.inf
-            return lo, hi
+            return memo.put_bound(expr, (lo, hi))
         elif expr.func_name == "abs":
             vals = [abs(arg_lo), abs(arg_hi)]
             if arg_lo <= 0 <= arg_hi:
-                return 0.0, max(vals)
-            return min(vals), max(vals)
+                return memo.put_bound(expr, (0.0, max(vals)))
+            return memo.put_bound(expr, (min(vals), max(vals)))
         elif expr.func_name == "sqrt":
             lo = np.sqrt(max(arg_lo, 0.0))
             hi = np.sqrt(max(arg_hi, 0.0)) if np.isfinite(arg_hi) else np.inf
-            return lo, hi
+            return memo.put_bound(expr, (lo, hi))
         elif expr.func_name in ("sin", "cos"):
             # Conservative for trig
-            return -1.0, 1.0
+            return memo.put_bound(expr, (-1.0, 1.0))
         elif expr.func_name == "neg":
-            return -arg_hi, -arg_lo
+            return memo.put_bound(expr, (-arg_hi, -arg_lo))
 
     # Fallback: unknown expression type
-    return -np.inf, np.inf
+    return memo.put_bound(expr, (-np.inf, np.inf))
 
 
-def bound_expression_error(expr: Expression, model: Model) -> tuple[float, float]:
+def bound_expression_error(
+    expr: Expression, model: Model, memo: _BoundMemo | None = None
+) -> tuple[float, float]:
     """#1397: upper bounds on the floating-point error in each of
     :func:`_bound_expression`'s two endpoints for *expr*, as ``(err_lo, err_hi)``.
 
@@ -837,8 +887,12 @@ def bound_expression_error(expr: Expression, model: Model) -> tuple[float, float
     The bound is deliberately loose. Every caller uses it to *widen* a refusal
     threshold, so an over-estimate costs only the strength of an optional rewrite
     while an under-estimate costs soundness.
+
+    Linear in DAG size: each node's error and interval are computed once per
+    *memo* (#1565). A caller making several calls over one variable box may pass
+    one shared :class:`_BoundMemo` to reuse work across them.
     """
-    return _bound_error(expr, model)
+    return _bound_error(expr, model, memo)
 
 
 #: ``ROUNDOFF_OPS`` ulps per node: ``_bound_expression`` evaluates up to four
@@ -872,34 +926,47 @@ def _pick_err(target: float, corners) -> float:
     return max(matched) if matched else max((e for _, e in corners), default=np.inf)
 
 
-def _bound_error(expr: Expression, model: Model) -> tuple[float, float]:
+def _bound_error(
+    expr: Expression, model: Model, memo: _BoundMemo | None = None
+) -> tuple[float, float]:
+    # Operand errors and every interval come from *memo*, so no subtree is
+    # re-walked (#1565); one frame per level, as in :func:`_bound_expression`.
+    if memo is None:
+        memo = _BoundMemo()
+    hit = memo.errors.get(id(expr))
+    if hit is not None:
+        return hit[1]
     if isinstance(expr, (Variable, Constant, IndexExpression)):
         # Declared bounds and literals are exact floats: no arithmetic happened.
-        return 0.0, 0.0
+        return memo.put_error(expr, (0.0, 0.0))
 
     terms = _sumover_terms(expr)
     if terms is not None:
         # Left-fold of ``t1 + ... + tn``: lo endpoints add, hi endpoints add.
         e_lo = e_hi = 0.0
         for term in terms:
-            t_elo, t_ehi = _bound_error(term, model)
+            t_elo, t_ehi = _bound_error(term, model, memo)
             e_lo += t_elo
             e_hi += t_ehi
-        lo, hi = _bound_expression(expr, model)
-        return _corner_err(lo, e_lo), _corner_err(hi, e_hi)
+        lo, hi = _bound_expression(expr, model, memo)
+        return memo.put_error(expr, (_corner_err(lo, e_lo), _corner_err(hi, e_hi)))
 
     if isinstance(expr, BinaryOp):
-        el_lo, el_hi = _bound_error(expr.left, model)
-        er_lo, er_hi = _bound_error(expr.right, model)
-        l_lo, l_hi = _bound_expression(expr.left, model)
-        r_lo, r_hi = _bound_expression(expr.right, model)
-        lo, hi = _bound_expression(expr, model)
+        el_lo, el_hi = _bound_error(expr.left, model, memo)
+        er_lo, er_hi = _bound_error(expr.right, model, memo)
+        l_lo, l_hi = _bound_expression(expr.left, model, memo)
+        r_lo, r_hi = _bound_expression(expr.right, model, memo)
+        lo, hi = _bound_expression(expr, model, memo)
 
         if expr.op == "+":
-            return _corner_err(lo, el_lo + er_lo), _corner_err(hi, el_hi + er_hi)
+            return memo.put_error(
+                expr, (_corner_err(lo, el_lo + er_lo), _corner_err(hi, el_hi + er_hi))
+            )
         if expr.op == "-":
             # lo = l_lo - r_hi, hi = l_hi - r_lo.
-            return _corner_err(lo, el_lo + er_hi), _corner_err(hi, el_hi + er_lo)
+            return memo.put_error(
+                expr, (_corner_err(lo, el_lo + er_hi), _corner_err(hi, el_hi + er_lo))
+            )
         if expr.op in ("*", "/"):
             # ``_bound_expression`` takes min/max over the four corner combinations,
             # so each endpoint inherits the error of whichever corner attained it.
@@ -910,12 +977,19 @@ def _bound_error(expr: Expression, model: Model) -> tuple[float, float]:
                         corners.append((a * b, _mul0(abs(b), ea) + _mul0(abs(a), eb)))
                     else:
                         if not (r_lo > 0 or r_hi < 0):
-                            return np.inf, np.inf  # matches the (-inf, inf) branch
+                            return memo.put_error(
+                                expr, (np.inf, np.inf)
+                            )  # matches the (-inf, inf) branch
                         ab = abs(b)
                         corners.append((a / b, ea / ab + _mul0(abs(a), eb) / (ab * ab)))
-            return (
-                _corner_err(lo, _pick_err(lo, corners)),
-                _corner_err(hi, _pick_err(hi, corners)),
+            return memo.put_error(
+                expr,
+                (
+                    (
+                        _corner_err(lo, _pick_err(lo, corners)),
+                        _corner_err(hi, _pick_err(hi, corners)),
+                    )
+                ),
             )
         if expr.op == "**" and isinstance(expr.right, Constant):
             p = float(expr.right.value)
@@ -928,53 +1002,62 @@ def _bound_error(expr: Expression, model: Model) -> tuple[float, float]:
                         _mul0(p_int * abs(l_lo) ** (p_int - 1), el_lo),
                         _mul0(p_int * abs(l_hi) ** (p_int - 1), el_hi),
                     )
-                    return 0.0, _corner_err(hi, e_up)
+                    return memo.put_error(expr, (0.0, _corner_err(hi, e_up)))
                 vals = (
                     (l_lo**p_int, _mul0(p_int * abs(l_lo) ** (p_int - 1), el_lo)),
                     (l_hi**p_int, _mul0(p_int * abs(l_hi) ** (p_int - 1), el_hi)),
                 )
-                return (
-                    _corner_err(lo, _pick_err(lo, vals)),
-                    _corner_err(hi, _pick_err(hi, vals)),
+                return memo.put_error(
+                    expr,
+                    (
+                        (
+                            _corner_err(lo, _pick_err(lo, vals)),
+                            _corner_err(hi, _pick_err(hi, vals)),
+                        )
+                    ),
                 )
-        return np.inf, np.inf
+        return memo.put_error(expr, (np.inf, np.inf))
 
     if isinstance(expr, UnaryOp):
-        e_lo, e_hi = _bound_error(expr.operand, model)
+        e_lo, e_hi = _bound_error(expr.operand, model, memo)
         if expr.op == "neg":
-            return e_hi, e_lo  # lo = -arg_hi, hi = -arg_lo
+            return memo.put_error(expr, (e_hi, e_lo))  # lo = -arg_hi, hi = -arg_lo
         if expr.op == "abs":
-            return _abs_error(expr.operand, model, e_lo, e_hi)
-        return np.inf, np.inf
+            return memo.put_error(expr, (_abs_error(expr.operand, model, e_lo, e_hi, memo)))
+        return memo.put_error(expr, (np.inf, np.inf))
 
     if isinstance(expr, FunctionCall):
-        e_lo, e_hi = _bound_error(expr.args[0], model)
-        a_lo, a_hi = _bound_expression(expr.args[0], model)
-        lo, hi = _bound_expression(expr, model)
+        e_lo, e_hi = _bound_error(expr.args[0], model, memo)
+        a_lo, a_hi = _bound_expression(expr.args[0], model, memo)
+        lo, hi = _bound_expression(expr, model, memo)
         name = expr.func_name
         if name == "neg":
-            return e_hi, e_lo
+            return memo.put_error(expr, (e_hi, e_lo))
         if name == "abs":
-            return _abs_error(expr.args[0], model, e_lo, e_hi)
+            return memo.put_error(expr, (_abs_error(expr.args[0], model, e_lo, e_hi, memo)))
         if name in ("sin", "cos"):
             # ``_bound_expression`` returns the exact literal interval (-1, 1)
             # regardless of the argument, so no argument error reaches it.
-            return 0.0, 0.0
+            return memo.put_error(expr, (0.0, 0.0))
         if name in ("exp", "log", "sqrt"):
             # All three are monotone increasing, so endpoints map to endpoints and
             # the local sensitivity is |f'| at that endpoint.
             d_lo, d_hi = _MONOTONE_SLOPE[name](a_lo, a_hi)
-            return _corner_err(lo, _mul0(d_lo, e_lo)), _corner_err(hi, _mul0(d_hi, e_hi))
-        return np.inf, np.inf
+            return memo.put_error(
+                expr, (_corner_err(lo, _mul0(d_lo, e_lo)), _corner_err(hi, _mul0(d_hi, e_hi)))
+            )
+        return memo.put_error(expr, (np.inf, np.inf))
 
-    return np.inf, np.inf
+    return memo.put_error(expr, (np.inf, np.inf))
 
 
-def _abs_error(operand: Expression, model: Model, e_lo: float, e_hi: float) -> tuple[float, float]:
+def _abs_error(
+    operand: Expression, model: Model, e_lo: float, e_hi: float, memo: _BoundMemo
+) -> tuple[float, float]:
     """``|u|``: on a straddling interval the lower endpoint is the exact literal
     0.0; otherwise both endpoints are ``|`` of an operand endpoint, so the error
     can arrive from either side."""
-    a_lo, a_hi = _bound_expression(operand, model)
+    a_lo, a_hi = _bound_expression(operand, model, memo)
     worst = max(e_lo, e_hi)
     if a_lo <= 0 <= a_hi:
         return 0.0, worst
@@ -1822,8 +1905,16 @@ def _collect_variables(expr: Expression) -> dict[str, Variable]:
     ``__eq__`` returning a Constraint).
     """
     found: dict[str, Variable] = {}
+    # #1565: a shared subexpression is walked once. Re-walking it can only
+    # re-assign names already in ``found`` (same name, same Variable), which
+    # changes neither the contents nor the insertion order, so skipping it is
+    # exact. Holding the node keeps its ``id`` from being recycled mid-walk.
+    seen: dict[int, Expression] = {}
 
     def _walk(e: Expression) -> None:
+        if id(e) in seen:
+            return
+        seen[id(e)] = e
         if isinstance(e, Variable):
             found[e.name] = e
         elif isinstance(e, IndexExpression):

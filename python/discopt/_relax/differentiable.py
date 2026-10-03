@@ -346,11 +346,10 @@ def _safe_x0(evaluator) -> np.ndarray:
     - clip final x0 to [-10, 10] respecting bounds so exp/log NLPs with
       one-sided bounds don't get a starting point that overflows
     """
-    from discopt.constants import STARTING_POINT_CLIP
+    from discopt.constants import clip_start_box
 
     lb, ub = evaluator.variable_bounds
-    lb_clipped = np.clip(lb, -STARTING_POINT_CLIP, STARTING_POINT_CLIP)
-    ub_clipped = np.clip(ub, -STARTING_POINT_CLIP, STARTING_POINT_CLIP)
+    lb_clipped, ub_clipped = clip_start_box(lb, ub)
     x0 = 0.5 * (lb_clipped + ub_clipped)
     fully_unbounded = (lb <= -1e15) & (ub >= 1e15)
     x0 = np.where(fully_unbounded, 0.5, x0)

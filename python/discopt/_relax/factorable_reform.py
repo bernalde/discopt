@@ -51,7 +51,9 @@ from discopt.modeling.core import (
     Expression,
     FunctionCall,
     IndexExpression,
+    MatMulExpression,
     Model,
+    Parameter,
     SumExpression,
     SumOverExpression,
     UnaryOp,
@@ -63,11 +65,14 @@ from discopt.mpec import carry_complementarities
 
 from .gdp_reformulate import (
     _bound_expression,
+    _BoundMemo,
     _collect_variables,
     _is_linear,
     bound_expression_error,
 )
 from .term_classifier import (
+    _affine_atom_key,
+    _affine_walk,
     _get_flat_index,
     distribute_products,
     distribution_exceeds_budget,
@@ -216,26 +221,47 @@ def _liftable_call_power_base(expr: Expression, model: Model) -> tuple[FunctionC
 _DEEP_RECURSION_SIZE_GATE = 700
 
 
+def _expr_node_count_children(node: Expression) -> tuple[Expression, ...]:
+    if isinstance(node, BinaryOp):
+        return (node.left, node.right)
+    if isinstance(node, UnaryOp):
+        return (node.operand,)
+    if isinstance(node, FunctionCall):
+        return tuple(node.args)
+    if isinstance(node, SumExpression):
+        return (node.operand,)
+    if isinstance(node, SumOverExpression):
+        return tuple(node.terms)
+    return ()
+
+
 def _expr_node_count(expr: Expression) -> int:
     """Count the nodes in *expr* iteratively (so this measurement never itself
-    recurses into the very depth it is trying to size)."""
-    count = 0
-    stack: list[Expression] = [expr]
+    recurses into the very depth it is trying to size).
+
+    The count is of the expression *as a tree* (a shared subexpression counts
+    once per occurrence), which is what the recursion-headroom gates were sized
+    against. #1565: it is computed bottom-up over the DAG -- ``size(n) = 1 +
+    sum(size(child))``, memoised by node identity -- instead of by visiting every
+    occurrence, which was exponential on a reduced-space NN embedding. Same
+    number, linear time.
+    """
+    sizes: dict[int, int] = {}
+    held: list[Expression] = []  # keep every sized node alive: ids cannot recycle
+    stack: list[tuple[Expression, bool]] = [(expr, False)]
     while stack:
-        node = stack.pop()
-        count += 1
-        if isinstance(node, BinaryOp):
-            stack.append(node.left)
-            stack.append(node.right)
-        elif isinstance(node, UnaryOp):
-            stack.append(node.operand)
-        elif isinstance(node, FunctionCall):
-            stack.extend(node.args)
-        elif isinstance(node, SumExpression):
-            stack.append(node.operand)
-        elif isinstance(node, SumOverExpression):
-            stack.extend(node.terms)
-    return count
+        node, expanded = stack.pop()
+        nid = id(node)
+        if nid in sizes:
+            continue
+        children = _expr_node_count_children(node)
+        if not expanded and children:
+            stack.append((node, True))
+            stack.extend((c, False) for c in children if id(c) not in sizes)
+            continue
+        sizes[nid] = 1 + sum(sizes[id(c)] for c in children)
+        held.append(node)
+    return sizes[id(expr)]
 
 
 def _max_expr_node_count(model: Model) -> int:
@@ -349,23 +375,129 @@ def _needs_lift(powers: dict[int, list]) -> bool:
     return any(exp >= 2 for _leaf, exp in powers.values())
 
 
+def _structural_key(expr: Expression, pins: list) -> tuple:
+    """An exact, hashable structural key for *expr* (#1555).
+
+    Two expressions get the same key only if they are the same expression:
+
+    * constants by dtype, shape and raw bytes (``repr`` rounds to ``.6g`` and
+      prints arrays by shape, #1497);
+    * variables and parameters by identity -- the model keeps them alive, so
+      their ``id()`` cannot be recycled during the lift (the ex7_2_3 hazard);
+    * an ``IndexExpression``'s index exactly (an ndarray index by its bytes);
+    * any node type not listed below by ``id()``, with the node appended to
+      *pins* so its address stays reserved for as long as the cache lives.
+
+    Never contains an expression object itself: ``Expression.__eq__`` builds a
+    ``Constraint``, which would break dict lookup on a hash collision.
+    """
+    memo: dict[int, tuple] = {}
+
+    def index_key(idx) -> tuple:
+        if isinstance(idx, np.ndarray):
+            return ("nd", idx.dtype.str, idx.shape, idx.tobytes())
+        if isinstance(idx, tuple):
+            return ("t",) + tuple(index_key(i) for i in idx)
+        if isinstance(idx, list):  # elementwise: repr truncates large nested arrays
+            return ("l",) + tuple(index_key(i) for i in idx)
+        if isinstance(idx, slice):
+            return ("s", idx.start, idx.stop, idx.step)
+        if isinstance(idx, (bool, np.bool_)):  # before int: bool subclasses int
+            return ("b", bool(idx))
+        if isinstance(idx, (int, np.integer)):
+            return ("i", int(idx))
+        return ("r", type(idx).__name__, repr(idx))  # Ellipsis / None: exact reprs
+
+    def walk(node: Expression) -> tuple:
+        nid = id(node)
+        hit = memo.get(nid)
+        if hit is not None:
+            return hit
+        if isinstance(node, Constant):
+            v = np.asarray(node.value)
+            k: tuple = ("C", v.dtype.str, v.shape, v.tobytes())
+        elif isinstance(node, (Variable, Parameter)):
+            k = (type(node).__name__, id(node))
+        elif isinstance(node, IndexExpression):
+            k = ("I", walk(node.base), index_key(node.index))
+        elif isinstance(node, BinaryOp):
+            k = ("B", node.op, walk(node.left), walk(node.right))
+        elif isinstance(node, UnaryOp):
+            k = ("U", node.op, walk(node.operand))
+        elif type(node) is FunctionCall:
+            k = ("F", node.func_name) + tuple(walk(a) for a in node.args)
+        elif isinstance(node, SumOverExpression):
+            k = ("SO",) + tuple(walk(t) for t in node.terms)
+        elif isinstance(node, SumExpression):
+            k = ("S", node.axis, walk(node.operand))
+        elif isinstance(node, MatMulExpression):
+            k = ("M", walk(node.left), walk(node.right))
+        else:
+            pins.append(node)
+            k = ("id", type(node).__name__, nid)
+        memo[nid] = k
+        return k
+
+    return walk(expr)
+
+
+class _LiftAbandoned(Exception):
+    """The solve clock ran out inside one constraint's lift (#1565).
+
+    Private to this module: raised only by :meth:`_Lifter.tick` and caught only
+    by :func:`_factorable_reformulate_inner`, which then discards everything the
+    lifter built and returns the model it was given -- the same wholesale
+    abandonment the per-constraint #1456 check performs, reached from deeper in
+    the traversal. It is never a defect signal, so catching it hides nothing.
+    """
+
+
+# How many lift-walker visits pass between two consultations of the deadline.
+# The walkers are cheap per visit; the expensive steps (a convexity
+# classification, an aux bound) consult it unconditionally.
+_LIFT_DEADLINE_STRIDE = 256
+
+
 class _Lifter:
     """Allocates monomial auxiliary variables ``w == leaf**k`` on *model*,
     deduplicating by (flat_index, exponent)."""
 
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, deadline: Optional[Callable[[], bool]] = None):
         self.model = model
+        # #1565: the #1456 deadline, consulted *inside* a constraint's lift. A
+        # single reduced-space NN constraint can hold the whole network, so a
+        # per-constraint check alone cannot stop a lift that never reaches the
+        # next constraint.
+        self._deadline = deadline
+        self._ticks = 0
+        # #1565: ``_should_lift_call_arg`` per call node, keyed by ``id`` and
+        # holding the node so the id cannot be recycled while the lifter lives.
+        # The verdict reads only the node and the bounds of the variables in it,
+        # neither of which the lift changes, so a memo hit returns exactly what
+        # a recomputation would.
+        self._call_arg_memo: dict[int, tuple[Expression, Expression | None]] = {}
+        # #1565: ``_scan_for_liftable_call_power`` verdicts (pure, node-held).
+        self.call_power_memo: dict[int, tuple[Expression, bool]] = {}
         self._cache: dict[tuple[int, int], Variable] = {}
-        # Keyed by a STRUCTURAL representation of the expression, never ``id()``:
-        # CPython recycles the ``id()`` of a garbage-collected object, so a later,
-        # structurally *different* expression can reuse a freed address and score a
-        # false cache hit — returning a stale aux for the wrong sub-expression.
-        # In ex7_2_3 that dropped a ``/x8`` denominator from a lifted ratio,
-        # producing a non-feasibility-preserving reformulation that certified an
-        # infeasible box corner as the global optimum (a false "optimal"). A
-        # structural key can only ever *fail* to dedup (harmless — an extra aux),
-        # never falsely merge two distinct expressions.
-        self._expr_cache: dict[tuple[str, float | None], Variable] = {}
+        # Keyed by an EXACT structural key (:func:`_structural_key`), never a bare
+        # ``id()`` of an expression node and never ``repr()``:
+        #
+        # * ``id()``: CPython recycles the ``id()`` of a garbage-collected object,
+        #   so a later, structurally *different* expression can reuse a freed
+        #   address and score a false cache hit. In ex7_2_3 that dropped a ``/x8``
+        #   denominator from a lifted ratio and certified an infeasible box corner
+        #   as the global optimum (a false "optimal").
+        # * ``repr()``: a DISPLAY string, and lossy -- ``SumOverExpression`` prints
+        #   as ``"Σ[n terms]"``, so ``dm.sum([x, 1])`` and ``dm.sum([y, 1])`` shared
+        #   one aux and ``(y+1)**1.7`` was silently rewritten as ``(x+1)**1.7``: a
+        #   certified 1.8095 against a true 4.0 (#1555).
+        #
+        # Only a LOSSLESS key can fail solely by not deduplicating (an extra aux,
+        # harmless) and never by merging two distinct expressions.
+        self._expr_cache: dict[tuple, Variable] = {}
+        # Nodes whose key falls back to ``id()`` are pinned here, so their address
+        # cannot be recycled while this lifter (and its cache) is alive.
+        self._key_pins: list[Expression] = []
         self.aux_constraints: list[Constraint] = []
         self._counter = 0
         # R4: names of lifted product-factor auxes whose interval spans 0. These
@@ -373,6 +505,32 @@ class _Lifter:
         # ``_lift_zero_spanning_factors_enabled``). Populated only when the flag
         # is on, so the default reform is byte-identical.
         self.zero_spanning_factor_auxes: set[str] = set()
+        # Auxes created with ``integer=True`` (an exact integer-valued affine
+        # definition): integral because of the columns they are defined by, see
+        # ``Model._implied_integer_auxes``. Populated only with
+        # ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, so ``=0`` reproduces main exactly
+        # (#1588 review: the default-path behaviour change has no panel of its own).
+        self.implied_integer_auxes: set[str] = set()
+
+    def tick(self, *, force: bool = False) -> None:
+        """Charge one walker visit; raise :class:`_LiftAbandoned` once the clock
+        is spent. ``force`` consults the deadline now (before an expensive step)
+        rather than at the next stride boundary."""
+        if self._deadline is None:
+            return
+        self._ticks += 1
+        if (force or self._ticks % _LIFT_DEADLINE_STRIDE == 0) and self._deadline():
+            raise _LiftAbandoned(f"time limit spent after {self._ticks} lift visits")
+
+    def call_arg_to_lift(self, call: Expression) -> Expression | None:
+        """Memoised :func:`_should_lift_call_arg` (see ``_call_arg_memo``)."""
+        hit = self._call_arg_memo.get(id(call))
+        if hit is not None:
+            return hit[1]
+        self.tick(force=True)
+        arg = _should_lift_call_arg(call, self.model)
+        self._call_arg_memo[id(call)] = (call, arg)
+        return arg
 
     def monomial(self, leaf: Expression, flat_index: int, exp: int) -> Variable | None:
         """Return an aux variable equal to ``leaf**exp`` (creating it on first
@@ -399,7 +557,9 @@ class _Lifter:
         self.aux_constraints.append(Constraint(BinaryOp("-", w, pow_expr), "==", 0.0))
         return w
 
-    def expression(self, expr: Expression, *, lb_floor: float | None = None) -> Variable | None:
+    def expression(
+        self, expr: Expression, *, lb_floor: float | None = None, integer: bool = False
+    ) -> Variable | None:
         """Return an aux variable equal to *expr* (creating it on first use), or
         ``None`` if a finite bound for it cannot be established.
 
@@ -417,8 +577,14 @@ class _Lifter:
         abstains on an argument whose lower bound is negative). The floor is part
         of the cache key so a floored aux is never reused where an unfloored one
         is expected (which would unsoundly tighten the other use site).
+
+        *integer*, when true, types a NEWLY created aux ``INTEGER``. The caller
+        asserts *expr* is integer-valued at every integer-feasible point
+        (:func:`_is_integer_valued_affine`), so the type is exact, never a
+        restriction. A cached aux is returned as it was created.
         """
-        key = (repr(expr), lb_floor)
+        self.tick(force=True)
+        key = (_structural_key(expr, self._key_pins), lb_floor)
         cached = self._expr_cache.get(key)
         if cached is not None:
             return cached
@@ -431,7 +597,10 @@ class _Lifter:
             return None
         name = f"_fr_aux_{self._counter}"
         self._counter += 1
-        w = Variable(name, VarType.CONTINUOUS, (), lo, hi, self.model)
+        vtype = VarType.INTEGER if integer else VarType.CONTINUOUS
+        w = Variable(name, vtype, (), lo, hi, self.model)
+        if integer and _lift_affine_monomials_enabled():
+            self.implied_integer_auxes.add(name)
         self.model._variables.append(w)
         self._expr_cache[key] = w
         # Clear any sign-definite division in the defining equality ``w == expr``
@@ -501,6 +670,84 @@ def _rebuild_product(coeff: float, atoms: list[Expression]) -> Expression:
 # multilinear product of variables directly.
 _DISTRIBUTE_TERM_LIMIT = 1024  # est. distributed-term count above which a product is lifted
 
+# A product is also lifted, whatever its term count, when multiplying it out would
+# CANCEL catastrophically (#1544). Expanding ``prod_k f_k`` sums terms whose
+# magnitudes multiply ``mag(f_k) = sum_j max|t_kj|`` over the box, while the value
+# itself is at most ``prod_k max|f_k|``; the ratio ``prod_k mag(f_k) / max|f_k|``
+# is the factor by which float64 rounding in the expanded polynomial is amplified.
+# Under an exact change of variables ``x = y - c`` it grows like
+# ``(2c / width)**n``: nvs09 shifted by c ~ 1e3 has ten factors ``y_k - c_k`` over
+# width-6 boxes, ratio ~1e25, and its distributed objective evaluated to -1123.3
+# at a point whose true value is 10.87. At this limit the amplified rounding is
+# ~2e-10 relative, below the solver's tolerances; above it the factors are lifted
+# to auxes ``w_k == f_k`` (exact equalities, each well conditioned).
+_DISTRIBUTE_CANCELLATION_LIMIT = 1e6
+
+
+def _additive_terms(expr: Expression) -> list[Expression]:
+    """Flatten ``+``/``-``/``neg`` into additive terms (signs dropped)."""
+    if isinstance(expr, BinaryOp) and expr.op in ("+", "-"):
+        return _additive_terms(expr.left) + _additive_terms(expr.right)
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        return _additive_terms(expr.operand)
+    return [expr]
+
+
+def _distribution_cancellation(factors: list[Expression], model: Model) -> float:
+    """Rounding amplification of multiplying *factors* out (see
+    :data:`_DISTRIBUTE_CANCELLATION_LIMIT`).
+
+    A factor whose magnitude cannot be measured (an unbounded term, or a factor
+    identically zero over the box) contributes 1: "cannot measure" is not evidence
+    of cancellation, and such a factor could not be lifted to a bounded aux anyway.
+    """
+    ratio = 1.0
+    for f in factors:
+        terms = _additive_terms(f)
+        if len(terms) < 2:
+            continue
+        mag = 0.0
+        for t in terms:
+            t_lo, t_hi = _bound_expression(t, model)
+            mag += max(abs(t_lo), abs(t_hi))
+        lo, hi = _bound_expression(f, model)
+        size = max(abs(lo), abs(hi))
+        if not (np.isfinite(mag) and np.isfinite(size)) or size == 0.0:
+            continue
+        ratio *= max(1.0, mag / size)
+    return ratio
+
+
+def _is_integer_valued_affine(expr: Expression) -> bool:
+    """True when *expr* is affine with integral coefficients and constant over
+    integer/binary scalar variables, so it is integer at every integer-feasible
+    point (e.g. ``y - 1450`` with ``y`` integer)."""
+    if isinstance(expr, Constant):
+        v = np.asarray(expr.value, dtype=np.float64)
+        return v.size == 1 and bool(np.isfinite(v).all()) and float(v.reshape(())).is_integer()
+    if isinstance(expr, Variable):
+        return expr.var_type != VarType.CONTINUOUS and int(np.prod(expr.shape)) == 1
+    if isinstance(expr, IndexExpression):
+        return (
+            isinstance(expr.base, Variable)
+            and expr.base.var_type != VarType.CONTINUOUS
+            and np.ndim(np.empty(expr.base.shape)[expr.index]) == 0
+        )
+    if isinstance(expr, UnaryOp) and expr.op == "neg":
+        return _is_integer_valued_affine(expr.operand)
+    if isinstance(expr, SumOverExpression) and _lift_affine_monomials_enabled():
+        # Recentring writes ``y + c`` this way (#1537). Gated with the lift that
+        # introduced it, so ``=0`` is the pre-#1537 rule exactly.
+        return bool(expr.terms) and all(_is_integer_valued_affine(t) for t in expr.terms)
+    if isinstance(expr, BinaryOp):
+        if expr.op in ("+", "-"):
+            return _is_integer_valued_affine(expr.left) and _is_integer_valued_affine(expr.right)
+        if expr.op == "*":
+            for a, b in ((expr.left, expr.right), (expr.right, expr.left)):
+                if isinstance(a, Constant) and _is_integer_valued_affine(a):
+                    return _is_integer_valued_affine(b)
+    return False
+
 
 def _collect_mul_factors(expr: Expression) -> list[Expression]:
     """Flatten a left/right-nested ``*`` chain into its factor list."""
@@ -509,35 +756,192 @@ def _collect_mul_factors(expr: Expression) -> list[Expression]:
     return [expr]
 
 
-def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") -> Expression:
+def _lift_affine_monomials_enabled() -> bool:
+    """``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1537): lift the translated factors of a
+    multilinear monomial instead of multiplying them out. See
+    :func:`_is_translated_monomial` for the rule and its measurement.
+
+    Default ON since its graduation panel (2026-10-02, on top of the #1586 OBBT
+    cascade fix; 206 interleaved comparisons over the in-repo corpus as written,
+    under 1e3/1e6 translations and the generated families;
+    ``recentre_graduation_panel.py --flag``): 0 false, 0 lost, 0 neutrality drift;
+    certificates 166 -> 168 (nvs05 as written, nvs01 at the 1e3 shift). Re-run
+    2026-10-03 after the #1588 review fixes (maximal-chain rule, reach, implied-
+    integer auxes): same verdict, certificates 167 -> 169. ``=0`` restores the
+    distribute-then-cap path."""
+    import os
+
+    return os.environ.get("DISCOPT_LIFT_AFFINE_MONOMIALS", "1") != "0"
+
+
+def _univariate_affine_key(expr: Expression) -> Optional[tuple[tuple, bool]]:
+    """``(variable key, has_offset)`` when *expr* is ``a * v + b`` with ``v`` ONE
+    scalar variable (or a scalar element of one) and ``a != 0``, else ``None``.
+
+    ``has_offset`` is ``b != 0`` -- the factor is a translated copy of ``v``, which
+    distributes into two terms. Coefficients are folded exactly (``Fraction``).
+    """
+    coef: dict[tuple, object] = {}
+    const = [0]
+    ok = [True]
+
+    def visit(kind: str, node: Expression, scale) -> None:
+        if kind == "const":
+            const[0] = const[0] + scale
+            return
+        if isinstance(node, SumOverExpression):  # recentring writes ``y + c`` this way
+            for t in node.terms:
+                _affine_walk(t, None, lambda k, n, s: visit(k, n, s * scale))
+            return
+        key = _affine_atom_key(node)
+        if key[0] == "n" or (isinstance(node, Variable) and int(np.prod(node.shape)) != 1):
+            ok[0] = False
+            return
+        coef[key] = coef.get(key, 0) + scale
+
+    _affine_walk(expr, None, visit)
+    if not ok[0]:
+        return None
+    live = [k for k, a in coef.items() if a != 0]
+    if len(live) != 1:
+        return None
+    return live[0], const[0] != 0
+
+
+def _is_translated_monomial(factors: list[Expression]) -> bool:
+    """True when the product of *factors* is a multilinear monomial written in
+    translated coordinates: every factor is a constant or ``a_k v_k + b_k`` over
+    pairwise-distinct scalar variables, at least three factors are non-constant,
+    and at least one carries an offset ``b_k != 0``.
+
+    #1537: such a product is ``prod_k (a_k v_k + b_k)``. Multiplying it out gives
+    ``2**n`` multilinear terms whose term-wise relaxation depends on the offsets;
+    lifting each translated factor to an exact aux ``w_k == a_k v_k + b_k`` gives
+    the monomial ``prod_k w_k``, whose relaxation is the one the model would get in
+    the coordinates where the offsets are zero. So the relaxation no longer depends
+    on where the user put the origin. Measured on nvs09 (``- (prod_k x_k)**0.2``,
+    ten integers on [3, 9]) moved by ``x = y - 3`` / ``x = y + 3``: the 1024-term
+    expansion sits exactly AT :data:`_DISTRIBUTE_TERM_LIMIT` (so was not lifted)
+    and its McCormick LP (10,177 x 42,518) exceeded the dense cap, leaving
+    interval/alphaBB bounds of -48.0 / -81.0 and no certificate in 30 s; lifted,
+    both certify -43.1343 in 39 nodes (unshifted: 31).
+
+    Bilinear products are excluded: McCormick is exact under translation of
+    either factor, so lifting changes nothing there. A repeated variable is
+    excluded: ``(x - 1)(x - 2)(x - 3)`` is a univariate polynomial, which the
+    expanded form relaxes better than three independent auxes would.
+
+    Reach (#1588 review): the rule is applied to maximal ``*`` chains found by the
+    prelift's walk -- through ``+``/``-``, unary nodes and ``dm.sum`` terms, and a
+    product found this way counts as factorable work on its own
+    (:func:`_scan_for_translated_monomial`). Not reached: a product inside a call
+    argument (``exp((x-1)(y-1)(z-1))``; the call-argument lift handles the call),
+    and ``dm.prod(X - 3)`` over an ARRAY, which is one ``prod`` reduction node
+    that is never distributed, so the ``2**n``-term expansion this rule prevents
+    does not arise for it (``dm.prod([...])`` over a list builds a ``*`` chain and
+    is lifted).
+    """
+    seen: set[tuple] = set()
+    nonconst = 0
+    offset = False
+    for f in factors:
+        if isinstance(f, Constant):
+            continue
+        hit = _univariate_affine_key(f)
+        if hit is None:
+            return False
+        key, has_offset = hit
+        if key in seen:
+            return False
+        seen.add(key)
+        nonconst += 1
+        offset = offset or has_offset
+    return nonconst >= 3 and offset
+
+
+def _scan_for_translated_monomial(expr: Expression, *, _in_chain: bool = False) -> bool:
+    """True if *expr* holds a maximal ``*`` chain that :func:`_is_translated_monomial`
+    accepts, found by exactly the walk :func:`_prelift_blowup_products` makes
+    (``BinaryOp`` / ``UnaryOp`` nodes, each maximal chain tested once).
+
+    #1588 review: this is what makes a translated monomial count as factorable
+    work on its own. Without it ``min (x-3)(y-1)(z-2)(u-4)`` was returned
+    unchanged, because the lift only ran when some *other* lift opened the pass.
+    """
+    if isinstance(expr, BinaryOp):
+        if expr.op == "*" and not _in_chain:
+            if _is_translated_monomial(_collect_mul_factors(expr)):
+                return True
+        sub = expr.op == "*"
+        return _scan_for_translated_monomial(
+            expr.left, _in_chain=sub
+        ) or _scan_for_translated_monomial(expr.right, _in_chain=sub)
+    if isinstance(expr, UnaryOp):
+        return _scan_for_translated_monomial(expr.operand)
+    if isinstance(expr, SumOverExpression):  # ``dm.sum([...])`` (see the prelift)
+        return any(_scan_for_translated_monomial(t) for t in expr.terms)
+    return False
+
+
+def _prelift_blowup_products(
+    expr: Expression, model: Model, lifter: "_Lifter", *, _in_chain: bool = False
+) -> Expression:
     """Lift the factors of any product whose naive distribution would explode.
 
     Walks *expr*; at each ``*``-rooted product whose estimated distributed term
-    count exceeds :data:`_DISTRIBUTE_TERM_LIMIT`, lifts every multi-term-sum
+    count exceeds :data:`_DISTRIBUTE_TERM_LIMIT`, or whose expansion would cancel
+    catastrophically (:data:`_DISTRIBUTE_CANCELLATION_LIMIT`), lifts every multi-term-sum
     factor ``f`` to an aux ``w == f`` (an exact equality) and rebuilds the
     product over the auxes, so the relaxation sees a bilinear/multilinear product
     of bounded variables instead of a high-degree expanded polynomial.  Sound:
     each ``w == f`` is exact and the lifted product is McCormick-relaxable.
-    Identity-preserving for every node under the limit, so non-blowup
-    constraints/objectives are byte-for-byte unchanged.
+    A ``*`` node that passes none of these tests is returned as the same
+    object when nothing beneath it is lifted; the pass as a whole still returns
+    new ``BinaryOp`` parents above any lifted node. A lifted factor that is
+    integer-valued (``y - c`` with ``y`` integer, ``c`` integral) gets an
+    ``INTEGER`` aux, so the lift keeps the integrality the factor had.
+
+    With ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, a product that
+    :func:`_is_translated_monomial` accepts is lifted too. That rule is applied
+    to the MAXIMAL ``*`` chain only (``_in_chain`` marks the inner ``*`` nodes of
+    a chain already tested): re-testing every sub-chain made the answer depend
+    on how the product was parenthesised -- ``(y-1)(z-2)(u-3)(y-4)`` lifted three
+    factors while ``(y-4)(y-1)(z-2)(u-3)`` lifted none (#1588 review).
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
-        if expr.op == "*" and _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT:
+        translated = (
+            expr.op == "*"
+            and not _in_chain
+            and _lift_affine_monomials_enabled()
+            and _is_translated_monomial(_collect_mul_factors(expr))
+        )
+        if expr.op == "*" and (
+            translated
+            or _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
+            or _distribution_cancellation(_collect_mul_factors(expr), model)
+            > _DISTRIBUTE_CANCELLATION_LIMIT
+        ):
             new_factors: list[Expression] = []
             changed = False
             for f in _collect_mul_factors(expr):
                 # Only a genuine multi-term sum drives the blowup; a constant,
                 # variable, or monomial power distributes to one term and is left
-                # for the normal monomial/bilinear path.
+                # for the normal monomial/bilinear path. A translated monomial's
+                # offset factors are lifted whatever node type spells them.
                 if (
                     isinstance(f, BinaryOp)
                     and f.op in ("+", "-")
                     and _estimate_distributed_terms(f) >= 2
+                ) or (
+                    translated
+                    and not isinstance(f, Constant)
+                    and (_univariate_affine_key(f) or (None, False))[1]
                 ):
                     # Recurse first so a factor that is *itself* a blowup product
                     # has its inner factors lifted before this one is bounded.
                     f_lifted = _prelift_blowup_products(f, model, lifter)
-                    w = lifter.expression(f_lifted)
+                    w = lifter.expression(f_lifted, integer=_is_integer_valued_affine(f_lifted))
                     if w is not None:
                         new_factors.append(w)
                         changed = True
@@ -561,8 +965,9 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
             # Couldn't bound any factor (unbounded box): leave the product to the
             # existing distribute/monomial path rather than alter it.
             return expr
-        left = _prelift_blowup_products(expr.left, model, lifter)
-        right = _prelift_blowup_products(expr.right, model, lifter)
+        sub = expr.op == "*"
+        left = _prelift_blowup_products(expr.left, model, lifter, _in_chain=sub)
+        right = _prelift_blowup_products(expr.right, model, lifter, _in_chain=sub)
         if left is expr.left and right is expr.right:
             return expr
         return BinaryOp(expr.op, left, right)
@@ -571,6 +976,15 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
         if operand is expr.operand:
             return expr
         return UnaryOp(expr.op, operand)
+    if isinstance(expr, SumOverExpression) and _lift_affine_monomials_enabled():
+        # ``dm.sum([...])`` is a sum node like ``+``; without this descent a
+        # translated monomial written inside one was never lifted (#1588 review,
+        # reach). Flag-gated with the lift so ``=0`` keeps the pre-#1537 walk,
+        # which stopped here for the blowup/cancellation lifts too.
+        terms = [_prelift_blowup_products(t, model, lifter) for t in expr.terms]
+        if all(a is b for a, b in zip(terms, expr.terms)):
+            return expr
+        return SumOverExpression(terms)
     return expr
 
 
@@ -592,6 +1006,12 @@ def _prelift_call_powers(expr: Expression, model: Model, lifter: "_Lifter") -> E
     dental power with a relaxable monomial.
     """
     if not _lift_loose_products_enabled():
+        return expr
+    lifter.tick()
+    # #1565: a subtree with no call power is returned unchanged by this walker
+    # (identity-preserving, no lifter call), so skipping it is exact -- and the
+    # memoised scan answers that once per shared node instead of once per path.
+    if not _scan_for_liftable_call_power(expr, model, lifter.call_power_memo):
         return expr
     if isinstance(expr, BinaryOp):
         call_power = _liftable_call_power_base(expr, model)
@@ -720,6 +1140,7 @@ def _lift_expr(expr: Expression, model: Model, lifter: _Lifter) -> Expression:
     to bilinear form via monomial aux variables.  Identity-preserving: returns
     the same object when nothing changed, so untouched subtrees are unaffected.
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
         if expr.op == "*":
             decomp = _decompose_poly_product(expr, model)
@@ -770,7 +1191,7 @@ def _lift_expr(expr: Expression, model: Model, lifter: _Lifter) -> Expression:
         # which is feasibility-preserving and lets the univariate sqrt envelope
         # apply.  Gated by ``_should_lift_call_arg`` so a node already proven convex
         # (an affine 2-norm) keeps its tight envelope rather than being downgraded.
-        arg = _should_lift_call_arg(expr, model)
+        arg = lifter.call_arg_to_lift(expr)
         if arg is not None:
             lb_floor = 0.0 if expr.func_name == "sqrt" else None
             t = lifter.expression(distribute_products(arg), lb_floor=lb_floor)
@@ -813,6 +1234,7 @@ def _lift_objective_atoms(expr: Expression, model: Model, lifter: "_Lifter") -> 
     interval (e.g. an unbounded variable), so the rewrite is never unsound — at
     worst the term stays dropped, exactly as before.
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
         if (
             expr.op == "**"
@@ -855,7 +1277,9 @@ def _lift_objective_atoms(expr: Expression, model: Model, lifter: "_Lifter") -> 
     return expr
 
 
-def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, float]:
+def _denominator_sign_slack(
+    denom: Expression, model: Model, memo: _BoundMemo | None = None
+) -> tuple[float, float]:
     """#1397: how much of each ``_bound_expression(denom)`` endpoint could be round-off.
 
     Returned as ``(lo_slack, hi_slack)`` in the denominator's own units so each adds
@@ -876,28 +1300,48 @@ def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, flo
     feasibility tolerance sound: an over-stated ``dmin`` would under-scale that body
     and let a gross violation slip under the tolerance.
     """
-    err_lo, err_hi = bound_expression_error(denom, model)
+    err_lo, err_hi = bound_expression_error(denom, model, memo)
     return (
         float(err_lo) if np.isfinite(err_lo) else np.inf,
         float(err_hi) if np.isfinite(err_hi) else np.inf,
     )
 
 
-def _find_clearable_denominator(expr: Expression, model: Model):
+def _find_clearable_denominator(
+    expr: Expression,
+    model: Model,
+    memo: _BoundMemo | None = None,
+    visited: dict[int, Expression] | None = None,
+):
     """Return the denominator ``D`` of the first division term ``N/D`` in
     *expr*'s additive structure whose ``D`` is non-constant and sign-definite
     over the variable box, as ``(D, sign, dmin)`` where ``sign`` is +1/-1 and
-    ``dmin = min |D|`` over the box.  ``None`` if no such division exists."""
+    ``dmin = min |D|`` over the box.  ``None`` if no such division exists.
+
+    #1565: linear in DAG size. *memo* shares every interval and interval error
+    across the denominators examined (and, from :func:`_clear_divisions`, across
+    its passes over one box). *visited* records each node already searched: the
+    search returns at the first hit, so a node seen before is one whose search
+    already came back ``None`` and would again -- skipping it is exact. It maps
+    ``id`` to the node itself so an address cannot be recycled mid-search.
+    """
+    if memo is None:
+        memo = _BoundMemo()
+    if visited is None:
+        visited = {}
+    if id(expr) in visited:
+        return None
+    visited[id(expr)] = expr
     if isinstance(expr, BinaryOp):
         if expr.op in ("+", "-"):
-            found = _find_clearable_denominator(expr.left, model)
+            found = _find_clearable_denominator(expr.left, model, memo, visited)
             if found is not None:
                 return found
-            return _find_clearable_denominator(expr.right, model)
+            return _find_clearable_denominator(expr.right, model, memo, visited)
         if expr.op == "/":
             d = expr.right
             if not isinstance(d, Constant):
-                lo, hi = _bound_expression(d, model)
+                lo, hi = _bound_expression(d, model, memo)
                 # #1397: ``_ZERO_MARGIN`` alone assumes ``lo``/``hi`` are exact.
                 # They are not -- ``_bound_expression`` is plain float interval
                 # arithmetic with no outward rounding -- and clearing a denominator
@@ -910,15 +1354,15 @@ def _find_clearable_denominator(expr: Expression, model: Model):
                 # 1e-9 margin, while its true infimum is ``-0.5``; the gate cleared
                 # it at every M from 1e16 to 1e18. An O(1) denominator is
                 # unaffected: its error is 0.0 (declared bounds are exact floats).
-                lo_slack, hi_slack = _denominator_sign_slack(d, model)
+                lo_slack, hi_slack = _denominator_sign_slack(d, model, memo)
                 if lo > _ZERO_MARGIN + lo_slack:
                     return d, 1, lo - lo_slack
                 if hi < -_ZERO_MARGIN - hi_slack:
                     return d, -1, -hi - hi_slack
             # Search the numerator for a nested division.
-            return _find_clearable_denominator(expr.left, model)
+            return _find_clearable_denominator(expr.left, model, memo, visited)
     if isinstance(expr, UnaryOp) and expr.op == "neg":
-        return _find_clearable_denominator(expr.operand, model)
+        return _find_clearable_denominator(expr.operand, model, memo, visited)
     return None
 
 
@@ -963,8 +1407,12 @@ def _clear_divisions(body: Expression, sense: str, model: Model):
     ever makes the feasibility test stricter, never looser.
     """
     scale = 1.0
+    # #1565: one interval memo for every pass. The box is fixed for the whole
+    # call (clearing builds expressions; it never touches a variable bound), and
+    # the nodes a later pass bounds are the same objects an earlier pass did.
+    memo = _BoundMemo()
     for _ in range(8):  # bounded: each pass clears one denominator family
-        found = _find_clearable_denominator(body, model)
+        found = _find_clearable_denominator(body, model, memo)
         if found is None:
             break
         denom, sign, dmin = found
@@ -1061,6 +1509,10 @@ def _has_factorable_work_inner(
         # would collapse it into the ``g·g`` product that hides the structure.
         if _lift_loose_products_enabled() and _scan_for_liftable_call_power(expr, model):
             return True
+        # #1537 / #1588 review: a translated monomial is factorable work in its
+        # own right (pre-distribute, the same walk the prelift makes).
+        if _lift_affine_monomials_enabled() and _scan_for_translated_monomial(expr):
+            return True
         dist = distribute_products(expr)
         if _scan_for_mixed_product(dist, model):
             return True
@@ -1140,22 +1592,38 @@ def _scan_for_liftable_call(expr: Expression, model: Model) -> bool:
     return False
 
 
-def _scan_for_liftable_call_power(expr: Expression, model: Model) -> bool:
+def _scan_for_liftable_call_power(
+    expr: Expression, model: Model, memo: dict[int, tuple[Expression, bool]] | None = None
+) -> bool:
     """True if *expr* contains an integer power ``g(x)**n`` (n >= 2) of a univariate
     transcendental call — the TD-A lift target. Scans the *pre-distribute* tree
     (``distribute_products`` would collapse ``g(x)**2`` into ``g·g`` and hide it).
+
+    #1565: memoised by node identity (the node is held, so its ``id`` cannot be
+    recycled), so a shared subexpression is scanned once. The verdict is a pure
+    function of the node, so a memo hit is exactly the recomputed answer. It
+    descends the same edges ``_prelift_call_powers`` does, which is what lets that
+    walker skip a subtree this scan clears.
     """
+    if memo is None:
+        memo = {}
+    hit = memo.get(id(expr))
+    if hit is not None:
+        return hit[1]
     if _liftable_call_power_base(expr, model) is not None:
-        return True
-    if isinstance(expr, BinaryOp):
-        return _scan_for_liftable_call_power(expr.left, model) or _scan_for_liftable_call_power(
-            expr.right, model
-        )
-    if isinstance(expr, UnaryOp):
-        return _scan_for_liftable_call_power(expr.operand, model)
-    if isinstance(expr, FunctionCall):
-        return any(_scan_for_liftable_call_power(a, model) for a in expr.args)
-    return False
+        found = True
+    elif isinstance(expr, BinaryOp):
+        found = _scan_for_liftable_call_power(
+            expr.left, model, memo
+        ) or _scan_for_liftable_call_power(expr.right, model, memo)
+    elif isinstance(expr, UnaryOp):
+        found = _scan_for_liftable_call_power(expr.operand, model, memo)
+    elif isinstance(expr, FunctionCall):
+        found = any(_scan_for_liftable_call_power(a, model, memo) for a in expr.args)
+    else:
+        found = False
+    memo[id(expr)] = (expr, found)
+    return found
 
 
 def _scan_for_liftable_fractional_power(expr: Expression, model: Model) -> bool:
@@ -1676,9 +2144,10 @@ def _factorable_reformulate_inner(
     clear_only: bool = False,
     deadline: Optional[Callable[[], bool]] = None,
 ) -> Model:
-    # #1520: no except. Every decline is an explicit ``return model`` (no work, the
-    # deadline, the soundness gates); the old ``except Exception: return model``
-    # could only hide a defect in the rewrite as "nothing to reformulate".
+    # #1520: no catch-all. Every decline is an explicit ``return model`` (no work,
+    # the deadline, the soundness gates); the old ``except Exception: return model``
+    # could only hide a defect in the rewrite as "nothing to reformulate". The one
+    # ``except`` below catches only the private ``_LiftAbandoned`` sentinel.
     if not _has_factorable_work_inner(model, deadline=deadline):
         return model
 
@@ -1688,8 +2157,46 @@ def _factorable_reformulate_inner(
     new_model._rebuild_name_index()  # keep the name cache in sync (M7)
     new_model._objective = model._objective
 
-    lifter = _Lifter(new_model)
+    lifter = _Lifter(new_model, deadline=deadline)
+    # #1565: the deadline is also consulted inside a constraint's lift (see
+    # ``_Lifter.tick``); on expiry everything built so far is dropped, exactly as
+    # the per-constraint check below drops it.
+    try:
+        rebuilt = _rebuild_and_lift(model, new_model, lifter, clear_only, deadline)
+    except _LiftAbandoned:
+        return model
+    if rebuilt is None:
+        return model
 
+    # Defining equalities for the aux variables come first so downstream
+    # bound propagation sees them early.
+    new_model._constraints = lifter.aux_constraints + rebuilt
+    # R4: surface the zero-spanning product-factor auxes (if any were tagged
+    # under the flag) so the solver can keep them branchable. Always set the
+    # attribute (empty by default) for a stable, easy-to-read contract.
+    new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
+    new_model._implied_integer_auxes = set(getattr(model, "_implied_integer_auxes", ())) | set(
+        lifter.implied_integer_auxes
+    )
+    # Complementarity provenance (#1147). The lifts rewrite constraint
+    # *bodies*; the relation's source operands are untouched and still read
+    # the shared Variable objects, so the relation set forwards intact.
+    carry_complementarities(model, new_model, pass_name="factorable reformulation")
+    carry_validation_guards(model, new_model)  # #1498
+    return new_model
+
+
+def _rebuild_and_lift(
+    model: Model,
+    new_model: Model,
+    lifter: _Lifter,
+    clear_only: bool,
+    deadline: Optional[Callable[[], bool]],
+) -> list[Constraint] | None:
+    """The rebuild loop of :func:`_factorable_reformulate_inner`: returns the
+    rebuilt constraints (and lifts the objective of *new_model* in place), or
+    ``None`` when the per-constraint deadline fired. ``_LiftAbandoned`` from
+    inside a lift propagates to the caller."""
     rebuilt: list[Constraint] = []
     for c in model._constraints:
         # #1456 item 2. Wholesale abandonment: ``new_model`` and everything
@@ -1697,7 +2204,7 @@ def _factorable_reformulate_inner(
         # caller gets the model it passed in. A partial rewrite would be a
         # third state nothing downstream is written against.
         if deadline is not None and deadline():
-            return model
+            return None
         if not isinstance(c, Constraint):
             rebuilt.append(c)  # pass through anything exotic untouched
             continue
@@ -1745,16 +2252,4 @@ def _factorable_reformulate_inner(
 
             new_model._objective = Objective(lifted_obj, new_model._objective.sense)
 
-    # Defining equalities for the aux variables come first so downstream
-    # bound propagation sees them early.
-    new_model._constraints = lifter.aux_constraints + rebuilt
-    # R4: surface the zero-spanning product-factor auxes (if any were tagged
-    # under the flag) so the solver can keep them branchable. Always set the
-    # attribute (empty by default) for a stable, easy-to-read contract.
-    new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
-    # Complementarity provenance (#1147). The lifts rewrite constraint
-    # *bodies*; the relation's source operands are untouched and still read
-    # the shared Variable objects, so the relation set forwards intact.
-    carry_complementarities(model, new_model, pass_name="factorable reformulation")
-    carry_validation_guards(model, new_model)  # #1498
-    return new_model
+    return rebuilt

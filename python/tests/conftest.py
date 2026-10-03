@@ -56,7 +56,7 @@ def heterogeneous_array_bounds():
 # 300 s, chosen when clay0303hfsg measured 194 s there. The feral 0.16.0 bump
 # (#1025, threshold-Markowitz pivoting) moved that instance's rounding trajectory
 # -- measured locally as 141 -> 207 nodes (+47%) and 7.00 s -> 9.03 s (+29%),
-# sound in both (bound 26669.109557 / 26669.109563, optimum 26669.10955143) --
+# sound in both (bound 26669.109557 / 26669.109563, optimum 26669.1095724859) --
 # and 194 s became >=300 s, i.e. the budget itself started deciding the result.
 # CI is ~30-40x this machine on this instance (9.4 s local vs 194 s pre-bump; the
 # docstring in test_convex_kernel_perspective_865 records a 40x spread), so 600 s
