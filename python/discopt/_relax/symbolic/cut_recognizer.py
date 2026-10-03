@@ -150,6 +150,44 @@ def _var_key(node) -> Optional[str]:
     return None
 
 
+def _prod_to_sympy(node, syms: dict, memo: dict, opaque: dict) -> tuple:
+    """SymPy image of a ``prod`` node.
+
+    ``FunctionCall("prod", a)`` with ONE argument is a full reduction: the product
+    of every element of ``a`` (``jnp.prod`` over the flattened operand, and
+    ``expr.rs::reduction_values`` in Rust). Translating ``a`` to a single symbol and
+    calling ``sympy.prod`` on it fed a scalar where an iterable belongs and raised
+    ``TypeError: reduce() arg 2 must support iteration``. The elements are spelled
+    out instead, exactly as the hand-written ``x[0] * x[1] * ...`` would be. With
+    several arguments the call is a plain product of scalars.
+
+    Returns ``(image, children)``: *children* are the nodes actually translated
+    (the spelled-out elements, for a full reduction), so the caller's #1565
+    opaque check sees an opaque element and keeps the ``prod`` node unmemoised.
+    """
+    from discopt.modeling import core
+
+    if len(node.args) != 1:
+        out = sp.Integer(1)
+        for a in node.args:
+            out = out * _to_sympy(a, syms, memo, opaque)
+        return out, tuple(node.args)
+    arg = node.args[0]
+    shape = core._known_shape(arg)
+    if shape is None:
+        raise SymbolicTranslationError("cut recognizer: prod over an expression of unknown shape")
+    if shape == ():
+        return _to_sympy(arg, syms, memo, opaque), (arg,)
+    if int(np.prod(shape)) == 0:
+        # The empty product is 1, matching the evaluator.
+        return sp.Integer(1), ()
+    elems = tuple(arg._flat_elements("prod"))
+    out = sp.Integer(1)
+    for elem in elems:
+        out = out * _to_sympy(elem, syms, memo, opaque)
+    return out, elems
+
+
 def _to_sympy(node, syms: dict, memo: dict | None = None, opaque: dict | None = None):
     """Translate one model-graph expression to SymPy.
 
@@ -218,6 +256,8 @@ def _to_sympy(node, syms: dict, memo: dict | None = None, opaque: dict | None = 
         else:
             raise SymbolicTranslationError(f"cut recognizer: unary op {node.op!r}")
         children = (node.operand,)
+    elif isinstance(node, core.FunctionCall) and node.func_name == "prod":
+        res, children = _prod_to_sympy(node, syms, memo, opaque)
     elif isinstance(node, core.FunctionCall):
         args = [_to_sympy(a, syms, memo, opaque) for a in node.args]
         fn = getattr(sp, node.func_name, None)

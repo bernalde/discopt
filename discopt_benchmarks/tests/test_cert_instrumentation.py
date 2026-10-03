@@ -212,7 +212,16 @@ def test_reduction_separation_timers_present_and_bounded():
     # ``certificate/`` (#1551) holds the certificate guards' diagnostics: the
     # objective's float evaluation error at the incumbent (a non-negative width,
     # recorded on every certified solve the check applies to) and 0/1 flags.
-    _NON_TIMER_FAMILIES = ("cuts/", "pool/", "row_filter/", "bound_provenance/", "certificate/")
+    # ``recentre/`` (#1537 C, ``DISCOPT_RECENTRE``) holds COUNTS and 0/1 flags:
+    # ``variables_moved`` and ``mapped_point_refused``, present only when the pass ran.
+    _NON_TIMER_FAMILIES = (
+        "cuts/",
+        "pool/",
+        "row_filter/",
+        "bound_provenance/",
+        "certificate/",
+        "recentre/",
+    )
     _KNOWN = _TIMER_FAMILIES + _NON_TIMER_FAMILIES
     # ``gap_criterion`` (#1243) is the one documented non-numeric entry: which arm
     # of the convergence test the returned pair meets, present only when one does.
@@ -224,7 +233,9 @@ def test_reduction_separation_timers_present_and_bounded():
     assert skipped is None or isinstance(skipped, str), f"skip reason={skipped!r}"
     # #1537 E's incumbent repair records why it did not run (``repair_skipped``)
     # or why it declined (``repair_declined``) as strings, present only then.
-    for key in ("certificate/repair_skipped", "certificate/repair_declined"):
+    # ``recentre/skipped`` (#1537 C) is the reason the recentring pass refused a
+    # model it was asked to recentre, present only then.
+    for key in ("certificate/repair_skipped", "certificate/repair_declined", "recentre/skipped"):
         why = stats.pop(key, None)
         assert why is None or isinstance(why, str), f"{key}={why!r}"
     # Every other entry is a non-negative float in a known instrumentation family.
