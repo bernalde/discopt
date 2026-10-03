@@ -217,10 +217,19 @@ class _Rewriter:
         self.var_map = var_map  # id(old var) -> new var
         self.shifts = shifts  # id(old var) -> c (only moved vars)
         self.memo: dict[int, tuple[Expression, Optional[_Aff]]] = {}
+        # One folded node per source node. ``_canonical`` builds a fresh node, so
+        # without this a shared subexpression is DE-shared: ``y * y`` (one
+        # Variable node on both sides) became ``(z + c) * (z + c)`` with two
+        # distinct sums, and the square rule (``left is right``) lost it:
+        # ``min x*x + w`` with a moved ``x`` went CONVEX -> not convex under
+        # recentring (test_1537_recentre.py::test_shared_square_keeps_its_verdict).
+        # The key is ``id(aff)``; every ``aff`` is kept alive by ``self.memo``, so
+        # ids are not reused.
+        self.emitted: dict[int, Expression] = {}
 
     def __call__(self, expr: Expression) -> Expression:
         node, aff = self._rw(expr)
-        return _canonical(aff) if aff is not None and not _is_leaf(node) else node
+        return self._emit(node, aff)
 
     def _rw(self, expr: Expression) -> tuple[Expression, Optional[_Aff]]:
         key = id(expr)
@@ -292,10 +301,18 @@ class _Rewriter:
             return node, None
         raise RecentreUnsupported(f"no rewrite rule for {type(expr).__name__}")
 
-    @staticmethod
-    def _emit(node: Expression, aff: Optional[_Aff]) -> Expression:
-        """A child as it appears under a NON-affine parent: folded if affine."""
-        return _canonical(aff) if aff is not None and not _is_leaf(node) else node
+    def _emit(self, node: Expression, aff: Optional[_Aff]) -> Expression:
+        """A child as it appears under a NON-affine parent: folded if affine.
+
+        The same source node always emits the same object (``self.emitted``), so
+        the rewrite preserves the DAG's sharing."""
+        if aff is None or _is_leaf(node):
+            return node
+        out = self.emitted.get(id(aff))
+        if out is None:
+            out = _canonical(aff)
+            self.emitted[id(aff)] = out
+        return out
 
 
 def _is_leaf(node: Expression) -> bool:

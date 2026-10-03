@@ -76,6 +76,28 @@ def test_constant_folding_removes_the_cancelling_constant():
         assert np.allclose(ev_rc.evaluate_constraints(zpt), ev.evaluate_constraints(x), atol=1e-6)
 
 
+@pytest.mark.parametrize("lb", [1e6, 3e3])
+def test_shared_square_keeps_its_verdict(lb):
+    """The rewrite preserves the DAG's sharing. ``x * x`` is ONE node on both
+    sides, and the square rule reads that identity (``left is right``). Folding
+    each use of ``x`` into a fresh ``z + c`` sum made the two sides distinct
+    objects, so ``min x*x + w`` was convex as written and not convex once
+    recentred: the solve left the convex route on a model it had proven."""
+    from discopt._relax.convexity import classify_model
+
+    m = dm.Model("share")
+    x = m.continuous("x", lb=lb, ub=lb + 10)
+    w = m.continuous("w", lb=0, ub=1)
+    m.minimize(x * x + w)
+    m.subject_to(x * x - w <= (lb + 5) ** 2)
+    rc = recentre(m)
+    assert rc is not None and rc.model is not m
+    sq = rc.model._objective.expression.left
+    assert sq.left is sq.right
+    assert classify_model(m) == (True, [True])
+    assert classify_model(rc.model) == classify_model(m)
+
+
 def test_parameters_are_not_folded_and_stay_live(flag_on):
     m = dm.Model("par")
     y = m.continuous("y", lb=1e6, ub=1e6 + 10)
