@@ -21687,7 +21687,14 @@ def _solve_continuous(
             if model._objective.sense == ObjectiveSense.MAXIMIZE
             else _rigorous_bound_internal
         )
-        _c_gap = _relative_gap_from_objective_bound(obj_val, _c_bound)
+        # Since #1596 every certificate on this path carries the rigorous bound,
+        # so keep the near-zero contract of ``_optimal_relative_gap``: a relative
+        # gap is undefined at a ~0 incumbent (``None``, not ``0.0``).
+        _c_gap = (
+            None
+            if _optimal_relative_gap(obj_val) is None
+            else _relative_gap_from_objective_bound(obj_val, _c_bound)
+        )
 
     # #815: this single-NLP path reports the solver's returned point as the
     # incumbent. A local NLP that stalls at the time/iteration limit — or, on a
