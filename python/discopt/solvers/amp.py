@@ -1495,6 +1495,15 @@ def _apply_partition_refinement_hook(
     return result
 
 
+def _routes_to_verified_lp(model) -> bool:
+    """Whether the default route would solve *model* on the verified HiGHS LP engine:
+    a pure LP with ``DISCOPT_LP_MILP_BACKEND`` at its ``highs`` default (#1229)."""
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
+    from discopt.solver import _lp_milp_backend
+
+    return _lp_milp_backend() == "highs" and classify_problem(model) == ProblemClass.LP
+
+
 def _normalize_partition_method(
     partition_method: str,
     disc_var_pick: int | str | Callable[[dict[str, Any]], Any] | None,
@@ -2357,6 +2366,18 @@ def _solve_amp_impl(
             from discopt.solver import _solve_continuous
 
             is_convex, _ = _classify_convexity(model, use_certificate=True)
+            if is_convex and _routes_to_verified_lp(model):
+                # A pure LP takes the default route's verified HiGHS engine (#1229).
+                # The NLP certificate below cannot certify an LP whose columns are
+                # free on the 1e20 default box: no float multiplier cancels the
+                # slope exactly, and a 1e-17 slope over a 1e19 reach is ~1e2 of
+                # bound (#1605). The LP route corrects the dual in exact rational
+                # arithmetic instead.
+                from discopt.solver import _solve_lp_highs
+
+                result = _solve_lp_highs(model, t_start, time_limit)
+                result.convex_fast_path = True
+                return _finish(result)
             if is_convex:
                 logger.info(
                     "AMP: convex NLP detected; solving with single NLP "
