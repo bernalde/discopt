@@ -4013,6 +4013,54 @@ def _is_integer_feasible_solution(x, int_offsets, int_sizes, tol=1e-5):
     return True
 
 
+# #1606: how far past the #952 exit gate an integral incumbent may sit and still
+# be re-derived (rather than refused) by :func:`_integral_claim_recovery`. Relative
+# to each row's magnitude ``1 + |b_i| + sum_j |a_ij x_j|`` (a bound's: ``1 +
+# |bound|``). 1e-5 is the repo's integrality tolerance -- the snap arm already
+# re-derives residuals of ``sum_j |a_ij| * 1e-5`` -- and sits an order above the
+# measured LP-vertex residuals (~1.2e-6 at unit-scale rows) while an order below
+# a 1e-3 excursion on such a row, which stays a refusal.
+_LP_RESIDUAL_WINDOW_RTOL = 1e-5
+
+
+def _within_lp_residual_window(x, A_ub, b_ub, A_eq, b_eq, bounds) -> bool:
+    """True when every row and bound residual of ``x`` is at most
+    :data:`_LP_RESIDUAL_WINDOW_RTOL` times that row's magnitude.
+
+    This is not an acceptance test -- the #952 arbiter
+    (:func:`_matrix_solution_feasible`) stays the only one. It decides only
+    whether an incumbent that FAILED the arbiter is close enough to be an
+    LP-tolerance residual worth re-deriving, after which the arbiter judges the
+    re-derived point. Non-finite input is outside the window.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if not np.all(np.isfinite(x)):
+        return False
+    w = _LP_RESIDUAL_WINDOW_RTOL
+    for A, b, two_sided in ((A_ub, b_ub, False), (A_eq, b_eq, True)):
+        if A is None or b is None or not len(b):
+            continue
+        Ad = _dense_A(A)
+        bd = np.asarray(b, dtype=np.float64)
+        r = Ad @ x - bd
+        if two_sided:
+            r = np.abs(r)
+        scale = 1.0 + np.abs(bd) + np.abs(Ad) @ np.abs(x)
+        if np.any(r > w * scale):
+            return False
+    if bounds is not None:
+        box = np.asarray(bounds, dtype=np.float64)
+        if box.size:
+            k = min(x.shape[0], box.shape[0])
+            lo, hi, xk = box[:k, 0], box[:k, 1], x[:k]
+            with np.errstate(invalid="ignore"):
+                below = np.where(np.isfinite(lo), lo - xk - w * (1.0 + np.abs(lo)), -1.0)
+                above = np.where(np.isfinite(hi), xk - hi - w * (1.0 + np.abs(hi)), -1.0)
+            if np.any(below > 0.0) or np.any(above > 0.0):
+                return False
+    return True
+
+
 def _integral_claim_recovery(
     sol_flat,
     rounded_inc,
@@ -4062,12 +4110,45 @@ def _integral_claim_recovery(
     the objective returned is the objective OF the re-derived point, so nothing
     is reported that was not computed at the point being reported.
     """
+    box = np.asarray(declared_box, dtype=np.float64)
     if not arbiter(np.asarray(sol_flat, dtype=np.float64)):
-        # The incumbent was already off-row; the snap is not the cause and this
-        # is not this guard's business.
+        # The incumbent was already off-row; the snap is not the cause.
+        #
+        # #1606: one sub-case is still this guard's business. An incumbent read
+        # off a node LP vertex of the CUT-augmented relaxation is feasible only to
+        # the node LP's own tolerance on that augmented system; where a valid cut
+        # is tight at the vertex, the residual on an ORIGINAL row can land just
+        # past the gate's abs=1e-6 (measured 1.15e-6 and 1.29e-6). That is the
+        # same kind of residual the snap arm below re-derives away, so it gets the
+        # same re-derivation -- fix the integers, re-solve the continuous columns
+        # over the declared rows and box -- and nothing more: the window is
+        # bounded (:func:`_within_lp_residual_window`), so a point genuinely off a
+        # row (the #952 regression tests move one by 1e-3) still reaches the exit
+        # gate untouched and is refused in #952's own words.
+        if _within_lp_residual_window(
+            np.asarray(sol_flat, dtype=np.float64)[: box.shape[0]], A_ub, b_ub, A_eq, b_eq, box
+        ):
+            repolished = _pounce_snap_incumbent(
+                np.asarray(rounded_inc, dtype=np.float64),
+                int_offsets,
+                int_sizes,
+                box[:, 0],
+                box[:, 1],
+                c,
+                float(obj_const),
+                A_ub,
+                b_ub,
+                A_eq,
+                b_eq,
+                t_start,
+                time_limit,
+                Q=Q,
+            )
+            if repolished is not None:
+                _robj, _rx = repolished
+                return "repolished", np.asarray(_rx, dtype=np.float64), float(_robj)
         return "not_snap_caused", None, None
 
-    box = np.asarray(declared_box, dtype=np.float64)
     recovered = _pounce_snap_incumbent(
         np.asarray(rounded_inc, dtype=np.float64),
         int_offsets,
@@ -28515,6 +28596,14 @@ def _verified_cut_screen_points(
     every constraint (1e-6) -- the checks the MILP warm-start injection applies.
     Only such a point may reject a cut. Returns the structural slices
     ``x[:n_orig]``.
+
+    The integer columns are SNAPPED to their integers before the box/row checks,
+    and the snapped point is what is verified and returned. A cut is valid for
+    the integer hull, not for points whose integer columns sit a hair off an
+    integer: screening with the unsnapped point let ``b1 = 9e-6`` (inside the
+    1e-5 integrality test) reject five valid cuts and log a false "separator
+    defect" WARNING (#1607 review). A snap that leaves the rows drops the
+    candidate -- dropping one only weakens the backstop, never a cut.
     """
     from discopt._relax.primal_heuristics import _check_constraint_feasibility
 
@@ -28523,7 +28612,7 @@ def _verified_cut_screen_points(
     for cand in candidates:
         if cand is None:
             continue
-        x = np.asarray(cand, dtype=np.float64).ravel()
+        x = np.array(cand, dtype=np.float64).ravel()
         if x.shape[0] < n_vars or not np.all(np.isfinite(x[:n_vars])):
             continue
         if any(
@@ -28531,6 +28620,8 @@ def _verified_cut_screen_points(
             for o, s in zip(int_offsets, int_sizes)
         ):
             continue
+        for o, s in zip(int_offsets, int_sizes):
+            x[o : o + s] = np.round(x[o : o + s])
         if ev is None:
             ev = _make_evaluator(model)
         if not _point_within_variable_box(ev, x[:n_vars]):
@@ -30711,6 +30802,7 @@ def _solve_milp_bb(
     # incumbent. 0.0 (the default) reproduces the pre-#917 deadline exactly.
     _incumbent_extension_s = max(0.0, float(incumbent_time_extension))
     _incumbent_extension_taken = 0.0
+    _incumbent_repolished = False  # #1606
     while True:
         elapsed = time.perf_counter() - t_start
         if elapsed >= time_limit:
@@ -31077,6 +31169,21 @@ def _solve_milp_bb(
                 )
                 sol_flat = np.asarray(_point, dtype=np.float64)
                 obj_val = float(_pobj)
+            elif _verdict == "repolished" and _milp_arbiter(_point):
+                # #1606: an integral incumbent a node-LP residual past the gate,
+                # re-derived on the declared rows. ``obj_val`` is deliberately NOT
+                # replaced here: the tree fathomed against it, so the #1331 drift
+                # test below must compare it with the value at the returned point
+                # and re-run the stopping test if the re-derived point is worse.
+                logger.info(
+                    "MILP-BB: re-derived the continuous columns of an integral "
+                    "incumbent that missed the declared rows by a node-LP residual "
+                    "(#1606): objective %.12g -> %.12g.",
+                    obj_val,
+                    _pobj,
+                )
+                _incumbent_repolished = True
+                sol_flat = np.asarray(_point, dtype=np.float64)
             elif _verdict == "not_snap_caused":
                 # The incumbent was already off-row. Leave it exactly as it was so
                 # the #952 exit gate below judges it, and says so in its own words.
@@ -31300,6 +31407,9 @@ def _solve_milp_bb(
     _milp_solver_stats = {
         f"cuts/{_src}": float(_cnt) for _src, _cnt in _cut_by_source.items() if _cnt > 0
     }
+    # #1606: the exit re-derived an integral incumbent's continuous columns.
+    if _incumbent_repolished:
+        _milp_solver_stats["incumbent/repolished"] = 1.0
 
     # #917: seconds of the caller's withheld fallback reserve this search
     # actually reclaimed (see ``_extend_budget_for_incumbent``). Surfaced only
@@ -31696,6 +31806,7 @@ def _solve_miqp_bb(
     # incumbent. 0.0 (the default) reproduces the pre-#917 deadline exactly.
     _incumbent_extension_s = max(0.0, float(incumbent_time_extension))
     _incumbent_extension_taken = 0.0
+    _incumbent_repolished = False  # #1606
     while True:
         elapsed = time.perf_counter() - t_start
         if elapsed >= time_limit:
@@ -31973,6 +32084,21 @@ def _solve_miqp_bb(
                 )
                 sol_flat = np.asarray(_point, dtype=np.float64)
                 obj_val = float(_pobj)
+            elif _verdict == "repolished" and _miqp_arbiter(_point):
+                # #1606: an integral incumbent a node-LP residual past the gate,
+                # re-derived on the declared rows. ``obj_val`` is deliberately NOT
+                # replaced here: the tree fathomed against it, so the #1331 drift
+                # test below must compare it with the value at the returned point
+                # and re-run the stopping test if the re-derived point is worse.
+                logger.info(
+                    "MIQP-BB: re-derived the continuous columns of an integral "
+                    "incumbent that missed the declared rows by a node-LP residual "
+                    "(#1606): objective %.12g -> %.12g.",
+                    obj_val,
+                    _pobj,
+                )
+                _incumbent_repolished = True
+                sol_flat = np.asarray(_point, dtype=np.float64)
             elif _verdict == "not_snap_caused":
                 logger.debug(
                     "MIQP-BB: the integer snap is not what leaves the rows; "
@@ -32229,6 +32355,8 @@ def _solve_miqp_bb(
         if _incumbent_extension_taken > 0.0
         else None
     )
+    if _incumbent_repolished:  # #1606
+        _ext_stats = {**(_ext_stats or {}), "incumbent/repolished": 1.0}
 
     # #1383: the certificate must survive the FINAL (objective, bound) pair.
     # Everything above may still have moved `obj_val` after the tree computed

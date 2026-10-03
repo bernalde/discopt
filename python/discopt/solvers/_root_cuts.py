@@ -857,9 +857,11 @@ def generate_root_cuts(
             logger.debug("root-cuts: c-MIR separation failed: %s", exc)
         try:
             # #1603: the column box, so a row's tiny nonzeros are charged to its
-            # capacity instead of dropped. The RAW separation bounds (infinite
-            # where unbounded), never ``lb_s``/``ub_s``: those substitute 0 and
-            # 1e5 for a missing bound, which would make the accounting unsound.
+            # capacity instead of dropped. The bounds are ``root.lb_sep``/``ub_sep``:
+            # the declared box tightened by root FBBT over the linear rows, valid
+            # at the root and still infinite where no bound exists. Never
+            # ``lb_s``/``ub_s``: those substitute 0 and 1e5 for a missing bound,
+            # which would make the accounting unsound.
             for cover, rhs in separate_cover_cuts(
                 a_all, b_all, x, is_bin, max_cuts=32, lb=root.lb_sep, ub=root.ub_sep
             ):

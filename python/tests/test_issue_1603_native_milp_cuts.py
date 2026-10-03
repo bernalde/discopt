@@ -312,11 +312,12 @@ def test_randomized_native_cut_panel():
     (4 wrong ``optimal`` objectives, 2 false ``infeasible``); native-nocuts 0/200.
     After the fix: 0/200 wrong on both.
 
-    A loud refusal from the #952 exit gate is recorded separately, not counted as
-    wrong: it is no answer, never a false one. Two instances (seeds 73, 195) end
-    there on native+cuts -- an integral incumbent ~1.2e-6 off an original row on a
-    tight but VALID GMI face; seed 195 does so on main too. Tracked in #1606, which
-    removes this arm.
+    A loud refusal from the #952 exit gate is recorded separately from a wrong
+    answer, and since #1606 there must be none. Before it, two instances (seeds 73,
+    195) ended there on native+cuts -- an integral incumbent ~1.2e-6 off an
+    original row on a tight but VALID GMI face. The exit now re-derives such an
+    incumbent's continuous columns on the declared rows (see
+    ``test_issue_1606_lp_residual_incumbent_is_repolished``).
     """
     n_seeds = 200
     compared = 0
@@ -349,4 +350,110 @@ def test_randomized_native_cut_panel():
         print("  WRONG", w)
     assert compared > 0
     assert not wrong, wrong
-    assert len(refused) <= 2, refused  # #1606
+    assert not refused, refused  # #1606: zero exit-gate refusals
+
+
+# ---------------------------------------------------------------------------
+# #1607 review: the cut screen judges the SNAPPED point
+# ---------------------------------------------------------------------------
+def _two_packing_rows():
+    m = dm.Model("screen_snap")
+    b = [m.binary(f"b{i}") for i in range(3)]
+    m.subject_to(2 * b[0] + 2 * b[1] <= 3)
+    m.subject_to(2 * b[1] + 2 * b[2] <= 3)
+    m.maximize(b[0] + b[1] + b[2])
+    return m, b
+
+
+def test_verified_screen_points_snap_integer_columns():
+    m, _ = _two_packing_rows()
+    n_vars, _lb, _ub, offs, sizes = S._extract_variable_info(m)
+    near = np.array([1.0, 9e-6, 1.0 - 4e-6])
+    pts = S._verified_cut_screen_points(m, [near], n_vars, 3, offs, sizes)
+    assert len(pts) == 1
+    np.testing.assert_array_equal(pts[0], [1.0, 0.0, 1.0])
+    assert near[1] == 9e-6, "the caller's candidate must not be modified in place"
+
+
+def test_near_integral_warm_start_does_not_reject_valid_cuts(caplog):
+    """``b1 = 9e-6`` passes the 1e-5 integrality test. Screened unsnapped, it
+    rejected 5 valid root cuts and logged a false "separator defect" WARNING."""
+    m, b = _two_packing_rows()
+    start = {b[0]: 1.0, b[1]: 9e-6, b[2]: 1.0}
+    with caplog.at_level("WARNING", logger="discopt.solver"):
+        r = m.solve(time_limit=30, milp_backend="native", initial_solution=start)
+    stats = r.solver_stats or {}
+    assert r.status == "optimal" and r.objective == pytest.approx(2.0, abs=1e-9)
+    installed = sum(v for k, v in stats.items() if k.startswith("cuts/") and "rejected" not in k)
+    assert installed > 0, f"no root cut was installed, so nothing was screened: {stats}"
+    assert stats.get("cuts/rejected_by_incumbent", 0) == 0, stats
+    assert not [rec for rec in caplog.records if "separator defect" in rec.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# #1606: an integral incumbent a node-LP residual off a declared row
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("seed", [73, 195])
+def test_issue_1606_lp_residual_incumbent_is_repolished(seed):
+    """Native+cuts used to raise the #952 refusal here: the tree's integral
+    incumbent sat on a tight valid GMI face, 1.15e-6 (seed 73) / 1.29e-6 (seed 195)
+    off an original row. The exit now re-solves its continuous columns with the
+    integers fixed, over the declared rows, and the gate accepts the result."""
+    ref = _random_milp(seed).solve(time_limit=30)
+    r = _random_milp(seed).solve(time_limit=30, milp_backend="native")
+    assert (r.solver_stats or {}).get("incumbent/repolished") == 1.0, (
+        "the repolish arm did not fire -- this no longer exercises #1606",
+        r.solver_stats,
+    )
+    assert r.status == "optimal", r.status
+    assert _close(r.objective, ref.objective), (r.objective, ref.objective)
+    # The certificate: the bound never crosses the reported objective.
+    sense = 1.0 if seed == 73 else -1.0  # 73 minimises, 195 maximises
+    assert sense * (r.bound - r.objective) <= 1e-9, (r.bound, r.objective)
+
+
+def _residual_lp():
+    # min -x0  s.t.  x0 + y <= 1,  x0 in [0, 2],  y binary.  Optimum x0 = 1, y = 0.
+    A_ub = np.array([[1.0, 1.0]])
+    b_ub = np.array([1.0])
+    box = np.array([[0.0, 2.0], [0.0, 1.0]])
+    c = np.array([-1.0, 0.0])
+    return A_ub, b_ub, box, c
+
+
+@pytest.mark.parametrize("excursion, verdict", [(1.2e-6, "repolished"), (1e-3, "not_snap_caused")])
+def test_integral_claim_recovery_repolishes_only_lp_residuals(excursion, verdict):
+    """The window is bounded: a node-LP residual is re-derived, a real excursion
+    (the size the #952 regression tests inject) is left for the exit gate."""
+    import time
+
+    A_ub, b_ub, box, c = _residual_lp()
+    x = np.array([1.0 + excursion, 0.0])
+
+    def arbiter(p):
+        return S._matrix_solution_feasible(np.asarray(p)[:2], A_ub, b_ub, None, None, box)
+
+    assert not arbiter(x)
+    got, point, obj = S._integral_claim_recovery(
+        x,
+        x.copy(),
+        int_offsets=[1],
+        int_sizes=[1],
+        declared_box=box,
+        c=c,
+        obj_const=0.0,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=None,
+        b_eq=None,
+        t_start=time.perf_counter(),
+        time_limit=30.0,
+        arbiter=arbiter,
+    )
+    assert got == verdict
+    if verdict == "repolished":
+        assert arbiter(point)
+        assert point[1] == 0.0
+        assert obj == pytest.approx(-1.0, abs=1e-9)
+    else:
+        assert point is None and obj is None
