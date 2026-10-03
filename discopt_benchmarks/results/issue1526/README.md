@@ -12,6 +12,16 @@ The artifact was executed against:
 - DiscOpt `ac5dcf760b5e65aae58c9b8ac6a5bb66378d97cd` (the implementation
   commit immediately preceding this generated artifact).
 
+**The exact arms are seeded from the POUNCE point.** Every GDP/SOS1 solve is
+warm-started from POUNCE's point once `accept_local_incumbent` accepts it. The
+objective is identically zero, so that incumbent meets the bound at the root:
+the one-node certificates below are a feasibility and regime check of POUNCE's
+point, not an independent exact cross-validation. That is also why the exact
+records sit about `1e-12` from the oracle. In review of jkitchin/discopt#1532 the
+exact GDP was run unseeded: 300 K and 324 K certified in one node, while 250 K
+hit the 60 s limit after 419 nodes, uncertified. Those cold-start runs are not
+in this artifact.
+
 All ten GDP/SOS1 cells are globally certified at one node. All five Scholtes
 cells are `local_optimal`, with `bound=null`, `gap=null`, and
 `gap_certified=false`. Every cell matches the POUNCE regime and algebraic root

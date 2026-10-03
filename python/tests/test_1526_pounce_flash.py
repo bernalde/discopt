@@ -1,4 +1,4 @@
-"""Gate-1 POUNCE flash cross-validation (#1526)."""
+"""Gate-1 POUNCE flash feasibility and regime check (#1526)."""
 
 from __future__ import annotations
 

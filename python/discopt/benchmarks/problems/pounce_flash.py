@@ -1,4 +1,4 @@
-"""Reduced POUNCE Gate-1 flash cross-validation (#1526).
+"""Reduced POUNCE Gate-1 flash feasibility and regime check (#1526).
 
 This module rebuilds the ethane/n-butane phase-changing flash from
 ``pounce.examples.flash_mpcc`` on DiscOpt's expression tree.  POUNCE remains
@@ -9,6 +9,11 @@ comparison, and the version-2 comparison records.
 The zero objective is intentional.  A zero gap proves only that a feasible
 point was globally certified; the physical result is decided by the complete
 point, explicit Boolean identities, and source residuals.
+
+The exact GDP/SOS1 arms are warm-started from the POUNCE point (after
+``accept_local_incumbent`` rechecks it).  With a zero objective the incumbent
+meets the bound at the root, so a one-node certificate is a feasibility and
+regime check *of POUNCE's point*, not an independent exact solve.
 """
 
 from __future__ import annotations
