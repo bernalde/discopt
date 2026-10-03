@@ -341,3 +341,14 @@ def test_a_tree_stopped_on_its_own_1e_8_gap_is_not_exhausted(finished, open_node
     tree = _FakeTree(finished, open_nodes)
     assert _tree_drained(tree) is drained
     assert _tree_exhausted_with_proof(tree) is drained
+
+
+def test_finished_with_open_nodes_is_not_an_exhaustion_proof():
+    """The discriminating case on its own, with no dependency on ``_tree_drained``
+    existing: before #1242, ``_tree_exhausted_with_proof`` trusted
+    ``is_finished()`` alone and returned True for a tree that stopped at its own
+    1e-8 gap with 4 nodes still open."""
+    from discopt.solver import _tree_exhausted_with_proof
+
+    assert _tree_exhausted_with_proof(_FakeTree(finished=True, open_nodes=4)) is False
+    assert _tree_exhausted_with_proof(_FakeTree(finished=True, open_nodes=0)) is True

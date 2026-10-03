@@ -2163,7 +2163,7 @@ def _build_univariate_call(ctx: _Builder, node: CNode, w: int) -> Envelope:
         return Envelope(rows=[], tight=False)  # unknown intrinsic -> interval floor
     f, fp, curv_fn, dom_ok = entry
     if not dom_ok(lo):
-        edge_lo = _closed_edge_lo(fname, lo, hi)
+        edge_lo = _closed_edge_lo(fname, lo, hi, _closed_edge_tol(ctx, lt, fname))
         if edge_lo is None:
             return Envelope(rows=[], tight=False)  # arg box violates domain -> floor
         lo = edge_lo  # #1510: the closed lower domain edge
@@ -2215,18 +2215,63 @@ def _closed_edge_envelopes_enabled() -> bool:
     incorrect, 0 certification regressions, 11 gains (``feasible``/``unknown`` ->
     ``optimal``), nodes 12743 -> 215 and wall 19.6 s -> 4.8 s over the 20 models
     both arms certify (``sqrt(y) + sqrt(1 - y)`` takes more nodes: 19 -> 27,
-    11 -> 31, 7 -> 7).
+    11 -> 31, 7 -> 7). The edge clamp now also pins the aux column of every edge
+    atom (asin/acos/acosh included) to the interval image of the clamped box,
+    and its tolerance scales with the argument's own rounding
+    (:func:`_closed_edge_tol`): an absolute 1e-12 declined ``K - K*y`` at
+    ``K >= 1e4`` and left the root LP unbounded.
     """
     return os.environ.get("DISCOPT_CLOSED_EDGE_ENVELOPES", "1").strip() != "0"
 
 
-#: How far below a closed edge an argument's lower bound may sit and still be read
-#: as that edge (#1510): interval evaluation of an affine argument rounds
+#: How far below a closed edge an argument's lower bound may ALWAYS sit and still
+#: be read as that edge (#1510): interval evaluation of an affine argument rounds
 #: OUTWARD, so ``asin(x - 1)`` over ``x in [0, 1]`` arrives as ``lo = -1 - ulp``.
+#: This absolute floor is widened to the argument's own rounding scale by
+#: :func:`_closed_edge_tol`.
 _CLOSED_EDGE_TOL = 1e-12
 
+#: Rounding budget, in units of ``eps * S``, per term of the argument's LinForm
+#: (#1242 review). Interval evaluation of ``const + sum_j a_j x_j`` does one
+#: multiply and one add per term; each is round-to-nearest (<= 0.5 ulp) followed
+#: by one outward ``nextafter`` (1 ulp), and every intermediate has magnitude
+#: <= ``S = |const| + sum_j |a_j| max(|lb_j|, |ub_j|)``, so with
+#: ``ulp(x) <= eps |x|`` the enclosure's ``lo`` sits at most ``2 * 1.5 = 3`` units
+#: below the exact value per term. 8 leaves a ~2.7x margin for an expression tree
+#: that groups the same affine map differently (``K * (1 - y)`` vs ``K - K*y``).
+_CLOSED_EDGE_ULPS_PER_TERM = 8.0
 
-def _closed_edge_lo(fname: str, lo: float, hi: float) -> Optional[float]:
+#: Column bounds at or beyond this magnitude are the LP layer's infinity sentinel;
+#: an argument over such a column has no rounding scale, only the absolute floor.
+_CLOSED_EDGE_BIG = 1e20
+
+
+def _closed_edge_tol(ctx: _Builder, lt: LinForm, fname: str) -> float:
+    """The clamp tolerance for ``fname``'s closed edge over argument ``lt``: the
+    larger of the absolute floor ``_CLOSED_EDGE_TOL * max(1, |edge|)`` and the
+    outward-rounding error of evaluating ``lt`` over the node box,
+    ``_CLOSED_EDGE_ULPS_PER_TERM * (n_terms + 1) * eps * S`` (#1242 review: an
+    absolute 1e-12 declined ``K - K*y`` at ``K = 1e4``, whose ``lo`` is
+    ``-1.8e-12``, and the root LP came back unbounded again). An argument over an
+    infinite or sentinel-sized column keeps the floor.
+    """
+    edge = _CLOSED_LOWER_EDGE.get(fname, 0.0)
+    floor = _CLOSED_EDGE_TOL * max(1.0, abs(edge))
+    scale = abs(float(lt.const))
+    if not math.isfinite(scale):
+        return floor
+    for j, c in lt.coeffs.items():
+        mag = max(abs(float(ctx.col_lb[j])), abs(float(ctx.col_ub[j])))
+        if not math.isfinite(mag) or mag >= _CLOSED_EDGE_BIG:
+            return floor
+        scale += abs(float(c)) * mag
+    eps = float(np.finfo(np.float64).eps)
+    return max(floor, _CLOSED_EDGE_ULPS_PER_TERM * (len(lt.coeffs) + 1) * eps * scale)
+
+
+def _closed_edge_lo(
+    fname: str, lo: float, hi: float, tol: Optional[float] = None
+) -> Optional[float]:
     """The lower end to envelope a box over when its argument starts at (or a
     rounding error below) the CLOSED lower domain edge of ``fname`` -- that edge --
     or ``None`` to keep the interval floor (#1510; ``=0`` opts out).
@@ -2238,15 +2283,19 @@ def _closed_edge_lo(fname: str, lo: float, hi: float) -> Optional[float]:
     is the tangent AT the edge, whose slope is infinite, and ``_tangent_row``
     already drops a non-finite slope. Clamping an outward-rounded ``lo`` up to the
     edge removes only argument values where ``f`` is undefined, i.e. no point the
-    model can take. A ``lo`` further below the edge than ``_CLOSED_EDGE_TOL`` (a box
-    genuinely reaching outside the domain) keeps the floor, as before.
+    model can take. A ``lo`` further below the edge than ``tol`` (a box genuinely
+    reaching outside the domain) keeps the floor, as before. ``tol`` is the
+    argument's rounding scale from :func:`_closed_edge_tol`; ``None`` means the
+    absolute floor ``_CLOSED_EDGE_TOL * max(1, |edge|)``.
     """
     edge = _CLOSED_LOWER_EDGE.get(fname)
     if edge is None or not _closed_edge_envelopes_enabled():
         return None
     if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= edge:
         return None
-    if not (edge - _CLOSED_EDGE_TOL * max(1.0, abs(edge)) <= lo <= edge):
+    if tol is None:
+        tol = _CLOSED_EDGE_TOL * max(1.0, abs(edge))
+    if not (edge - tol <= lo <= edge):
         return None
     return edge
 

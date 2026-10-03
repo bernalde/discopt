@@ -2826,14 +2826,21 @@ def xlogx(x: Union[Expression, float]) -> Expression:
       *symbolic* derivative (:func:`discopt.bilevel.symbolic_diff.diff`) is the
       exact ``log(x) + 1`` and is therefore unbounded at 0.
     - ``x < 0`` is outside the domain. The interval rule abstains (returns
-      ``[-inf, inf]``) rather than guessing, so a certificate over a box that
-      dips below zero is refused, not silently wrong.
+      ``[-inf, inf]``) rather than guessing. One case is not a genuine dip:
+      interval evaluation rounds OUTWARD, so an affine argument that reaches 0
+      exactly (``1 - y`` over ``y in [0, 1]``, ``K - K*y``) arrives with a lower
+      bound a rounding error below 0 (``-2.2e-16``; ``O(K * eps)`` in general).
+      The relaxation reads such a box as starting at the closed edge 0 and
+      envelopes it over ``[0, hi]`` (#1242; ``DISCOPT_CLOSED_EDGE_ENVELOPES=0``
+      opts out), which removes only argument values where the atom is
+      undefined. A box reaching further below 0 than the argument's own
+      rounding scale gets no envelope, only the interval floor.
 
     Parameters
     ----------
     x : Expression or float
         Input expression. The relaxation and interval rules require a
-        nonnegative, finite box on ``x``.
+        nonnegative (up to outward rounding, see above), finite box on ``x``.
 
     Returns
     -------
