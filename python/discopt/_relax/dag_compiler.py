@@ -432,7 +432,7 @@ def compile_objective_params(model: Model, param_index: dict | None = None) -> C
     """Compile the model's objective into ``fn(x_flat, params) -> scalar``."""
     if model._objective is None:
         raise ValueError("Model has no objective set.")
-    return compile_expression_params(model._objective.expression, model, param_index)
+    return compile_expression_params(model._objective_expression(), model, param_index)
 
 
 def compile_constraint_params(

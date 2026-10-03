@@ -6606,8 +6606,7 @@ def _objective_evaluation_error(model: Model, x: Mapping[str, Any]) -> tuple[Opt
     how far apart the two can be.
 
     Returns ``(width, "")``, or ``(None, reason)`` when the question does not
-    apply: no resident objective (absent, or held by the Rust builder behind a
-    placeholder), a variable the point carries no usable value for, or an atom
+    apply: no objective, a variable the point carries no usable value for, or an atom
     the interval evaluator cannot enclose (an unbounded enclosure). Callers treat
     ``None`` as "not measured", never as "measured 0". Anything else -- including
     a failure of the walk itself -- RAISES; the caller decides what a failed
@@ -6622,8 +6621,6 @@ def _objective_evaluation_error(model: Model, x: Mapping[str, Any]) -> tuple[Opt
     objective = getattr(model, "_objective", None)
     if objective is None:
         return None, "no objective"
-    if getattr(objective, "_is_placeholder", False):
-        return None, "objective held by the builder, not resident in the expression DAG"
     from discopt._relax.convexity.interval import Interval
     from discopt._relax.convexity.interval_ad import _expr_node_count_capped, _stack_depth
     from discopt._relax.convexity.interval_eval import evaluate_interval
@@ -6637,7 +6634,7 @@ def _objective_evaluation_error(model: Model, x: Mapping[str, Any]) -> tuple[Opt
         if val.size != int(np.prod(v.shape)) or not np.all(np.isfinite(val)):
             return None, f"the point's value for {v.name!r} is not a finite {v.shape} array"
         box[v] = Interval.point(val.reshape(v.shape))
-    expr = objective.expression
+    expr = model._objective_expression()  # builder objectives too (#1609)
     n_nodes = _expr_node_count_capped(expr, 10**7)
     enc = _run_with_deep_recursion(
         lambda: evaluate_interval(expr, model, box),

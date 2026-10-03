@@ -267,10 +267,13 @@ def test_corpus_nvs09_shift_no_longer_crashes(flag_on):
 def test_one_sided_offsets_are_moved():
     m = dm.Model("one")
     a = m.continuous("a", lb=1e6, ub=1e15)  # effectively x >= 1e6
-    b = m.integer("b", lb=-3e6, ub=1e15)  # ub effectively open (a bare lb gets the 1e6 default box)
+    b = m.integer("b", lb=3e6, ub=1e15)  # ub effectively open (a bare lb gets the 1e6 default box)
     d = m.continuous("d", ub=-5e5)  # lb open: anchored at ub
     e = m.continuous("e", lb=50.0)  # |lb| < ratio: untouched
-    m.minimize(a + b - d + e)
+    # Boxes that contain 0 are never moved (#1609), however far their bounds reach.
+    f = m.integer("f", lb=-3e6, ub=1e15)
+    g = m.continuous("g", ub=5e5)
+    m.minimize(a + b - d + e + f - g)
     plan = plan_shifts(m, 100.0)
     assert set(plan) == {id(a), id(b), id(d)}
     assert float(plan[id(d)]) == -5e5

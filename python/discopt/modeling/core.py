@@ -9689,20 +9689,14 @@ class Model:
 
         _log = _logging.getLogger(__name__)
 
-        # The evaluator can only speak for an objective that lives in
-        # ``_objective``. ``add_linear_objective`` / ``add_quadratic_objective``
-        # put the real objective in the Rust BUILDER and leave a zero placeholder
-        # here, flagged ``_is_placeholder``; evaluating that placeholder returns
-        # 0.0 for every point. Caught by the smoke suite (#681 builder tests):
-        # this pass "corrected" a correct objective of 3 to 0 and then withdrew a
-        # valid certificate because the bound then crossed it. A reconciliation
-        # that cannot see the objective must not have an opinion about it.
-        if self._objective is None or getattr(self._objective, "_is_placeholder", False):
-            _log.debug(
-                "objective reconciliation skipped: this model's objective is not "
-                "resident in `_objective` (builder-held or absent), so the "
-                "evaluator cannot represent it."
-            )
+        # ``add_linear_objective`` / ``add_quadratic_objective`` leave a zero
+        # placeholder in ``_objective``; reconciling against that placeholder
+        # "corrected" a correct objective of 3 to 0 (#681 builder tests). The
+        # evaluator now lowers the builder block itself via
+        # ``_objective_expression`` (#1609), so builder objectives are reconciled
+        # like any other. Only a model with no objective at all is skipped.
+        if self._objective is None:
+            _log.debug("objective reconciliation skipped: this model has no objective.")
             return
 
         point = result.x
@@ -10205,6 +10199,60 @@ class Model:
         if not blocks:
             return 0
         return int(builtins_sum(int(A.shape[0]) for A, *_ in blocks))
+
+    def _objective_expression(self) -> Expression:
+        """The expression this model minimizes or maximizes, builder objectives included.
+
+        ``add_linear_objective`` / ``add_quadratic_objective`` hold the real
+        objective in the Rust builder and leave a zero placeholder in
+        ``_objective``. An evaluator that lowered the placeholder evaluated every
+        point at 0: the #1537 E incumbent repair then "refuted" a valid bound and
+        withdrew the certificate, and the ``pounce:nlp`` route minimized 0 (#1609).
+        This rebuilds the builder objective from its retained block, in the
+        builder's own convention -- ``0.5 xᵀSx`` with ``S = triu(Q) + triu(Q, 1)ᵀ``
+        (only the upper triangle of ``Q`` is read) -- as gathered elementwise
+        products, so its size is ``O(nnz)`` and never a chain of scalar terms.
+        The sense stays on ``_objective``. Raises if there is no objective.
+        """
+        if self._objective is None:
+            raise ValueError("Model has no objective set.")
+        if not getattr(self._objective, "_is_placeholder", False):
+            return self._objective.expression
+        lin_blk = self._builder_linear_objective
+        quad_blk = self._builder_quadratic_objective
+        if lin_blk is not None:
+            c, x, constant, _sense = lin_blk
+            Q = None
+        elif quad_blk is not None:
+            Q, c, x, constant, _sense = quad_blk
+        else:
+            raise ValueError(
+                "objective is a builder placeholder but the model retains no builder "
+                "objective block to rebuild it from"
+            )
+
+        def gather(flat_idx: np.ndarray) -> Expression:
+            out: Expression
+            if x.shape == ():
+                out = x * np.ones(flat_idx.shape)
+            else:
+                out = x[np.unravel_index(flat_idx, x.shape)]
+            return out
+
+        c = np.asarray(c, dtype=np.float64).ravel()
+        expr: Expression = Constant(np.float64(constant))
+        nz = np.flatnonzero(c)
+        if nz.size:
+            expr = expr + sum(c[nz] * gather(nz))
+        if Q is not None:
+            import scipy.sparse as sp
+
+            S = (sp.triu(Q, 0) + sp.triu(Q, 1).T).tocoo()
+            keep = S.data != 0.0
+            if np.any(keep):
+                rows, cols, vals = S.row[keep], S.col[keep], S.data[keep]
+                expr = expr + sum((0.5 * vals) * gather(rows) * gather(cols))
+        return expr
 
     def _builder_linear_constraints(self) -> list[Constraint]:
         """Materialize the builder-resident linear rows as fresh :class:`Constraint`
