@@ -58,6 +58,114 @@ const MAX_PASSES: usize = 4;
 /// genuine per-line coefficient range, well above float noise.
 pub(crate) const MAX_LINE_RANGE: f64 = 1e-10;
 
+/// Whether [`equilibrate`] starts from a power-of-two **row-normalisation**
+/// pre-pass (`DISCOPT_LP_ROW_PRESCALE`; default on, `0` is the opt-out) (#1537).
+///
+/// Without it the first sweep is a *column* sweep on the raw matrix, so the
+/// [`MAX_LINE_RANGE`] noise filter judges an entry against entries of *other
+/// rows*. Multiplying a row by a positive scalar changes no feasible point, yet a
+/// column holding one entry from a row scaled by 1e5 and one from a row scaled by
+/// 1e-6 then reads the small entry as noise, the row sweep cannot recover it (the
+/// row's other entries, e.g. a slack's `1`, cap the row factor), and the #1296
+/// guard in the MILP driver correctly withdraws every certificate: m3 and flay03m
+/// with rows scaled in 10^[-6,6] lost theirs this way. The pre-pass first divides
+/// every row by the power of two nearest its largest magnitude, which is an exact
+/// reformulation (only exponents shift), so the column sweep compares entries on a
+/// row-scale-invariant footing.
+///
+/// Bound-changing in the CLAUDE.md §5 sense — it changes the factors for every LP
+/// whose range exceeds [`SCALE_TRIGGER`] — so the OFF arm is kept bit-identical to
+/// the pre-#1537 factors. Read fresh on every call (a cached read pins the first
+/// solve's arm for the whole process and makes a differential panel compare an arm
+/// with itself), and an unrecognised value is a refusal rather than a silently
+/// chosen arm.
+pub(crate) fn row_prescale_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROW_PRESCALE_OVERRIDE.with(|c| c.get()) {
+        return on;
+    }
+    match std::env::var("DISCOPT_LP_ROW_PRESCALE") {
+        Err(_) => ROW_PRESCALE_DEFAULT,
+        Ok(v) => match parse_row_prescale_flag(&v) {
+            Ok(on) => on,
+            Err(msg) => panic!("{msg}"),
+        },
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROW_PRESCALE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pin [`row_prescale_enabled`] on this thread until the guard drops.
+///
+/// Unit-test fixtures captured under the pre-#1537 factors (the #1595 sub-tol
+/// witnesses, the bchoco06 unstable-pivot LP, the #1296 gate grid) assert that a
+/// specific code path is *reached*; the pre-pass changes which path they walk. A
+/// thread-local, not `set_var`, so pinning one test never flips the arm under a
+/// test running concurrently on another thread.
+#[cfg(test)]
+pub(crate) fn force_row_prescale(on: bool) -> RowPrescaleGuard {
+    let prev = ROW_PRESCALE_OVERRIDE.with(|c| c.replace(Some(on)));
+    RowPrescaleGuard(prev)
+}
+
+#[cfg(test)]
+pub(crate) struct RowPrescaleGuard(Option<bool>);
+
+#[cfg(test)]
+impl Drop for RowPrescaleGuard {
+    fn drop(&mut self) {
+        ROW_PRESCALE_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// Default arm of `DISCOPT_LP_ROW_PRESCALE` when the variable is unset or empty.
+///
+/// Graduated default-ON (CLAUDE.md §5, 2026-10-03, #1537): flag OFF vs ON over the
+/// 66-file corpus as written and with rows scaled in 10^[-3,3] / 10^[-6,6] (198
+/// interleaved pairs) gave 0 false bounds, 0 lost certificates, 0 failed point
+/// verifications, certified 145 -> 147, total wall 1347 -> 1264 s; the pure LP/MILP
+/// panel through this driver (49 pairs) certified 21 -> 38 with 0 false answers.
+/// `DISCOPT_LP_ROW_PRESCALE=0` keeps the pre-#1537 factors bit-identical.
+const ROW_PRESCALE_DEFAULT: bool = true;
+
+/// Parse a `DISCOPT_LP_ROW_PRESCALE` value. Pure, so the refusal is testable
+/// without touching the process environment.
+fn parse_row_prescale_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // An empty value is how a shell spells "unset": it takes the default.
+        "" => Ok(ROW_PRESCALE_DEFAULT),
+        "0" | "false" | "no" => Ok(false),
+        "1" | "true" | "yes" => Ok(true),
+        other => Err(format!(
+            "DISCOPT_LP_ROW_PRESCALE={other:?} is not recognized (expected 1/true/yes \
+             or 0/false/no). Refusing rather than silently picking an arm."
+        )),
+    }
+}
+
+/// Power-of-two row-normalisation factors: `r_i = 2^k` nearest `1 / max_j |a_ij|`
+/// (`1` for an empty row). Every factor is an exact power of two, so `r_i a_ij`
+/// and `r_i b_i` are exact and the scaled row is the same constraint. Shared by
+/// [`equilibrate`] and the MILP driver's #1296 noise-floor guard, which must judge
+/// entries on the matrix the equilibration actually sees.
+pub(crate) fn row_prescale_factors(sp: &SparseCols, m: usize) -> Vec<f64> {
+    let (_, row_idx, vals) = sp.raw();
+    let mut rmax = vec![0.0f64; m];
+    for (&i, &v) in row_idx.iter().zip(vals) {
+        let av = v.abs();
+        if av > rmax[i] {
+            rmax[i] = av;
+        }
+    }
+    rmax.iter()
+        .map(|&h| if h > 0.0 { nearest_pow2(1.0 / h) } else { 1.0 })
+        .collect()
+}
+
 /// Round `v > 0` to the nearest power of two (an exact float scale factor).
 #[inline]
 fn nearest_pow2(v: f64) -> f64 {
@@ -286,8 +394,21 @@ impl ScaledLp {
 /// zero entry never affects a line's significant min/max, so skipping the
 /// structural zeros changes nothing.
 fn equilibrate(sp: &SparseCols, m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    equilibrate_with(sp, m, n, row_prescale_enabled())
+}
+
+/// [`equilibrate`] with the #1537 row pre-pass chosen explicitly (`prescale`), so
+/// both arms are testable without touching the process environment.
+fn equilibrate_with(sp: &SparseCols, m: usize, n: usize, prescale: bool) -> (Vec<f64>, Vec<f64>) {
     let (col_ptr, row_idx, vals) = sp.raw();
-    let mut row = vec![1.0f64; m];
+    // #1537: optionally start from the exact pow2 row normalisation so the first
+    // column sweep's noise filter is row-scale invariant (see
+    // [`row_prescale_enabled`]). OFF keeps the all-ones start, bit-identical.
+    let mut row = if prescale {
+        row_prescale_factors(sp, m)
+    } else {
+        vec![1.0f64; m]
+    };
     let mut col = vec![1.0f64; n];
     for _ in 0..MAX_PASSES {
         let mut changed = false;
@@ -483,5 +604,136 @@ mod tests {
         assert_eq!(single.c, sc.scale_c(lp.c));
         assert_eq!(single.l, sc.scale_lower(lp.l));
         assert_eq!(single.u, sc.scale_upper(lp.u));
+    }
+
+    // ---------------------------------------------------------------------- //
+    // #1537: the row-normalisation pre-pass (`DISCOPT_LP_ROW_PRESCALE`).
+    // ---------------------------------------------------------------------- //
+
+    /// The witness shape from the m3 / flay03m masters with rows scaled in
+    /// 10^[-6,6]: row 0 is `1e5·(x + y)`, row 1 is `1e-6·(x - y)`, and each row
+    /// carries its engine slack with coefficient 1, which no row scaling touches.
+    /// Column `x` holds `1e5` and `1e-6`: a ratio of 1e-11, under the noise floor.
+    #[rustfmt::skip]
+    const WITNESS: [f64; 8] = [
+        1e5,  1e5,  1.0, 0.0,
+        1e-6, -1e-6, 0.0, 1.0,
+    ];
+
+    /// Entries of the scaled matrix `R A C` that sit below [`MAX_LINE_RANGE`]
+    /// times their row's or column's largest magnitude -- what the simplex treats
+    /// as noise.
+    fn noise_entries(a: &[f64], m: usize, n: usize, row: &[f64], col: &[f64]) -> usize {
+        let s: Vec<f64> = (0..m * n)
+            .map(|k| (row[k / n] * a[k] * col[k % n]).abs())
+            .collect();
+        let rmax: Vec<f64> = (0..m)
+            .map(|i| (0..n).map(|j| s[i * n + j]).fold(0.0, f64::max))
+            .collect();
+        let cmax: Vec<f64> = (0..n)
+            .map(|j| (0..m).map(|i| s[i * n + j]).fold(0.0, f64::max))
+            .collect();
+        (0..m * n)
+            .filter(|&k| {
+                s[k] > 0.0
+                    && (s[k] < MAX_LINE_RANGE * rmax[k / n] || s[k] < MAX_LINE_RANGE * cmax[k % n])
+            })
+            .count()
+    }
+
+    #[test]
+    fn row_prescale_flag_parses_and_refuses() {
+        for on in ["1", "true", "YES", " 1 "] {
+            assert_eq!(parse_row_prescale_flag(on), Ok(true), "{on:?}");
+        }
+        for off in ["0", "false", "no"] {
+            assert_eq!(parse_row_prescale_flag(off), Ok(false), "{off:?}");
+        }
+        assert_eq!(parse_row_prescale_flag(""), Ok(ROW_PRESCALE_DEFAULT));
+        assert!(parse_row_prescale_flag("on").is_err());
+        assert!(parse_row_prescale_flag("2").is_err());
+    }
+
+    #[test]
+    fn row_prescale_factors_are_exact_powers_of_two() {
+        let sp = SparseCols::from_dense(&WITNESS, 2, 4);
+        let r = row_prescale_factors(&sp, 2);
+        for &ri in &r {
+            let (mant, _) = frexp(ri);
+            assert_eq!(mant, 0.5, "{ri} is not a power of two");
+        }
+        // Row 0's largest entry 1e5 lands within a factor sqrt(2) of 1; row 1's
+        // largest entry is the slack's 1, so its factor is 1.
+        assert!((r[0] * 1e5 - 1.0).abs() <= std::f64::consts::SQRT_2 - 1.0 + 1e-12);
+        assert_eq!(r[1], 1.0);
+        // An empty row keeps factor 1.
+        let empty = SparseCols::from_dense(&[0.0, 0.0, 3.0, 0.0], 2, 2);
+        assert_eq!(row_prescale_factors(&empty, 2)[0], 1.0);
+    }
+
+    fn frexp(v: f64) -> (f64, i32) {
+        let e = v.abs().log2().floor() as i32 + 1;
+        (v / 2f64.powi(e), e)
+    }
+
+    #[test]
+    fn prescaled_unscale_is_bit_exact() {
+        // The certificate is published in original units, so the round trip
+        // through the pre-scaled factors must be the identity, bit for bit: the
+        // matrix, the primal point, and the dual map `y = R ŷ` all go through
+        // power-of-two products only.
+        let (m, n) = (2, 4);
+        let mut sp = SparseCols::from_dense(&WITNESS, m, n);
+        let (row, col) = equilibrate_with(&sp, m, n, true);
+        let sc = Scaling { row, col, m, n };
+        let orig = sp.clone();
+        sc.scale_cols(&mut sp);
+        sc.unscale_cols(&mut sp);
+        assert_eq!(sp.raw(), orig.raw());
+
+        let x = [3.25, -7.0e-3, 1.5e6, 0.1];
+        let l = sc.scale_lower(&x);
+        let mut back = l.clone();
+        sc.unscale_x(&mut back);
+        assert_eq!(back.to_vec(), x.to_vec());
+
+        // b̂ᵀŷ = bᵀ(Rŷ) exactly for a power-of-two R.
+        let b = [3.5e5, 1e-6];
+        let bh = sc.scale_b(&b);
+        let yh = [0.37, -2.5];
+        let mut y = yh;
+        sc.unscale_dual(&mut y);
+        assert_eq!(bh[0] * yh[0], b[0] * y[0]);
+        assert_eq!(bh[1] * yh[1], b[1] * y[1]);
+    }
+
+    #[test]
+    fn prescale_keeps_the_witness_entry_significant() {
+        let (m, n) = (2, 4);
+        let sp = SparseCols::from_dense(&WITNESS, m, n);
+        // Anti-vacuity (CLAUDE.md §6): the legacy factors DO leave a noise entry
+        // on this shape, so the ON assertion below is about the fix, not the data.
+        let (r0, c0) = equilibrate_with(&sp, m, n, false);
+        assert!(noise_entries(&WITNESS, m, n, &r0, &c0) > 0);
+        let (r1, c1) = equilibrate_with(&sp, m, n, true);
+        assert_eq!(noise_entries(&WITNESS, m, n, &r1, &c1), 0);
+    }
+
+    #[test]
+    fn prescale_leaves_no_noise_entry_on_either_spelling() {
+        // The same LP with its rows written at unit scale (the "as written" model).
+        // After the pre-pass both spellings equilibrate to matrices with no noise
+        // entry.
+        #[rustfmt::skip]
+        let unit = [
+            1.0, 1.0, 1.0, 0.0,
+            1.0, -1.0, 0.0, 1.0,
+        ];
+        let (m, n) = (2, 4);
+        for a in [&unit[..], &WITNESS[..]] {
+            let sp = SparseCols::from_dense(a, m, n);
+            let (r, c) = equilibrate_with(&sp, m, n, true);
+            assert_eq!(noise_entries(a, m, n, &r, &c), 0);
+        }
     }
 }

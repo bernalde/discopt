@@ -35,6 +35,7 @@ families, each row scaled by its own seeded log-uniform factor in 10^[-3,3] and
 from __future__ import annotations
 
 import os
+import zlib
 
 import discopt.modeling as dm
 import numpy as np
@@ -167,3 +168,61 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
     assert other.gap_certified, (other.status, other.bound)
     assert other.objective == pytest.approx(base.objective, abs=1e-6)
     assert other.bound <= 0.0 + 1e-6, other.bound
+
+
+# --------------------------------------------------------------------------- #
+# Rust MILP equilibration under DISCOPT_LP_ROW_PRESCALE (#1537).
+# --------------------------------------------------------------------------- #
+
+
+def _per_row_scaled(name: str, span: float):
+    """The probe's model: every row of ``name`` multiplied by its own seeded
+    log-uniform factor in ``10^[-span, span]`` (seed = crc32 of the file name)."""
+    path = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl", name)
+    base = dm.from_nl(path)
+    new = _rebuild(base, lambda v: np.zeros(v.lb.shape), 1.0, f"{name}_pr{span:g}")
+    rng = np.random.default_rng(zlib.crc32(name.encode()))
+    new._constraints = [
+        Constraint(
+            body=float(10.0 ** rng.uniform(-span, span)) * c.body,
+            sense=c.sense,
+            rhs=0.0,
+            name=c.name,
+        )
+        for c in new._constraints
+    ]
+    return new
+
+
+def test_row_scaled_m3_certifies_with_row_prescale(monkeypatch):
+    """m3 with rows scaled in 10^[-6,6]. An OA-master column for a variable that
+    appears in a row scaled by ~1e5 and one scaled by ~1e-6 holds a 1e-11 ratio,
+    which the column-first equilibration read as noise. The #1296 guard then
+    (correctly) withdrew every master certificate and the solve ended uncertified.
+    The pow2 row pre-pass judges the column on row-normalised entries."""
+    from discopt._rust import profile_counters_py, profile_reset_py
+
+    monkeypatch.setenv("DISCOPT_PROFILE", "1")
+    # OFF arm, anti-vacuity: the shape still reaches the guard and loses the cert.
+    monkeypatch.setenv("DISCOPT_LP_ROW_PRESCALE", "0")
+    profile_reset_py()
+    off = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
+    assert not off.gap_certified, (off.status, off.bound)
+
+    monkeypatch.setenv("DISCOPT_LP_ROW_PRESCALE", "1")
+    profile_reset_py()
+    on = _per_row_scaled("m3.nl", 6.0).solve(time_limit=60)
+    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) == 0
+    assert on.gap_certified, (on.status, on.bound)
+    # minlplib.solu: m3 =opt= 37.8 (minimize).
+    assert on.bound <= 37.8 + 1e-6
+    assert on.objective == pytest.approx(37.8, abs=1e-4)
+
+    # Graduated default (#1537): with the variable unset the pre-pass runs.
+    monkeypatch.delenv("DISCOPT_LP_ROW_PRESCALE")
+    profile_reset_py()
+    dflt = _per_row_scaled("m3.nl", 6.0).solve(time_limit=60)
+    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) == 0
+    assert dflt.gap_certified, (dflt.status, dflt.bound)
+    assert dflt.bound <= 37.8 + 1e-6

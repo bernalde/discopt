@@ -23,7 +23,7 @@ use crate::lp::crossover::LpView;
 use crate::lp::cut_select::select_cuts;
 use crate::lp::gomory::{separate_gomory_cols, GomoryCut};
 use crate::lp::simplex::linsolve::{FeralLU, LinearSolver};
-use crate::lp::simplex::scaling::MAX_LINE_RANGE;
+use crate::lp::simplex::scaling::{row_prescale_enabled, row_prescale_factors, MAX_LINE_RANGE};
 use crate::lp::simplex::sparse::SparseCols;
 use crate::lp::simplex::{
     solve_lp, solve_lp_cols, solve_lp_cols_scaled, solve_lp_warm, solve_lp_warm_scaled_csc,
@@ -1310,6 +1310,14 @@ pub fn solve_milp_node_hooked(
 ///
 /// Open bounds are tested on the bound against the `1e20` sentinel, never on the
 /// product (see `presolve::contrib`).
+///
+/// With `DISCOPT_LP_ROW_PRESCALE=1` (#1537) the equilibration first divides each
+/// row by an exact power of two near its largest magnitude, so the guard judges
+/// the same row-normalised matrix (and rhs) that the column sweep's noise filter
+/// sees. The row-relative test is unchanged by that (it is invariant under row
+/// scaling); the column-relative test and the rhs scale are the ones that move.
+/// With the flag off the factors are all `1.0`, so the test is bit-identical to
+/// the pre-#1537 guard.
 fn has_unscalable_tiny_entry(
     csc: &SparseCols,
     m: usize,
@@ -1318,12 +1326,31 @@ fn has_unscalable_tiny_entry(
     u: &[f64],
     b: &[f64],
 ) -> bool {
+    has_unscalable_tiny_entry_with(csc, m, n, l, u, b, row_prescale_enabled())
+}
+
+/// [`has_unscalable_tiny_entry`] with the #1537 row pre-pass chosen explicitly.
+#[allow(clippy::too_many_arguments)]
+fn has_unscalable_tiny_entry_with(
+    csc: &SparseCols,
+    m: usize,
+    n: usize,
+    l: &[f64],
+    u: &[f64],
+    b: &[f64],
+    prescale: bool,
+) -> bool {
+    let rs = if prescale {
+        row_prescale_factors(csc, m)
+    } else {
+        vec![1.0f64; m]
+    };
     let (col_ptr, row_idx, vals) = csc.raw();
     let mut row_max = vec![0.0f64; m];
     let mut col_max = vec![0.0f64; n];
     for j in 0..n {
         for idx in col_ptr[j]..col_ptr[j + 1] {
-            let a = vals[idx].abs();
+            let a = (rs[row_idx[idx]] * vals[idx]).abs();
             row_max[row_idx[idx]] = row_max[row_idx[idx]].max(a);
             col_max[j] = col_max[j].max(a);
         }
@@ -1332,12 +1359,12 @@ fn has_unscalable_tiny_entry(
         let open = l[j] <= -INF || u[j] >= INF;
         let reach = l[j].abs().max(u[j].abs());
         for idx in col_ptr[j]..col_ptr[j + 1] {
-            let a = vals[idx].abs();
             let i = row_idx[idx];
+            let a = (rs[i] * vals[idx]).abs();
             if a == 0.0 || (a >= MAX_LINE_RANGE * row_max[i] && a >= MAX_LINE_RANGE * col_max[j]) {
                 continue;
             }
-            if open || a * reach > TINY_ENTRY_ROW_TOL * b[i].abs().max(1.0) {
+            if open || a * reach > TINY_ENTRY_ROW_TOL * (rs[i] * b[i]).abs().max(1.0) {
                 return true;
             }
         }
@@ -8777,9 +8804,85 @@ mod tiny_entry_tests {
     //! certificate when it can move its row.
     use super::*;
 
+    /// The #1296 grid below was written against the raw-matrix (pre-#1537) gate,
+    /// so it is pinned to the `DISCOPT_LP_ROW_PRESCALE=0` arm; the graduated
+    /// default is covered by `row_prescale_gate_grid`.
     fn gate(dense: &[f64], m: usize, l: &[f64], u: &[f64], b: &[f64]) -> bool {
+        gate_arm(dense, m, l, u, b, false)
+    }
+
+    fn gate_arm(dense: &[f64], m: usize, l: &[f64], u: &[f64], b: &[f64], pre: bool) -> bool {
         let n = l.len();
-        has_unscalable_tiny_entry(&SparseCols::from_dense(dense, m, n), m, n, l, u, b)
+        has_unscalable_tiny_entry_with(&SparseCols::from_dense(dense, m, n), m, n, l, u, b, pre)
+    }
+
+    /// The #1296 grid under the graduated row pre-pass (#1537). Every verdict is
+    /// unchanged except the last case, whose small entry is the ONLY entry of its
+    /// row (`1e-11·x0 <= 1`): that row is `x0 <= 1e11` written at a different scale,
+    /// the pre-pass normalises it, equilibration no longer reads it as noise, and
+    /// the gate correctly stays quiet -- the row-scale invariance #1537 asks for.
+    #[test]
+    fn row_prescale_gate_grid() {
+        let b = [1.0, 0.0];
+        #[allow(clippy::type_complexity)]
+        let cases: [(&[f64], &[f64], &[f64], bool, bool); 7] = [
+            (
+                &[1.0, 2.0, 0.0, 3.0],
+                &[0.0, 0.0],
+                &[1.0, INF],
+                false,
+                false,
+            ),
+            (
+                &[1.0, -1e-11, 0.0, 1.0],
+                &[0.0, 0.0],
+                &[1.0, INF],
+                true,
+                true,
+            ),
+            (
+                &[1.0, -1e-11, 0.0, 1.0],
+                &[0.0, -INF],
+                &[1.0, 5.0],
+                true,
+                true,
+            ),
+            (
+                &[1.0, -1e-11, 0.0, 1.0],
+                &[0.0, 0.0],
+                &[1.0, 10.0],
+                false,
+                false,
+            ),
+            (
+                &[1.0, -1e-11, 0.0, 1.0],
+                &[0.0, 0.0],
+                &[1.0, 1e11],
+                true,
+                true,
+            ),
+            (
+                &[1e-11, 0.0, 0.0, 1.0],
+                &[0.0, 0.0],
+                &[INF, INF],
+                false,
+                false,
+            ),
+            (
+                &[1e-11, 0.0, 1.0, 1.0],
+                &[0.0, 0.0],
+                &[INF, 1.0],
+                true,
+                false,
+            ),
+        ];
+        let mut checked = 0;
+        for (dense, l, u, off, on) in cases {
+            assert_eq!(gate_arm(dense, 2, l, u, &b, false), off, "OFF {dense:?}");
+            assert_eq!(gate_arm(dense, 2, l, u, &b, true), on, "ON {dense:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 7);
     }
 
     #[test]
@@ -8841,6 +8944,42 @@ mod tiny_entry_tests {
             &[INF, 1.0],
             &b
         ));
+    }
+
+    #[test]
+    fn row_prescale_clears_the_gate_on_the_row_scaled_witness() {
+        // #1537: `1e5·(x + y) + s0 = 3.5e5`, `1e-6·(x - y) + s1 = 1e-6`. Column x
+        // holds 1e5 and 1e-6 (ratio 1e-11): noise against the raw column, not
+        // against the row-normalised one. The legacy gate fires (that is the
+        // decertification m3/flay03m hit); with the pre-pass it does not.
+        #[rustfmt::skip]
+        let dense = [
+            1e5,  1e5,  1.0, 0.0,
+            1e-6, -1e-6, 0.0, 1.0,
+        ];
+        let (m, n) = (2, 4);
+        // s0 <= 0 makes row 0 a `>=`, s1 >= 0 makes row 1 a `<=`.
+        let l = [0.0, 0.0, -INF, 0.0];
+        let u = [10.0, 100.0, 0.0, INF];
+        let b = [3.5e5, 1e-6];
+        let sp = SparseCols::from_dense(&dense, m, n);
+        assert!(has_unscalable_tiny_entry_with(&sp, m, n, &l, &u, &b, false));
+        assert!(!has_unscalable_tiny_entry_with(&sp, m, n, &l, &u, &b, true));
+        // The pre-pass is not a blanket pass: a genuinely row-relative noise
+        // entry (the #1296 big-M shape) still fires on both arms.
+        let big = [1.0, -1e-11, 0.0, 1.0];
+        let sp = SparseCols::from_dense(&big, 2, 2);
+        for arm in [false, true] {
+            assert!(has_unscalable_tiny_entry_with(
+                &sp,
+                2,
+                2,
+                &[0.0, 0.0],
+                &[1.0, INF],
+                &[1.0, 0.0],
+                arm
+            ));
+        }
     }
 
     #[test]
