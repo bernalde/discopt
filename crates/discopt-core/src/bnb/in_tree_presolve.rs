@@ -53,7 +53,7 @@ pub struct InTreePresolveOptions {
     pub probe_max_vars: usize,
     /// Expand array-valued rows elementwise for the per-scalar kernel (#1568,
     /// [`expand_rows_for_fbbt`]). `None` reads `DISCOPT_IN_TREE_ARRAY_ROWS`
-    /// ([`array_rows_enabled`], default OFF); `Some(b)` overrides it. Only
+    /// ([`array_rows_enabled`], default ON; `=0` opts out); `Some(b)` overrides it. Only
     /// consulted by [`run_in_tree_presolve_scalar`] on a non-scalar layout.
     pub expand_array_rows: Option<bool>,
 }
@@ -496,21 +496,28 @@ pub fn scalarize_for_fbbt(model: &ModelRepr) -> Result<ScalarFbbtView, String> {
     })
 }
 
-/// `DISCOPT_IN_TREE_ARRAY_ROWS` -- **default OFF** (#1568, CLAUDE.md §5).
+/// `DISCOPT_IN_TREE_ARRAY_ROWS` -- **default ON** since the #1568 graduation
+/// panel (CLAUDE.md §5); `=0` (or `false`/`off`/`no`) is the opt-out and
+/// restores the legacy proxy view exactly.
 ///
 /// ON: [`run_in_tree_presolve_scalar`] hands FBBT [`expand_rows_for_fbbt`]'s
 /// view, in which every array-valued constraint row is one scalar row per
 /// element, instead of [`scalarize_for_fbbt`]'s, in which an array-valued
 /// reference is a never-tightened hull proxy. It is bound-changing only on models
 /// with an array-valued row or reference: a scalar-layout model never builds a
-/// view, so the whole `.nl` corpus is unaffected by construction.
+/// view, so the whole `.nl` corpus is unaffected by construction (measured: 66/66
+/// in-repo `.nl` instances identical ON vs OFF, bar one wall-clock-limited run).
+/// Graduation panel (`discopt_benchmarks/scripts/array_rows_graduation_panel.py
+/// --scale all`, 58 array instances, 30 s): 0 violations over 282 checks,
+/// certificates +5 / -0, wall 1350 s -> 1244 s, FBBT 3.2% of ON wall.
 pub fn array_rows_enabled() -> bool {
-    std::env::var("DISCOPT_IN_TREE_ARRAY_ROWS").is_ok_and(|v| {
-        matches!(
+    match std::env::var("DISCOPT_IN_TREE_ARRAY_ROWS") {
+        Err(_) => true,
+        Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        )
-    })
+            "0" | "false" | "off" | "no"
+        ),
+    }
 }
 
 /// Per-scalar `VarInfo`s for a contiguous layout: slot `j` is flat scalar `j`.

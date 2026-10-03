@@ -2352,7 +2352,8 @@ def _in_tree_presolve_skipped() -> dict[str, int]:
 
 
 # #1568: how the per-scalar kernel saw array-valued rows, per node call, when
-# ``DISCOPT_IN_TREE_ARRAY_ROWS`` is on (read in Rust, ``array_rows_enabled``):
+# ``DISCOPT_IN_TREE_ARRAY_ROWS`` is on (read in Rust, ``array_rows_enabled``;
+# default ON since the #1568 graduation panel, ``=0`` opts out):
 # ``expanded`` -- every array-structured row expanded elementwise; ``partial`` --
 # some rows expanded and the rest kept their proxy (hull) form; ``declined`` --
 # no expanded view was built and the proxy view (the pre-#1568 behaviour) ran.

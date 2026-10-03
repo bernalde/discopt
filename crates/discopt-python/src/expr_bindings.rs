@@ -1018,7 +1018,7 @@ impl PyModelRepr {
     ///
     /// `expand_array_rows` turns the #1568 elementwise row expansion on or off
     /// for this call; `None` (the default) reads `DISCOPT_IN_TREE_ARRAY_ROWS`
-    /// (default OFF). The expanded view is built once per repr and cached.
+    /// (default ON; `=0` opts out). The expanded view is built once per repr and cached.
     #[pyo3(signature = (
         node_lb,
         node_ub,

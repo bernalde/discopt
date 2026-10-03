@@ -4,7 +4,11 @@ The flag changes nothing on a scalar-layout model (no FBBT view is built), so th
 ``.nl`` corpus is unaffected by construction; the class it can change is models
 with array variables and array-valued rows. Panel: #1513's dispersion family
 (array form) and the ``discopt.ml`` embeddings (ReLU big-M, sigmoid full space,
-sigmoid reduced space) over a width x depth x seed grid.
+sigmoid reduced space) over a width x depth x seed grid, plus a vectorised
+nonconvex QP family (``A @ x <= b``, ``x <= z`` over binaries). ``--scale large``
+adds widths {50, 100} x depths {2, 3}: the per-node FBBT cost class, since the
+expanded view grows with the element count. ``--nl-dir`` adds the scalar-layout
+neutrality check (ON and OFF must agree exactly on every ``.nl`` that finishes).
 
 Per instance, flag OFF then ON, each on a FRESHLY built model (a solve writes
 implied bounds back onto its model), ``deterministic=True``. Checks:
@@ -13,11 +17,13 @@ implied bounds back onto its model), ``deterministic=True``. Checks:
   crosses the best incumbent either arm found; every published incumbent
   re-verifies with ``verify_point`` on the model; no certificate is lost ON;
 * net-positive -- certificates gained, nodes on instances both arms certify,
-  final bound on instances neither certifies, total wall.
+  final bound on instances neither certifies, total wall, and the in-tree FBBT
+  time (``reduce/fbbt``) per node and as a share of wall.
 
 Prints an executed-check count and exits non-zero if nothing was compared (§6).
 
-    python -u discopt_benchmarks/scripts/array_rows_graduation_panel.py [--time-limit 30]
+    python -u discopt_benchmarks/scripts/array_rows_graduation_panel.py [--time-limit 30] \
+        [--scale base|large|all] [--nl-dir python/tests/data/minlplib_nl]
 """
 
 from __future__ import annotations
@@ -66,18 +72,100 @@ def network(act: str, method: str, width: int, depth: int, seed: int):
     return m
 
 
-def instances():
-    for n in (3, 4, 5, 6):
-        yield f"disp{n}", (lambda n=n: dispersion(n))
+def vector_qp(n: int, seed: int):
+    """Nonconvex box QP with vector linear rows and a binary on/off block.
+
+    A generic vectorised model (not a network): ``A @ x <= b`` is an
+    array-valued row, ``x <= u * z`` an elementwise vector row over binaries.
+    """
+    import discopt.modeling as dm
+
+    rng = np.random.default_rng(seed)
+    q = rng.normal(size=(n, n))
+    q = 0.5 * (q + q.T)
+    a = rng.uniform(0.0, 1.0, size=(max(2, n // 3), n))
+    b = a.sum(axis=1) * 0.4
+    m = dm.Model(f"vqp{n}_s{seed}")
+    x = m.continuous("x", shape=(n,), lb=0.0, ub=1.0)
+    z = m.binary("z", shape=(n,))
+    m.subject_to(a @ x <= b)
+    m.subject_to(x - z <= 0)
+    m.subject_to(dm.sum(z) <= max(2, n // 2))
+    # ``dm.sum(x * (q @ x))``, not ``x @ q @ x``: the latter currently gets no LP
+    # relaxation and stops at the root (#1591), which would make the
+    # instance measure nothing here.
+    m.minimize(dm.sum(x * (q @ x)) + 0.1 * dm.sum(z))
+    return m
+
+
+def instances(scale: str = "base"):
+    if scale in ("base", "all"):
+        for n in (3, 4, 5, 6):
+            yield f"disp{n}", (lambda n=n: dispersion(n))
+        for n in (8, 12, 16):
+            for seed in (0, 1):
+                yield f"vqp{n}_s{seed}", (lambda n=n, s=seed: vector_qp(n, s))
     forms = (("relu", "relu_bigm"), ("sigmoid", "full_space"), ("sigmoid", "reduced_space"))
+    grid = []
+    if scale in ("base", "all"):
+        grid += [(w, d) for w in (10, 25) for d in (1, 2)]
+    if scale in ("large", "all"):
+        # The per-node FBBT cost class: element counts 4-30x the base grid.
+        grid += [(50, 2), (100, 2), (50, 3), (100, 3)]
     for act, method in forms:
-        for width in (10, 25):
-            for depth in (1, 2):
-                for seed in (0, 1):
-                    yield (
-                        f"{method}_{width}x{depth}_s{seed}",
-                        lambda a=act, me=method, w=width, d=depth, s=seed: network(a, me, w, d, s),
-                    )
+        for width, depth in grid:
+            for seed in (0, 1):
+                yield (
+                    f"{method}_{width}x{depth}_s{seed}",
+                    lambda a=act, me=method, w=width, d=depth, s=seed: network(a, me, w, d, s),
+                )
+
+
+def nl_neutrality(paths, tl: float) -> tuple[int, list[str]]:
+    """Scalar-layout ``.nl`` models: the flag must change nothing.
+
+    No FBBT view is built on a scalar layout, so ON and OFF must agree exactly
+    on status, node count and objective, and ON must report no array-row stat.
+    """
+    from discopt.modeling.core import from_nl
+
+    checks, viol = 0, []
+    for p in paths:
+        out = {}
+        for f in ("0", "1"):
+            os.environ[FLAG] = f
+            r = from_nl(str(p)).solve(time_limit=tl, deterministic=True)
+            out[f] = r
+        r0, r1 = out["0"], out["1"]
+        st1 = r1.solver_stats or {}
+        checks += 1
+        arr = [k for k in st1 if k.startswith("reduce/array_row")]
+        same = (
+            r0.status == r1.status
+            and r0.node_count == r1.node_count
+            and (
+                r0.objective == r1.objective
+                or (
+                    r0.objective is not None
+                    and r1.objective is not None
+                    and abs(r0.objective - r1.objective) <= 1e-9 * (1 + abs(r0.objective))
+                )
+            )
+        )
+        timed_out = r0.status == "time_limit" or r1.status == "time_limit"
+        if arr:
+            viol.append(f"{p.name}: scalar .nl model reported array-row stats {arr}")
+        if not same and not timed_out:
+            viol.append(
+                f"{p.name}: OFF {r0.status} n={r0.node_count} obj={r0.objective} vs "
+                f"ON {r1.status} n={r1.node_count} obj={r1.objective}"
+            )
+        print(
+            f"NL {p.name:24s} OFF {r0.status:10s} n={r0.node_count:<6d} | ON {r1.status:10s} "
+            f"n={r1.node_count:<6d} array_stats={arr} same={same}",
+            flush=True,
+        )
+    return checks, viol
 
 
 def solve(build, flag: str, tl: float):
@@ -103,6 +191,13 @@ def solve(build, flag: str, tl: float):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--time-limit", type=float, default=30.0)
+    ap.add_argument("--scale", choices=("base", "large", "all"), default="base")
+    ap.add_argument(
+        "--nl-dir",
+        default=None,
+        help="also run the scalar-layout neutrality check on every .nl in this dir",
+    )
+    ap.add_argument("--nl-time-limit", type=float, default=10.0)
     args = ap.parse_args()
     import discopt
 
@@ -112,13 +207,26 @@ def main() -> int:
     nodes_both = {"0": 0, "1": 0}
     wall = {"0": 0.0, "1": 0.0}
     tighter = looser = 0
-    for name, build in instances():
+    fbbt_s = {"0": 0.0, "1": 0.0}
+    nodes_all = {"0": 0, "1": 0}
+    if args.nl_dir:
+        from pathlib import Path
+
+        nl_checks, nl_viol = nl_neutrality(
+            sorted(Path(args.nl_dir).glob("*.nl")), args.nl_time_limit
+        )
+        checks += nl_checks
+        compared += nl_checks
+        viol += nl_viol
+    for name, build in instances(args.scale):
         res = {f: solve(build, f, args.time_limit) for f in ("0", "1")}
         compared += 1
         r0, r1 = res["0"][0], res["1"][0]
         maximize = res["0"][3]
         for f in ("0", "1"):
             wall[f] += res[f][1]
+            fbbt_s[f] += float((res[f][0].solver_stats or {}).get("reduce/fbbt", 0.0))
+            nodes_all[f] += int(res[f][0].node_count)
             if res[f][2] is not None:
                 checks += 1
                 if res[f][2]:
@@ -152,13 +260,17 @@ def main() -> int:
             tighter += bool(better and abs(r1.bound - r0.bound) > 1e-9)
             looser += bool(worse and abs(r1.bound - r0.bound) > 1e-9)
         st = r1.solver_stats or {}
+        f0 = float((r0.solver_stats or {}).get("reduce/fbbt", 0.0))
+        f1 = float(st.get("reduce/fbbt", 0.0))
         print(
             f"{name:28s} OFF {r0.status:9s} {'C' if c0 else '-'} n={r0.node_count:<6d} "
             f"b={r0.bound!s:>22.12s} | "
             f"ON {r1.status:9s} {'C' if c1 else '-'} n={r1.node_count:<6d} "
             f"b={r1.bound!s:>22.12s} expanded={int(st.get('reduce/array_rows_expanded', 0))} "
             f"declined={int(st.get('reduce/array_rows_declined', 0))} "
-            f"wall {res['0'][1]:.1f}/{res['1'][1]:.1f} load={os.getloadavg()[0]:.2f}",
+            f"wall {res['0'][1]:.1f}/{res['1'][1]:.1f} "
+            f"fbbt {f0:.2f}/{f1:.2f}s ({1e3 * f0 / max(1, r0.node_count):.2f}/"
+            f"{1e3 * f1 / max(1, r1.node_count):.2f} ms/node) load={os.getloadavg()[0]:.2f}",
             flush=True,
         )
     print(f"\nCOMPARED {compared}; executed checks {checks}")
@@ -170,6 +282,13 @@ def main() -> int:
     print(f"nodes on both-certified: OFF {nodes_both['0']} ON {nodes_both['1']}")
     print(f"uncertified both: ON bound tighter {tighter}, looser {looser}")
     print(f"total wall: OFF {wall['0']:.0f}s ON {wall['1']:.0f}s")
+    print(
+        f"FBBT time: OFF {fbbt_s['0']:.1f}s "
+        f"({100 * fbbt_s['0'] / max(wall['0'], 1e-9):.1f}% of wall, "
+        f"{1e3 * fbbt_s['0'] / max(1, nodes_all['0']):.2f} ms/node) "
+        f"ON {fbbt_s['1']:.1f}s ({100 * fbbt_s['1'] / max(wall['1'], 1e-9):.1f}% of wall, "
+        f"{1e3 * fbbt_s['1'] / max(1, nodes_all['1']):.2f} ms/node)"
+    )
     return 0 if compared and checks else 1
 
 

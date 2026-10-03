@@ -7,7 +7,7 @@ reference at a hull proxy that is never tightened, so a branch on an input
 moved nothing downstream: measured on a 2-10-1 sigmoid net with ``x0`` branched
 to [0, 1] and ``x1`` to [-1, 0], the vector rows tightened 2 half-bounds where
 the same rows written per element tightened 26. ``DISCOPT_IN_TREE_ARRAY_ROWS``
-(the ``expand_array_rows`` kwarg; default OFF) replaces each array row with one
+(the ``expand_array_rows`` kwarg; default ON, ``=0`` opts out) replaces each array row with one
 scalar row per element. Ported from #1579.
 """
 
@@ -124,15 +124,15 @@ def test_expansion_never_cuts_a_point_on_the_network():
 
 
 @pytest.mark.slow
-def test_flagged_solve_uses_expanded_rows_and_default_does_not(monkeypatch):
-    """End to end: with the flag the node loop reaches the expansion and
-    certifies the 2-10-1 net; the default (OFF) never fires it."""
-    monkeypatch.setenv("DISCOPT_IN_TREE_ARRAY_ROWS", "1")
+def test_default_solve_uses_expanded_rows_and_opt_out_does_not(monkeypatch):
+    """End to end: by default the node loop reaches the expansion and certifies
+    the 2-10-1 net; the ``=0`` opt-out never fires it."""
+    monkeypatch.delenv("DISCOPT_IN_TREE_ARRAY_ROWS", raising=False)
     r_on = _net_model(False).solve(time_limit=60)
     assert S._in_tree_array_row_calls() > 0
     assert r_on.status == "optimal" and r_on.gap_certified
     assert r_on.bound <= r_on.objective + 1e-9
-    monkeypatch.delenv("DISCOPT_IN_TREE_ARRAY_ROWS", raising=False)
+    monkeypatch.setenv("DISCOPT_IN_TREE_ARRAY_ROWS", "0")
     r_off = _net_model(False).solve(time_limit=5)
     assert S._in_tree_array_row_calls() == 0
     assert r_off.objective is not None
