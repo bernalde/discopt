@@ -856,7 +856,13 @@ def generate_root_cuts(
         except Exception as exc:  # pragma: no cover - separator robustness
             logger.debug("root-cuts: c-MIR separation failed: %s", exc)
         try:
-            for cover, rhs in separate_cover_cuts(a_all, b_all, x, is_bin, max_cuts=32):
+            # #1603: the column box, so a row's tiny nonzeros are charged to its
+            # capacity instead of dropped. The RAW separation bounds (infinite
+            # where unbounded), never ``lb_s``/``ub_s``: those substitute 0 and
+            # 1e5 for a missing bound, which would make the accounting unsound.
+            for cover, rhs in separate_cover_cuts(
+                a_all, b_all, x, is_bin, max_cuts=32, lb=root.lb_sep, ub=root.ub_sep
+            ):
                 a = np.zeros(root.n)
                 for j in cover:
                     a[j] = 1.0

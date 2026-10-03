@@ -41,9 +41,12 @@ pub struct StructureManifest {
     /// discovered during probing or by structural inspection.
     pub implications: Vec<Implication>,
     /// Pairwise binary conflict edges (item F2 of the roadmap). Each
-    /// edge `(i, j)` with `i < j` records that binary variable blocks
-    /// `i` and `j` cannot simultaneously equal 1 under some constraint.
-    /// Sorted lexicographically.
+    /// edge `(i, j)` with `i < j` records that the scalar binary
+    /// variables at FLAT COLUMNS `i` and `j` (`VarInfo::offset`, the
+    /// index into the solver's flat `x`) cannot simultaneously equal 1
+    /// under some constraint. Sorted lexicographically. (#1603: these
+    /// used to be variable-BLOCK indices, which the only consumer read
+    /// as flat columns -- the cut landed on the wrong variables.)
     pub cliques: Vec<(usize, usize)>,
     /// Constraint indices a pass proved redundant *without removing
     /// them* — the row is implied by the current variable bounds, but
