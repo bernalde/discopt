@@ -354,3 +354,25 @@ def test_qp_route_certifies_without_backend_duals():
     assert out is not None and out.status == "optimal" and out.gap_certified
     assert out.bound <= 0.5
     assert out.bound >= 0.5 - 1e-9
+
+
+def test_amp_takes_the_verified_lp_route_on_a_pure_lp(monkeypatch):
+    """A pure LP under ``solver="amp"`` is certified by the default route's verified
+    HiGHS engine, not by the NLP tangent bound. On nlp_cvx_002_010 both columns are
+    free on the 1e20 box; with float multipliers the exact Lagrangian slope is ~4e-17,
+    worth ~1e2 of bound over that reach, so the NLP certificate is (correctly)
+    withheld. ``DISCOPT_LP_MILP_BACKEND=rust`` keeps the NLP path."""
+    from test_minlptests import MINLPTESTS_CVX_BY_ID
+
+    inst = MINLPTESTS_CVX_BY_ID["nlp_cvx_002_010"]
+    r = inst.build_fn().solve(time_limit=60.0, gap_tolerance=1e-6, solver="amp", nlp_solver="ipm")
+    assert r.status == "optimal" and r.convex_fast_path is True
+    assert r.algorithm_route is not None and r.algorithm_route.startswith("highs-lp")
+    assert r.bound is not None and r.bound <= r.objective
+    assert abs(r.objective - inst.expected_obj) <= 1e-6 + 1e-4 * abs(inst.expected_obj)
+
+    monkeypatch.setenv("DISCOPT_LP_MILP_BACKEND", "rust")
+    r = inst.build_fn().solve(time_limit=60.0, gap_tolerance=1e-6, solver="amp", nlp_solver="ipm")
+    assert r.algorithm_route is None or not r.algorithm_route.startswith("highs-lp")
+    if r.bound is not None:
+        assert r.bound <= inst.expected_obj + 1e-9
