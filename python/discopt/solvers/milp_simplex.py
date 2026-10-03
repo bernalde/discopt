@@ -17,6 +17,7 @@ can fall back.
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import time
@@ -447,6 +448,170 @@ def _safe_lp_lower_bound(
     if _tuning_current().ns_sharp_margin:
         return _safe_lp_lower_bound_sharp(y, c, a_std, b, lb, ub)
     return _safe_lp_lower_bound_std(y, c, a_std, b, lb, ub)
+
+
+#: Largest basis the verified-basis-dual bound (:func:`_safe_lp_lower_bound_basis`)
+#: will factor densely. It runs only after the NS bound has abstained, and its cost
+#: is one dense ``m×m`` inverse plus an ``m×m`` product (O(m³)); above this size it
+#: abstains instead, exactly as before it existed.
+_BASIS_VERIFY_MAX_M = 400
+
+#: Outcome of the safe-bound step on every in-house ``optimal`` solve that goes
+#: through :func:`solve_lp_warm_std` (#1595). Keys: ``ns`` (the dispatched NS bound
+#: certified it), ``basis_verified`` (NS abstained; the verified-basis-dual bound
+#: certified it), ``declined`` (no rigorous bound — the solve is reported unproven
+#: and the caller falls back). Diagnostic only: nothing reads it back, so no bound
+#: depends on it. It exists so the #1595 Layer-2 decline rate is measurable.
+SAFE_BOUND_OUTCOMES: "collections.Counter[str]" = collections.Counter()
+
+
+def _safe_lp_lower_bound_basis(
+    y: np.ndarray,
+    c: np.ndarray,
+    a_std,
+    b: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    col_status: np.ndarray,
+) -> Optional[float]:
+    """Weak-duality bound at the *exact* dual of the final basis (#1595).
+
+    The NS bound (:func:`_safe_lp_lower_bound_sharp`) abstains when a column with
+    an open side has a reduced cost that is zero only up to rounding. For a
+    *basic* column that is the normal case: the simplex sets ``rc_k = 0`` by
+    construction, but ``c_k − A_kᵀŷ`` evaluated in float64 is only known to within
+    ``E_k``, and ``E_k·∞`` is ``−∞``. Measured on the #1597 random-LP panel, every
+    abstention on an ``optimal`` solve was of this kind (a basic free or one-sided
+    open column); the old code published the raw objective there, the #1595 fix
+    reports no bound.
+
+    This bound evaluates weak duality at the exact ``y* = B⁻ᵀ c_B`` instead of at
+    the float ``ŷ``. At ``y*`` every basic column's reduced cost is *exactly* zero,
+    so it contributes exactly 0 whatever its box. ``y*`` is not computed; it is
+    enclosed: with ``R ≈ (Bᵀ)⁻¹`` and ``‖I − R Bᵀ‖∞ ≤ α < 1`` (evaluated with
+    Higham's ``γ`` error terms), ``‖y* − ŷ‖∞ ≤ ‖R r‖∞ / (1 − α)`` for the residual
+    ``r = c_B − Bᵀŷ``, since ``(R Bᵀ)⁻¹`` exists with norm ``≤ 1/(1 − α)`` (the
+    standard approximate-inverse verification, Neumaier 1990, *Interval Methods
+    for Systems of Equations*). Every non-basic reduced cost then lies in an interval of
+    radius ``E_k + δ·Σ_i|a_ik|`` and is enclosed by box corners exactly as in the
+    sharp bound; ``bᵀy*`` is bounded below by ``bᵀŷ − δ‖b‖₁``. The result is
+    ``≤ g(y*) ≤ p*`` — rigorous at any conditioning, never a tolerance.
+
+    Abstains (``None``) when the status vector does not hold exactly ``m`` basic
+    columns, when ``m`` exceeds :data:`_BASIS_VERIFY_MAX_M`, when the basis is
+    singular in float64 or too ill-conditioned for ``α < 1/2``, or when a
+    *non-basic* column is sign-uncertain on a side FBBT cannot close.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    m = y.size
+    if m == 0 or m > _BASIS_VERIFY_MAX_M or not np.all(np.isfinite(y)):
+        return None
+    col_status = np.asarray(col_status)
+    basic = np.flatnonzero(col_status == 1)
+    if basic.size != m:
+        return None
+    lb = np.where(np.asarray(lb, dtype=np.float64) <= -_INF, -np.inf, lb)
+    ub = np.where(np.asarray(ub, dtype=np.float64) >= _INF, np.inf, ub)
+    c = np.asarray(c, dtype=np.float64)
+    b64 = np.asarray(b, dtype=np.float64)
+    a_csc = a_std if sp.issparse(a_std) else sp.csc_matrix(np.asarray(a_std, dtype=np.float64))
+    a_csc = a_csc.tocsc()
+    n = a_csc.shape[1]
+
+    mt = np.asarray(a_csc[:, basic].toarray(), dtype=np.float64).T  # Bᵀ, m×m
+    if not np.all(np.isfinite(mt)):
+        return None
+    try:
+        r_inv = np.linalg.inv(mt)
+    except np.linalg.LinAlgError:
+        # A singular float basis has no enclosure to verify: abstain (the caller
+        # counts it as ``declined``), as the NS bound did.
+        return None
+    if not np.all(np.isfinite(r_inv)):
+        return None
+    c_b = c[basic]
+    abs_mt = np.abs(mt)
+    abs_r = np.abs(r_inv)
+    g_m = float(_gamma(m + 2))
+    # One refinement step only moves the centre; any centre is valid.
+    y = y + r_inv @ (c_b - mt @ y)
+    if not np.all(np.isfinite(y)):
+        return None
+    # ‖I − R Bᵀ‖∞ with the forward error of R·Bᵀ (length-m dot products) and the
+    # subtraction from I folded into γ_{m+2}.
+    e_hat = np.eye(m) - r_inv @ mt
+    e_err = g_m * (abs_r @ abs_mt + np.eye(m))
+    alpha = float(np.max((np.abs(e_hat) + e_err).sum(axis=1))) * (1.0 + g_m) * 1.0625
+    if not (alpha < 0.5):
+        return None
+    # Residual r = c_B − Bᵀŷ: computed value ± its forward-error bound.
+    r_hat = c_b - mt @ y
+    r_err = g_m * (np.abs(c_b) + abs_mt @ np.abs(y))
+    delta = float(np.max(abs_r @ (np.abs(r_hat) + r_err))) * (1.0 + g_m) / (1.0 - alpha) * 1.0625
+    if not np.isfinite(delta):
+        return None
+
+    rc = c - np.asarray(a_csc.T @ y).ravel()
+    abs_a = a_csc.copy()
+    abs_a.data = np.abs(abs_a.data)
+    aty_abs = np.asarray(abs_a.T @ np.abs(y)).ravel()
+    col_abs = np.asarray(abs_a.sum(axis=0)).ravel()
+    col_nnz = np.diff(a_csc.indptr)
+    rad = (_gamma(col_nnz + 1) * (np.abs(c) + aty_abs) + delta * col_abs) * (
+        1.0 + _gamma(col_nnz + 2)
+    )
+    if not (np.all(np.isfinite(rc)) and np.all(np.isfinite(rad))):
+        return None
+
+    nonbasic = np.ones(n, dtype=bool)
+    nonbasic[basic] = False
+    cert_pos = nonbasic & (rc > rad)
+    cert_neg = nonbasic & (rc < -rad)
+    uncertain = nonbasic & ~(cert_pos | cert_neg)
+    need = (
+        (cert_pos & ~np.isfinite(lb))
+        | (cert_neg & ~np.isfinite(ub))
+        | (uncertain & ~(np.isfinite(lb) & np.isfinite(ub)))
+    )
+    if need.any():
+        lb, ub = _fbbt_eq_bounds(a_csc, b64, lb, ub)
+
+    # Basic columns: rc(y*) = 0 exactly, so their term is exactly 0.
+    term = np.zeros(n)
+    err_term = np.zeros(n)
+    term[cert_pos] = rc[cert_pos] * lb[cert_pos]
+    term[cert_neg] = rc[cert_neg] * ub[cert_neg]
+    side = np.zeros(n)
+    side[cert_pos] = lb[cert_pos]
+    side[cert_neg] = ub[cert_neg]
+    cert = cert_pos | cert_neg
+    err_term[cert] = rad[cert] * np.abs(side[cert]) + _U64 * np.abs(term[cert])
+    if uncertain.any():
+        rl, rh = rc[uncertain] - rad[uncertain], rc[uncertain] + rad[uncertain]
+        lo_u, hi_u = lb[uncertain], ub[uncertain]
+        with np.errstate(invalid="ignore"):  # 0·±inf → nan, handled below
+            corners = np.minimum(np.minimum(rl * lo_u, rl * hi_u), np.minimum(rh * lo_u, rh * hi_u))
+        corners = np.where((rl == 0.0) & (rh == 0.0), 0.0, corners)
+        if not np.all(np.isfinite(corners)):
+            return None
+        term[uncertain] = corners
+        err_term[uncertain] = 2.0 * _U64 * np.abs(corners)
+    if not np.all(np.isfinite(term)):
+        return None
+
+    by = float(b64 @ y)
+    s = float(term.sum())
+    g = by + s
+    b_l1 = float(np.abs(b64).sum())
+    margin = (
+        float(err_term.sum())
+        + float(_gamma(max(n, 1)) * np.abs(term).sum())
+        + float(_gamma(m + 1) * (np.abs(b64) * np.abs(y)).sum())
+        + delta * b_l1 * (1.0 + float(_gamma(m + 1)))
+        + 4.0 * _U64 * (abs(by) + abs(s) + abs(g))
+    ) * 1.0625
+    out = g - margin
+    return out if np.isfinite(out) else None
 
 
 # #671: geometric RHS-regularization schedule for the numerical-failure refinement.
@@ -1569,10 +1734,24 @@ def solve_lp_warm_std(
             # one (the safe bound, clamped to never exceed the raw value, since a
             # well-conditioned raw value <= safe bound is itself sound and tighter).
             safe = _safe_lp_lower_bound(dual, c_std, a_std, b_vec, lb_std, ub_std)
+            if safe is not None:
+                SAFE_BOUND_OUTCOMES["ns"] += 1
+            elif dual is not None and cs is not None:
+                # #1595 / #1597 review N1: the NS bound abstains on a column with
+                # an open side whose reduced cost is zero only up to rounding —
+                # in practice a *basic* free or one-sided-open column. Evaluate
+                # weak duality at the exact basis dual instead, where every basic
+                # reduced cost is exactly zero (rigorous; see the function).
+                safe = _safe_lp_lower_bound_basis(
+                    dual, c_std, a_std, b_vec, lb_std, ub_std, np.asarray(cs)
+                )
+                if safe is not None:
+                    SAFE_BOUND_OUTCOMES["basis_verified"] += 1
             if safe is None:
-                # #1595: the safe bound abstains exactly when the duals carry a
-                # wrong-signed reduced cost on an open side — i.e. when this
-                # "optimal" vertex is NOT proven dual feasible. The raw ``obj`` is
+                SAFE_BOUND_OUTCOMES["declined"] += 1
+                # #1595: no rigorous bound exists for this "optimal" vertex — it
+                # is not proven dual feasible (a wrong-signed reduced cost on an
+                # open side, or one too close to zero to sign). The raw ``obj`` is
                 # then an upper estimate of the LP minimum, not a lower bound, and
                 # publishing it as ``bound`` was a false bound (0 against a true -1
                 # on the issue witness). Report it unproven: result ``None`` is the

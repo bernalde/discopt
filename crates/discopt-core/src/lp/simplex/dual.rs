@@ -520,21 +520,22 @@ fn warm_dual_armed(
     repair_subtol_dual_optimum(sol, sp, m, n, c, l, u, b, opts)
 }
 
-/// Re-check a warm DUAL `Optimal` with [`super::primal::subtol_dual_violation`]
-/// and, when it fails, finish the solve with a primal phase 2 from that basis
-/// (#1595).
+/// Re-check a warm DUAL `Optimal` for sub-`tol` reduced costs that can still move
+/// the objective ([`super::primal::subtol_candidates`]) and, when one may, finish
+/// the solve with a primal phase 2 from that basis (#1595).
 ///
 /// The dual loop holds dual feasibility only to the absolute `tol`, so it can stop
 /// at a primal-feasible vertex whose wrong-signed, sub-`tol` reduced cost is real:
-/// on an equilibrated LP with tiny scaled costs, `|d_j| < tol` on a column with
-/// a lot of room (or none bounding it) moves the objective by far more than any
-/// tolerance — the state the cold primal used to certify on the #1595 witness,
-/// publishing `0` for an LP whose minimum is `-1`. The terminal basis is primal
-/// feasible, so a primal warm re-solve (whose pricing now refuses that state)
-/// continues from it. A hand-off that does not return `Optimal` turns the solve
-/// `Numerical` — the caller then falls back — and never claims the optimum. An
-/// optimum that passes the check is returned untouched, so every other solve pays
-/// one `O(nnz)` pass and changes nothing.
+/// `|d_j| < tol` on a column with a lot of room (or none bounding it) moves the
+/// objective by far more than any tolerance — the state the cold primal used to
+/// certify on the #1595 witness, publishing `0` for an LP whose minimum is `-1`.
+/// The candidate filter here only bounds each column's step by its own box; the
+/// primal warm re-solve from the (primal-feasible) terminal basis measures the
+/// true ratio-test step (`Simplex::subtol_entering` in `primal.rs`) and pivots only when it is
+/// worth more than the objective floor. When it takes no pivot the dual's own
+/// result is returned untouched, so the hand-off is bound-neutral wherever nothing
+/// is wrong. A hand-off that does not return `Optimal` turns the solve
+/// `Numerical` — the caller then falls back — and never claims the optimum.
 #[allow(clippy::too_many_arguments)]
 fn repair_subtol_dual_optimum(
     sol: LpSolve,
@@ -554,7 +555,7 @@ fn repair_subtol_dual_optimum(
     {
         return sol;
     }
-    let viol = super::primal::subtol_dual_violation(
+    let cands = super::primal::subtol_candidates(
         sp,
         n,
         c,
@@ -562,13 +563,20 @@ fn repair_subtol_dual_optimum(
         u,
         &sol.basis.col_status,
         &sol.dual,
-        opts.tol,
+        super::primal::subtol_impact_floor(sol.obj),
     );
-    if viol.is_none() {
+    if cands.is_empty() {
         return sol;
     }
     crate::profile::incr(crate::profile::Ctr::WarmSubtolRepair);
     let fixed = solve_lp_cols_warm(sp.clone(), m, n, c, l, u, b, &sol.basis, opts);
+    if fixed.status == LpStatus::Optimal && fixed.iters == 0 {
+        // The primal measured every candidate's actual step and took no pivot:
+        // the dual's vertex is optimal at the objective tolerance. Return the
+        // dual's own result so this path is bound-neutral when nothing is wrong.
+        crate::profile::incr(crate::profile::Ctr::WarmSubtolRepairNoop);
+        return sol;
+    }
     if fixed.status == LpStatus::Optimal {
         let mut fixed = fixed;
         fixed.iters = fixed.iters.saturating_add(sol.iters);
@@ -3782,50 +3790,146 @@ mod tests {
         assert_eq!(failed, 0);
     }
 
-    // The re-pricing is the absolute tolerance made relative to the cost scale:
-    // with max|c| >= 1 it is inert (bound-neutral on every O(1)-cost LP), and the
-    // same sub-`tol` reduced cost on a cost vector scaled down by 2^-40 is caught.
-    #[test]
-    fn subtol_check_is_relative_to_cost_scale() {
-        // min −x − 1e-12·w s.t. x ≤ 1 (w absent from the row), w ∈ [0, 1e-3].
-        let sp = SparseCols::from_dense(&[1.0, 0.0, 1.0], 1, 3);
-        let l = [0.0, 0.0, 0.0];
-        let u = [INF, 1e-3, INF];
-        let stat = [BASIC, AT_LOWER, AT_LOWER];
-        let tol = SimplexOptions::default().tol;
-        let c = [-1.0, -1e-12, 0.0];
-        let y = [-1.0];
-        assert!(
-            super::super::primal::subtol_dual_violation(&sp, 3, &c, &l, &u, &stat, &y, tol)
-                .is_none(),
-            "max|c| = 1: the absolute tolerance already is relative, the check is inert"
-        );
-        let s = (2.0f64).powi(-40);
-        let cs = [c[0] * s, c[1] * s, 0.0];
-        let ys = [y[0] * s];
-        assert!(
-            super::super::primal::subtol_dual_violation(&sp, 3, &cs, &l, &u, &stat, &ys, tol)
-                .is_none(),
-            "w's d_j = -1e-12 is at relative size 1e-12, below the relative tol 1e-9"
-        );
-        let cw = [c[0] * s, -1e-3 * s, 0.0];
-        assert_eq!(
-            super::super::primal::subtol_dual_violation(&sp, 3, &cw, &l, &u, &stat, &ys, tol)
-                .map(|(j, _)| j),
-            Some(1),
-            "a relative-size 1e-3 wrong-signed d_j hidden under the absolute tol"
-        );
-        // An all-zero cost vector carries no optimality question.
-        assert!(super::super::primal::subtol_dual_violation(
-            &sp,
-            3,
-            &[0.0; 3],
-            &l,
-            &u,
-            &stat,
-            &[0.0],
-            tol
+    /// #1597 review (B1) mixed-cost witness in standard form: the #1595 row plus an
+    /// unrelated column `z` with an O(1)-scale cost in its own row,
+    /// `min −cx·x + cz·z` s.t. `a·x − e·y + s₁ = 0`, `z + s₂ = 1`,
+    /// `x, z ∈ [0, 1]`, `y, s ≥ 0`; the minimum is `−cx`. A cost-scale-relative
+    /// tolerance is inert here because `z` keeps `max|ĉ|` at O(1).
+    #[allow(clippy::type_complexity)]
+    fn mixed_subtol_witness(
+        a: f64,
+        e: f64,
+        cx: f64,
+        cz: f64,
+    ) -> (SparseCols, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let sp = SparseCols::from_dense(&[a, -e, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0], 2, 5);
+        (
+            sp,
+            vec![-cx, 0.0, cz, 0.0, 0.0],
+            vec![0.0; 5],
+            vec![1.0, INF, 1.0, INF, INF],
+            vec![0.0, 1.0],
         )
-        .is_none());
+    }
+
+    // B1: every (a, e, cx, cz) of the reviewer's grid that main and the
+    // cost-relative rule both certified wrongly, cold and warm from the basis they
+    // certified (`x` and `s₂` basic, the rest at lower).
+    #[test]
+    fn mixed_cost_subtol_vertex_is_refused_cold_and_warm() {
+        let _guard = crate::profile::test_guard();
+        crate::profile::reset();
+        crate::profile::set_enabled(true);
+        let mut checked = 0;
+        for &a in &[1e9, 3e9, 7.5e9] {
+            for &e in &[1.0, 1e-6] {
+                for &cx in &[1e-3, 1.0, 1e3] {
+                    for &cz in &[1.0, 1e-3, 1e3] {
+                        let (sp, c, l, u, b) = mixed_subtol_witness(a, e, cx, cz);
+                        let tag = format!("a={a} e={e} cx={cx} cz={cz}");
+                        let opts = SimplexOptions::default();
+                        let cold = solve_lp_warm_csc(sp.clone(), 2, 5, &c, &l, &u, &b, None, &opts);
+                        assert_eq!(cold.status, LpStatus::Optimal, "cold {tag}");
+                        assert!(
+                            (cold.obj + cx).abs() <= 1e-7 * (1.0 + cx),
+                            "cold {tag}: obj {}",
+                            cold.obj
+                        );
+                        let start = Basis {
+                            col_status: vec![BASIC, AT_LOWER, AT_LOWER, AT_LOWER, BASIC],
+                            basic_vars: vec![0, 4],
+                        };
+                        let warm = solve_lp_warm_csc(sp, 2, 5, &c, &l, &u, &b, Some(&start), &opts);
+                        assert_eq!(warm.status, LpStatus::Optimal, "warm {tag}");
+                        assert!(
+                            (warm.obj + cx).abs() <= 1e-7 * (1.0 + cx),
+                            "warm {tag}: obj {}",
+                            warm.obj
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        let pivots = crate::profile::counter(crate::profile::Ctr::SubtolPivots);
+        crate::profile::set_enabled(false);
+        assert_eq!(checked, 54);
+        assert!(
+            pivots >= 1,
+            "the sub-tol step test must have fired, got {pivots}"
+        );
+    }
+
+    // The candidate filter is an objective-impact bound, not a tolerance on `d_j`:
+    // a sub-`tol` reduced cost on a column whose whole box cannot move the
+    // objective past the floor is not a candidate (no FTRAN, no pivot), cancellation
+    // noise is never one, and the same `d_j` on an open column is.
+    #[test]
+    fn subtol_candidates_bound_the_objective_impact() {
+        use super::super::primal::{subtol_candidates, subtol_impact_floor};
+        // min −x + d·w (w absent from the row), x ≤ 1 via the slack, w at lower.
+        let sp = SparseCols::from_dense(&[1.0, 0.0, 1.0], 1, 3);
+        let stat = [BASIC, AT_LOWER, AT_LOWER];
+        let y = [-1.0];
+        let floor = subtol_impact_floor(-1.0);
+        let c = [-1.0, -1e-10, 0.0];
+        // w ∈ [0, 1]: worth at most 1e-10 < floor = 2e-7.
+        assert!(
+            subtol_candidates(&sp, 3, &c, &[0.0; 3], &[INF, 1.0, INF], &stat, &y, floor).is_empty()
+        );
+        // w ∈ [0, 1e4]: worth up to 1e-6 > floor — a candidate, for the step test.
+        assert_eq!(
+            subtol_candidates(&sp, 3, &c, &[0.0; 3], &[INF, 1e4, INF], &stat, &y, floor)
+                .iter()
+                .map(|t| t.0)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        // w ≥ 0 open: a candidate.
+        assert_eq!(
+            subtol_candidates(&sp, 3, &c, &[0.0; 3], &[INF, INF, INF], &stat, &y, floor).len(),
+            1
+        );
+        // Optimal-signed (d_w > 0 at lower) is never a candidate.
+        let cpos = [-1.0, 1e-10, 0.0];
+        assert!(
+            subtol_candidates(&sp, 3, &cpos, &[0.0; 3], &[INF, INF, INF], &stat, &y, floor)
+                .is_empty()
+        );
+        // Cancellation noise: d_w = -eps against |c_w| + |a·y| = 2 is not real.
+        let spn = SparseCols::from_dense(&[1.0, 1.0, 1.0], 1, 3);
+        let cn = [-1.0, -1.0 - f64::EPSILON, 0.0];
+        assert!(
+            subtol_candidates(&spn, 3, &cn, &[0.0; 3], &[INF, INF, INF], &stat, &y, floor)
+                .is_empty()
+        );
+    }
+
+    // Bound-neutral where nothing is wrong: an O(1)-cost LP whose sub-`tol`
+    // reduced costs cannot move the objective takes no sub-tol step test at all.
+    #[test]
+    fn subtol_check_is_inert_on_a_negligible_reduced_cost() {
+        let _guard = crate::profile::test_guard();
+        crate::profile::reset();
+        crate::profile::set_enabled(true);
+        // min −x − 1e-12·w s.t. x + s = 1, w ∈ [0, 1e-3] (absent from the row).
+        let sp = SparseCols::from_dense(&[1.0, 0.0, 1.0], 1, 3);
+        let sol = solve_lp_warm_csc(
+            sp,
+            1,
+            3,
+            &[-1.0, -1e-12, 0.0],
+            &[0.0; 3],
+            &[INF, 1e-3, INF],
+            &[1.0],
+            None,
+            &SimplexOptions::default(),
+        );
+        let tests = crate::profile::counter(crate::profile::Ctr::SubtolStepTests);
+        let pivots = crate::profile::counter(crate::profile::Ctr::SubtolPivots);
+        crate::profile::set_enabled(false);
+        assert_eq!(sol.status, LpStatus::Optimal);
+        assert!((sol.obj + 1.0).abs() < 1e-9, "obj {}", sol.obj);
+        assert_eq!((tests, pivots), (0, 0));
     }
 }

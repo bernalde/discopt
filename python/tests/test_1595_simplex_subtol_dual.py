@@ -98,6 +98,9 @@ def test_optimal_with_abstaining_safe_bound_is_not_published(monkeypatch):
         return None
 
     monkeypatch.setattr(ms, "_safe_lp_lower_bound", _abstain)
+    # The basis-verified fallback would otherwise certify this LP; stub it too so
+    # the "both routes decline" contract is what is pinned here.
+    monkeypatch.setattr(ms, "_safe_lp_lower_bound_basis", _abstain)
     c = np.array([-1.0, -1.0])
     A = sp.csr_matrix(np.array([[1.0, 1.0]]))
     b = np.array([1.0])
@@ -107,3 +110,104 @@ def test_optimal_with_abstaining_safe_bound_is_not_published(monkeypatch):
     assert result is None, "an unproven optimum was published as a bound"
     assert basis is None
     assert cert.safe_bound is None and not cert.farkas_certified
+
+
+# --- #1597 review B1: mixed costs ------------------------------------------------
+#
+# ``min -cx*x + cz*z  s.t.  a*x - e*y <= 0,  z <= 1,  x, z in [0, 1],  y >= 0``.
+# The true minimum is ``-cx`` (``x = 1``, ``z = 0``). The column ``z`` has a cost of
+# ordinary size, so a pricing rule judged relative to the largest scaled cost is
+# inert here; on main the simplex certified ``x = 0`` (objective 0) with ``y``'s
+# wrong-signed reduced cost hidden under ``tol``.
+MIXED_WITNESSES = [
+    (7.5e9, 1.0, 1.0, 1.0),
+    (1e9, 1e-6, 1e-3, 1e3),
+    (3e9, 1e-6, 1e-3, 1.0),
+    (7.5e9, 1e-6, 1.0, 1e-3),
+]
+
+
+def _mixed_lp(a, e, cx, cz):
+    c = np.array([-cx, 0.0, cz])
+    A = sp.csr_matrix(np.array([[a, -e, 0.0], [0.0, 0.0, 1.0]]))
+    b = np.array([0.0, 1.0])
+    bounds = [(0.0, 1.0), (0.0, np.inf), (0.0, 1.0)]
+    return c, A, b, bounds
+
+
+@pytest.mark.parametrize("a,e,cx,cz", MIXED_WITNESSES)
+def test_mixed_cost_warm_std_returns_true_minimum(a, e, cx, cz):
+    c, A, b, bounds = _mixed_lp(a, e, cx, cz)
+    result, _basis, _cert = solve_lp_warm_std(c, A, b, bounds, return_cert=True)
+    assert result is not None
+    assert result.status == SolveStatus.OPTIMAL
+    tol = TOL * (1.0 + cx)
+    assert result.bound <= -cx + tol, (result.objective, result.bound)
+    assert result.objective == pytest.approx(-cx, abs=tol)
+
+
+@pytest.mark.parametrize("a,e,cx,cz", MIXED_WITNESSES)
+def test_mixed_cost_relaxation_model_bound_is_valid(a, e, cx, cz):
+    c, A, b, bounds = _mixed_lp(a, e, cx, cz)
+    res = MilpRelaxationModel(c=c, A_ub=A, b_ub=b, bounds=bounds).solve(backend="simplex")
+    assert res.status == "optimal"
+    tol = TOL * (1.0 + cx)
+    assert res.bound is not None and res.bound <= -cx + tol, (res.objective, res.bound)
+    assert res.objective == pytest.approx(-cx, abs=tol)
+
+
+# --- #1597 review N1: the basis-verified bound ----------------------------------
+#
+# ``min x0  s.t.  3*x0 - x1 = 2,  x0 free,  x1 >= 0`` (standard form, no slack).
+# Optimum 2/3 with ``x0`` BASIC: its computed reduced cost is zero only up to
+# rounding, and FBBT leaves it the open side ``x0 <= inf``, which is exactly where
+# the NS bound abstains. Weak duality at the exact basis dual needs no such sign.
+OPT_BF = 2.0 / 3.0
+
+
+def _basic_free_std():
+    a_std = sp.csc_matrix(np.array([[3.0, -1.0]]))
+    c = np.array([1.0, 0.0])
+    b = np.array([2.0])
+    lb = np.array([-ms._INF, 0.0])
+    ub = np.array([ms._INF, ms._INF])
+    col_status = np.array([1, 0], dtype=np.int8)  # x0 BASIC, x1 AT_LOWER
+    return a_std, c, b, lb, ub, col_status
+
+
+def test_basis_bound_certifies_a_basic_free_column():
+    a_std, c, b, lb, ub, cs = _basic_free_std()
+    y = np.array([1.0 / 3.0])
+    assert ms._safe_lp_lower_bound(y, c, a_std, b, lb, ub) is None, (
+        "NS no longer abstains here; this witness no longer exercises the fallback"
+    )
+    g = ms._safe_lp_lower_bound_basis(y, c, a_std, b, lb, ub, cs)
+    assert g is not None
+    assert g <= OPT_BF and g >= OPT_BF - 1e-9, g
+
+
+@pytest.mark.parametrize("y_bad", [0.5, 0.0, -3.0, 1.0 / 3.0 + 1e-7])
+def test_basis_bound_is_valid_from_a_wrong_dual(y_bad):
+    """The bound encloses the EXACT basis dual; a drifted ``ŷ`` may loosen it or
+    make it decline, never lift it above the optimum."""
+    a_std, c, b, lb, ub, cs = _basic_free_std()
+    g = ms._safe_lp_lower_bound_basis(np.array([y_bad]), c, a_std, b, lb, ub, cs)
+    assert g is None or g <= OPT_BF, g
+
+
+def test_basis_bound_declines_without_a_full_basis():
+    a_std, c, b, lb, ub, _cs = _basic_free_std()
+    no_basic = np.array([0, 0], dtype=np.int8)
+    assert ms._safe_lp_lower_bound_basis(np.array([1.0]), c, a_std, b, lb, ub, no_basic) is None
+
+
+def test_safe_bound_outcome_counter_records_the_route(monkeypatch):
+    """Layer-2 decline counter: every ``optimal`` exit lands in exactly one bucket."""
+    monkeypatch.setattr(ms, "SAFE_BOUND_OUTCOMES", __import__("collections").Counter())
+    c = np.array([-1.0, -1.0])
+    A = sp.csr_matrix(np.array([[1.0, 1.0]]))
+    b = np.array([1.0])
+    bounds = [(0.0, 1.0), (0.0, 1.0)]
+    result, _basis, _cert = solve_lp_warm_std(c, A, b, bounds, return_cert=True)
+    assert result is not None
+    assert sum(ms.SAFE_BOUND_OUTCOMES.values()) == 1, dict(ms.SAFE_BOUND_OUTCOMES)

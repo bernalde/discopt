@@ -533,29 +533,39 @@ const RAY_CERT_REL: f64 = 1e-7;
 /// at relative size 1 and clear this by six orders of magnitude.
 pub(super) const SUBTOL_NOISE_REL: f64 = 1e-6;
 
-/// The nonbasic column (among the first `n_real`) whose reduced cost is
-/// wrong-signed by more than the pricing tolerance *measured relative to the cost
-/// scale* — the largest such `|d_j|`, as `(j, d_j)` — or `None` when the vertex is
-/// dual feasible at that scale (#1595).
+/// Objective decrease, relative to `1 + |obj|`, that a single pivot on a
+/// sub-`tol` reduced cost must be able to make before the vertex is refused as
+/// optimal (#1595). Ten times tighter than the `1e-6·(1+|opt|)` a bound is held
+/// to downstream, and far above any rounding in `obj` itself.
+pub(super) const SUBTOL_IMPACT_REL: f64 = 1e-7;
+
+/// The objective decrease below which a sub-`tol` reduced cost is accepted as
+/// optimal at objective value `obj` (see [`SUBTOL_IMPACT_REL`]).
+#[inline]
+pub(super) fn subtol_impact_floor(obj: f64) -> f64 {
+    SUBTOL_IMPACT_REL * (1.0 + obj.abs())
+}
+
+/// The columns a pricing pass at the absolute `tol` may have wrongly called
+/// optimal (#1595): nonbasic real columns (the first `n_real`) whose reduced cost
+/// is wrong-signed, clears [`SUBTOL_NOISE_REL`], and could move the objective by
+/// more than `floor` if the column were free to travel its whole box — i.e.
+/// `|d_j|·room_j > floor`, `room_j` the distance to the column's far bound in the
+/// improving direction (`∞` on an open side). Returned as `(j, d_j, room_j)`.
 ///
-/// Pricing compares `d_j` with an absolute `tol = 1e-9`. That is only meaningful
-/// when the costs are O(1): reduced costs are linear in `c`, so an absolute
-/// tolerance is really `tol / max|c|` relative. Equilibration scales column `j`'s
-/// cost by its column factor, so a row with an entry ≥ ~1e9 lands the whole
-/// scaled cost vector near 1e-10 and every reduced cost is "below tolerance" —
-/// the #1595 witness `min −x s.t. 7.5e9·x − y ≤ 0`, `x ∈ [0,1]`, `y ≥ 0` was
-/// certified `Optimal` at `x = 0` (objective 0) with `d_y = −1.3e-10` on the open
-/// column `y`, against a true optimum of −1, and a caller then published the raw
-/// 0 as a bound.
-///
-/// The check applies `tol · max|c|` — the same relative tolerance an O(1)-cost LP
-/// already gets — and so is **inert whenever `max|c| ≥ 1`** (pricing has already
-/// found every `|d_j| > tol`): such an LP pivots exactly as before. Costs that are
-/// all zero carry no optimality question and return `None`. A candidate must also
-/// clear [`SUBTOL_NOISE_REL`] relative to the magnitudes `d_j` was computed from,
-/// so rounding noise in `c_j − A_jᵀy` is never mistaken for an improving column.
+/// Why an objective-impact test and not a smaller `tol`: pricing compares `d_j`
+/// with an absolute `1e-9`, which is a statement about `d_j` alone, while the
+/// quantity optimality is about is the objective change `|d_j|·t` a pivot makes.
+/// On the #1595 witness `min −x s.t. 7.5e9·x − y ≤ 0`, `x ∈ [0,1]`, `y ≥ 0`, the
+/// open column `y` has `d_y = −1/7.5e9` — below `tol` in the original space AND
+/// after equilibration — and its step to `x = 1` is `7.5e9`: the pivot is worth
+/// the whole objective, `1`. No per-column rescaling of `tol` sees that without
+/// the step: a cost-scale-relative `tol` is defeated by one unrelated column with
+/// an O(1) cost (the mixed-cost witness of the #1597 review), and the unscaled
+/// `d_y` is itself sub-`tol`. `room_j` here is only an upper bound on the step —
+/// the cheap prefilter; the caller measures the true ratio-test step.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn subtol_dual_violation(
+pub(super) fn subtol_candidates(
     cols: &SparseCols,
     n_real: usize,
     cost: &[f64],
@@ -563,14 +573,12 @@ pub(super) fn subtol_dual_violation(
     ub: &[f64],
     stat: &[i8],
     y: &[f64],
-    tol: f64,
-) -> Option<(usize, f64)> {
-    let cmax = cost[..n_real].iter().fold(0.0f64, |a, &c| a.max(c.abs()));
-    if !(cmax > 0.0 && cmax < 1.0) {
-        return None; // O(1) costs: the absolute tolerance already is relative
+    floor: f64,
+) -> Vec<(usize, f64, f64)> {
+    let mut out = Vec::new();
+    if !(floor.is_finite() && floor > 0.0) {
+        return out;
     }
-    let rel_tol = tol * cmax;
-    let mut best: Option<(usize, f64)> = None;
     for j in 0..n_real {
         if stat[j] == BASIC {
             continue;
@@ -586,17 +594,19 @@ pub(super) fn subtol_dual_violation(
         } else {
             (stat[j] == AT_LOWER && dj < 0.0) || (stat[j] == AT_UPPER && dj > 0.0)
         };
-        if !improving || dj.abs() <= rel_tol {
-            continue;
+        if !improving || dj.abs() <= SUBTOL_NOISE_REL * (cost[j].abs() + mag) {
+            continue; // optimal-signed, or indistinguishable from rounding
         }
-        if dj.abs() <= SUBTOL_NOISE_REL * (cost[j].abs() + mag) {
-            continue; // indistinguishable from rounding
-        }
-        if best.is_none_or(|(_, b)| dj.abs() > b.abs()) {
-            best = Some((j, dj));
+        let room = if lo_inf || hi_inf {
+            f64::INFINITY
+        } else {
+            ub[j] - lb[j]
+        };
+        if dj.abs() * room > floor {
+            out.push((j, dj, room));
         }
     }
-    best
+    out
 }
 
 // The dot-product error factor lives in `crate::numeric` so the reduced-cost fixing
@@ -2125,11 +2135,30 @@ impl<'a> Simplex<'a> {
     ///
     /// `cost` is the phase's own cost vector, not `self.c`: in phase 1 the loop is
     /// minimizing infeasibility and `self.c` is not the objective being improved.
-    fn ray_certifies_unbounded(&self, d: &[f64], cost: &[f64], alpha: &[f64]) -> bool {
+    fn ray_certifies_unbounded(&self, d: &mut [f64], cost: &[f64], alpha: &[f64]) -> bool {
         let (m, n) = (self.m, self.n);
         if d.len() != n || !d.iter().all(|v| v.is_finite()) {
             crate::profile::incr(crate::profile::Ctr::UnboundedRejectRowResidual);
             return false;
+        }
+        // Recession first, and exactly (#1597 review): a coordinate that moves
+        // against a finite bound — by any amount — is not a recession direction.
+        // The ratio test ignores `|α_i| <= tol`, so a basic column with a finite
+        // bound can carry a sub-`tol` ray entry; the old check let it through with
+        // the same `tol`, and on the #1597 random-LP panel that certified 11
+        // bounded LPs as unbounded (exact-rational oracle), 5 of them reached
+        // through #1595's sub-tol pivots. Such an entry is set to zero; if the
+        // ray was only a ray *because of* it, the row residual below no longer
+        // closes and the ray is refused. An entry above `tol` is refused outright.
+        for j in 0..n {
+            let against = (d[j] > 0.0 && self.ub[j] < INF) || (d[j] < 0.0 && self.lb[j] > -INF);
+            if against {
+                if d[j].abs() > self.tol {
+                    crate::profile::incr(crate::profile::Ctr::UnboundedRejectBox);
+                    return false;
+                }
+                d[j] = 0.0;
+            }
         }
         // A basic *artificial* moving along the ray puts the direction in the
         // extended space `[A | art]`; truncating it to the real columns silently
@@ -2162,7 +2191,11 @@ impl<'a> Simplex<'a> {
             }
         }
         for i in 0..m {
-            if r[i].abs() > RAY_CERT_REL * (1.0 + r_abs[i]) {
+            // Relative to the row's own accumulation only. The former `1 + r_abs`
+            // floor made the test absolute for a short ray: a residual of 1.6e-11
+            // against an accumulation of 3.2e-11 (relative 0.5) passed. A ray's
+            // scale is arbitrary, so its acceptance must not depend on it.
+            if r[i].abs() > RAY_CERT_REL * r_abs[i] {
                 crate::profile::incr(crate::profile::Ctr::UnboundedRejectRowResidual);
                 return false;
             }
@@ -2183,23 +2216,85 @@ impl<'a> Simplex<'a> {
             crate::profile::incr(crate::profile::Ctr::UnboundedRejectObjective);
             return false;
         }
-        // Recession: travelling along `d` forever must stay inside the box. `INF` is
-        // the sentinel `1e20`, so the comparison is against the *bound*, never a
-        // product involving it.
-        for j in 0..n {
-            let open = if d[j] > self.tol {
-                self.ub[j] >= INF
-            } else if d[j] < -self.tol {
-                self.lb[j] <= -INF
+        // Recession was enforced exactly at the top (`INF` is the sentinel `1e20`,
+        // so the comparison there is against the *bound*, never a product).
+        true
+    }
+
+    /// The sub-`tol` column whose pivot would decrease the objective by the most,
+    /// when that decrease exceeds [`subtol_impact_floor`] — `None` when the vertex
+    /// is optimal at that objective tolerance (#1595).
+    ///
+    /// Called only where pricing at the absolute `tol` found no entering column.
+    /// [`subtol_candidates`] keeps the columns whose `|d_j|·room_j` could clear the
+    /// floor; for each, the step `t_j` a pivot would actually take is measured
+    /// with a plain (Harris-free, exact-bound) ratio test on `α = B⁻¹A_j`, and the
+    /// pivot is worth `|d_j|·t_j`. Scale-free: equilibration rescales `d_j` and
+    /// `t_j` inversely, so the product is the same in either space, and an
+    /// unrelated column's cost does not enter it. An unblocked direction is worth
+    /// `∞`; the ordinary pivot that follows certifies (or refuses) the ray.
+    ///
+    /// A degenerate candidate (`t_j = 0`) is worth nothing here and does not
+    /// enter; this is the same verdict the absolute pricing gives a degenerate
+    /// vertex, and it keeps an LP whose sub-`tol` reduced costs cannot move the
+    /// objective pivoting exactly as before — the check then costs one FTRAN per
+    /// surviving candidate and changes nothing.
+    fn subtol_entering(
+        &mut self,
+        cost: &[f64],
+        y: &[f64],
+        xb: &[f64],
+        art_sign: &[f64],
+    ) -> Result<Option<(usize, f64)>, LpStatus> {
+        let mut obj = 0.0f64;
+        for j in 0..self.n {
+            let v = if self.stat[j] == BASIC {
+                xb[self.slot_of[j] as usize]
             } else {
-                true
+                self.nb_value(j)
             };
-            if !open {
-                crate::profile::incr(crate::profile::Ctr::UnboundedRejectBox);
-                return false;
+            obj += cost[j] * v;
+        }
+        let floor = subtol_impact_floor(obj);
+        let cands = subtol_candidates(
+            &self.cols, self.n, cost, &self.lb, &self.ub, &self.stat, y, floor,
+        );
+        let mut best: Option<(usize, f64)> = None;
+        let mut best_gain = floor;
+        for (j, dj, room) in cands {
+            crate::profile::incr(crate::profile::Ctr::SubtolStepTests);
+            let dir = if self.is_free(j) {
+                if dj < 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            } else if self.stat[j] == AT_LOWER {
+                1.0
+            } else {
+                -1.0
+            };
+            let mut alpha = self.column(j, art_sign);
+            if self.lu.ftran(&mut alpha).is_err() {
+                return Err(LpStatus::Numerical);
+            }
+            let mut t = room;
+            for (i, &a) in alpha.iter().enumerate() {
+                let delta = -dir * a;
+                let bi = self.basis[i];
+                if delta < -self.tol && self.lb[bi] > -INF {
+                    t = t.min(((xb[i] - self.lb[bi]) / (-delta)).max(0.0));
+                } else if delta > self.tol && self.ub[bi] < INF {
+                    t = t.min(((self.ub[bi] - xb[i]) / delta).max(0.0));
+                }
+            }
+            let gain = dj.abs() * t; // `∞` on an unblocked direction
+            if gain > best_gain {
+                best_gain = gain;
+                best = Some((j, dj));
             }
         }
-        true
+        Ok(best)
     }
 
     /// Primal simplex iterations for the given `cost`. Returns Ok(()) at
@@ -2336,14 +2431,12 @@ impl<'a> Simplex<'a> {
                 }
             }
             drop(_t_sweep);
-            // #1595: before calling the vertex optimal, re-price at the tolerance
-            // relative to the cost scale (see `subtol_dual_violation`; inert when
-            // max|c| >= 1). Phase 2 only: phase 1's costs are the unit artificial
-            // weights, already O(1).
+            // #1595: before calling the vertex optimal, ask whether a sub-`tol`
+            // reduced cost can still move the objective (see `subtol_candidates`
+            // and `Self::subtol_entering`). Phase 2 only: phase 1's costs are the
+            // unit artificial weights and its optimum is checked by the handoff.
             if enter.is_none() && !is_phase1 {
-                if let Some((j, dj)) = subtol_dual_violation(
-                    &self.cols, self.n, cost, &self.lb, &self.ub, &self.stat, &y, self.tol,
-                ) {
+                if let Some((j, dj)) = self.subtol_entering(cost, &y, &xb, art_sign)? {
                     if subtol_pivots >= subtol_cap {
                         // Out of budget: an honest refusal, never a claimed optimum.
                         crate::profile::incr(crate::profile::Ctr::SubtolCapNumerical);
@@ -2514,7 +2607,7 @@ impl<'a> Simplex<'a> {
                 // status that routes into `dense_retry`'s robust LU path (§3:
                 // refuse loudly rather than claim). A genuine unbounded ray passes
                 // untouched, so no true `Unbounded` is downgraded.
-                if !self.ray_certifies_unbounded(&ray, cost, &alpha) {
+                if !self.ray_certifies_unbounded(&mut ray, cost, &alpha) {
                     return Err(LpStatus::Numerical);
                 }
                 crate::profile::incr(crate::profile::Ctr::UnboundedRayCertified);
@@ -3954,6 +4047,81 @@ mod tests {
         let cd: f64 = (0..2).map(|j| c[j] * r.ray[j]).sum();
         assert!(ad.abs() < 1e-9, "A·d = {ad} (should be 0)");
         assert!(cd < -1e-9, "c·d = {cd} (should be < 0)");
+    }
+
+    /// Run `ray_certifies_unbounded` on a hand-built direction `d` for the 1-row
+    /// LP `a·z = 0` (basis slot 0 = column 0, a real column, so the artificial
+    /// check is inert). Returns the verdict and the cleaned direction.
+    fn certify_ray(a: &[f64], c: &[f64], l: &[f64], u: &[f64], d: &[f64]) -> (bool, Vec<f64>) {
+        let n = a.len();
+        let cols = SparseCols::from_dense(a, 1, n);
+        let opts = SimplexOptions::default();
+        let b = [0.0];
+        let mut sx = Simplex::new_from_cols(cols, 1, n, c, l, u, &b, &opts);
+        sx.basis = vec![0];
+        let mut dd = d.to_vec();
+        let ok = sx.ray_certifies_unbounded(&mut dd, c, &[0.0]);
+        (ok, dd)
+    }
+
+    #[test]
+    fn ray_with_load_bearing_subtol_entry_against_a_bound_is_refused() {
+        // #1597 review: min -x0 s.t. x0 + 2e9·x1 = 0, x0 free, x1 ∈ [-1, 1]. The LP is
+        // BOUNDED (x0 = -2e9·x1 ≥ -2e9). d = (1, -5e-10) closes the row exactly, but
+        // only through x1 moving below its finite lower bound by a sub-`tol` amount.
+        // The former check let |d1| <= tol through and certified "unbounded".
+        let (ok, _) = certify_ray(
+            &[1.0, 2e9],
+            &[-1.0, 0.0],
+            &[-CERT_INF, -1.0],
+            &[CERT_INF, 1.0],
+            &[1.0, -5e-10],
+        );
+        assert!(!ok, "a bounded LP was certified unbounded");
+    }
+
+    #[test]
+    fn short_ray_with_large_relative_residual_is_refused() {
+        // x0 - x1 = 0, both in [0, inf), min -x0. d = (1e-11, 0.5e-11) is NOT in the
+        // null space (relative residual 1/3) but its absolute residual 5e-12 sat
+        // under the former `1e-7·(1 + r_abs)` floor and passed.
+        let (ok, _) = certify_ray(
+            &[1.0, -1.0],
+            &[-1.0, 0.0],
+            &[0.0, 0.0],
+            &[CERT_INF, CERT_INF],
+            &[1e-11, 0.5e-11],
+        );
+        assert!(!ok, "a non-null-space direction was certified");
+    }
+
+    #[test]
+    fn genuine_ray_is_still_certified_and_cleaned() {
+        // x0 - x1 + x2 = 0, x0,x1 ∈ [0,inf), x2 ∈ [0,1], min -x0: unbounded along
+        // (1, 1, 0). A sub-tol entry against x2's finite upper bound that the ray does
+        // NOT need is zeroed and the ray still certifies; the exported ray is the
+        // cleaned one (exact recession direction).
+        let (ok, d) = certify_ray(
+            &[1.0, -1.0, 1.0],
+            &[-1.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0],
+            &[CERT_INF, CERT_INF, 1.0],
+            &[1.0, 1.0, 1e-13],
+        );
+        assert!(ok, "a genuine recession ray was refused");
+        assert_eq!(
+            d[2], 0.0,
+            "sub-tol entry against a finite bound must be zeroed"
+        );
+        // An entry against a finite bound ABOVE tol is refused outright.
+        let (ok2, _) = certify_ray(
+            &[1.0, -1.0, 1.0],
+            &[-1.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0],
+            &[CERT_INF, CERT_INF, 1.0],
+            &[1.0, 1.0 + 1e-3, 1e-3],
+        );
+        assert!(!ok2, "a direction leaving a finite box was certified");
     }
 
     #[test]

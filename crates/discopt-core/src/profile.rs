@@ -414,17 +414,21 @@ counters!(
     UnboundedRejectObjective,
     UnboundedRejectBox,
     // #1595: a phase-2 vertex the absolute `tol` pricing called optimal, but at
-    // which a nonbasic column still had a wrong-signed reduced cost above the
-    // tolerance taken relative to the cost scale (`tol · max|c|` when max|c| < 1)
-    // and above rounding noise. `SubtolPivots` counts
-    // the primal pivots taken on such a column instead of returning `Optimal`;
-    // `SubtolCapNumerical` counts loops that ran out of the budget for them and
-    // refused (`Numerical`) rather than claim optimality. `WarmSubtolRepair`
-    // counts warm DUAL optima that failed the same check and were handed to the
-    // primal; `WarmSubtolRepairFailed` the ones that hand-off could not finish.
+    // which a nonbasic column's wrong-signed, sub-`tol` reduced cost could still
+    // decrease the objective by more than `subtol_impact_floor` in one pivot.
+    // `SubtolStepTests` counts the ratio tests run to measure that decrease (one
+    // FTRAN each — the check's cost); `SubtolPivots` the pivots taken on such a
+    // column instead of returning `Optimal`; `SubtolCapNumerical` the loops that
+    // ran out of the budget for them and refused (`Numerical`) rather than claim
+    // optimality. `WarmSubtolRepair` counts warm DUAL optima with a candidate
+    // handed to the primal; `WarmSubtolRepairNoop` the hand-offs whose primal
+    // made no pivot (the dual's own result is returned untouched);
+    // `WarmSubtolRepairFailed` the ones that hand-off could not finish.
+    SubtolStepTests,
     SubtolPivots,
     SubtolCapNumerical,
     WarmSubtolRepair,
+    WarmSubtolRepairNoop,
     WarmSubtolRepairFailed,
     // #1008 R1: the warm dual's unstable- (near-zero-) pivot exit, split by which
     // way it went. `Recoveries` counts in-place refactorize+recompute+re-select,
