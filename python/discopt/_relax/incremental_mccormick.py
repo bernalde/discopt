@@ -1123,7 +1123,16 @@ class IncrementalMcCormickLP:
         result, out_basis = solve_lp_warm_std(cobj, sp.csr_matrix(A), b, bounds, in_basis=in_basis)
         if result is None or result.status != SolveStatus.OPTIMAL or result.objective is None:
             return None, None, None
-        return float(result.objective) + off, np.asarray(result.x, dtype=float), out_basis
+        if c_override is not None:
+            # A surrogate objective (feasibility pump): the vertex value is what the
+            # caller wants, and it is never used as a bound.
+            return float(result.objective), np.asarray(result.x, dtype=float), out_basis
+        # #1595: the value returned here is used as a node BOUND (lp_spatial_bb), so
+        # report the certified ``bound`` (min of the vertex objective and its
+        # Neumaier-Shcherbina safe bound), never the raw vertex objective.
+        if result.bound is None:
+            return None, None, None
+        return float(result.bound) + off, np.asarray(result.x, dtype=float), out_basis
 
     def solve_assembled_full(
         self, A, b, bounds, in_basis=None, c_override=None, *, return_cert=False, time_limit=None

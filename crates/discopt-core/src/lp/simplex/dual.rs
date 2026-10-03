@@ -516,6 +516,85 @@ fn warm_dual_armed(
     basis: &Basis,
     opts: &SimplexOptions,
 ) -> LpSolve {
+    let sol = warm_dual_armed_inner(p, sp, m, n, c, l, u, b, basis, opts);
+    repair_subtol_dual_optimum(sol, sp, m, n, c, l, u, b, opts)
+}
+
+/// Re-check a warm DUAL `Optimal` with [`super::primal::subtol_dual_violation`]
+/// and, when it fails, finish the solve with a primal phase 2 from that basis
+/// (#1595).
+///
+/// The dual loop holds dual feasibility only to the absolute `tol`, so it can stop
+/// at a primal-feasible vertex whose wrong-signed, sub-`tol` reduced cost is real:
+/// on an equilibrated LP with tiny scaled costs, `|d_j| < tol` on a column with
+/// a lot of room (or none bounding it) moves the objective by far more than any
+/// tolerance — the state the cold primal used to certify on the #1595 witness,
+/// publishing `0` for an LP whose minimum is `-1`. The terminal basis is primal
+/// feasible, so a primal warm re-solve (whose pricing now refuses that state)
+/// continues from it. A hand-off that does not return `Optimal` turns the solve
+/// `Numerical` — the caller then falls back — and never claims the optimum. An
+/// optimum that passes the check is returned untouched, so every other solve pays
+/// one `O(nnz)` pass and changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn repair_subtol_dual_optimum(
+    sol: LpSolve,
+    sp: &SparseCols,
+    m: usize,
+    n: usize,
+    c: &[f64],
+    l: &[f64],
+    u: &[f64],
+    b: &[f64],
+    opts: &SimplexOptions,
+) -> LpSolve {
+    if sol.status != LpStatus::Optimal
+        || sol.dual.len() != m
+        || sol.basis.col_status.len() != n
+        || !sol.obj.is_finite()
+    {
+        return sol;
+    }
+    let viol = super::primal::subtol_dual_violation(
+        sp,
+        n,
+        c,
+        l,
+        u,
+        &sol.basis.col_status,
+        &sol.dual,
+        sol.obj,
+    );
+    if viol.is_none() {
+        return sol;
+    }
+    crate::profile::incr(crate::profile::Ctr::WarmSubtolRepair);
+    let fixed = solve_lp_cols_warm(sp.clone(), m, n, c, l, u, b, &sol.basis, opts);
+    if fixed.status == LpStatus::Optimal {
+        let mut fixed = fixed;
+        fixed.iters = fixed.iters.saturating_add(sol.iters);
+        return fixed;
+    }
+    crate::profile::incr(crate::profile::Ctr::WarmSubtolRepairFailed);
+    LpSolve {
+        status: LpStatus::Numerical,
+        dual: Vec::new(),
+        ..sol
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warm_dual_armed_inner(
+    p: &PreparedDual<'_>,
+    sp: &SparseCols,
+    m: usize,
+    n: usize,
+    c: &[f64],
+    l: &[f64],
+    u: &[f64],
+    b: &[f64],
+    basis: &Basis,
+    opts: &SimplexOptions,
+) -> LpSolve {
     if opts.dual_cost_perturb > 0.0 {
         let mut probe = opts.clone();
         probe.dual_stall_patience = match opts.dual_stall_patience {
@@ -3612,5 +3691,118 @@ mod tests {
             primal >= 4,
             "primal warm refusals must be counted, got {primal}"
         );
+    }
+
+    /// #1595 witness family in standard form `[a, -e, 1] z = 0`,
+    /// `z = (x, y, s)`, `x ∈ [0, 1]`, `y, s ≥ 0`, `min −x`; the minimum is `−1`.
+    fn subtol_witness(a: f64, e: f64) -> (SparseCols, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let sp = SparseCols::from_dense(&[a, -e, 1.0], 1, 3);
+        (
+            sp,
+            vec![-1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, INF, INF],
+            vec![0.0],
+        )
+    }
+
+    const SUBTOL_WITNESSES: [(f64, f64); 6] = [
+        (7.5e9, 1.0),
+        (1.5e10, 1e-6),
+        (7.5e9, 5e-7),
+        (7.5e9, 4.5e-10),
+        (7.5e9, 7.5e9),
+        (1e9, 1.0),
+    ];
+
+    // #1595 layer 1, cold: equilibration lands every scaled cost below the absolute
+    // pricing `tol`, and the primal used to stop at `x = 0` (objective 0) with the
+    // open column `y`'s wrong-signed reduced cost hidden under `tol`.
+    #[test]
+    fn cold_primal_refuses_a_subtol_dual_infeasible_vertex() {
+        let _guard = crate::profile::test_guard();
+        crate::profile::reset();
+        crate::profile::set_enabled(true);
+        let mut checked = 0;
+        for &(a, e) in &SUBTOL_WITNESSES {
+            let (sp, c, l, u, b) = subtol_witness(a, e);
+            let sol = solve_lp_warm_csc(sp, 1, 3, &c, &l, &u, &b, None, &SimplexOptions::default());
+            assert_eq!(sol.status, LpStatus::Optimal, "a={a} e={e}");
+            assert!((sol.obj + 1.0).abs() < 1e-9, "a={a} e={e}: obj {}", sol.obj);
+            checked += 1;
+        }
+        let pivots = crate::profile::counter(crate::profile::Ctr::SubtolPivots);
+        crate::profile::set_enabled(false);
+        assert_eq!(checked, SUBTOL_WITNESSES.len());
+        assert!(
+            pivots >= 1,
+            "the sub-tol check must have fired, got {pivots}"
+        );
+    }
+
+    // #1595 layer 1, warm dual: started from the exact basis main certified (`x`
+    // basic, `y` and the slack at lower) — primal feasible and dual feasible to the
+    // absolute `tol` — the dual loop stops at once; the post-check must hand the
+    // solve to the primal, which reaches `−1`.
+    #[test]
+    fn warm_dual_hands_a_subtol_dual_infeasible_optimum_to_the_primal() {
+        let _guard = crate::profile::test_guard();
+        crate::profile::reset();
+        crate::profile::set_enabled(true);
+        let mut checked = 0;
+        for &(a, e) in &SUBTOL_WITNESSES {
+            let (sp, c, l, u, b) = subtol_witness(a, e);
+            let start = Basis {
+                col_status: vec![BASIC, AT_LOWER, AT_LOWER],
+                basic_vars: vec![0],
+            };
+            let sol = solve_lp_warm_csc(
+                sp,
+                1,
+                3,
+                &c,
+                &l,
+                &u,
+                &b,
+                Some(&start),
+                &SimplexOptions::default(),
+            );
+            assert_eq!(sol.status, LpStatus::Optimal, "a={a} e={e}");
+            assert!((sol.obj + 1.0).abs() < 1e-9, "a={a} e={e}: obj {}", sol.obj);
+            checked += 1;
+        }
+        let repairs = crate::profile::counter(crate::profile::Ctr::WarmSubtolRepair);
+        let failed = crate::profile::counter(crate::profile::Ctr::WarmSubtolRepairFailed);
+        crate::profile::set_enabled(false);
+        assert_eq!(checked, SUBTOL_WITNESSES.len());
+        assert!(
+            repairs >= 1,
+            "the warm post-check must have fired, got {repairs}"
+        );
+        assert_eq!(failed, 0);
+    }
+
+    // The check is not a tolerance tightening: a genuinely optimal vertex with a
+    // sub-`tol` reduced cost whose objective impact is below the floor (bounded,
+    // tiny room) is still certified without an extra pivot.
+    #[test]
+    fn subtol_check_ignores_negligible_impact() {
+        // min −x − 1e-12·w s.t. x ≤ 1 (w absent from the row), w ∈ [0, 1e-3]:
+        // w's reduced cost −1e-12 is real (no cancellation) but moving w to its
+        // upper bound changes the objective by 1e-15, far below the floor.
+        let sp = SparseCols::from_dense(&[1.0, 0.0, 1.0], 1, 3);
+        let c = [-1.0, -1e-12, 0.0];
+        let l = [0.0, 0.0, 0.0];
+        let u = [INF, 1e-3, INF];
+        let b = [1.0];
+        let stat = [BASIC, AT_LOWER, AT_LOWER];
+        let y = [-1.0];
+        assert!(
+            super::super::primal::subtol_dual_violation(&sp, 3, &c, &l, &u, &stat, &y, -1.0)
+                .is_none()
+        );
+        let sol = solve_lp_warm_csc(sp, 1, 3, &c, &l, &u, &b, None, &SimplexOptions::default());
+        assert_eq!(sol.status, LpStatus::Optimal);
+        assert!((sol.obj + 1.0).abs() < 1e-9);
     }
 }

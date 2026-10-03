@@ -524,6 +524,97 @@ fn row_residual_floor(grain: f64) -> f64 {
 /// verdict on its own merits.
 const RAY_CERT_REL: f64 = 1e-7;
 
+/// A reduced cost is *real* — not rounding noise — when it is larger than this
+/// fraction of the magnitudes it was computed from, `|c_j| + Σ_i |a_ij·y_i|`
+/// (#1595). Noise in `d_j = c_j − A_jᵀy` is the dot product's own rounding plus
+/// the error in `y = B⁻ᵀc_B`, both relative to that sum; `1e-6` covers a basis
+/// condition number up to ~1e10 before noise can pass for signal. The #1595
+/// reduced costs are not cancellations at all (`c_j = 0`, one term), so they sit
+/// at relative size 1 and clear this by six orders of magnitude.
+pub(super) const SUBTOL_NOISE_REL: f64 = 1e-6;
+
+/// Objective-impact floor, relative to `1 + |obj|`, for a sub-`tol` wrong-signed
+/// reduced cost to block an `Optimal` verdict (#1595). The impact of accepting
+/// `d_j` is `|d_j|·room_j`; with an open side it is unbounded.
+pub(super) const SUBTOL_IMPACT_REL: f64 = 1e-9;
+
+/// The nonbasic column (among the first `n_real`) whose reduced cost is
+/// wrong-signed below the absolute pricing tolerance, yet is real and moves the
+/// objective by more than tolerance over the column's room — the column with the
+/// largest such impact, as `(j, d_j)` — or `None` when the vertex is genuinely
+/// dual feasible (#1595).
+///
+/// The absolute `tol = 1e-9` on `d_j` is a statement about a reduced cost's
+/// *size*, but what makes a vertex optimal is what accepting a wrong-signed `d_j`
+/// costs in objective: `|d_j|·(u_j − l_j)`, and without bound when the improving
+/// side is open. Equilibration scales column `j`'s cost by its factor, so on a row
+/// with an entry ≥ ~1e9 the whole cost vector lands near 1e-10 in scaled space and
+/// every reduced cost is "below tolerance" — the #1595 witness `min −x s.t.
+/// 7.5e9·x − y ≤ 0`, `x ∈ [0,1]`, `y ≥ 0` was certified `Optimal` at `x = 0`
+/// (objective 0) with `d_y = −1.3e-10` on the open column `y`; the true optimum is
+/// −1. The only remaining cover was the Neumaier–Shcherbina bound, which abstains
+/// there, and a caller trusted the raw objective. This check is the simplex's own
+/// refusal to call such a vertex optimal.
+///
+/// Only consulted once the ordinary pricing has found nothing, so an LP whose
+/// optimum passes it is pivoted exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn subtol_dual_violation(
+    cols: &SparseCols,
+    n_real: usize,
+    cost: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    stat: &[i8],
+    y: &[f64],
+    obj: f64,
+) -> Option<(usize, f64)> {
+    let impact_floor = SUBTOL_IMPACT_REL * (1.0 + obj.abs());
+    let mut best: Option<(usize, f64)> = None;
+    let mut best_impact = 0.0f64;
+    for j in 0..n_real {
+        if stat[j] == BASIC {
+            continue;
+        }
+        let (lo_inf, hi_inf) = (lb[j] <= -INF, ub[j] >= INF);
+        if !lo_inf && !hi_inf && ub[j] - lb[j] <= 0.0 {
+            continue; // fixed: no room to move
+        }
+        let (ay, mag, _) = cols.dot_with_magnitude(j, y);
+        let dj = cost[j] - ay;
+        // Room in the improving direction. A free column improves either way.
+        let room = if lo_inf && hi_inf {
+            if dj == 0.0 {
+                continue;
+            }
+            f64::INFINITY
+        } else if stat[j] == AT_LOWER && dj < 0.0 {
+            if hi_inf {
+                f64::INFINITY
+            } else {
+                ub[j] - lb[j]
+            }
+        } else if stat[j] == AT_UPPER && dj > 0.0 {
+            if lo_inf {
+                f64::INFINITY
+            } else {
+                ub[j] - lb[j]
+            }
+        } else {
+            continue;
+        };
+        if dj.abs() <= SUBTOL_NOISE_REL * (cost[j].abs() + mag) {
+            continue; // indistinguishable from rounding
+        }
+        let impact = dj.abs() * room;
+        if impact > impact_floor && impact > best_impact {
+            best_impact = impact;
+            best = Some((j, dj));
+        }
+    }
+    best
+}
+
 // The dot-product error factor lives in `crate::numeric` so the reduced-cost fixing
 // paths share this definition instead of re-deriving a factor each (#1409).
 use crate::numeric::gamma;
@@ -2187,6 +2278,11 @@ impl<'a> Simplex<'a> {
         // ≤48-update refactorizations. See `xb_refresh_cadence`.
         let xb_refresh_every = self.xb_refresh;
         let mut since_xb_refresh = 0usize;
+        // #1595: pivots taken on a sub-`tol` but real, objective-moving reduced
+        // cost, and their budget. A genuine instance needs a handful; the cap only
+        // keeps a noise-driven run from churning to `max_iter`.
+        let mut subtol_pivots = 0usize;
+        let subtol_cap = m + 64;
         for _iter in 0..self.max_iter {
             // Poll the wall-clock deadline every 256 pivots (cheap relative to a
             // pricing+ftran iteration). A dense, degenerate lifted-McCormick LP
@@ -2257,6 +2353,37 @@ impl<'a> Simplex<'a> {
                 }
             }
             drop(_t_sweep);
+            // #1595: before calling the vertex optimal, make sure no sub-`tol`
+            // reduced cost still moves the objective by more than tolerance (see
+            // `subtol_dual_violation`). Phase 2 only: phase 1's costs are the unit
+            // artificial weights, whose reduced costs are not cost-scaled.
+            if enter.is_none() && !is_phase1 {
+                let mut obj = 0.0f64;
+                for (i, &bj) in self.basis.iter().enumerate() {
+                    obj += cost[bj] * xb[i];
+                }
+                for j in 0..self.n {
+                    if self.stat[j] != BASIC {
+                        let v = self.nb_value(j);
+                        if v != 0.0 {
+                            obj += cost[j] * v;
+                        }
+                    }
+                }
+                if let Some((j, dj)) = subtol_dual_violation(
+                    &self.cols, self.n, cost, &self.lb, &self.ub, &self.stat, &y, obj,
+                ) {
+                    if subtol_pivots >= subtol_cap {
+                        // Out of budget: an honest refusal, never a claimed optimum.
+                        crate::profile::incr(crate::profile::Ctr::SubtolCapNumerical);
+                        return Err(LpStatus::Numerical);
+                    }
+                    subtol_pivots += 1;
+                    crate::profile::incr(crate::profile::Ctr::SubtolPivots);
+                    enter = Some(j);
+                    enter_dj = dj;
+                }
+            }
             let q = match enter {
                 Some(q) => q,
                 None => {

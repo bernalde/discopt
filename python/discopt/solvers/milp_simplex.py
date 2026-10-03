@@ -1466,7 +1466,10 @@ def solve_lp_warm_std(
     Returns ``(result, out_basis)``. ``out_basis`` is the final ``(col_status,
     basic_vars)`` to thread into the next re-solve (``None`` when the LP is not
     optimal). ``result`` is ``None`` for ``iter_limit``/``numerical`` exits so the
-    caller can fall back to a cold/HiGHS path. Soundness: the dual simplex
+    caller can fall back to a cold/HiGHS path — and also for an ``optimal`` exit
+    whose Neumaier–Shcherbina safe bound abstains (#1595): that vertex is not
+    proven dual feasible, so its objective is never published as a bound.
+    Soundness: the dual simplex
     converges to the LP optimum exactly as a cold solve (a bad basis is ignored
     inside Rust), so the returned objective/bound is unchanged — only the speed is.
 
@@ -1566,7 +1569,26 @@ def solve_lp_warm_std(
             # one (the safe bound, clamped to never exceed the raw value, since a
             # well-conditioned raw value <= safe bound is itself sound and tighter).
             safe = _safe_lp_lower_bound(dual, c_std, a_std, b_vec, lb_std, ub_std)
-            bound = float(obj) if safe is None else min(float(obj), float(safe))
+            if safe is None:
+                # #1595: the safe bound abstains exactly when the duals carry a
+                # wrong-signed reduced cost on an open side — i.e. when this
+                # "optimal" vertex is NOT proven dual feasible. The raw ``obj`` is
+                # then an upper estimate of the LP minimum, not a lower bound, and
+                # publishing it as ``bound`` was a false bound (0 against a true -1
+                # on the issue witness). Report it unproven: result ``None`` is the
+                # existing fallback signal (as for iter_limit / numerical), so every
+                # caller re-solves on its generic path instead of trusting it.
+                return (
+                    None,
+                    None,
+                    LpWarmCert(
+                        safe_bound=None,
+                        farkas_certified=False,
+                        dual=np.asarray(dual, dtype=np.float64) if dual is not None else None,
+                        col_status=np.asarray(cs) if cs is not None else None,
+                    ),
+                )
+            bound = min(float(obj), float(safe))
             return (
                 MILPResult(
                     status=SolveStatus.OPTIMAL,

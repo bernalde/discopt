@@ -413,6 +413,19 @@ counters!(
     UnboundedRejectRowResidual,
     UnboundedRejectObjective,
     UnboundedRejectBox,
+    // #1595: a phase-2 vertex the absolute `tol` pricing called optimal, but at
+    // which a nonbasic column still had a wrong-signed reduced cost that is real
+    // (not rounding noise) and whose objective impact over its room is above
+    // tolerance — an open side makes that impact unbounded. `SubtolPivots` counts
+    // the primal pivots taken on such a column instead of returning `Optimal`;
+    // `SubtolCapNumerical` counts loops that ran out of the budget for them and
+    // refused (`Numerical`) rather than claim optimality. `WarmSubtolRepair`
+    // counts warm DUAL optima that failed the same check and were handed to the
+    // primal; `WarmSubtolRepairFailed` the ones that hand-off could not finish.
+    SubtolPivots,
+    SubtolCapNumerical,
+    WarmSubtolRepair,
+    WarmSubtolRepairFailed,
     // #1008 R1: the warm dual's unstable- (near-zero-) pivot exit, split by which
     // way it went. `Recoveries` counts in-place refactorize+recompute+re-select,
     // which keeps the monotone dual loop alive; `Bails` counts the hand-off to the
