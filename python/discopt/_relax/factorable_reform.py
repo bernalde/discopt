@@ -763,8 +763,10 @@ def _lift_affine_monomials_enabled() -> bool:
     cascade fix; 206 interleaved comparisons over the in-repo corpus as written,
     under 1e3/1e6 translations and the generated families;
     ``recentre_graduation_panel.py --flag``): 0 false, 0 lost, 0 neutrality drift;
-    certificates 166 -> 168 (nvs05 as written, nvs01 at the 1e3 shift). ``=0``
-    restores the distribute-then-cap path."""
+    certificates 166 -> 168 (nvs05 as written, nvs01 at the 1e3 shift). Re-run
+    2026-10-03 after the #1588 review fixes (maximal-chain rule, reach, implied-
+    integer auxes): same verdict, certificates 167 -> 169. ``=0`` restores the
+    distribute-then-cap path."""
     import os
 
     return os.environ.get("DISCOPT_LIFT_AFFINE_MONOMIALS", "1") != "0"
