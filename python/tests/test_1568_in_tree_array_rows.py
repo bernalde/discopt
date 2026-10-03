@@ -426,15 +426,23 @@ def test_unexpandable_row_default_solve_emits_no_warning(monkeypatch, caplog):
 
     monkeypatch.delenv(FLAG, raising=False)
     S._IN_TREE_ARRAY_ROWS_DECLINED_SEEN.clear()
+    # Nonconvex objective (sin(3x)*x) so spatial B&B must branch: the kernel runs
+    # at many nodes, not only at a root that a faster machine might close first.
     m = dm.Model("max_row")
-    x = m.continuous("x", shape=(3,), lb=-2, ub=2)
+    x = m.continuous("x", shape=(3,), lb=-3, ub=3)
     y = m.continuous("y", shape=(3,), lb=-10, ub=10)
     m.subject_to(y - dm.maximum(x, 0.5) == 0)
-    m.subject_to(dm.sum(x * x) >= 1.0)
-    m.minimize(dm.sum(y) + dm.sum(x * x))
-    with caplog.at_level(logging.DEBUG):
-        res = m.solve(time_limit=20)
+    m.minimize(dm.sum(y) + dm.sum(dm.sin(3 * x) * x))
+    # Set the level ON the emitting logger: caplog.at_level() without ``logger=``
+    # only lowers the root, so a level another test left on ``discopt`` (e.g.
+    # INFO) silently filters the DEBUG note -- the xdist failure on PR #1592.
+    with caplog.at_level(logging.DEBUG, logger="discopt.solver"):
+        res = m.solve(time_limit=30, max_nodes=40)
     assert res.objective is not None
+    assert res.node_count > 1, res.node_count
+    stats = res.solver_stats or {}
+    # The kernel saw the refused row (separates "never ran" from "not logged").
+    assert stats.get("reduce/array_rows_partial", 0) > 0, stats
     ours = [rec for rec in caplog.records if "DISCOPT_IN_TREE_ARRAY_ROWS" in rec.getMessage()]
     assert ours, "the partial-expansion note was never logged: the refused row never ran"
     for rec in ours:
