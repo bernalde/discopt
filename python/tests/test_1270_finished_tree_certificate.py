@@ -20,9 +20,17 @@ INF = float("inf")
 
 
 class _Tree:
-    def __init__(self, finished, bound_unresolved=False, unresolved_floor=INF):
+    def __init__(self, finished, bound_unresolved=False, unresolved_floor=INF, open_nodes=None):
         self._finished = finished
-        self._stats = {"bound_unresolved": bound_unresolved, "unresolved_floor": unresolved_floor}
+        # The Rust tree's stats() always carries ``open_nodes``; #1242's
+        # ``_tree_drained`` reads it to tell exhaustion from the 1e-8 gap shortcut.
+        if open_nodes is None:
+            open_nodes = 0 if finished else 1
+        self._stats = {
+            "bound_unresolved": bound_unresolved,
+            "unresolved_floor": unresolved_floor,
+            "open_nodes": open_nodes,
+        }
 
     def is_finished(self):
         return self._finished
@@ -40,6 +48,7 @@ class _Tree:
         (_Tree(True, bound_unresolved=True), False),  # #467 -inf pin
         (_Tree(True, unresolved_floor=2.81), False),  # #598 finite floor
         (_Tree(True, unresolved_floor=-INF), False),
+        (_Tree(True, open_nodes=4), False),  # #1242: finished by the 1e-8 gap shortcut
     ],
 )
 def test_empty_tree_is_a_proof_only_without_unproven_removals(tree, expected):
