@@ -533,31 +533,27 @@ const RAY_CERT_REL: f64 = 1e-7;
 /// at relative size 1 and clear this by six orders of magnitude.
 pub(super) const SUBTOL_NOISE_REL: f64 = 1e-6;
 
-/// Objective-impact floor, relative to `1 + |obj|`, for a sub-`tol` wrong-signed
-/// reduced cost to block an `Optimal` verdict (#1595). The impact of accepting
-/// `d_j` is `|d_j|·room_j`; with an open side it is unbounded.
-pub(super) const SUBTOL_IMPACT_REL: f64 = 1e-9;
-
 /// The nonbasic column (among the first `n_real`) whose reduced cost is
-/// wrong-signed below the absolute pricing tolerance, yet is real and moves the
-/// objective by more than tolerance over the column's room — the column with the
-/// largest such impact, as `(j, d_j)` — or `None` when the vertex is genuinely
-/// dual feasible (#1595).
+/// wrong-signed by more than the pricing tolerance *measured relative to the cost
+/// scale* — the largest such `|d_j|`, as `(j, d_j)` — or `None` when the vertex is
+/// dual feasible at that scale (#1595).
 ///
-/// The absolute `tol = 1e-9` on `d_j` is a statement about a reduced cost's
-/// *size*, but what makes a vertex optimal is what accepting a wrong-signed `d_j`
-/// costs in objective: `|d_j|·(u_j − l_j)`, and without bound when the improving
-/// side is open. Equilibration scales column `j`'s cost by its factor, so on a row
-/// with an entry ≥ ~1e9 the whole cost vector lands near 1e-10 in scaled space and
-/// every reduced cost is "below tolerance" — the #1595 witness `min −x s.t.
-/// 7.5e9·x − y ≤ 0`, `x ∈ [0,1]`, `y ≥ 0` was certified `Optimal` at `x = 0`
-/// (objective 0) with `d_y = −1.3e-10` on the open column `y`; the true optimum is
-/// −1. The only remaining cover was the Neumaier–Shcherbina bound, which abstains
-/// there, and a caller trusted the raw objective. This check is the simplex's own
-/// refusal to call such a vertex optimal.
+/// Pricing compares `d_j` with an absolute `tol = 1e-9`. That is only meaningful
+/// when the costs are O(1): reduced costs are linear in `c`, so an absolute
+/// tolerance is really `tol / max|c|` relative. Equilibration scales column `j`'s
+/// cost by its column factor, so a row with an entry ≥ ~1e9 lands the whole
+/// scaled cost vector near 1e-10 and every reduced cost is "below tolerance" —
+/// the #1595 witness `min −x s.t. 7.5e9·x − y ≤ 0`, `x ∈ [0,1]`, `y ≥ 0` was
+/// certified `Optimal` at `x = 0` (objective 0) with `d_y = −1.3e-10` on the open
+/// column `y`, against a true optimum of −1, and a caller then published the raw
+/// 0 as a bound.
 ///
-/// Only consulted once the ordinary pricing has found nothing, so an LP whose
-/// optimum passes it is pivoted exactly as before.
+/// The check applies `tol · max|c|` — the same relative tolerance an O(1)-cost LP
+/// already gets — and so is **inert whenever `max|c| ≥ 1`** (pricing has already
+/// found every `|d_j| > tol`): such an LP pivots exactly as before. Costs that are
+/// all zero carry no optimality question and return `None`. A candidate must also
+/// clear [`SUBTOL_NOISE_REL`] relative to the magnitudes `d_j` was computed from,
+/// so rounding noise in `c_j − A_jᵀy` is never mistaken for an improving column.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn subtol_dual_violation(
     cols: &SparseCols,
@@ -567,11 +563,14 @@ pub(super) fn subtol_dual_violation(
     ub: &[f64],
     stat: &[i8],
     y: &[f64],
-    obj: f64,
+    tol: f64,
 ) -> Option<(usize, f64)> {
-    let impact_floor = SUBTOL_IMPACT_REL * (1.0 + obj.abs());
+    let cmax = cost[..n_real].iter().fold(0.0f64, |a, &c| a.max(c.abs()));
+    if !(cmax > 0.0 && cmax < 1.0) {
+        return None; // O(1) costs: the absolute tolerance already is relative
+    }
+    let rel_tol = tol * cmax;
     let mut best: Option<(usize, f64)> = None;
-    let mut best_impact = 0.0f64;
     for j in 0..n_real {
         if stat[j] == BASIC {
             continue;
@@ -582,33 +581,18 @@ pub(super) fn subtol_dual_violation(
         }
         let (ay, mag, _) = cols.dot_with_magnitude(j, y);
         let dj = cost[j] - ay;
-        // Room in the improving direction. A free column improves either way.
-        let room = if lo_inf && hi_inf {
-            if dj == 0.0 {
-                continue;
-            }
-            f64::INFINITY
-        } else if stat[j] == AT_LOWER && dj < 0.0 {
-            if hi_inf {
-                f64::INFINITY
-            } else {
-                ub[j] - lb[j]
-            }
-        } else if stat[j] == AT_UPPER && dj > 0.0 {
-            if lo_inf {
-                f64::INFINITY
-            } else {
-                ub[j] - lb[j]
-            }
+        let improving = if lo_inf && hi_inf {
+            dj != 0.0 // a free column improves either way
         } else {
-            continue;
+            (stat[j] == AT_LOWER && dj < 0.0) || (stat[j] == AT_UPPER && dj > 0.0)
         };
+        if !improving || dj.abs() <= rel_tol {
+            continue;
+        }
         if dj.abs() <= SUBTOL_NOISE_REL * (cost[j].abs() + mag) {
             continue; // indistinguishable from rounding
         }
-        let impact = dj.abs() * room;
-        if impact > impact_floor && impact > best_impact {
-            best_impact = impact;
+        if best.is_none_or(|(_, b)| dj.abs() > b.abs()) {
             best = Some((j, dj));
         }
     }
@@ -2278,9 +2262,8 @@ impl<'a> Simplex<'a> {
         // ≤48-update refactorizations. See `xb_refresh_cadence`.
         let xb_refresh_every = self.xb_refresh;
         let mut since_xb_refresh = 0usize;
-        // #1595: pivots taken on a sub-`tol` but real, objective-moving reduced
-        // cost, and their budget. A genuine instance needs a handful; the cap only
-        // keeps a noise-driven run from churning to `max_iter`.
+        // #1595: pivots taken by the cost-relative re-pricing, and their budget.
+        // The cap only keeps a noise-driven run from churning to `max_iter`.
         let mut subtol_pivots = 0usize;
         let subtol_cap = m + 64;
         for _iter in 0..self.max_iter {
@@ -2353,25 +2336,13 @@ impl<'a> Simplex<'a> {
                 }
             }
             drop(_t_sweep);
-            // #1595: before calling the vertex optimal, make sure no sub-`tol`
-            // reduced cost still moves the objective by more than tolerance (see
-            // `subtol_dual_violation`). Phase 2 only: phase 1's costs are the unit
-            // artificial weights, whose reduced costs are not cost-scaled.
+            // #1595: before calling the vertex optimal, re-price at the tolerance
+            // relative to the cost scale (see `subtol_dual_violation`; inert when
+            // max|c| >= 1). Phase 2 only: phase 1's costs are the unit artificial
+            // weights, already O(1).
             if enter.is_none() && !is_phase1 {
-                let mut obj = 0.0f64;
-                for (i, &bj) in self.basis.iter().enumerate() {
-                    obj += cost[bj] * xb[i];
-                }
-                for j in 0..self.n {
-                    if self.stat[j] != BASIC {
-                        let v = self.nb_value(j);
-                        if v != 0.0 {
-                            obj += cost[j] * v;
-                        }
-                    }
-                }
                 if let Some((j, dj)) = subtol_dual_violation(
-                    &self.cols, self.n, cost, &self.lb, &self.ub, &self.stat, &y, obj,
+                    &self.cols, self.n, cost, &self.lb, &self.ub, &self.stat, &y, self.tol,
                 ) {
                     if subtol_pivots >= subtol_cap {
                         // Out of budget: an honest refusal, never a claimed optimum.

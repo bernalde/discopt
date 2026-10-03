@@ -414,9 +414,9 @@ counters!(
     UnboundedRejectObjective,
     UnboundedRejectBox,
     // #1595: a phase-2 vertex the absolute `tol` pricing called optimal, but at
-    // which a nonbasic column still had a wrong-signed reduced cost that is real
-    // (not rounding noise) and whose objective impact over its room is above
-    // tolerance — an open side makes that impact unbounded. `SubtolPivots` counts
+    // which a nonbasic column still had a wrong-signed reduced cost above the
+    // tolerance taken relative to the cost scale (`tol · max|c|` when max|c| < 1)
+    // and above rounding noise. `SubtolPivots` counts
     // the primal pivots taken on such a column instead of returning `Optimal`;
     // `SubtolCapNumerical` counts loops that ran out of the budget for them and
     // refused (`Numerical`) rather than claim optimality. `WarmSubtolRepair`
