@@ -254,3 +254,23 @@ def test_psig40r_still_certifies_through_the_default_path():
     assert res.gap_certified, (res.status, res.objective, res.bound)
     assert res.bound <= PSIG40R_OPT + 1e-6 * (1 + abs(PSIG40R_OPT))
     assert res.objective == pytest.approx(PSIG40R_OPT, rel=1e-4)
+
+
+@pytest.mark.parametrize("seed", [0, 2])
+def test_row_scaled_psig40r_publishes_no_false_bound(seed):
+    """#1537's row-scaling probe on psig40r: every row multiplied by its own seeded
+    factor in 10^[-3,3] (an exact reformulation). On main seed 0 timed out at 0 nodes
+    and seed 2 published bound 86.666 > the optimum 86.5451; here both certify."""
+    from _invariance import _rebuild
+    from discopt.modeling.core import Constraint
+
+    m = _rebuild(_psig40r(), lambda v: np.zeros(v.lb.shape), 1.0, "rows")
+    f = 10.0 ** np.random.default_rng(seed).uniform(-3.0, 3.0, len(m._constraints))
+    m._constraints = [
+        Constraint(body=s * c.body, sense=c.sense, rhs=s * c.rhs, name=c.name)
+        for s, c in zip(f, m._constraints)
+    ]
+    res = m.solve(time_limit=30)
+    assert res.bound is None or res.bound <= PSIG40R_OPT + 1e-6 * (1 + abs(PSIG40R_OPT)), res
+    assert res.gap_certified, (res.status, res.objective, res.bound)
+    assert res.objective == pytest.approx(PSIG40R_OPT, rel=1e-4)
