@@ -220,9 +220,18 @@ def _is_free_integer(v, model: Model) -> bool:
     """True when *v* is an integer/binary column a heuristic may round, fix or
     move on its own -- i.e. not an implied-integer lifted aux (see
     :func:`_get_integer_mask`). The one predicate every integer-fixing site here
-    uses, so the mask and the bound pinning cannot disagree."""
+    uses, so the mask and the bound pinning cannot disagree.
+
+    Gated with ``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1588 review): with ``=0`` every
+    INTEGER column is free, exactly as on main. An ungated A/B on main's #1544
+    path (28 rows) was mixed -- nvs09 faster, nvs06/st_e38/beuster at the 1e6 shift
+    worse -- and has not passed a panel of its own."""
     if v.var_type not in (VarType.BINARY, VarType.INTEGER):
         return False
+    from discopt._relax.factorable_reform import _lift_affine_monomials_enabled
+
+    if not _lift_affine_monomials_enabled():
+        return True
     implied = getattr(model, "_implied_integer_auxes", None)
     return not (implied and v.name in implied)
 

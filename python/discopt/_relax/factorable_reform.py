@@ -507,7 +507,9 @@ class _Lifter:
         self.zero_spanning_factor_auxes: set[str] = set()
         # Auxes created with ``integer=True`` (an exact integer-valued affine
         # definition): integral because of the columns they are defined by, see
-        # ``Model._implied_integer_auxes``.
+        # ``Model._implied_integer_auxes``. Populated only with
+        # ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, so ``=0`` reproduces main exactly
+        # (#1588 review: the default-path behaviour change has no panel of its own).
         self.implied_integer_auxes: set[str] = set()
 
     def tick(self, *, force: bool = False) -> None:
@@ -597,7 +599,7 @@ class _Lifter:
         self._counter += 1
         vtype = VarType.INTEGER if integer else VarType.CONTINUOUS
         w = Variable(name, vtype, (), lo, hi, self.model)
-        if integer:
+        if integer and _lift_affine_monomials_enabled():
             self.implied_integer_auxes.add(name)
         self.model._variables.append(w)
         self._expr_cache[key] = w

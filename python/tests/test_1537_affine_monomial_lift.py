@@ -319,3 +319,47 @@ def test_translated_nvs22_keeps_its_incumbent():
     flat = np.concatenate([np.ravel(np.asarray(r.x[v.name], float)) for v in m._variables])
     assert verify_point(m, flat).ok
     assert r.objective >= 6.05822 - 1e-4  # minlplib.solu: never below the optimum
+
+
+# ------------------------------------------- ``=0`` reproduces main (#1588 review)
+
+NVS06 = os.path.join(HERE, "data", "minlplib_nl", "nvs06.nl")
+
+
+def _legacy_is_free_integer(v, model):
+    """main's predicate: every BINARY/INTEGER column is free."""
+    from discopt.modeling.core import VarType
+
+    return v.var_type in (VarType.BINARY, VarType.INTEGER)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "build, shift",
+    [(_nvs22, 1e3), (lambda: dm.from_nl(NVS06), 1e6)],
+    ids=["nvs22@1e3", "nvs06@1e6"],
+)
+def test_flag_off_reproduces_main(monkeypatch, build, shift):
+    """#1588 review: the implied-integer handling of the primal heuristics is
+    gated with the lift, so ``=0`` matches main exactly. nvs06@1e6 creates #1544
+    INTEGER auxes even at ``=0``; before the gate it stopped at node 1 on a
+    cancellation-garbage ILS incumbent (-419428 vs a true 2.45) where main runs on.
+    Deterministic node budget, so node counts are comparable."""
+    import sys
+
+    sys.path.insert(0, HERE)
+    from _invariance import translate
+    from discopt._relax import primal_heuristics as ph
+
+    monkeypatch.setenv("DISCOPT_LIFT_AFFINE_MONOMIALS", "0")
+    m0 = translate(build(), shift)
+    assert not fr.factorable_reformulate(m0)._implied_integer_auxes
+    kw = dict(time_limit=300, max_nodes=30, deterministic=True)
+    r_off = m0.solve(**kw)
+    monkeypatch.setattr(ph, "_is_free_integer", _legacy_is_free_integer)
+    r_main = translate(build(), shift).solve(**kw)
+    assert (r_off.status, r_off.node_count, r_off.objective) == (
+        r_main.status,
+        r_main.node_count,
+        r_main.objective,
+    )
