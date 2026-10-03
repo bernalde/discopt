@@ -202,3 +202,43 @@ def test_1569_differential_bound_on_array_model():
 )
 def test_gate_abstains_outside_constant_hessian_convexity(obj):
     assert _gate(_two_var(obj)) is False
+
+
+# ================================================ opaque (CustomCall) objectives
+def _custom_objective_model(body):
+    m = dm.Model("custom_obj")
+    x = m.continuous("x", 2, lb=[0.1, 0.1], ub=[2.0, 2.0])
+    f = dm.custom(body, name="f")
+    m.minimize(f(x[0], x[1]))
+    m.subject_to(x[0] + x[1] >= 1.0)
+    return m
+
+
+def _numpy_only_body(a, b):
+    # Written for the value path only: ``np.exp`` on a JAX tracer raises
+    # ``TracerArrayConversionError`` if anything tries to differentiate it.
+    return a * np.exp(-b) + b * np.exp(-a)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_numpy_only_body, lambda a, b: a * a + b * b],
+    ids=["numpy-body", "quadratic-body"],
+)
+def test_custom_call_objective_abstains_without_probing_hessian(body):
+    """An opaque objective has no provable degree: the gate abstains structurally
+    and never evaluates the Hessian. Before the pre-check, the array-box fix
+    (#1569) let a CustomCall objective reach the Hessian probe, which raised
+    TracerArrayConversionError through the whole solve (test_1112)."""
+    m = _custom_objective_model(body)
+    calls = {"n": 0}
+
+    class _Spy:
+        def evaluate_hessian(self, _x):
+            calls["n"] += 1
+            raise AssertionError("Hessian probed on an opaque objective")
+
+    assert solver._objective_is_convex_quadratic(m, _Spy(), 2) is False
+    assert calls["n"] == 0
+    # and through the real evaluator, no exception escapes
+    assert _gate(m) is False

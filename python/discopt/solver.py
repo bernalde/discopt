@@ -3180,6 +3180,16 @@ def _objective_is_convex_quadratic(
     """
     if model._objective is None or n_vars == 0:
         return False
+    # An opaque ``dm.custom`` node has no provable degree, so the objective
+    # cannot be shown quadratic and the constant-Hessian argument does not
+    # apply. The term classifier below does not see one: its walker yields no
+    # children for a ``CustomCall`` and files nothing, so without this check an
+    # opaque objective reached the Hessian probe -- where a body written for the
+    # value/MCBox paths raises ``TracerArrayConversionError`` under JAX
+    # differentiation (masked on main by the #1569 box bug, which raised first on
+    # array models). Abstain structurally, before evaluating anything.
+    if _expression_contains_custom_call(model._objective.expression):
+        return False
     from discopt._relax.term_classifier import classify_nonlinear_terms
 
     t = classify_nonlinear_terms(model)
