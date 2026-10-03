@@ -167,10 +167,18 @@ def test_a_failed_measurement_fails_closed(monkeypatch):
 
 
 @pytest.mark.parametrize("n_terms", [2000])
-def test_loop_built_objective_is_measured(n_terms):
+def test_loop_built_objective_is_measured(n_terms, monkeypatch):
     """``f = f + term`` in a loop is as deep as it has terms; the guard must still
     measure it. On the first revision of #1556 this raised ``RecursionError``, the
     guard skipped, and the #1551 false certificate came back (bound +8.17e-4)."""
+    # Pinned OFF: this tests the #1551 guard on the route that reaches a
+    # certificate. Recentring (default ON, #1537) moves ``y`` and rewrites
+    # ``(6*y)*y`` as ``(6*z + c1)*(z + c2)``, which the quadratic extractor does not
+    # expand, so the recentred objective is not proven convex: the solve takes
+    # spatial B&B, stops uncertified at the node limit with a valid bound, and never
+    # reaches the certificate this guard checks. No false certificate either way,
+    # and no certificate in either arm: the ON arm is measured by the next test.
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     m, _, opt = _expanded(BAD_C)
     f = m._objective.expression
     for i in range(n_terms):
@@ -184,21 +192,58 @@ def test_loop_built_objective_is_measured(n_terms):
     assert stats.get("certificate/objective_unresolved") == 1.0
 
 
-def test_convex_kernel_return_is_guarded(monkeypatch):
-    """The convex-kernel fast path returns from ``Model.solve`` before
-    ``solve_model``; its result must pass the guard too."""
-    import discopt.solvers._convex_kernel as ck
+@pytest.mark.slow
+def test_loop_built_objective_under_recentring_is_not_certified_either(monkeypatch):
+    """The recentred arm of the test above, measured rather than pinned (#1537).
 
-    m, _, _ = _expanded(BAD_C)
+    The model is uncertifiable by construction (#1551: the objective cannot be
+    evaluated to its own gap tolerance), and the OFF arm above asserts it is NOT
+    certified. Under recentring it reaches the same verdict by a different route:
+    ``(6*z + c1)*(z + c2)`` is not recognised as quadratic, so the solve takes
+    spatial B&B and stops at a limit (measured: the 100000-node limit at ~22 s).
+    That is a cost in time, not a lost certificate. The bound it keeps must still
+    be valid."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "1")
+    m, _, opt = _expanded(BAD_C)
+    f = m._objective.expression
+    for i in range(2000):
+        f = f + 1e-3 * m.continuous(f"z{i}", lb=0, ub=1)
+    m.minimize(f)
+    r = m.solve(time_limit=60)
+    stats = r.solver_stats or {}
+    assert stats.get("recentre/variables_moved", 0) > 0
+    assert not r.gap_certified
+    assert r.bound is None or F(r.bound) <= opt
+
+
+@pytest.mark.parametrize("recentre", ["0", "1"])
+def test_convex_kernel_return_is_guarded(monkeypatch, recentre):
+    """The convex-kernel fast path returns from ``Model.solve`` before
+    ``solve_model``; its result must pass the guard too.
+
+    Both recentring arms (#1537). With it ON (the default) ``y`` is moved, so the
+    kernel is handed the recentred model, not ``m``, and the fake must answer in
+    that model's coordinates (``y - shift``); the guard has to fire on the
+    mapped-back result all the same."""
+    import discopt.solvers._convex_kernel as ck
+    from discopt.modeling import _recentre
+
+    monkeypatch.setenv("DISCOPT_RECENTRE", recentre)
+    m, y, _ = _expanded(BAD_C)
     y0 = float(math.ceil(BAD_C) + 1)
+    shift = 0.0
+    if recentre == "1":
+        shift = float(_recentre.plan_shifts(m, _recentre.recentre_ratio())[id(y)])
+        assert shift != 0.0
     calls = []
 
     def fake(model, **kwargs):
         calls.append(model)
-        return _certified(-5.9375, -5.9375, y0)
+        return _certified(-5.9375, -5.9375, y0 - shift)
 
     monkeypatch.setattr(ck, "try_convex_solve", fake)
     r = m.solve(time_limit=30)
-    assert calls == [m]
+    assert len(calls) == 1
+    assert (calls[0] is m) == (recentre == "0")
     assert not r.gap_certified and r.bound is None
     assert r.solver_stats["certificate/objective_unresolved"] == 1.0

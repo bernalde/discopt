@@ -78,7 +78,13 @@ def _st_miqp4(c):
 
 @pytest.fixture
 def shift_spy(monkeypatch):
-    """Count the shifts actually applied, so a green run proves the path fired."""
+    """Count the shifts actually applied, so a green run proves the path fired.
+
+    Pins ``DISCOPT_RECENTRE=0``: recentring (default ON since #1537) moves these
+    offset boxes to the origin before the MIQP route, so ``_miqp_origin_shift``
+    would see an unshifted model and this file would test nothing. The recentred
+    arm is covered by test_1543_real_instance_shift.py and test_1537_recentre.py."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     calls = {"applied": 0}
     real = solver_mod._miqp_origin_shift
 
