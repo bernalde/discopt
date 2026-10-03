@@ -572,6 +572,16 @@ class _Canonicalizer:
             spelled = _norm_scalar_spelling(name, args[0])
             if spelled is not None:
                 return self.canon(spelled)
+        if name == "prod" and len(args) == 1:
+            # ``prod`` of an array is the product of its ELEMENTS (``jnp.prod``;
+            # the tape's ``*`` fold in ``_nl_expr_compiler``), so it is spelled
+            # out exactly as the user's ``x[0] * x[1] * ...`` would be and relaxes
+            # through the existing bilinear/multilinear envelopes (#1582). Before,
+            # the call stayed opaque with an array-shaped enclosure and the
+            # relaxation build refused it, so no ``dm.prod`` model had a bound.
+            spelled = _prod_scalar_spelling(args[0])
+            if spelled is not None:
+                return self.canon(spelled)
         if any(_array_valued(a) for a in args):
             # A call over an array-valued argument has no scalar canonical form
             # (a 2-D ``norm`` is jnp's MATRIX norm, not a fold over elements).
@@ -604,6 +614,30 @@ def _norm_order(name: str) -> Optional[float]:
     except ValueError:
         return None
     return p if p >= 1.0 else None
+
+
+def _prod_scalar_spelling(arg: Expression) -> Optional[Expression]:
+    """Value-preserving scalar spelling of a one-argument ``prod(arg)`` (#1582).
+
+    The left ``*`` fold over ``arg``'s C-order elements, matching
+    ``_nl_expr_compiler``'s lowering. An empty argument is the empty product
+    ``1``. ``None`` (unknown shape, or too large to scalarize) keeps the call
+    opaque; its interval enclosure is then the scalar ``_prod_interval``.
+    """
+    shape = static_shape(arg)
+    if shape is None:
+        return None
+    if shape == ():
+        return arg
+    if int(np.prod(shape)) == 0:
+        return Constant(1.0)
+    elems = scalar_elements(arg)
+    if elems is None:
+        return None
+    out: Expression = elems[0]
+    for e in elems[1:]:
+        out = BinaryOp("*", out, e)
+    return out
 
 
 def _norm_scalar_spelling(name: str, arg: Expression) -> Optional[Expression]:
