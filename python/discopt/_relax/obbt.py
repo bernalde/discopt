@@ -2047,16 +2047,22 @@ def obbt_tighten_root(
     if not relaxer.has_relaxable_nonlinearity:
         return RootObbtResult(lb, ub, 0, 0, 0.0)
 
-    # #208 cascade: carry OBBT-tightened auxiliary-column bounds across rounds,
-    # keyed by (stable) column index. The aux columns are a fixed function of
-    # the model's nonlinear terms, so their indices are identical across
-    # rebuilds even as the original box shrinks. Intersecting a previously
-    # captured (valid) aux bound into a freshly built relaxation keeps it a
-    # valid outer approximation and lets the tighter aux box cascade onto the
-    # original variables via the McCormick rows.
-    carried_aux: dict[int, list[float]] = {}
+    # #208 cascade: carry OBBT-tightened auxiliary-column bounds across rounds.
+    # Intersecting a previously captured (valid) aux bound into a freshly built
+    # relaxation keeps it a valid outer approximation and lets the tighter aux
+    # box cascade onto the original variables via the McCormick rows.
+    #
+    # #1586: a carried bound is keyed by the QUANTITY its column represents --
+    # ``(varmap kind, term key)``, e.g. ``("bilinear", (i, j))`` is x_i*x_j --
+    # never by raw column index. Column indices are NOT stable across rebuilds:
+    # a term whose arguments become fixed at the tightened box is no longer
+    # lifted, so every later aux column shifts (measured 69 -> 66 -> 52 columns
+    # in one call on nvs22). Index keying applied x_a*x_b's bound to x_c*x_d and
+    # the cascade cut the optimum out of the box. Columns no varmap entry names
+    # are not carried: weaker, never unsound.
+    carried_aux: dict[tuple, list[float]] = {}
 
-    def _apply_carried_aux(milp) -> None:
+    def _apply_carried_aux(milp, varmap) -> None:
         if not (cascade_aux and carried_aux):
             return
         # #1152: the index correspondence above holds only across WHOLE builds.
@@ -2068,12 +2074,13 @@ def obbt_tighten_root(
         if bool(getattr(milp, "_build_truncated", False)):
             return
         n_total = len(milp._bounds)
-        for col, (alb, aub) in carried_aux.items():
-            if n_orig <= col < n_total:
+        for col, term in _aux_column_terms(varmap, n_orig, n_total).items():
+            carried = carried_aux.get(term)
+            if carried is not None:
                 lo, hi = milp._bounds[col]
-                milp._bounds[col] = (max(float(lo), alb), min(float(hi), aub))
+                milp._bounds[col] = (max(float(lo), carried[0]), min(float(hi), carried[1]))
 
-    def _capture_aux(milp, res) -> None:
+    def _capture_aux(milp, varmap, res) -> None:
         if not cascade_aux:
             return
         # #1152, the mirror of ``_apply_carried_aux``: never record an aux bound
@@ -2084,15 +2091,15 @@ def obbt_tighten_root(
         tl, tu = res.tightened_lb, res.tightened_ub
         if len(tl) < n_total:  # not a full_result run; nothing to capture
             return
-        for col in range(n_orig, n_total):
+        for col, term in _aux_column_terms(varmap, n_orig, n_total).items():
             alo, ahi = float(tl[col]), float(tu[col])
             if not (np.isfinite(alo) and np.isfinite(ahi)):
                 continue
-            if col in carried_aux:
-                cur = carried_aux[col]
-                carried_aux[col] = [max(cur[0], alo), min(cur[1], ahi)]
+            cur = carried_aux.get(term)
+            if cur is not None:
+                carried_aux[term] = [max(cur[0], alo), min(cur[1], ahi)]
             else:
-                carried_aux[col] = [alo, ahi]
+                carried_aux[term] = [alo, ahi]
 
     for _ in range(max(1, rounds)):
         if deadline is not None and time.perf_counter() >= deadline:
@@ -2127,7 +2134,7 @@ def obbt_tighten_root(
                 "root OBBT ends with the tightening found so far",
             )
             break
-        _apply_carried_aux(milp)
+        _apply_carried_aux(milp, varmap)
 
         # Duality-based bound tightening first: one objective LP yields
         # reduced costs that tighten every variable at once (cheap), before
@@ -2158,9 +2165,11 @@ def obbt_tighten_root(
                 if np.any(lb[:m] > ub[:m] + 1e-9):
                     return RootObbtResult(lb, ub, total_tight, n_rounds, total_lp_time, True)
                 # Rebuild the envelope at the DBBT-tightened box so OBBT
-                # below sees the strengthened relaxation.
+                # below sees the strengthened relaxation. #1586: keep THIS build's
+                # varmap -- the layout can differ from the round's first build, and
+                # the cascade below reads aux columns through it.
                 try:
-                    milp, _ = build_milp_relaxation(
+                    milp, varmap = build_milp_relaxation(
                         relaxer._model,
                         relaxer._terms,
                         relaxer._disc,
@@ -2179,7 +2188,7 @@ def obbt_tighten_root(
                         "root OBBT ends with the DBBT bounds already applied",
                     )
                     break
-                _apply_carried_aux(milp)
+                _apply_carried_aux(milp, varmap)
 
         # Include the aux columns as OBBT candidates (and request the full
         # column vector) when cascading, so their tightening is captured and
@@ -2213,7 +2222,7 @@ def obbt_tighten_root(
         )
         total_lp_time += res.total_lp_time
         n_rounds += 1
-        _capture_aux(milp, res)
+        _capture_aux(milp, varmap, res)
 
         sweep_tight = 0
         for i in range(min(n_orig, len(res.tightened_lb))):
@@ -2385,6 +2394,35 @@ def cascade_reachable_aux(
             reachable.add(int(cw))
 
     return sorted(reachable)
+
+
+_CASCADE_TERM_KINDS = ("bilinear", "monomial", "trilinear", "multilinear", "ratio")
+
+
+def _aux_column_terms(varmap: dict, n_orig: int, n_total: int) -> dict[int, tuple]:
+    """Map each aux column of one relaxation build to the term it represents.
+
+    Returns ``{col: (kind, key)}`` for the varmap kinds whose entries name a single
+    column (the kinds the #208 cascade reads). ``(kind, key)`` identifies the
+    quantity -- e.g. ``("bilinear", (i, j))`` is x_i*x_j -- and so is comparable
+    across builds where the column index is not (#1586). A column named by two
+    entries is ambiguous and dropped; dropping a carried bound is sound.
+    """
+    out: dict[int, tuple] = {}
+    ambiguous: set[int] = set()
+    for kind in _CASCADE_TERM_KINDS:
+        for key, col in varmap.get(kind, {}).items():
+            if not isinstance(col, (int, np.integer)):
+                continue
+            c = int(col)
+            if not (n_orig <= c < n_total):
+                continue
+            if c in out:
+                ambiguous.add(c)
+            out[c] = (kind, key)
+    for c in ambiguous:
+        del out[c]
+    return out
 
 
 def reverse_fbbt_from_aux(
