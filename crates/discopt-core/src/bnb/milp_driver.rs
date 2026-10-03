@@ -8844,6 +8844,34 @@ mod tiny_entry_tests {
     }
 
     #[test]
+    fn row_scaled_witness_fires_the_gate_1537() {
+        // #1537 C (retired row pre-pass): `1e5·(x + y) + s0 = 3.5e5`,
+        // `1e-6·(x - y) + s1 = 1e-6`. Column x holds 1e5 and 1e-6 (ratio 1e-11), so
+        // the column-first equilibration reads the 1e-6 as noise and the gate
+        // withdraws the certificate. That is the row-scale NON-invariance #1537
+        // reported (m3/flay03m with rows scaled in 10^[-6,6]); it is sound -- a lost
+        // certificate, never a false bound -- and it is the behaviour main keeps
+        // after the pre-pass was retired. A fix that makes this row-scale invariant
+        // flips the second assertion, and must pass the §5 panel to do so.
+        #[rustfmt::skip]
+        let dense = [
+            1e5,  1e5,  1.0, 0.0,
+            1e-6, -1e-6, 0.0, 1.0,
+        ];
+        let l = [0.0, 0.0, -INF, 0.0];
+        let u = [10.0, 100.0, 0.0, INF];
+        // The same model written with unit rows does not reach the gate ...
+        #[rustfmt::skip]
+        let unit = [
+            1.0,  1.0, 1.0, 0.0,
+            1.0, -1.0, 0.0, 1.0,
+        ];
+        assert!(!gate(&unit, 2, &l, &u, &[3.5, 1.0]));
+        // ... and the row-scaled spelling does.
+        assert!(gate(&dense, 2, &l, &u, &[3.5e5, 1e-6]));
+    }
+
+    #[test]
     fn withdraw_keeps_the_point_and_drops_every_proof() {
         for (from, to) in [
             (MilpStatus::Optimal, MilpStatus::Feasible),

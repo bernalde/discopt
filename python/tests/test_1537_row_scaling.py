@@ -35,6 +35,7 @@ families, each row scaled by its own seeded log-uniform factor in 10^[-3,3] and
 from __future__ import annotations
 
 import os
+import zlib
 
 import discopt.modeling as dm
 import numpy as np
@@ -167,3 +168,52 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
     assert other.gap_certified, (other.status, other.bound)
     assert other.objective == pytest.approx(base.objective, abs=1e-6)
     assert other.bound <= 0.0 + 1e-6, other.bound
+
+
+# --------------------------------------------------------------------------- #
+# Rust MILP equilibration under per-row scaling (#1537; row pre-pass retired).
+# --------------------------------------------------------------------------- #
+
+
+def _per_row_scaled(name: str, span: float):
+    """The probe's model: every row of ``name`` multiplied by its own seeded
+    log-uniform factor in ``10^[-span, span]`` (seed = crc32 of the file name)."""
+    path = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl", name)
+    base = dm.from_nl(path)
+    new = _rebuild(base, lambda v: np.zeros(v.lb.shape), 1.0, f"{name}_pr{span:g}")
+    rng = np.random.default_rng(zlib.crc32(name.encode()))
+    new._constraints = [
+        Constraint(
+            body=float(10.0 ** rng.uniform(-span, span)) * c.body,
+            sense=c.sense,
+            rhs=0.0,
+            name=c.name,
+        )
+        for c in new._constraints
+    ]
+    return new
+
+
+def test_row_scaled_m3_loses_its_certificate_soundly(monkeypatch):
+    """m3 with rows scaled in 10^[-6,6]. An OA-master column for a variable that
+    appears in a row scaled by ~1e5 and one scaled by ~1e-6 holds a 1e-11 ratio,
+    which the column-first equilibration reads as noise, so the #1296 guard
+    withdraws the master certificates and the solve ends uncertified.
+
+    A pow2 row pre-pass (``DISCOPT_LP_ROW_PRESCALE``) restored this certificate but
+    was retired after its §5 panel: clay0303hfsg (rows scaled in 10^[-3,3]) lost its
+    certificate at 20 s, with 15x the Numerical LP verdicts of the legacy factors
+    (see ``docs/dev/flag-retirement-audit.md``). This pins what main keeps: the
+    certificate is lost, never replaced by a bound above the optimum. A future
+    row-scale-invariant fix flips the ``gap_certified`` assertion and must pass the
+    panel to do so."""
+    from discopt._rust import profile_counters_py, profile_reset_py
+
+    monkeypatch.setenv("DISCOPT_PROFILE", "1")
+    profile_reset_py()
+    res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    # Anti-vacuity (CLAUDE.md §6): the shape still reaches the guard.
+    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
+    assert not res.gap_certified, (res.status, res.bound)
+    # minlplib.solu: m3 =opt= 37.8 (minimize). No false bound.
+    assert res.bound is None or res.bound <= 37.8 + 1e-6, res.bound

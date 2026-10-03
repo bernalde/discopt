@@ -124,6 +124,9 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **Row-scaled MILP certificates: regression fixtures; row pre-pass retired** (`test`, contributes to #1537).
+  - Scaling a model's rows by powers of ten (10^[-6,6]) makes the #1296 tiny-entry guard withdraw the certificate on m3/flay03m. That is sound (a lost certificate, never a false bound) and is now pinned by regression tests, so a future row-scale-invariant fix flips them visibly.
+  - A pow2 row pre-pass in `scaling::equilibrate` that restored these certificates was tried and retired under §5: it lost clay0303hfsg's certificate at 20 s, with 15x the Numerical LP verdicts of the legacy factors, and a legacy-factor retry at every `Scaling` entry point did not reach the failing (unscaled, warm) solves. Measurements in `docs/dev/flag-retirement-audit.md`. No solver code changes.
 - **`to_nl` writes the nonlinear rows first, as the `.nl` format requires** (`fix`, #1562).
   - **The bug.** The header's `nlc` names rows `C0 .. C{nlc-1}` as nonlinear, but both writers emitted rows in declaration order. A linear row declared before a nonlinear one therefore produced a file whose header named the wrong rows, and pyscipopt's reader segfaulted on it. Both writers now write `[nonlinear | linear]`, stable within each group, as Pyomo does.
   - **Header.** Line 2 now carries the true `neqns` count; it was always written as `0`.
