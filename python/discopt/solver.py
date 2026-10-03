@@ -4015,11 +4015,12 @@ def _is_integer_feasible_solution(x, int_offsets, int_sizes, tol=1e-5):
 
 # #1606: how far past the #952 exit gate an integral incumbent may sit and still
 # be re-derived (rather than refused) by :func:`_integral_claim_recovery`. Relative
-# to each row's magnitude ``1 + |b_i| + sum_j |a_ij x_j|`` (a bound's: ``1 +
-# |bound|``). 1e-5 is the repo's integrality tolerance -- the snap arm already
-# re-derives residuals of ``sum_j |a_ij| * 1e-5`` -- and sits an order above the
-# measured LP-vertex residuals (~1.2e-6 at unit-scale rows) while an order below
-# a 1e-3 excursion on such a row, which stays a refusal.
+# to each row's magnitude ``1 + max(|b_i|, max_j |a_ij x_j|)`` -- the largest
+# single term, so cancelling terms cannot widen it (a bound's: ``1 + |bound|``).
+# 1e-5 is the repo's integrality tolerance -- the snap arm already re-derives
+# residuals of ``sum_j |a_ij| * 1e-5`` -- and sits an order above the measured
+# LP-vertex residuals (~1.2e-6 at unit-scale rows) while an order below a 1e-3
+# excursion on such a row, which stays a refusal.
 _LP_RESIDUAL_WINDOW_RTOL = 1e-5
 
 
@@ -4045,7 +4046,12 @@ def _within_lp_residual_window(x, A_ub, b_ub, A_eq, b_eq, bounds) -> bool:
         r = Ad @ x - bd
         if two_sided:
             r = np.abs(r)
-        scale = 1.0 + np.abs(bd) + np.abs(Ad) @ np.abs(x)
+        # The LARGEST single term, not their sum: a row whose terms cancel
+        # (``x0 - x1 <= 0`` at ``x0 = x1 = 1e3``) would otherwise widen the window
+        # with |x| and pass a 1e-2 excursion as an LP residual.
+        terms = np.abs(Ad) * np.abs(x)[None, :]
+        tmax = terms.max(axis=1) if terms.shape[1] else np.zeros(len(bd))
+        scale = 1.0 + np.maximum(np.abs(bd), tmax)
         if np.any(r > w * scale):
             return False
     if bounds is not None:
@@ -31184,9 +31190,11 @@ def _solve_milp_bb(
                 )
                 _incumbent_repolished = True
                 sol_flat = np.asarray(_point, dtype=np.float64)
-            elif _verdict == "not_snap_caused":
-                # The incumbent was already off-row. Leave it exactly as it was so
-                # the #952 exit gate below judges it, and says so in its own words.
+            elif _verdict in ("not_snap_caused", "repolished"):
+                # The incumbent was already off-row (a "repolished" point the arbiter
+                # rejected lands here too: the snap did not cause it either). Leave it
+                # exactly as it was so the #952 exit gate below judges it, and says so
+                # in its own words.
                 logger.debug(
                     "MILP-BB: the integer snap is not what leaves the rows; "
                     "deferring to the #952 exit gate."
@@ -32099,7 +32107,8 @@ def _solve_miqp_bb(
                 )
                 _incumbent_repolished = True
                 sol_flat = np.asarray(_point, dtype=np.float64)
-            elif _verdict == "not_snap_caused":
+            elif _verdict in ("not_snap_caused", "repolished"):
+                # A "repolished" point the arbiter rejected: not snap-caused either.
                 logger.debug(
                     "MIQP-BB: the integer snap is not what leaves the rows; "
                     "deferring to the #952 exit gate."
