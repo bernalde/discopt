@@ -442,6 +442,11 @@ def test_integer_snap_that_would_leave_the_rows_is_re_derived(monkeypatch):
     # Python ``_solve_milp_bb`` path, which the routed Rust engine bypasses.
     monkeypatch.setenv("DISCOPT_MILP_ENGINE", "0")
     monkeypatch.setenv("DISCOPT_LP_MILP_BACKEND", "rust")
+    # And recentring OFF (#1537, default ON): ``x`` in [-100, 100] meets the
+    # one-sided rule (|lb| >= 100, width >= |lb|), so the tree would run on the
+    # recentred model while ``_NearIntegralTree`` injects a point in the ORIGINAL
+    # coordinates -- an x outside the inner box, not the near-integral snap case.
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     monkeypatch.setattr(S, "PyTreeManager", _NearIntegralTree)
 
     r = m.solve(time_limit=60)  # must NOT raise: the unrounded point is feasible

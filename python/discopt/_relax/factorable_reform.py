@@ -507,9 +507,12 @@ class _Lifter:
         self.zero_spanning_factor_auxes: set[str] = set()
         # Auxes created with ``integer=True`` (an exact integer-valued affine
         # definition): integral because of the columns they are defined by, see
-        # ``Model._implied_integer_auxes``. Populated only with
-        # ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on, so ``=0`` reproduces main exactly
-        # (#1588 review: the default-path behaviour change has no panel of its own).
+        # ``Model._implied_integer_auxes``. Every such aux, whichever rule made it
+        # (the translated-monomial lift or main's #1544 cancellation / term-limit
+        # path). Populated only with ``DISCOPT_LIFT_AFFINE_MONOMIALS`` on (the
+        # default), so the ``=0`` opt-out reproduces pre-#1588 main exactly. The
+        # default-path handling has its own panel (#1593): see
+        # ``primal_heuristics._is_free_integer``.
         self.implied_integer_auxes: set[str] = set()
 
     def tick(self, *, force: bool = False) -> None:

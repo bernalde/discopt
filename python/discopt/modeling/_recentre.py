@@ -26,8 +26,8 @@ Two requirements came out of the entry experiment, both binding:
   not free (st_e36: 89 -> 93 nodes, 11 -> 19 s), and a model with nothing to move
   is solved exactly as before.
 
-Gated by ``DISCOPT_RECENTRE`` (default off, CLAUDE.md §5); the threshold by
-``DISCOPT_RECENTRE_RATIO`` (default 100).
+Gated by ``DISCOPT_RECENTRE`` (default ON, ``=0`` opts out; CLAUDE.md §5); the
+threshold by ``DISCOPT_RECENTRE_RATIO`` (default 100).
 """
 
 from __future__ import annotations
@@ -71,31 +71,29 @@ class RecentreUnsupported(ValueError):
 
 
 def recentre_enabled() -> bool:
-    """``DISCOPT_RECENTRE`` -- default OFF; graduation blocked (CLAUDE.md §5).
+    """``DISCOPT_RECENTRE`` -- default ON since #1537 (graduated, CLAUDE.md §5);
+    ``DISCOPT_RECENTRE=0`` restores the unrecentred solve exactly.
 
     Graduation panel (``discopt_benchmarks/scripts/recentre_graduation_panel.py``,
-    run 2026-10-02 on ``main`` after #1546/#1555, 20 s, 204 comparisons: the corpus
-    as written, the corpus under ``x = y - c`` with c ~ 1e3 / 1e6, and the #1537
-    generated families): ON vs OFF, false certificates **0 vs 2** (the #1542
-    ``polynomial`` 1e6 shift), certified **176 vs 162**, total wall **856 s vs
-    1157 s**, bound-neutral drift 0 of 48 untouched instances. These numbers
-    predate the #1577 review fixes (exact builder-state translation, mapped-point
-    verification); the panel has not been re-run since. BAR 2 (net-positive)
-    passes. BAR 1 fails only on the no-certification-regression clause: ON loses
-    three certificates the OFF arm keeps, so graduation is blocked:
+    run 2026-10-03 on ``main`` after #1588/#1592 plus the n-ary-sum convexity fix,
+    20 s, OFF/ON interleaved per instance, load 5-7, 206 comparisons: the corpus as
+    written, the corpus under ``x = y - c`` with c ~ 1e3 / 1e6, and the #1537
+    generated families): ON vs OFF false certificates **0 vs 0**, published
+    incumbents failing re-verification **0 vs 0**, certified **185 vs 167**, ON
+    loses **0** certificates OFF keeps (OFF loses 18 ON keeps), total wall **612 s
+    vs 881 s**, bound-neutral drift **0 of 49** untouched instances.
 
-    * ``nvs09`` (both shifts): the recentred box is ``[0, 6]``, and the solver is
-      translation-sensitive there with this flag OFF too -- the unshifted model
-      moved by -3 (box ``[0, 6]``) does not certify in 60 s (841 nodes) while its
-      own box ``[3, 9]`` certifies in 31. Writing the shift as a BinaryOp instead
-      of a two-term SumOver does not help (falsified: 645 vs 655 nodes).
-    * ``cvxnonsep_psig40r`` (1e3 shift): not analysed.
-
-    What would change it: the solver becoming invariant to small translations
-    (the #1537 class ``nvs09`` exposes), or a choice of recentred box that avoids
-    the sensitive region, followed by a re-run of the panel with zero losses.
+    The three losses that blocked the 2026-10-02 attempt are gone. ``nvs09`` (both
+    shifts) was the translated multilinear monomial distributing into 1,024 terms,
+    fixed by ``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1588). ``clay0303hfsg`` (1e3) was the
+    convexity recognisers not seeing through the n-ary ``SumOverExpression`` this
+    pass's constant folding emits (the perspective denominator ``0.001 + 0.999 y``):
+    36 hull rows lost their CONVEX verdict and the model left the OA route. That is
+    fixed in the recognisers (``_relax/convexity``), so a user who writes
+    ``dm.sum`` gets it too. ``cvxnonsep_psig40r`` (1e3) certifies in both arms on
+    this run (13 vs 23 nodes); it was not separately root-caused.
     """
-    return os.environ.get(FLAG, "0") != "0"
+    return os.environ.get(FLAG, "1") != "0"
 
 
 def recentre_ratio() -> float:
@@ -219,10 +217,19 @@ class _Rewriter:
         self.var_map = var_map  # id(old var) -> new var
         self.shifts = shifts  # id(old var) -> c (only moved vars)
         self.memo: dict[int, tuple[Expression, Optional[_Aff]]] = {}
+        # One folded node per source node. ``_canonical`` builds a fresh node, so
+        # without this a shared subexpression is DE-shared: ``y * y`` (one
+        # Variable node on both sides) became ``(z + c) * (z + c)`` with two
+        # distinct sums, and the square rule (``left is right``) lost it:
+        # ``min x*x + w`` with a moved ``x`` went CONVEX -> not convex under
+        # recentring (test_1537_recentre.py::test_shared_square_keeps_its_verdict).
+        # The key is ``id(aff)``; every ``aff`` is kept alive by ``self.memo``, so
+        # ids are not reused.
+        self.emitted: dict[int, Expression] = {}
 
     def __call__(self, expr: Expression) -> Expression:
         node, aff = self._rw(expr)
-        return _canonical(aff) if aff is not None and not _is_leaf(node) else node
+        return self._emit(node, aff)
 
     def _rw(self, expr: Expression) -> tuple[Expression, Optional[_Aff]]:
         key = id(expr)
@@ -294,10 +301,18 @@ class _Rewriter:
             return node, None
         raise RecentreUnsupported(f"no rewrite rule for {type(expr).__name__}")
 
-    @staticmethod
-    def _emit(node: Expression, aff: Optional[_Aff]) -> Expression:
-        """A child as it appears under a NON-affine parent: folded if affine."""
-        return _canonical(aff) if aff is not None and not _is_leaf(node) else node
+    def _emit(self, node: Expression, aff: Optional[_Aff]) -> Expression:
+        """A child as it appears under a NON-affine parent: folded if affine.
+
+        The same source node always emits the same object (``self.emitted``), so
+        the rewrite preserves the DAG's sharing."""
+        if aff is None or _is_leaf(node):
+            return node
+        out = self.emitted.get(id(aff))
+        if out is None:
+            out = _canonical(aff)
+            self.emitted[id(aff)] = out
+        return out
 
 
 def _is_leaf(node: Expression) -> bool:

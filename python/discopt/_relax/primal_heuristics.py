@@ -222,10 +222,27 @@ def _is_free_integer(v, model: Model) -> bool:
     :func:`_get_integer_mask`). The one predicate every integer-fixing site here
     uses, so the mask and the bound pinning cannot disagree.
 
-    Gated with ``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1588 review): with ``=0`` every
-    INTEGER column is free, exactly as on main. An ungated A/B on main's #1544
-    path (28 rows) was mixed -- nvs09 faster, nvs06/st_e38/beuster at the 1e6 shift
-    worse -- and has not passed a panel of its own."""
+    Scope on the default path (``DISCOPT_LIFT_AFFINE_MONOMIALS`` ON): EVERY #1544
+    INTEGER aux, not only the ones the translated-monomial lift creates -- the
+    lifter records any ``integer=True`` aux, including those main's cancellation /
+    term-limit path makes. ``=0`` is the documented opt-out and restores pre-#1588
+    main exactly (nothing recorded, every INTEGER column free), so the flag A/Bs
+    the lift and this handling together.
+
+    Measured on its own (#1593): every corpus row whose reformulation makes a
+    #1544 INTEGER aux (33 rows: in-repo corpus as written and under 1e3 / 1e6
+    translations), this predicate vs main's, lift ON, 20 s, 2 interleaved reps:
+    false certificates 0 / 0, unverifiable points 0 / 0, 37 ``minlplib.solu``
+    checks; certified 19 vs 18 (ex1221@1e6 certifies in 3.3 s, uncertified at 20 s
+    before); faster certificates on nvs09 (both shifts) and ex1225@1e6; better
+    incumbents on nvs01@1e6, nvs05@1e3 and nvs05@1e6; total wall 990 vs 1065 s.
+    Worse: ex1224 / st_e29 at 1e6 (still certified, 17 vs 5 nodes), hda@1e6's
+    bound, and nvs06@1e6, which stops at node 1 with bound -20710 (vs 1.30). That
+    last one is double-precision cancellation in the expanded 1e6-translated
+    objective (an ILS point whose reformulated objective is garbage closes the
+    gap; the #1383 reconciliation withdraws the certificate), the class
+    ``DISCOPT_RECENTRE`` removes: with it on, nvs06@1e6 certifies 1.77031 in 5
+    nodes."""
     if v.var_type not in (VarType.BINARY, VarType.INTEGER):
         return False
     from discopt._relax.factorable_reform import _lift_affine_monomials_enabled

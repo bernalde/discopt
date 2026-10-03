@@ -185,6 +185,13 @@ def _flatten_sum_terms(expr: Expression, scale: float, out: list[tuple[float, Ex
         _flatten_sum_terms(expr.left, scale, out)
         _flatten_sum_terms(expr.right, scale, out)
         return
+    # An n-ary ``dm.sum([...])`` is the same sum as the binary chain (#1537: the
+    # recentring rewrite folds every affine subtree into one, and the recognisers
+    # must not lose a structure because of how a sum was spelled).
+    if isinstance(expr, SumOverExpression):
+        for term in expr.terms:
+            _flatten_sum_terms(term, scale, out)
+        return
     if isinstance(expr, BinaryOp) and expr.op == "-":
         _flatten_sum_terms(expr.left, scale, out)
         _flatten_sum_terms(expr.right, -scale, out)
@@ -352,7 +359,13 @@ def _expr_struct_eq(a: Expression, b: Expression) -> bool:
     if isinstance(a, Constant) and isinstance(b, Constant):
         va = np.asarray(a.value)
         vb = np.asarray(b.value)
-        return va.shape == vb.shape and bool(np.allclose(va, vb))
+        # Exact: a recogniser that matches ``L`` against ``L`` must be matching the
+        # same function. ``np.allclose`` (atol 1e-8) equated 1e-9 with 2e-9 and
+        # 4e-13 with -4e-13, so ``((x/L1)**2)*L2`` read as a perspective and the
+        # verdict cache reused a CONVEX verdict across different constants (PR #1594
+        # review). ``from_nl`` rebuilds shared constants bit-identically, so exact
+        # equality loses no genuine match. (0.0 == -0.0 is the same function.)
+        return va.shape == vb.shape and bool(np.array_equal(va, vb))
     if isinstance(a, Variable) and isinstance(b, Variable):
         return a.name == b.name
     if isinstance(a, IndexExpression) and isinstance(b, IndexExpression):
@@ -365,6 +378,12 @@ def _expr_struct_eq(a: Expression, b: Expression) -> bool:
         )
     if isinstance(a, UnaryOp) and isinstance(b, UnaryOp):
         return a.op == b.op and _expr_struct_eq(a.operand, b.operand)
+    if isinstance(a, SumOverExpression) and isinstance(b, SumOverExpression):
+        # Term-wise and in order: equal sums spelled in a different order compare
+        # unequal, which can only make a recogniser decline, never mis-fire.
+        return len(a.terms) == len(b.terms) and all(
+            _expr_struct_eq(x, y) for x, y in zip(a.terms, b.terms)
+        )
     return False
 
 
@@ -421,6 +440,8 @@ def _has_positive_lower_bound(expr: Expression, model: Model) -> bool:
         return _has_positive_lower_bound(expr.left, model) and _has_positive_lower_bound(
             expr.right, model
         )
+    if isinstance(expr, SumOverExpression):
+        return bool(expr.terms) and all(_has_positive_lower_bound(t, model) for t in expr.terms)
     if isinstance(expr, BinaryOp) and expr.op == "*":
         if isinstance(expr.left, (Constant, Parameter)):
             v = np.asarray(expr.left.value)
@@ -450,6 +471,8 @@ def _is_nonneg_domain(expr: Expression, model: Model) -> bool:
             return lb >= 0.0
     if isinstance(expr, BinaryOp) and expr.op == "+":
         return _is_nonneg_domain(expr.left, model) and _is_nonneg_domain(expr.right, model)
+    if isinstance(expr, SumOverExpression):
+        return all(_is_nonneg_domain(t, model) for t in expr.terms)
     if isinstance(expr, BinaryOp) and expr.op == "*":
         if isinstance(expr.left, (Constant, Parameter)):
             v = np.asarray(expr.left.value)
@@ -658,7 +681,9 @@ def _sum_of_squares_linear_matrix(expr: Expression, model: Model) -> Optional[np
     right = _linear_vector_matrix(operand.right, model)
     if left is None or right is None:
         return None
-    if left.shape != right.shape or not np.allclose(left, right, atol=1e-12):
+    # Exact: ``(A x) * (A' x)`` with ``A' != A`` is not ``||A x||^2`` and can be
+    # indefinite however close ``A'`` is (``allclose``'s rtol=1e-5 accepted it).
+    if left.shape != right.shape or not np.array_equal(left, right):
         return None
     return left
 

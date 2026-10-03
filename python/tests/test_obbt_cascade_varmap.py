@@ -99,8 +99,17 @@ def test_cascade_keeps_the_optimum_when_the_rebuild_changes_layout(monkeypatch, 
     assert _outside(r.lb, r.ub) == [], (r.lb.tolist(), r.ub.tolist())
 
 
-def test_solve_certifies_the_true_optimum_with_an_integer_affine_variable():
-    """End to end. Fails before the fix: certified 7.59956 in 3 nodes."""
+def test_solve_certifies_the_true_optimum_with_an_integer_affine_variable(monkeypatch):
+    """End to end. Fails before the fix: certified 7.59956 in 3 nodes.
+
+    Recentring pinned OFF (#1537, default ON). The witness is the root cascade on
+    the model as written. Recentring moves x5..x8 out of their [-1e7, 1e7] boxes
+    under the one-sided rule, and the solve becomes a different search: measured
+    on PR #1594 it still certifies 6.05822, but it takes 351 nodes and 33 s
+    against 11 nodes and 3.4 s. Under xdist load that pushed it past the 60 s
+    limit with no incumbent. This is recorded on #1537 as a performance cost of the
+    one-sided rule on zero-containing boxes, not a correctness loss."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     r = _nvs22_with_w(True).solve(time_limit=60)
     assert r.objective is not None
     assert r.objective == pytest.approx(OPT, abs=1e-4)
