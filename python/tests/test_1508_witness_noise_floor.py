@@ -17,6 +17,8 @@ those suites are the kill criterion for this change.
 
 from __future__ import annotations
 
+import os
+
 import discopt.modeling as dm
 import numpy as np
 import pytest
@@ -66,6 +68,7 @@ def test_ulp_noise_does_not_manufacture_a_witness(rho):
 
     executed = 0
     withheld = []
+    why: list = []
     for seed in range(20):
         rng = np.random.default_rng(seed)
         x = x0 * (1.0 + rho * rng.standard_normal(2))
@@ -77,12 +80,32 @@ def test_ulp_noise_does_not_manufacture_a_witness(rho):
         # None`` is the withheld verdict.
         if cert is None or cert.bound is None or cert.better_x is not None:
             withheld.append(seed)
+            # Enough to tell a state leak from a numerical one when this fails only
+            # under xdist (CLAUDE.md sec. 7: an instrument must say why).
+            why.append(
+                (
+                    seed,
+                    type(ev).__name__,
+                    None
+                    if cert is None
+                    else (
+                        cert.bound if cert.bound is None else cert.bound - obj,
+                        cert.better_obj,
+                        cert.stationarity_rel,
+                        cert.complementarity_rel,
+                    ),
+                )
+            )
         else:
             assert cert.stationarity_rel < 1e-4 and cert.complementarity_rel < 1e-6
             assert cert.bound <= obj
             assert cert.bound == pytest.approx(obj, rel=1e-6, abs=1e-6)
     assert executed == 20  # the probe fired (CLAUDE.md sec. 6)
-    assert withheld == [], f"noise-level perturbation withheld/altered seeds {withheld}"
+    assert withheld == [], (
+        f"noise-level perturbation withheld/altered seeds {withheld}; "
+        f"(seed, evaluator, (bound - obj, better_obj, stat, comp)): {why[:4]}; "
+        f"env: {sorted((k, v) for k, v in os.environ.items() if k.startswith('DISCOPT_'))}"
+    )
 
 
 def test_exact_optimum_still_certifies_exactly():
