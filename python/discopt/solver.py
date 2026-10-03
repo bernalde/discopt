@@ -3201,6 +3201,15 @@ def _objective_is_convex_quadratic(
     everywhere and its supporting-hyperplane underestimator (see
     :func:`_convex_objective_lower_bound`) is a rigorous lower bound.
 
+    (a) is decided by the model-wide term classifier, which is conservative: a
+    scaled square ``c * x**2`` is filed under ``general_nl`` and a cubic in a
+    constraint rejects a quadratic objective. An objective-only degree gate that
+    removed both abstentions was built and RETIRED per CLAUDE.md §5 (#1574):
+    cert-clean on a 75-model panel but not net-positive — every finished
+    instance it admitted was bit-identical in nodes and bound, because this box
+    bound is dominated by the LP bound there. The measurement is
+    ``discopt_benchmarks/scripts/issue1574_convex_obj_degree_gate_panel.py``.
+
     This is the structural fact the spatial McCormick relaxation throws away: it
     linearizes a convex x^2 with two tangents (a gap of width^2/4 at the midpoint —
     on a [0,200] integer range that is ~10^4 *per square*), so the LP bound is
@@ -3221,79 +3230,108 @@ def _objective_is_convex_quadratic(
     """
     if model._objective is None or n_vars == 0:
         return False
-    try:
-        from discopt._relax.term_classifier import classify_nonlinear_terms
+    # An opaque ``dm.custom`` node has no provable degree, so the objective
+    # cannot be shown quadratic and the constant-Hessian argument does not
+    # apply. The term classifier below does not see one: its walker yields no
+    # children for a ``CustomCall`` and files nothing, so without this check an
+    # opaque objective reached the Hessian probe -- where a body written for the
+    # value/MCBox paths raises ``TracerArrayConversionError`` under JAX
+    # differentiation (masked on main by the #1569 box bug, which raised first on
+    # array models). Abstain structurally, before evaluating anything.
+    if _expression_contains_custom_call(model._objective.expression):
+        return False
+    from discopt._relax.term_classifier import classify_nonlinear_terms
 
-        t = classify_nonlinear_terms(model)
-        # Reject anything above degree two anywhere in the model. ``monomial`` maps
-        # ``var -> power``, so a cubic ``x**3`` shows up as power 3 here even though
-        # it leaves ``general_nl`` empty — without this guard it would be mistaken
-        # for a quadratic and the single-point Hessian below would not characterize
-        # the (non-constant) curvature, an unsound over-claim.
-        # ``monomial`` is an iterable of ``(var, power)`` (a list of pairs or a
-        # dict); pull the powers robustly across either shape.
-        _monos = list(t.monomial.items() if hasattr(t.monomial, "items") else t.monomial)
-        if (
-            t.trilinear
-            or t.multilinear
-            or t.fractional_power
-            or t.bilinear_with_fp
-            or t.ratio_of_products
-            or t.general_nl
-            or any(int(deg) > 2 for _, deg in _monos)
-        ):
+    t = classify_nonlinear_terms(model)
+    # ``monomial`` is an iterable of ``(var, power)`` (a list of pairs or a dict);
+    # pull the powers robustly across either shape.
+    _monos = list(t.monomial.items() if hasattr(t.monomial, "items") else t.monomial)
+    _n_square_terms = sum(1 for _, deg in _monos if int(deg) == 2)
+    # Reject anything above degree two anywhere in the model. ``monomial`` maps
+    # ``var -> power``, so a cubic ``x**3`` shows up as power 3 here even though
+    # it leaves ``general_nl`` empty — without this guard it would be mistaken
+    # for a quadratic and the single-point Hessian below would not characterize
+    # the (non-constant) curvature, an unsound over-claim.
+    if (
+        t.trilinear
+        or t.multilinear
+        or t.fractional_power
+        or t.bilinear_with_fp
+        or t.ratio_of_products
+        or t.general_nl
+        or any(int(deg) > 2 for _, deg in _monos)
+    ):
+        return False
+    _obj_quad_nnz = len(t.bilinear) + _n_square_terms
+
+    # #654 budget gate: the PSD test below forces the dense objective-Hessian
+    # compile (``jacfwd∘jacfwd``), whose XLA codegen is super-linear in the
+    # objective's quadratic term count and uninterruptible once entered. On a
+    # large quadratic form that single compile dwarfs the whole time budget, so
+    # skip the (tightening-only) convex bound when it will not fit. The term
+    # count is a model-wide upper bound on the objective's quadratic nnz —
+    # conservative, so over-estimating only abstains (sound).
+    if remaining_budget is not None:
+        from discopt._hessian_cost_model import estimate_dense_obj_hessian_compile_s
+
+        _compile_est = estimate_dense_obj_hessian_compile_s(_obj_quad_nnz)
+        if _compile_est > remaining_budget:
+            logger.info(
+                "convex-objective node bound skipped: dense obj-Hessian compile "
+                "~%.1fs (%d quad terms) exceeds remaining budget %.1fs (#654)",
+                _compile_est,
+                _obj_quad_nnz,
+                remaining_budget,
+            )
             return False
 
-        # #654 budget gate: the PSD test below forces the dense objective-Hessian
-        # compile (``jacfwd∘jacfwd``), whose XLA codegen is super-linear in the
-        # objective's quadratic term count and uninterruptible once entered. On a
-        # large quadratic form that single compile dwarfs the whole time budget, so
-        # skip the (tightening-only) convex bound when it will not fit. The term
-        # count is a model-wide upper bound on the objective's quadratic nnz —
-        # conservative, so over-estimating only abstains (sound).
-        if remaining_budget is not None:
-            from discopt._hessian_cost_model import estimate_dense_obj_hessian_compile_s
-
-            _obj_quad_nnz = len(t.bilinear) + sum(1 for _, deg in _monos if int(deg) == 2)
-            _compile_est = estimate_dense_obj_hessian_compile_s(_obj_quad_nnz)
-            if _compile_est > remaining_budget:
-                logger.info(
-                    "convex-objective node bound skipped: dense obj-Hessian compile "
-                    "~%.1fs (%d quad terms) exceeds remaining budget %.1fs (#654)",
-                    _compile_est,
-                    _obj_quad_nnz,
-                    remaining_budget,
-                )
-                return False
-        lb = np.array([v.lb for v in model._variables for _ in range(v.size)], dtype=np.float64)
-        ub = np.array([v.ub for v in model._variables for _ in range(v.size)], dtype=np.float64)
-        lb_f = np.where(np.isfinite(lb), lb, -1.0)
-        ub_f = np.where(np.isfinite(ub), ub, 1.0)
-        # Evaluate the Hessian at two distinct points: a genuine quadratic has a
-        # CONSTANT Hessian, so a PSD verdict at one point holds on every node box.
-        # Requiring the two to agree is a belt-and-suspenders guard that the
-        # objective really is quadratic (rejecting any non-quadratic that slipped
-        # past the structural check above) before trusting the constant-Hessian
-        # convexity argument.
+    # #1569: the flat box, element by element in the tree's column layout. This
+    # used to repeat each variable's WHOLE ``lb``/``ub`` array ``v.size`` times, so
+    # every model with a ``shape=(n,)`` variable built an ``n²``-long (or ragged)
+    # box, the Hessian call below raised, and the broad ``except`` that wrapped this
+    # whole function filed it as a user-code failure — the bound never engaged on
+    # an array-variable model. A layout mismatch is a solver defect, so it raises.
+    lb, ub = _flat_var_box(model)
+    if lb.shape != (n_vars,) or ub.shape != (n_vars,):
+        raise RuntimeError(
+            f"convex-quadratic objective test: flat variable box has shape "
+            f"{lb.shape}/{ub.shape}, expected ({n_vars},) (#1569)"
+        )
+    lb_f = np.where(np.isfinite(lb), lb, -1.0)
+    ub_f = np.where(np.isfinite(ub), ub, 1.0)
+    # Evaluate the Hessian at two distinct points: a genuine quadratic has a
+    # CONSTANT Hessian, so a PSD verdict at one point holds on every node box.
+    # Requiring the two to agree is a belt-and-suspenders guard that the
+    # objective really is quadratic (rejecting any non-quadratic that slipped
+    # past the structural check above) before trusting the constant-Hessian
+    # convexity argument.
+    try:
         H1 = np.asarray(evaluator.evaluate_hessian(0.5 * (lb_f + ub_f)), dtype=np.float64)
         H2 = np.asarray(evaluator.evaluate_hessian(0.25 * lb_f + 0.75 * ub_f), dtype=np.float64)
-        if H1.shape != (n_vars, n_vars) or not np.all(np.isfinite(H1)):
-            return False
-        if not np.allclose(H1, H2, atol=1e-7, rtol=1e-7):
-            return False
-        # A pure-linear objective has a (near-)zero Hessian; its box bound is
-        # already exact via interval arithmetic, so only engage on genuine
-        # curvature. The margin is scale-aware (#1397): see
-        # ``_hessian_is_psd_with_margin``.
-        return _hessian_is_psd_with_margin(0.5 * (H1 + H1.T))
-    except Exception as exc:  # noqa: BLE001 - see below
-        # #1520: kept as a sound fallback. The Hessian evaluation runs user code
-        # (a ``dm.custom`` objective); abstaining keeps the McCormick bound, and
-        # the convex bound is a tightening only.
+    except (ValueError, ArithmeticError, RuntimeError) as exc:
+        # #1520/#1569: a sound fallback over the evaluator call ONLY — the box
+        # above is validated, so what reaches here is the objective's own
+        # evaluation failing at a sample point (a domain or numerical error, or a
+        # ``dm.custom`` objective raising). Abstaining keeps the McCormick bound,
+        # and the convex bound is a tightening only. Anything else propagates.
         _warn_fallback_once(
-            "convex-quadratic objective test", exc, "keeping the McCormick objective bound"
+            "convex-quadratic objective test",
+            exc,
+            "the objective Hessian could not be evaluated at the box sample points; "
+            "keeping the McCormick objective bound",
         )
         return False
+    if H1.shape != (n_vars, n_vars) or H2.shape != (n_vars, n_vars):
+        return False
+    if not (np.all(np.isfinite(H1)) and np.all(np.isfinite(H2))):
+        return False
+    if not np.allclose(H1, H2, atol=1e-7, rtol=1e-7):
+        return False
+    # A pure-linear objective has a (near-)zero Hessian; its box bound is
+    # already exact via interval arithmetic, so only engage on genuine
+    # curvature. The margin is scale-aware (#1397): see
+    # ``_hessian_is_psd_with_margin``.
+    return _hessian_is_psd_with_margin(0.5 * (H1 + H1.T))
 
 
 def _convex_objective_lower_bound(evaluator, node_lb, node_ub) -> float:
