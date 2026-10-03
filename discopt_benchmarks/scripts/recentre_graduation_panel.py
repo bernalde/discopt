@@ -15,6 +15,11 @@ fail verification, certificates lost relative to the other arm, and total wall.
 Exits non-zero when it compared nothing (CLAUDE.md §6).
 
     python -u discopt_benchmarks/scripts/recentre_graduation_panel.py [--time-limit 20]
+
+``--flag NAME`` A/Bs another default-off gate over the same three panels (e.g.
+``DISCOPT_LIFT_AFFINE_MONOMIALS``); ``--hold NAME=VALUE`` pins a flag in both arms.
+For a flag other than ``DISCOPT_RECENTRE`` the bound-neutrality check (panel A)
+applies wherever the flag's static detector says it does not fire.
 """
 
 from __future__ import annotations
@@ -38,8 +43,40 @@ from discopt.validation.feasibility import verify_point  # noqa: E402
 from test_1537_invariance import FAMILIES  # noqa: E402
 
 
+FLAG = "DISCOPT_RECENTRE"
+
+
+def _affine_monomial_fires(model) -> bool:
+    """Static detector for ``DISCOPT_LIFT_AFFINE_MONOMIALS``: does any product in
+    the model's objective or rows match ``_is_translated_monomial``?"""
+    from discopt._relax import factorable_reform as fr
+    from discopt.modeling.core import BinaryOp, SumOverExpression, UnaryOp
+
+    def walk(e) -> bool:
+        if isinstance(e, BinaryOp):
+            if e.op == "*" and fr._is_translated_monomial(fr._collect_mul_factors(e)):
+                return True
+            return walk(e.left) or walk(e.right)
+        if isinstance(e, UnaryOp):
+            return walk(e.operand)
+        if isinstance(e, SumOverExpression):
+            return any(walk(t) for t in e.terms)
+        for attr in ("args", "operand"):
+            sub = getattr(e, attr, None)
+            if isinstance(sub, (list, tuple)):
+                if any(walk(t) for t in sub):
+                    return True
+            elif sub is not None and walk(sub):
+                return True
+        return False
+
+    exprs = [model._objective.expression] + [c.body for c in model._constraints]
+    return any(walk(e) for e in exprs)
+
+
 def _solve(model, flag: str, tl: float):  # model: freshly built by the caller
-    os.environ["DISCOPT_RECENTRE"] = flag
+    os.environ[FLAG] = flag
+    fires = FLAG != "DISCOPT_RECENTRE" and _affine_monomial_fires(model)
     t0 = time.perf_counter()
     try:
         r = model.solve(time_limit=tl)
@@ -53,18 +90,37 @@ def _solve(model, flag: str, tl: float):  # model: freshly built by the caller
             [np.ravel(np.asarray(r.x[v.name], dtype=np.float64)) for v in model._variables]
         )
         bad_point = not verify_point(model, flat).ok
+    if r is not None and fires:
+        r._panel_fires = True
     return r, err, wall, bad_point
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--time-limit", type=float, default=20.0)
+    ap.add_argument("--flag", default="DISCOPT_RECENTRE")
+    ap.add_argument("--hold", action="append", default=[], metavar="NAME=VALUE")
+    ap.add_argument(
+        "--from",
+        dest="start",
+        default="",
+        metavar="NAME",
+        help="resume: skip corpus instances sorting before NAME (sections A/B only)",
+    )
     args = ap.parse_args()
+    global FLAG
+    FLAG = args.flag
+    for kv in args.hold:
+        k, v = kv.split("=", 1)
+        os.environ[k] = v
+    print(f"A/B flag {FLAG}; held {args.hold}", flush=True)
     tl = args.time_limit
     assert discopt.__file__.startswith(os.path.abspath(os.path.join(HERE, "..", "..", "python")))
     print(f"discopt from {discopt.__file__}; load {os.getloadavg()}", flush=True)
 
     corpus = sorted(glob.glob(os.path.join(TESTS, "data", "minlplib_nl", "*.nl")))
+    corpus = [p for p in corpus if os.path.basename(p) >= args.start]
+    assert corpus, f"--from {args.start!r} skips the whole corpus"
     tally = {
         arm: {"false": 0, "bad_point": 0, "raised": 0, "cert": 0, "wall": 0.0} for arm in ("0", "1")
     }
@@ -101,7 +157,10 @@ def main() -> int:
             print(f"LOST flag=1 {label}", flush=True)
         if c1 and not c0:
             lost["0"] += 1
-        moved = r1 is not None and (r1.solver_stats or {}).get("recentre/variables_moved")
+        if FLAG == "DISCOPT_RECENTRE":
+            moved = r1 is not None and (r1.solver_stats or {}).get("recentre/variables_moved")
+        else:
+            moved = int(bool(getattr(r1, "_panel_fires", False)))
         note = ""
         finished = r0 is not None and r0.status in ("optimal", "infeasible")
         if neutral and not moved and finished and r1 is not None:
@@ -127,7 +186,7 @@ def main() -> int:
 
     for path in corpus:  # A + B
         name = os.path.basename(path)
-        os.environ["DISCOPT_RECENTRE"] = "0"
+        os.environ[FLAG] = "0"
         try:
             base = dm.from_nl(path).solve(time_limit=tl)
         except Exception as exc:
@@ -146,7 +205,7 @@ def main() -> int:
 
     for fam, build in FAMILIES.items():  # C
         for s in range(4):
-            os.environ["DISCOPT_RECENTRE"] = "0"
+            os.environ[FLAG] = "0"
             base = build(s).solve(time_limit=tl)
             if not base.gap_certified:
                 continue

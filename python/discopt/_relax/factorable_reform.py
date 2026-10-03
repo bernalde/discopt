@@ -70,6 +70,8 @@ from .gdp_reformulate import (
     bound_expression_error,
 )
 from .term_classifier import (
+    _affine_atom_key,
+    _affine_walk,
     _get_flat_index,
     distribute_products,
     distribution_exceeds_budget,
@@ -651,6 +653,8 @@ def _is_integer_valued_affine(expr: Expression) -> bool:
         )
     if isinstance(expr, UnaryOp) and expr.op == "neg":
         return _is_integer_valued_affine(expr.operand)
+    if isinstance(expr, SumOverExpression):
+        return bool(expr.terms) and all(_is_integer_valued_affine(t) for t in expr.terms)
     if isinstance(expr, BinaryOp):
         if expr.op in ("+", "-"):
             return _is_integer_valued_affine(expr.left) and _is_integer_valued_affine(expr.right)
@@ -666,6 +670,97 @@ def _collect_mul_factors(expr: Expression) -> list[Expression]:
     if isinstance(expr, BinaryOp) and expr.op == "*":
         return _collect_mul_factors(expr.left) + _collect_mul_factors(expr.right)
     return [expr]
+
+
+def _lift_affine_monomials_enabled() -> bool:
+    """``DISCOPT_LIFT_AFFINE_MONOMIALS`` (#1537): lift the translated factors of a
+    multilinear monomial instead of multiplying them out. See
+    :func:`_is_translated_monomial` for the rule and its measurement.
+
+    Default ON since its graduation panel (2026-10-02, on top of the #1586 OBBT
+    cascade fix; 206 interleaved comparisons over the in-repo corpus as written,
+    under 1e3/1e6 translations and the generated families;
+    ``recentre_graduation_panel.py --flag``): 0 false, 0 lost, 0 neutrality drift;
+    certificates 166 -> 168 (nvs05 as written, nvs01 at the 1e3 shift). ``=0``
+    restores the distribute-then-cap path."""
+    import os
+
+    return os.environ.get("DISCOPT_LIFT_AFFINE_MONOMIALS", "1") != "0"
+
+
+def _univariate_affine_key(expr: Expression) -> Optional[tuple[tuple, bool]]:
+    """``(variable key, has_offset)`` when *expr* is ``a * v + b`` with ``v`` ONE
+    scalar variable (or a scalar element of one) and ``a != 0``, else ``None``.
+
+    ``has_offset`` is ``b != 0`` -- the factor is a translated copy of ``v``, which
+    distributes into two terms. Coefficients are folded exactly (``Fraction``).
+    """
+    coef: dict[tuple, object] = {}
+    const = [0]
+    ok = [True]
+
+    def visit(kind: str, node: Expression, scale) -> None:
+        if kind == "const":
+            const[0] = const[0] + scale
+            return
+        if isinstance(node, SumOverExpression):  # recentring writes ``y + c`` this way
+            for t in node.terms:
+                _affine_walk(t, None, lambda k, n, s: visit(k, n, s * scale))
+            return
+        key = _affine_atom_key(node)
+        if key[0] == "n" or (isinstance(node, Variable) and int(np.prod(node.shape)) != 1):
+            ok[0] = False
+            return
+        coef[key] = coef.get(key, 0) + scale
+
+    _affine_walk(expr, None, visit)
+    if not ok[0]:
+        return None
+    live = [k for k, a in coef.items() if a != 0]
+    if len(live) != 1:
+        return None
+    return live[0], const[0] != 0
+
+
+def _is_translated_monomial(factors: list[Expression]) -> bool:
+    """True when the product of *factors* is a multilinear monomial written in
+    translated coordinates: every factor is a constant or ``a_k v_k + b_k`` over
+    pairwise-distinct scalar variables, at least three factors are non-constant,
+    and at least one carries an offset ``b_k != 0``.
+
+    #1537: such a product is ``prod_k (a_k v_k + b_k)``. Multiplying it out gives
+    ``2**n`` multilinear terms whose term-wise relaxation depends on the offsets;
+    lifting each translated factor to an exact aux ``w_k == a_k v_k + b_k`` gives
+    the monomial ``prod_k w_k``, whose relaxation is the one the model would get in
+    the coordinates where the offsets are zero. So the relaxation no longer depends
+    on where the user put the origin. Measured on nvs09 (``- (prod_k x_k)**0.2``,
+    ten integers on [3, 9]) moved by ``x = y - 3`` / ``x = y + 3``: the 1024-term
+    expansion sits exactly AT :data:`_DISTRIBUTE_TERM_LIMIT` (so was not lifted)
+    and its McCormick LP (10,177 x 42,518) exceeded the dense cap, leaving
+    interval/alphaBB bounds of -48.0 / -81.0 and no certificate in 30 s; lifted,
+    both certify -43.1343 in 39 nodes (unshifted: 31).
+
+    Bilinear products are excluded: McCormick is exact under translation of
+    either factor, so lifting changes nothing there. A repeated variable is
+    excluded: ``(x - 1)(x - 2)(x - 3)`` is a univariate polynomial, which the
+    expanded form relaxes better than three independent auxes would.
+    """
+    seen: set[tuple] = set()
+    nonconst = 0
+    offset = False
+    for f in factors:
+        if isinstance(f, Constant):
+            continue
+        hit = _univariate_affine_key(f)
+        if hit is None:
+            return False
+        key, has_offset = hit
+        if key in seen:
+            return False
+        seen.add(key)
+        nonconst += 1
+        offset = offset or has_offset
+    return nonconst >= 3 and offset
 
 
 def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") -> Expression:
@@ -684,8 +779,14 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
     ``INTEGER`` aux, so the lift keeps the integrality the factor had.
     """
     if isinstance(expr, BinaryOp):
+        translated = (
+            expr.op == "*"
+            and _lift_affine_monomials_enabled()
+            and _is_translated_monomial(_collect_mul_factors(expr))
+        )
         if expr.op == "*" and (
-            _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
+            translated
+            or _estimate_distributed_terms(expr) > _DISTRIBUTE_TERM_LIMIT
             or _distribution_cancellation(_collect_mul_factors(expr), model)
             > _DISTRIBUTE_CANCELLATION_LIMIT
         ):
@@ -694,11 +795,16 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
             for f in _collect_mul_factors(expr):
                 # Only a genuine multi-term sum drives the blowup; a constant,
                 # variable, or monomial power distributes to one term and is left
-                # for the normal monomial/bilinear path.
+                # for the normal monomial/bilinear path. A translated monomial's
+                # offset factors are lifted whatever node type spells them.
                 if (
                     isinstance(f, BinaryOp)
                     and f.op in ("+", "-")
                     and _estimate_distributed_terms(f) >= 2
+                ) or (
+                    translated
+                    and not isinstance(f, Constant)
+                    and (_univariate_affine_key(f) or (None, False))[1]
                 ):
                     # Recurse first so a factor that is *itself* a blowup product
                     # has its inner factors lifted before this one is bounded.
