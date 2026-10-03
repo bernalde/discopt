@@ -96,6 +96,9 @@ dev = [
     "pytest",
     "pytest-timeout",
     "pytest-cov",
+    # Shared POUNCE/DiscOpt benchmark artifacts are checked against the
+    # versioned Draft-7 contract (issue #1526).
+    "jsonschema>=4",
     # test_gams_link.py opens with "None of this requires a GAMS installation"
     # and three of its tests `import yaml` unguarded, so PyYAML is a hard test
     # dependency and not a `[gams]`-only one. Declared here rather than relied
