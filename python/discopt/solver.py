@@ -26852,11 +26852,20 @@ def _qp_reduced_costs_at(
     A_ub,  # noqa: N803
     A_eq,  # noqa: N803
     row_dual: Optional[np.ndarray],
+    bounds: Optional[list] = None,
 ) -> Optional[np.ndarray]:
     """HiGHS-convention reduced costs ``Qx + c - A^T y`` at ``x`` (#1605).
 
     ``y`` is ``row_dual`` in the backend's layout (``A_ub`` rows, then ``A_eq``).
     ``None`` without row duals, as the backend's own reduced costs would be.
+
+    With ``bounds`` (the ``(lo, hi)`` box), a reduced cost is kept only on a bound
+    active at ``x`` on the side its sign selects (``> 0`` lower, ``< 0`` upper;
+    within ``1e-6 (1 + |bound|)``) and set to 0 elsewhere. A bound multiplier on an
+    inactive bound is zero by complementarity; what ``Qx + c - A^T y`` leaves there
+    is the stationarity residual of ``(x, y)``, not a price. Unmasked, a 2.5e-9
+    residue on a free column became a multiplier on its 9.999e19 default bound,
+    a complementarity violation of 2.5e11 (test_solver_duals).
     """
     blocks = [B for B in (A_ub, A_eq) if B is not None and B.shape[0] > 0]
     m = sum(B.shape[0] for B in blocks)
@@ -26871,6 +26880,17 @@ def _qp_reduced_costs_at(
         r = B.shape[0]
         rc = rc - np.asarray(B.T @ y[k : k + r], dtype=np.float64).ravel()
         k += r
+    if bounds is not None:
+        lo = np.array([float(b[0]) for b in bounds], dtype=np.float64)
+        hi = np.array([float(b[1]) for b in bounds], dtype=np.float64)
+        if lo.size != rc.size:
+            raise _CertificateShapeError(
+                f"QP reduced costs: {lo.size} column bounds for {rc.size} columns"
+            )
+        with np.errstate(invalid="ignore"):
+            lo_act = (lo > -1e19) & (xs - lo <= 1e-6 * (1.0 + np.abs(lo)))
+            hi_act = (hi < 1e19) & (hi - xs <= 1e-6 * (1.0 + np.abs(hi)))
+        rc = np.where((rc > 0.0) & lo_act, rc, np.where((rc < 0.0) & hi_act, rc, 0.0))
     return rc
 
 
@@ -26913,6 +26933,63 @@ class _QPCertEvaluator:
 
     def evaluate_jacobian(self, x):
         return self._A
+
+
+def _qp_estimated_multipliers(
+    A,  # noqa: N803
+    cl: np.ndarray,
+    cu: np.ndarray,
+    grad: np.ndarray,
+    x: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+) -> np.ndarray:
+    """Row multipliers for a QP backend that reports none (#1605).
+
+    The tangent bound of :func:`_convex_nlp_certificate` is valid for EVERY
+    sign-consistent multiplier (``lam_i >= 0`` on an upper side, ``<= 0`` on a lower
+    one; an equality row is free), so an estimate decides only how tight the bound
+    is, never whether it is valid. The estimate is the sign-constrained least-squares
+    fit ``min || (grad + A_R^T lam_R)_F ||`` over the rows ``R`` active at ``x``
+    (slack within ``1e-6 (1 + |side|)``; every other row gets 0, which is
+    sign-consistent) and the coordinates ``F`` not at a bound (a coordinate at its
+    bound has a box multiplier to absorb its slope). Zero multipliers when no row
+    is active.
+    """
+    m = int(A.shape[0])
+    lam = np.zeros(m, dtype=np.float64)
+    if m == 0:
+        return lam
+    Ax = np.asarray(A @ x, dtype=np.float64).ravel()
+    tol_u = 1e-6 * (1.0 + np.abs(cu))
+    tol_l = 1e-6 * (1.0 + np.abs(cl))
+    with np.errstate(invalid="ignore"):
+        up = np.isfinite(cu) & (cu < 1e19) & (np.abs(cu - Ax) <= tol_u)
+        lo = np.isfinite(cl) & (cl > -1e19) & (np.abs(Ax - cl) <= tol_l)
+    rows = np.flatnonzero(up | lo)
+    if rows.size == 0:
+        return lam
+    at_lb = (lb > -1e19) & (x - lb <= 1e-6 * (1.0 + np.abs(lb)))
+    at_ub = (ub < 1e19) & (ub - x <= 1e-6 * (1.0 + np.abs(ub)))
+    free = np.flatnonzero(~(at_lb | at_ub))
+    if free.size == 0:
+        return lam
+    lo_b = np.where(up[rows] & lo[rows], -np.inf, np.where(up[rows], 0.0, -np.inf))
+    hi_b = np.where(up[rows] & lo[rows], np.inf, np.where(up[rows], np.inf, 0.0))
+    from scipy.optimize import lsq_linear
+
+    if _sp_issparse(A):
+        At = A[rows].T.tocsr()[free]
+    else:
+        At = np.asarray(A, dtype=np.float64)[rows].T[free]
+    fit = lsq_linear(At, -grad[free], bounds=(lo_b, hi_b))
+    est = np.asarray(fit.x, dtype=np.float64)
+    if not np.all(np.isfinite(est)):
+        return lam
+    # The solver works to tolerance; clip so the sign is exact, which is what the
+    # bound's validity rests on.
+    lam[rows] = np.clip(est, lo_b, hi_b)
+    return lam
 
 
 def _qp_convex_certificate(
@@ -26969,10 +27046,17 @@ def _qp_convex_certificate(
     cl = np.concatenate(cl_parts) if cl_parts else np.zeros(0)
     cu = np.concatenate(cu_parts) if cu_parts else np.zeros(0)
     lam: Optional[np.ndarray] = None
+    estimate_lam = False
     if m > 0:
-        if dual_values is None or np.asarray(dual_values).size != m:
-            return None
-        lam = -np.asarray(dual_values, dtype=np.float64).ravel()
+        if dual_values is None:
+            # A backend that reports no row duals (#1605): estimate them below.
+            estimate_lam = True
+        elif np.asarray(dual_values).size != m:
+            raise _CertificateShapeError(
+                f"QP certificate: {np.asarray(dual_values).size} row duals for {m} rows"
+            )
+        else:
+            lam = -np.asarray(dual_values, dtype=np.float64).ravel()
     lb = np.array([float(b[0]) for b in bounds], dtype=np.float64)
     ub = np.array([float(b[1]) for b in bounds], dtype=np.float64)
 
@@ -27008,6 +27092,10 @@ def _qp_convex_certificate(
             obj_fn = ev.evaluate_objective
             grad_fn = ev.evaluate_gradient
 
+    if estimate_lam:
+        lam = _qp_estimated_multipliers(
+            A, cl, cu, np.asarray(grad_fn(xs), dtype=np.float64).ravel(), xs, lb, ub
+        )
     # Duck-typed: the certificate uses only the evaluator protocol it implements.
     evaluator: Any = _QPCertEvaluator(obj_fn, grad_fn, A, n, Q=Qd)
     cert = _convex_nlp_certificate(
@@ -27022,12 +27110,16 @@ def _qp_convex_certificate(
         gap_tolerance=gap_tolerance,
         implied_box=_fbbt_implied_box(model, n),
     )
-    if (
-        cert is None
-        or cert.bound is None
-        or cert.stationarity_rel > _KKT_STATIONARITY_REL_TOL
-        or cert.complementarity_rel > max(gap_tolerance, 1e-6)
-    ):
+    # No ``stationarity_rel`` gate here, unlike the NLP route. This route's
+    # stationarity guard is the backend KKT-residual test in ``_solve_qp_matrix``
+    # (#145, #1384), as it was before #1596. The certificate's unit-step measure
+    # describes the backend's ``x``, and the bound above is rigorous whatever
+    # ``x``'s stationarity: an IPM that stops with 200 coordinates at 6.8e-4 above
+    # the bound a 1e-3 gradient points to reads ``stationarity_rel = 6.8e-4`` while
+    # the tangent bound already certifies it to a relative gap of 2e-13
+    # (test_1537_recentre's ``cont_sq_loop``, #1605). Gating on it withheld a
+    # certified answer and removed no false one.
+    if cert is None or cert.bound is None or cert.complementarity_rel > max(gap_tolerance, 1e-6):
         return None
     return cert
 
@@ -27235,7 +27327,7 @@ def _solve_qp_matrix(
                     # row duals (HiGHS convention: rc = Qx + c - A^T y), as the
                     # NLP route refits its duals after a #1499 swap.
                     reduced_costs = _qp_reduced_costs_at(
-                        x_flat, Q_orig, c_orig, A_ub, A_eq, result.dual_values
+                        x_flat, Q_orig, c_orig, A_ub, A_eq, result.dual_values, bounds
                     )
                 qp_bound = -b_int if sense == ObjectiveSense.MAXIMIZE else b_int
 

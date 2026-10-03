@@ -227,3 +227,69 @@ def test_certificate_shape_errors_are_raised(monkeypatch):
     with pytest.raises(S._CertificateShapeError):
         m.solve(time_limit=30)
     assert calls["n"] >= 1
+
+
+def test_refreshed_reduced_costs_price_only_active_bounds():
+    """A refreshed reduced cost on a bound inactive at ``x`` is stationarity residue,
+    not a price: it is zeroed, and kept on the active side its sign selects."""
+    from discopt.solver import _qp_reduced_costs_at
+
+    Q = np.zeros((3, 3))  # noqa: N806
+    c = np.array([2.5e-9, 1.0, -1.0])
+    x = np.array([3.0, 0.0, 5.0])
+    bounds = [(-9.999e19, 9.999e19), (0.0, 10.0), (0.0, 5.0)]
+    rc = _qp_reduced_costs_at(x, Q, c, None, None, None, bounds)
+    # Column 0 is free: its 2.5e-9 residue would price a 9.999e19 default bound.
+    np.testing.assert_array_equal(rc, [0.0, 1.0, -1.0])
+    # Signs that point at an INACTIVE side are zeroed too.
+    rc2 = _qp_reduced_costs_at(x, Q, -c, None, None, None, bounds)
+    np.testing.assert_array_equal(rc2, [0.0, 0.0, 0.0])
+
+
+def test_estimated_qp_multipliers_are_sign_consistent():
+    """With no backend duals the QP route estimates them; only active rows get a
+    multiplier, with the sign of the side that is active (equality rows free)."""
+    from discopt.solver import _qp_estimated_multipliers
+
+    # min (x-1)^2 + (y-2)^2  s.t.  x + y <= 2 (active),  x - y <= 5 (inactive),
+    # x - y = -1 (active equality). Optimum (0.5, 1.5).
+    A = np.array([[1.0, 1.0], [1.0, -1.0], [1.0, -1.0]])  # noqa: N806
+    cl = np.array([-np.inf, -np.inf, -1.0])
+    cu = np.array([2.0, 5.0, -1.0])
+    x = np.array([0.5, 1.5])
+    grad = 2.0 * (x - np.array([1.0, 2.0]))
+    lb = np.array([0.0, 0.0])
+    ub = np.array([10.0, 10.0])
+    lam = _qp_estimated_multipliers(A, cl, cu, grad, x, lb, ub)
+    assert lam[0] >= 0.0 and lam[1] == 0.0
+    np.testing.assert_allclose(grad + A.T @ lam, 0.0, atol=1e-10)
+    # No active row: zero multipliers (sign-consistent, so still a valid bound).
+    lam0 = _qp_estimated_multipliers(A[1:2], cl[1:2], cu[1:2], grad, x, lb, ub)
+    np.testing.assert_array_equal(lam0, [0.0])
+
+
+def test_qp_route_certifies_without_backend_duals():
+    """A backend that returns a converged optimum but no row duals still gets a
+    certified answer: the multipliers are estimated, and the bound is the rigorous
+    tangent bound under them, at most the exact optimum 0.5."""
+    import time
+
+    import discopt.modeling as dm
+    import discopt.solver as S
+    from discopt.solvers import QPResult, SolveStatus
+
+    m = dm.Model("no_duals")
+    x = m.continuous("x", lb=0, ub=10)
+    y = m.continuous("y", lb=0, ub=10)
+    m.minimize((x - 1) ** 2 + (y - 2) ** 2)
+    m.subject_to(x + y <= 2)
+
+    def engine(*args, **kwargs):
+        return QPResult(
+            status=SolveStatus.OPTIMAL, x=np.array([0.5, 1.5]), objective=0.5, kkt_error=1e-9
+        )
+
+    out = S._solve_qp_matrix(m, time.perf_counter(), None, engine, "fake")
+    assert out is not None and out.status == "optimal" and out.gap_certified
+    assert out.bound <= 0.5
+    assert out.bound >= 0.5 - 1e-9
