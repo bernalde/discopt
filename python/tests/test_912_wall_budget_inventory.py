@@ -553,7 +553,7 @@ KNOWN: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "solver.py",
-        "deadline=_role2_deadline(time.perf_counter() + 5.0),",
+        "deadline=_role2_deadline(time.perf_counter() + _pc_budget),",
         "residual",
     ),
     (
