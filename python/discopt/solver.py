@@ -20464,11 +20464,24 @@ def _fbbt_implied_box(model: Model, n: int) -> Optional[tuple[np.ndarray, np.nda
     already feeds certified LP bounds), whose box contains every feasible point.
     ``None`` when FBBT reports the box empty: the NLP returned a point, so the
     certificate falls back on the declared box rather than reason from a
-    contradiction.
+    contradiction. ``None`` also when no Rust ``ModelRepr`` can be built for the
+    model: the solve has already warned that FBBT is disabled, and the declared box
+    alone is a valid (looser) box. Only that build is guarded; an error inside FBBT
+    itself propagates.
     """
+    from discopt._rust import model_to_repr
     from discopt.tightening import fbbt_box
 
-    box = fbbt_box(model)
+    try:
+        repr_ = model_to_repr(model, getattr(model, "_builder", None))
+    except Exception as exc:  # noqa: BLE001 - same capability gate as the solve's FBBT
+        logger.info(
+            "Convex certificate: no Rust model repr (%s: %s); using the declared box",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    box = fbbt_box(model, repr_=repr_)
     if box.infeasible:
         return None
     if box.lb.size != n or box.ub.size != n:
