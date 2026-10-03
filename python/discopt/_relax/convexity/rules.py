@@ -304,6 +304,8 @@ def _struct_hash(expr: Expression, hcache: dict) -> int:
         h = hash(("b", expr.op, _struct_hash(expr.left, hcache), _struct_hash(expr.right, hcache)))
     elif isinstance(expr, UnaryOp):
         h = hash(("u", expr.op, _struct_hash(expr.operand, hcache)))
+    elif isinstance(expr, SumOverExpression):
+        h = hash(("s", tuple(_struct_hash(t, hcache) for t in expr.terms)))
     else:
         # FunctionCall / SumExpression / MatMulExpression / ... are not
         # handled by _expr_struct_eq, so they can never match structurally;

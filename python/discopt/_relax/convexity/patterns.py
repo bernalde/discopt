@@ -185,6 +185,13 @@ def _flatten_sum_terms(expr: Expression, scale: float, out: list[tuple[float, Ex
         _flatten_sum_terms(expr.left, scale, out)
         _flatten_sum_terms(expr.right, scale, out)
         return
+    # An n-ary ``dm.sum([...])`` is the same sum as the binary chain (#1537: the
+    # recentring rewrite folds every affine subtree into one, and the recognisers
+    # must not lose a structure because of how a sum was spelled).
+    if isinstance(expr, SumOverExpression):
+        for term in expr.terms:
+            _flatten_sum_terms(term, scale, out)
+        return
     if isinstance(expr, BinaryOp) and expr.op == "-":
         _flatten_sum_terms(expr.left, scale, out)
         _flatten_sum_terms(expr.right, -scale, out)
@@ -365,6 +372,12 @@ def _expr_struct_eq(a: Expression, b: Expression) -> bool:
         )
     if isinstance(a, UnaryOp) and isinstance(b, UnaryOp):
         return a.op == b.op and _expr_struct_eq(a.operand, b.operand)
+    if isinstance(a, SumOverExpression) and isinstance(b, SumOverExpression):
+        # Term-wise and in order: equal sums spelled in a different order compare
+        # unequal, which can only make a recogniser decline, never mis-fire.
+        return len(a.terms) == len(b.terms) and all(
+            _expr_struct_eq(x, y) for x, y in zip(a.terms, b.terms)
+        )
     return False
 
 
@@ -421,6 +434,8 @@ def _has_positive_lower_bound(expr: Expression, model: Model) -> bool:
         return _has_positive_lower_bound(expr.left, model) and _has_positive_lower_bound(
             expr.right, model
         )
+    if isinstance(expr, SumOverExpression):
+        return bool(expr.terms) and all(_has_positive_lower_bound(t, model) for t in expr.terms)
     if isinstance(expr, BinaryOp) and expr.op == "*":
         if isinstance(expr.left, (Constant, Parameter)):
             v = np.asarray(expr.left.value)
@@ -450,6 +465,8 @@ def _is_nonneg_domain(expr: Expression, model: Model) -> bool:
             return lb >= 0.0
     if isinstance(expr, BinaryOp) and expr.op == "+":
         return _is_nonneg_domain(expr.left, model) and _is_nonneg_domain(expr.right, model)
+    if isinstance(expr, SumOverExpression):
+        return all(_is_nonneg_domain(t, model) for t in expr.terms)
     if isinstance(expr, BinaryOp) and expr.op == "*":
         if isinstance(expr.left, (Constant, Parameter)):
             v = np.asarray(expr.left.value)
