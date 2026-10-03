@@ -363,3 +363,49 @@ def test_flag_off_reproduces_main(monkeypatch, build, shift):
         r_main.node_count,
         r_main.objective,
     )
+
+
+# ------------------------------- #1593: the default path covers main's #1544 auxes
+
+
+@pytest.mark.parametrize("flag", [None, "1", "0"], ids=["default", "on", "off"])
+def test_default_path_leaves_every_1544_aux_to_the_repair(monkeypatch, flag):
+    """#1593: the implied-integer handling is not confined to the auxes the
+    translated-monomial lift creates. With the flag ON (the default) the lifter
+    records EVERY ``integer=True`` aux, including the ones main's own #1544 rule
+    makes on the cancellation / term-limit path. nvs06 at the 1e6 shift has no
+    translated monomial (bilinear and repeated-variable products only), yet its two
+    INTEGER auxes ``x - c`` are recorded and left out of the heuristics' integer
+    mask. ``=0`` is the documented opt-out and reproduces pre-#1588 main: nothing
+    recorded, every INTEGER column free. The default-path behaviour is the one the
+    #1593 panel measured (33 rows, cert-clean, 19 vs 18 certificates)."""
+    import sys
+
+    sys.path.insert(0, HERE)
+    from _invariance import translate
+    from discopt._relax.primal_heuristics import _get_integer_mask
+    from discopt.modeling.core import VarType
+
+    if flag is None:
+        monkeypatch.delenv("DISCOPT_LIFT_AFFINE_MONOMIALS", raising=False)
+    else:
+        monkeypatch.setenv("DISCOPT_LIFT_AFFINE_MONOMIALS", flag)
+    m = translate(dm.from_nl(NVS06), 1e6, seed=2)
+    exprs = [m._objective.expression] + [c.body for c in m._constraints]
+    assert not any(fr._scan_for_translated_monomial(e) for e in exprs)  # main's #1544 path
+    out = fr.factorable_reformulate(m)
+    int_auxes = {
+        v.name
+        for v in out._variables
+        if v.var_type == VarType.INTEGER and v.name.startswith("_fr_aux_")
+    }
+    assert len(int_auxes) == 2, int_auxes
+    names = [v.name for v in out._variables]
+    free = {names[k] for k in np.flatnonzero(_get_integer_mask(out))}
+    if flag == "0":
+        assert out._implied_integer_auxes == set()
+        assert int_auxes <= free
+    else:
+        assert out._implied_integer_auxes == int_auxes
+        assert not (int_auxes & free)
+        assert free == {"x0", "x1"}, free
