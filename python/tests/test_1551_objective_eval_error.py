@@ -176,7 +176,8 @@ def test_loop_built_objective_is_measured(n_terms, monkeypatch):
     # ``(6*y)*y`` as ``(6*z + c1)*(z + c2)``, which the quadratic extractor does not
     # expand, so the recentred objective is not proven convex: the solve takes
     # spatial B&B, stops uncertified at the node limit with a valid bound, and never
-    # reaches the certificate this guard checks. No false certificate either way.
+    # reaches the certificate this guard checks. No false certificate either way,
+    # and no certificate in either arm: the ON arm is measured by the next test.
     monkeypatch.setenv("DISCOPT_RECENTRE", "0")
     m, _, opt = _expanded(BAD_C)
     f = m._objective.expression
@@ -189,6 +190,30 @@ def test_loop_built_objective_is_measured(n_terms, monkeypatch):
     assert not r.gap_certified
     assert r.bound is None or F(r.bound) <= opt
     assert stats.get("certificate/objective_unresolved") == 1.0
+
+
+@pytest.mark.slow
+def test_loop_built_objective_under_recentring_is_not_certified_either(monkeypatch):
+    """The recentred arm of the test above, measured rather than pinned (#1537).
+
+    The model is uncertifiable by construction (#1551: the objective cannot be
+    evaluated to its own gap tolerance), and the OFF arm above asserts it is NOT
+    certified. Under recentring it reaches the same verdict by a different route:
+    ``(6*z + c1)*(z + c2)`` is not recognised as quadratic, so the solve takes
+    spatial B&B and stops at a limit (measured: the 100000-node limit at ~22 s).
+    That is a cost in time, not a lost certificate. The bound it keeps must still
+    be valid."""
+    monkeypatch.setenv("DISCOPT_RECENTRE", "1")
+    m, _, opt = _expanded(BAD_C)
+    f = m._objective.expression
+    for i in range(2000):
+        f = f + 1e-3 * m.continuous(f"z{i}", lb=0, ub=1)
+    m.minimize(f)
+    r = m.solve(time_limit=60)
+    stats = r.solver_stats or {}
+    assert stats.get("recentre/variables_moved", 0) > 0
+    assert not r.gap_certified
+    assert r.bound is None or F(r.bound) <= opt
 
 
 @pytest.mark.parametrize("recentre", ["0", "1"])
