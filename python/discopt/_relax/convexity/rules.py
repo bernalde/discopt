@@ -290,10 +290,13 @@ def _struct_hash(expr: Expression, hcache: dict) -> int:
         return cast(int, cached)
     if isinstance(expr, Constant):
         v = np.asarray(expr.value)
+        # Exact values, consistent with the exact equality in ``_expr_struct_eq``
+        # (``hash(0.0) == hash(-0.0)`` matches ``0.0 == -0.0``). Rounding to 12
+        # places collapsed distinct constants such as +/-4e-13 into one bucket.
         if v.ndim == 0:
-            h = hash(("c", round(float(v), 12)))
+            h = hash(("c", float(v)))
         else:
-            h = hash(("c", v.shape, tuple(np.round(v.ravel(), 12).tolist())))
+            h = hash(("c", v.shape, tuple(float(t) for t in v.ravel().tolist())))
     elif isinstance(expr, Variable):
         h = hash(("v", expr.name))
     elif isinstance(expr, Parameter):

@@ -1168,8 +1168,8 @@ def sanitize_relaxation_for_conditioning(
 
     1. Drop any constraint row whose coefficient or RHS is non-finite, or whose
        coefficient or RHS has magnitude >= ``_RELAX_NUMERIC_CAP`` and cannot be
-       brought under it by an exact power-of-two row scaling without pushing an
-       entry below ``_RESCUE_FLOOR`` (#1537: a rescued row is the same constraint,
+       brought under it by an exact power-of-two row scaling that leaves every
+       nonzero at least ``_RESCUE_FLOOR`` (#1537: a rescued row is the same constraint,
        so the decision no longer depends on how a row was scaled). Removing a
        constraint enlarges the feasible set; rescaling one leaves it unchanged.
     2. Clamp any variable bound of magnitude >= ``_RELAX_NUMERIC_CAP`` to +/-inf.
@@ -1198,9 +1198,9 @@ def sanitize_relaxation_for_conditioning(
         # 2.02e9 coefficient over the cap, lost the row and the certificate). Divide
         # such a row by the power of two that brings its largest entry (and RHS) under
         # the cap -- exact in binary floating point, so the constraint is bit-for-bit
-        # the same set -- and keep it when that loses nothing: every entry that was at
-        # least ``_RESCUE_FLOOR`` stays at least that (an LP backend may zero smaller
-        # entries, and zeroing an entry is not a relaxation). A row whose entries span
+        # the same set -- and keep it only when every nonzero is at least
+        # ``_RESCUE_FLOOR`` after scaling (an LP backend may zero smaller entries, and
+        # zeroing an entry is not a relaxation). A row whose entries span
         # more than ``cap / _RESCUE_FLOOR`` -- the bound-derived 1e11..1e37 envelope
         # coefficients this guard exists for, beside unit aux coefficients -- has no
         # such scaling and is dropped exactly as before. Non-finite rows are dropped,
@@ -1219,8 +1219,13 @@ def sanitize_relaxation_for_conditioning(
                 k = math.frexp(top / cap)[1]  # top * 2**-k < cap
                 scale = math.ldexp(1.0, -k)
                 sd = d * scale
-                sig = ad >= _RESCUE_FLOOR
-                if np.all(np.abs(sd[sig]) >= _RESCUE_FLOOR):
+                # Every stored nonzero must clear the floor after scaling -- including
+                # one that was already below it. A sub-floor entry kept in a row that
+                # the cap would otherwise drop is exactly what the in-house simplex
+                # mishandles (PR #1594 review: ``1.5e10*x - 9e-10*y <= 0`` gave a
+                # false LP bound of 0.0 against a true -1).
+                nz = ad > 0.0
+                if np.all(np.abs(sd[nz]) >= _RESCUE_FLOOR):
                     A.data[lo:hi] = sd
                     b[i] = b[i] * scale
                     keep[i] = True

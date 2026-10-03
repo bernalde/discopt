@@ -8051,7 +8051,7 @@ class Model:
         """
         self.validate()
 
-        # --- #1537 C: exact recentring of large-offset variables (default OFF) ---
+        # --- #1537 C: exact recentring of large-offset variables (default ON; =0 opts out) ---
         # A box far from the origin is the same model in coordinates ``x = z + c``
         # but not the same numerics (23/69 certificates lost and 4 false ones under
         # a 1e6 shift, measured by the invariance harness). The recentred twin is

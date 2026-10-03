@@ -21,8 +21,12 @@ families, each row scaled by its own seeded log-uniform factor in 10^[-3,3] and
   rows multiplied by 8.14 and 3.66 pushed a 2.02e9 coefficient to 1.64e10, the row
   was dropped, the fallback bound fell to -1.07e6 and the certificate the unscaled
   model earns (bound 0.0) was lost. An over-cap row is now divided by the power of
-  two that brings it under the cap (exact, so the same constraint) and dropped only
-  if that would push an entry below the 1e-9 floor an LP backend may zero.
+  two that brings it under the cap (exact, so the same constraint) and dropped
+  unless every nonzero is still at least the 1e-9 floor afterwards. (The first
+  version of the rescue checked only entries that started above the floor, so a
+  row already holding a sub-floor entry was kept where it used to be dropped and
+  the in-house simplex returned a false LP bound on it -- PR #1594 review; pinned
+  by ``test_sanitizer_rescue_never_keeps_a_sub_floor_entry``.)
 """
 
 from __future__ import annotations
@@ -90,6 +94,9 @@ def test_relaxation_builds_when_the_pin_is_one_ulp_past_the_box():
 
 @pytest.mark.parametrize("scale", [8.14, 1e-3, 3.7e5])
 def test_row_scaled_pin_solves_like_the_unscaled_model(scale):
+    """Guard, not a before/after witness: this passes on the pre-fix sources too
+    (the one-ulp crossing needs the exact 4stufen arithmetic pinned above). It keeps
+    the end-to-end answer row-scale invariant for this small pinned model."""
     base = _pinned_model(1.0).solve(time_limit=20)
     scaled = _pinned_model(scale).solve(time_limit=20)
     assert base.status == "optimal" and scaled.status == "optimal"
@@ -167,3 +174,33 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
     assert base.gap_certified
     assert other.gap_certified, (other.status, other.bound)
     assert other.objective == pytest.approx(base.objective, abs=1e-6)
+
+
+def test_sanitizer_rescue_never_keeps_a_sub_floor_entry():
+    """PR #1594 review witness. ``1.5e10*x - 9e-10*y <= 0``, x in [0, 1], y >= 0,
+    min -x: the true LP minimum is -1 (y grows until the row holds). The over-cap
+    row cannot be brought under the cap with every nonzero >= 1e-9 (the -9e-10 is
+    already below it), so it must be dropped, as before #1537. The first rescue
+    checked only the entries that started above the floor and kept the row, on
+    which the in-house simplex returned the false bound 0.0."""
+    rel = MilpRelaxationModel(
+        c=np.array([-1.0, 0.0]),
+        A_ub=sp.csr_matrix(np.array([[1.5e10, -9e-10]])),
+        b_ub=np.array([0.0]),
+        bounds=[(0.0, 1.0), (0.0, np.inf)],
+    )
+    out = sanitize_relaxation_for_conditioning(rel)
+    assert out._A_ub is None or out._A_ub.shape[0] == 0, "sub-floor row kept"
+    res = out.solve(backend="simplex")
+    assert res.status == "optimal"
+    # A valid lower bound for the min: never above the true optimum -1.
+    assert res.objective <= -1.0 + 1e-9
+
+
+def test_sanitizer_rescue_keeps_rows_whose_every_entry_clears_the_floor():
+    """The complement: the same shape with the small entry at 1e-6 rescales exactly."""
+    out = sanitize_relaxation_for_conditioning(_relax([[1.5e10, -1e-6]], [0.0]))
+    row = np.asarray(out._A_ub.todense()).ravel()
+    assert row.shape == (2,) and np.all(np.abs(row) >= _RESCUE_FLOOR)
+    ratio = row / np.array([1.5e10, -1e-6])
+    assert ratio[0] == ratio[1] and np.log2(ratio[0]) == np.round(np.log2(ratio[0]))

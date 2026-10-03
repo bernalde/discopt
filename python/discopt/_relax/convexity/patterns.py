@@ -359,7 +359,13 @@ def _expr_struct_eq(a: Expression, b: Expression) -> bool:
     if isinstance(a, Constant) and isinstance(b, Constant):
         va = np.asarray(a.value)
         vb = np.asarray(b.value)
-        return va.shape == vb.shape and bool(np.allclose(va, vb))
+        # Exact: a recogniser that matches ``L`` against ``L`` must be matching the
+        # same function. ``np.allclose`` (atol 1e-8) equated 1e-9 with 2e-9 and
+        # 4e-13 with -4e-13, so ``((x/L1)**2)*L2`` read as a perspective and the
+        # verdict cache reused a CONVEX verdict across different constants (PR #1594
+        # review). ``from_nl`` rebuilds shared constants bit-identically, so exact
+        # equality loses no genuine match. (0.0 == -0.0 is the same function.)
+        return va.shape == vb.shape and bool(np.array_equal(va, vb))
     if isinstance(a, Variable) and isinstance(b, Variable):
         return a.name == b.name
     if isinstance(a, IndexExpression) and isinstance(b, IndexExpression):
@@ -675,7 +681,9 @@ def _sum_of_squares_linear_matrix(expr: Expression, model: Model) -> Optional[np
     right = _linear_vector_matrix(operand.right, model)
     if left is None or right is None:
         return None
-    if left.shape != right.shape or not np.allclose(left, right, atol=1e-12):
+    # Exact: ``(A x) * (A' x)`` with ``A' != A`` is not ``||A x||^2`` and can be
+    # indefinite however close ``A'`` is (``allclose``'s rtol=1e-5 accepted it).
+    if left.shape != right.shape or not np.array_equal(left, right):
         return None
     return left
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 
 import discopt.modeling as dm
+import numpy as np
 import pytest
 from _invariance import translate
 from discopt._relax.convexity.patterns import _expr_struct_eq
@@ -115,3 +116,75 @@ def test_recentred_clay_certifies(monkeypatch):
     assert r.status == "optimal" and r.gap_certified
     assert r.objective == pytest.approx(26669.1095724859, rel=1e-6)
     assert r.bound <= 26669.1095724859 + 1e-6 * 26669.1095724859
+
+
+# --------------------------------------------------------------------------- #
+# PR #1594 review: structural equality must be EXACT. ``np.allclose`` (atol 1e-8)
+# in ``_expr_struct_eq`` and ``round(v, 12)`` in ``_struct_hash`` equated
+# different constants, so a recogniser matched ``L1`` against ``L2 != L1`` and the
+# verdict cache reused one row's CONVEX verdict for another row.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("spell_sum", [False, True], ids=["binary_chain", "dm_sum"])
+def test_perspective_with_different_tiny_constants_is_not_convex(spell_sum):
+    """``((x / (1e-9 + y))**2) * (2e-9 + y)`` is not a perspective: with ``t = y +
+    1e-9`` it is ``x^2 g(t)``, ``g = (t + 1e-9)/t^2``, and ``g g'' - 2 g'^2 =
+    -2e-18/t^6 < 0``, so it is nonconvex. ``allclose`` called the two denominators
+    equal."""
+    m = dm.Model("persp_tiny")
+    x = m.continuous("x", lb=-1, ub=1)
+    y = m.continuous("y", lb=0, ub=1)
+
+    def L(c):
+        return dm.sum([c, y]) if spell_sum else c + y
+
+    m.subject_to(((x / L(1e-9)) ** 2) * L(2e-9) - 5 <= 0)
+    m.minimize(x)
+    assert classify_constraint(m._constraints[0], m) is not True
+
+
+def test_struct_eq_and_hash_are_exact_on_constants():
+    m = dm.Model("c")
+    x = m.continuous("x", lb=-1, ub=1)
+    a, b = 4e-13 * x**2, -4e-13 * x**2
+    assert not _expr_struct_eq(a, b)
+    assert _struct_hash(a, {}) != _struct_hash(b, {})
+    assert not _expr_struct_eq(dm.sum([1e-9, x]), dm.sum([2e-9, x]))
+    # Bit-identical constants still match (``from_nl`` rebuilds them that way).
+    assert _expr_struct_eq(dm.sum([1e-9, x]), dm.sum([1e-9, x]))
+
+
+def test_norm_of_two_near_equal_affine_maps_is_not_convex():
+    """``sqrt(sum((A x) * (B x)))`` is the norm ``||A x||`` only when ``B == A``.
+    ``B = A + [0, 1e-6]`` passed ``allclose`` (rtol 1e-5), but ``(x1 + x2)(x1 +
+    (1 + 1e-6) x2)`` has Hessian determinant ``-1e-12``: indefinite."""
+    A = np.array([[1.0, 1.0]])
+    for B, want in [(np.array([[1.0, 1.0 + 1e-6]]), False), (A.copy(), True)]:
+        m = dm.Model("norm")
+        x = m.continuous("x", shape=(2,), lb=-1, ub=1)
+        m.subject_to(dm.sqrt(dm.sum((A @ x) * (B @ x))) <= 1)
+        m.minimize(x[0])
+        assert classify_constraint(m._constraints[0], m) is want
+
+
+@pytest.mark.parametrize("convex_row_first", [True, False])
+def test_verdict_cache_does_not_reuse_across_sign_flipped_constants(convex_row_first):
+    """End-to-end witness: ``4e-13 x^2 - z <= 1`` (convex) and ``-4e-13 x^2 + y <=
+    1`` (nonconvex feasible set) hashed and compared equal, so whichever row came
+    first fixed both verdicts. max ``y - 1e-8 x`` on x in [-1e6, 2e6]: the global
+    optimum is 2.58 at x = 2e6; the false certificate was 1.41 (x = -1e6). A
+    certificate, if issued, must be the true optimum."""
+    m = dm.Model("e2e")
+    x = m.continuous("x", lb=-1e6, ub=2e6)
+    y = m.continuous("y", lb=-10, ub=10)
+    z = m.continuous("z", lb=0, ub=10)
+    r_cvx = 4e-13 * x**2 - z <= 1
+    r_ccv = -4e-13 * x**2 + y <= 1
+    for r in [r_cvx, r_ccv] if convex_row_first else [r_ccv, r_cvx]:
+        m.subject_to(r)
+    m.maximize(y - 1e-8 * x)
+    res = m.solve(time_limit=30)
+    if res.gap_certified:
+        assert res.objective == pytest.approx(2.58, abs=1e-4)
+        assert res.bound >= 2.58 - 1e-4  # max sense: a valid bound is >= the optimum
