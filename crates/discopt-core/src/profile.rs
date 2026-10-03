@@ -413,6 +413,10 @@ counters!(
     UnboundedRejectRowResidual,
     UnboundedRejectObjective,
     UnboundedRejectBox,
+    // #1597: an uncertified ray resolved by the exact ratio test — a basic column
+    // moving toward a finite bound at a sub-`tol` rate is taken as the blocker and
+    // pivoted on, instead of refusing the LP as `Numerical`.
+    RayRescuePivots,
     // #1595: a phase-2 vertex the absolute `tol` pricing called optimal, but at
     // which a nonbasic column's wrong-signed, sub-`tol` reduced cost could still
     // decrease the objective by more than `subtol_impact_floor` in one pivot.

@@ -2361,6 +2361,9 @@ impl<'a> Simplex<'a> {
         // The cap only keeps a noise-driven run from churning to `max_iter`.
         let mut subtol_pivots = 0usize;
         let subtol_cap = m + 64;
+        // Exact-ratio-test rescues taken when a ray fails certification (#1597),
+        // capped like the sub-tol pivots so a pathological LP cannot loop on them.
+        let mut ray_rescues = 0usize;
         for _iter in 0..self.max_iter {
             // Poll the wall-clock deadline every 256 pivots (cheap relative to a
             // pricing+ftran iteration). A dense, degenerate lifted-McCormick LP
@@ -2607,12 +2610,64 @@ impl<'a> Simplex<'a> {
                 // status that routes into `dense_retry`'s robust LU path (§3:
                 // refuse loudly rather than claim). A genuine unbounded ray passes
                 // untouched, so no true `Unbounded` is downgraded.
-                if !self.ray_certifies_unbounded(&mut ray, cost, &alpha) {
-                    return Err(LpStatus::Numerical);
+                if self.ray_certifies_unbounded(&mut ray, cost, &alpha) {
+                    crate::profile::incr(crate::profile::Ctr::UnboundedRayCertified);
+                    self.unbounded_ray = ray;
+                    return Err(LpStatus::Unbounded);
                 }
-                crate::profile::incr(crate::profile::Ctr::UnboundedRayCertified);
-                self.unbounded_ray = ray;
-                return Err(LpStatus::Unbounded);
+                // #1597: the Harris test skips `|α_i| <= tol`, so a basic column
+                // with a finite bound that moves at a sub-`tol` rate along the ray
+                // never blocks — and the direction is NOT a recession direction
+                // (the strict certificate above just refused it). Measured on
+                // `cvxnonsep_psig40r`'s OA master: row `-1e9·x20 - x81 = b`,
+                // `x20 >= 1e-9` basic with α = 1e-9, entering x81 free. On main the
+                // ray was certified and the LP reported `Unbounded`; it is bounded.
+                // Refusing with `Numerical` is sound but leaves the LP unsolved,
+                // and the convex tree then re-solves it until its deadline.
+                //
+                // The textbook (exact) ratio test is the right answer: such a row
+                // DOES block, at `t = slack/|α_i|`. Take the nearest of those
+                // blockers as the leaving row and pivot. Entries at or below the
+                // FTRAN's roundoff floor (`ε·max|α|`) are not treated as real — a
+                // garbage FTRAN that zeroes every α (QPLIB_2170) still finds no
+                // blocker and is refused as before. Capped at `m + 64` rescues.
+                let amax = alpha.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+                let floor = f64::EPSILON * amax.max(1.0);
+                let mut rescue: Option<(usize, f64, bool)> = None;
+                for i in 0..m {
+                    let bi = self.basis[i];
+                    let delta = -dir * alpha[i];
+                    if delta.abs() <= floor || delta.abs() > self.tol {
+                        continue;
+                    }
+                    let (t_true, to_upper) = if delta < 0.0 {
+                        if self.lb[bi] <= -INF {
+                            continue;
+                        }
+                        (((xb[i] - self.lb[bi]) / (-delta)).max(0.0), false)
+                    } else {
+                        if self.ub[bi] >= INF {
+                            continue;
+                        }
+                        (((self.ub[bi] - xb[i]) / delta).max(0.0), true)
+                    };
+                    if rescue.is_none_or(|(_, t, _)| t_true < t) {
+                        rescue = Some((i, t_true, to_upper));
+                    }
+                }
+                match rescue {
+                    Some((slot, t_true, to_upper)) if ray_rescues < subtol_cap => {
+                        ray_rescues += 1;
+                        crate::profile::incr(crate::profile::Ctr::RayRescuePivots);
+                        leave_slot = Some(slot);
+                        leave_to_upper = to_upper;
+                        // `t_true` is finite here: the entering column is not
+                        // bounded (`cap` is INF, else `t_max` would be finite), and
+                        // the blocker's slack and |α_i| > 0 are both finite.
+                        t_max = t_true.min(cap);
+                    }
+                    _ => return Err(LpStatus::Numerical),
+                }
             }
             if t_max <= self.tol {
                 stall += 1;
@@ -4122,6 +4177,46 @@ mod tests {
             &[1.0, 1.0 + 1e-3, 1e-3],
         );
         assert!(!ok2, "a direction leaving a finite box was certified");
+    }
+
+    #[test]
+    fn subtol_blocker_is_pivoted_on_not_refused() {
+        // #1597, the shape of `cvxnonsep_psig40r`'s OA master: columns
+        // (x0 free, x1 free, x2 ∈ [1e-9, inf)), rows x0 + x1 = 0 and
+        // -1e9·x2 - x1 = -2, min -x1. Bounded: x1 = 2 - 1e9·x2 <= 1, optimum -1.
+        // Entering x1 drives the basic x2 down at the sub-`tol` rate 1e-9, which
+        // the Harris test skips. Main certified the resulting direction as an
+        // unbounded ray; the strict certificate refuses it, and the exact ratio
+        // test must then take x2 as the blocker so the LP is SOLVED, not left as
+        // `Numerical`.
+        let a = [1.0, 1.0, 0.0, 0.0, -1.0, -1e9];
+        let c = [0.0, -1.0, 0.0];
+        let l = [-CERT_INF, -CERT_INF, 1e-9];
+        let u = [CERT_INF, CERT_INF, CERT_INF];
+        let b = [0.0, -2.0];
+        let opts = SimplexOptions::default();
+        let mut checked = 0;
+        for scaled in [false, true] {
+            let cols = SparseCols::from_dense(&a, 2, 3);
+            let sol = if scaled {
+                solve_lp_cols_scaled(cols, 2, 3, &c, &l, &u, &b, &opts)
+            } else {
+                solve_lp_cols(cols, 2, 3, &c, &l, &u, &b, &opts)
+            };
+            assert_eq!(
+                sol.status,
+                LpStatus::Optimal,
+                "scaled={scaled}: {:?}",
+                sol.status
+            );
+            assert!(
+                (sol.obj + 1.0).abs() <= 1e-7,
+                "scaled={scaled}: obj {}",
+                sol.obj
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
     }
 
     #[test]

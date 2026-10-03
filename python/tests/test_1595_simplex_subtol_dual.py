@@ -211,3 +211,46 @@ def test_safe_bound_outcome_counter_records_the_route(monkeypatch):
     result, _basis, _cert = solve_lp_warm_std(c, A, b, bounds, return_cert=True)
     assert result is not None
     assert sum(ms.SAFE_BOUND_OUTCOMES.values()) == 1, dict(ms.SAFE_BOUND_OUTCOMES)
+
+
+# --- #1597: the convex kernel on an LP the strict ray certificate refuses -------
+#
+# ``cvxnonsep_psig40r``'s OA master has the row ``-1e9*x20 - x81 = b`` with
+# ``x20 >= 1e-9`` basic. Main certified the sub-``tol`` direction as an unbounded
+# ray; the strict certificate refuses it and the exact ratio test now pivots on the
+# blocker. Solving those LPs exposed two kernel reporting bugs: a node popped at the
+# deadline vanished from the reported bound (86.9096 published against the optimum
+# 86.5451), and an unbounded subtree fell back to the incumbent as the bound. The
+# root's safe bound declines, so the kernel now hands the budget back at once.
+
+PSIG40R_OPT = 86.5451047  # minlplib.solu, minimization
+
+
+def _psig40r():
+    import pathlib
+
+    from discopt.modeling.core import from_nl
+
+    path = pathlib.Path(__file__).parent / "data" / "minlplib_nl" / "cvxnonsep_psig40r.nl"
+    return from_nl(str(path))
+
+
+def test_convex_kernel_reports_no_false_bound_when_its_root_is_unbounded():
+    import discopt.solvers._convex_kernel as ck
+
+    spec = ck.build_convex_spec(_psig40r())
+    assert spec is not None, "psig40r no longer routes to the convex kernel"
+    r = ck.solve_convex_tree(spec, time_limit_s=3.0)
+    b = r["bound"]
+    assert b is None or b <= PSIG40R_OPT + 1e-6 * (1 + abs(PSIG40R_OPT)), r
+    assert r["status"] != "optimal", r
+    # The root's NS bound declines, so the tree stops after the root instead of
+    # spending the whole budget on a tree that cannot certify.
+    assert r["node_count"] <= 1, r
+
+
+def test_psig40r_still_certifies_through_the_default_path():
+    res = _psig40r().solve(time_limit=30)
+    assert res.gap_certified, (res.status, res.objective, res.bound)
+    assert res.bound <= PSIG40R_OPT + 1e-6 * (1 + abs(PSIG40R_OPT))
+    assert res.objective == pytest.approx(PSIG40R_OPT, rel=1e-4)
