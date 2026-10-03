@@ -206,3 +206,153 @@ def test_the_highs_node_count_is_highs_own_count():
     doc = Model.solve.__doc__
     assert "node_count == 0" not in doc
     assert "mip_node_count" in doc
+
+
+# ── #1590 review follow-ups (N1, N2, N5, N6) ──────────────────────────────
+
+
+@pytest.mark.requires_pounce
+def test_a_refused_option_escapes_the_default_branch_and_bound(monkeypatch):
+    """N1: the B&B node handler used to catch the refusal as a node failure, log
+    it, and keep going -- re-probing every option on every failing node NLP (73
+    probe solves on a model like this one) and silently dropping the option. It
+    now propagates, so the default path refuses as loudly as ``solver="pounce"``."""
+    import discopt.solvers.nlp_pounce as np_mod
+    from discopt.solvers import PounceOptionError
+
+    calls = {"n": 0}
+    real = np_mod._probe_one_option
+
+    def counting(k, v):
+        calls["n"] += 1
+        return real(k, v)
+
+    monkeypatch.setattr(np_mod, "_probe_one_option", counting)
+    m = dm.Model("minlp")
+    x = m.continuous("x", lb=-3, ub=3)
+    k = m.integer("k", lb=0, ub=3)
+    m.minimize((x - 1) ** 2 + dm.sin(3 * x) + 0.1 * (k - 1.5) ** 2 + 0.05 * x * k)
+    m.subject_to(x + k <= 3.5)
+    with pytest.raises(PounceOptionError, match="theta_min"):
+        m.solve(pounce_options={"theta_min": 1e-4}, time_limit=60)
+    assert calls["n"] > 0  # the probe ran: the refusal is POUNCE's own
+    # one failing NLP call's worth of probes, not one batch per node
+    assert calls["n"] <= 20
+    assert issubclass(PounceOptionError, ValueError)
+
+
+@pytest.mark.requires_pounce
+def test_a_convex_only_option_on_an_indefinite_qp_is_refused_loudly():
+    """N6: the indefinite QP runs on the NLP engine, which does not know the
+    convex engine's ``tau`` -- POUNCE refuses it and the refusal is raised."""
+    with pytest.raises(ValueError, match="OPTION_INVALID|Invalid_Option"):
+        _indefinite_qp().solve(solver="pounce", pounce_options={"tau": 0.99})
+
+
+class _Res:
+    def __init__(self, gap):
+        self.gap = gap
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("o", "b", "is_max"),
+    [(10.0, 11.0, False), (11.0, 10.0, True)],  # bound crosses the incumbent by ~10%
+)
+def test_a_materially_inverted_pair_keeps_the_routes_gap(o, b, is_max):
+    """N2: OA/GDPopt report 1.0 for an inverted pair ("nothing proved"); the
+    symmetric formula would rewrite it to ~0.09 -- an honest-looking open gap."""
+    from discopt.solver import _stamp_reported_gap
+
+    r = _Res(1.0)
+    _stamp_reported_gap(r, o, b, 1e-6, is_maximize=is_max)
+    assert r.gap == 1.0
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("o", "b", "is_max"),
+    [(11.0, 10.0, False), (10.0, 11.0, True)],  # an ordinary open gap
+)
+def test_an_ordinary_pair_is_restamped_with_the_formula(o, b, is_max):
+    from discopt.solver import _stamp_reported_gap
+
+    r = _Res(1.0)
+    _stamp_reported_gap(r, o, b, 1e-6, is_maximize=is_max)
+    assert r.gap == pytest.approx(_formula(o, b), rel=1e-12)
+
+
+@pytest.mark.smoke
+def test_an_inversion_within_rounding_is_still_reconciled():
+    from discopt.solver import _stamp_reported_gap
+
+    r = _Res(1.0)
+    _stamp_reported_gap(r, 10.0, 10.0 + 1e-9, 1e-6, is_maximize=False)
+    assert r.gap == 0.0
+
+
+@pytest.mark.smoke
+def test_an_unknown_sense_leaves_the_routes_gap():
+    from discopt.solver import _stamp_reported_gap
+
+    r = _Res(0.25)
+    _stamp_reported_gap(r, 11.0, 10.0, 1e-6, is_maximize=None)
+    assert r.gap == 0.25
+
+
+def _through_chokepoint(result, model=None, tols=(1e-4, 1e-6)):
+    """Run ``result`` through the solve-level chokepoint as a route's return."""
+    from discopt import solver as S
+
+    def fake(model):
+        S._GAP_TOLERANCES.append(tols)
+        return result
+
+    return S._stamp_layer_timing(fake)(model)
+
+
+@pytest.mark.smoke
+def test_the_chokepoint_keeps_an_inverted_pairs_sentinel():
+    """N2 end-to-end: the chokepoint knows the model's sense and passes it."""
+    from discopt.modeling.core import SolveResult
+
+    m = dm.Model("min")
+    x = m.continuous("x", lb=0, ub=20)
+    m.minimize(x)
+    r = SolveResult(status="feasible", objective=10.0, bound=11.0, gap=1.0)
+    assert _through_chokepoint(r, m).gap == 1.0
+    r2 = SolveResult(status="feasible", objective=11.0, bound=10.0, gap=1.0)
+    assert _through_chokepoint(r2, m).gap == pytest.approx(1 / 11, rel=1e-12)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("status", ["time_limit", "node_limit", "iteration_limit"])
+def test_the_chokepoint_names_a_limit_status_as_the_termination(status):
+    """N6: a route that set no reason but whose status names a budget."""
+    from discopt.modeling.core import SolveResult
+
+    r = _through_chokepoint(SolveResult(status=status))
+    assert r.termination == status
+
+
+@pytest.mark.smoke
+def test_the_chokepoint_infers_nothing_else_and_overrides_nothing():
+    from discopt.modeling.core import SolveResult
+
+    assert _through_chokepoint(SolveResult(status="feasible")).termination is None
+    assert _through_chokepoint(SolveResult(status="optimal")).termination is None
+    preset = SolveResult(status="time_limit", termination="interrupted")
+    assert _through_chokepoint(preset).termination == "interrupted"
+
+
+@pytest.mark.smoke
+def test_a_result_file_without_termination_reads_back_as_none():
+    """N5: files written before #1585 have no ``termination`` key."""
+    from discopt.modeling.core import SolveResult
+    from discopt.result_io import deserialize_result, serialize_result
+
+    d = serialize_result(SolveResult(status="optimal", objective=1.0, termination="gap"))
+    assert d.pop("termination") == "gap"
+    back = deserialize_result(d)
+    assert back.termination is None
+    assert back.status == "optimal"

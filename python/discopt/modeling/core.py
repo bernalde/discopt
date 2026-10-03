@@ -4424,9 +4424,9 @@ class SolveResult:
     # was PROVEN. One of ``discopt.status.TERMINATION_REASONS``:
     #
     # - ``"gap"``: the optimality gap closed within ``gap_tolerance`` /
-    #   ``abs_gap_tolerance`` (status ``optimal``);
+    #   ``abs_gap_tolerance`` (status usually ``optimal``);
     # - ``"exhausted"``: the tree drained -- every node was pruned or solved
-    #   (status ``optimal`` with an incumbent, ``infeasible`` without one);
+    #   (status usually ``optimal`` with an incumbent, ``infeasible`` without);
     # - ``"node_limit"`` / ``"time_limit"`` / ``"iteration_limit"``: a budget ran
     #   out first. Depending on the route the status of such an exit is either the
     #   budget name or ``feasible`` (an incumbent plus a certified bound with an
@@ -4437,6 +4437,21 @@ class SolveResult:
     #
     # ``None`` means the route records no reason (a direct NLP/LP solve that is not
     # a search, or a route that has not been taught the field).
+    #
+    # The field records why the LOOP stopped; ``status`` is decided afterwards and
+    # can disagree with the "usually" above (#1590 review N3). Known cases:
+    #
+    # - a tree that drains at exactly ``max_nodes`` with no incumbent reports
+    #   ``status="node_limit"`` (the no-incumbent branch tests the node budget
+    #   first) with ``termination="exhausted"``;
+    # - a ``"gap"`` exit the solve-level chokepoint later downgrades
+    #   (``_refuse_unclosed_published_pair`` / the #1285 polish recheck) reports
+    #   ``status="feasible"`` with ``termination="gap"``;
+    # - a drained tree whose bound is held below the incumbent by an unresolved
+    #   floor reports ``status="feasible"`` with ``termination="exhausted"``.
+    #
+    # Read ``status`` / ``gap_certified`` for what is proven; never infer a
+    # certificate from this field.
     termination: Optional[str] = None
 
     # Examiner-style validation report (populated if validate=True).

@@ -18,7 +18,7 @@ import numpy as np
 
 from discopt import _timing
 from discopt.modeling.core import Model
-from discopt.solvers import NLPResult, SolveStatus
+from discopt.solvers import NLPResult, PounceOptionError, SolveStatus
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # #75: importing this at module scope pulls jax on every solve, because
@@ -168,6 +168,7 @@ def _probe_one_option(key: str, value: object) -> tuple[bool, str]:
     the only place pounce 0.12.0 puts the reason. Any other exception propagates.
     """
     import os
+    import sys
     import tempfile
 
     import pounce
@@ -186,6 +187,10 @@ def _probe_one_option(key: str, value: object) -> tuple[bool, str]:
     elif isinstance(value, (np.integer, int)) and not isinstance(value, bool):
         value = int(value)
     with tempfile.TemporaryFile(mode="w+b") as sink:
+        # #1590 review N4: flush Python's buffers first, so nothing already
+        # written lands in the sink instead of on the caller's terminal.
+        sys.stdout.flush()
+        sys.stderr.flush()
         saved = [os.dup(1), os.dup(2)]
         refused = False
         try:
@@ -210,7 +215,7 @@ def _probe_one_option(key: str, value: object) -> tuple[bool, str]:
     return refused, captured.strip()
 
 
-def _invalid_option_error(opts: dict) -> ValueError:
+def _invalid_option_error(opts: dict) -> PounceOptionError:
     """The ``ValueError`` for a solve POUNCE stopped with ``Invalid_Option`` (#1585).
 
     Before #1585 the code fell through the status map to ``status="error"`` with
@@ -240,7 +245,7 @@ def _invalid_option_error(opts: dict) -> ValueError:
             "no single option reproduces the refusal on its own, so it is a "
             f"combination of {sorted(opts)}; POUNCE printed its reason to stderr"
         )
-    return ValueError(
+    return PounceOptionError(
         f"POUNCE rejected a solver option (Invalid_Option, status {_INVALID_OPTION}): "
         f"{detail}. Options reaching the NLP backend on this solve: {sorted(opts)}. "
         "Fix or drop the offending key (Model.solve(pounce_options={...}))."
@@ -468,7 +473,7 @@ def solve_nlp(
         # something to drop and carry on with (CLAUDE.md §3).
         msg = str(exc)
         if "OPTION_INVALID" in msg or "Unknown option" in msg:
-            raise ValueError(
+            raise PounceOptionError(
                 f"POUNCE rejected a solver option: {msg.splitlines()[0]}. Options reaching the "
                 f"NLP backend on this solve: {sorted(opts)}. Fix or drop the offending key "
                 "(Model.solve(ipopt_options={...}))."

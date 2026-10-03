@@ -87,6 +87,9 @@ LOCAL_INFEASIBLE = "local_infeasible"
 # incumbent, gap > 0 -- the documented meaning, which existing callers rely on)
 # with ``termination="node_limit"``. ``None`` means the route that answered does
 # not record a reason (a single local NLP/LP/QP solve, a decomposition loop).
+# The pairing below ("gap" -> optimal, "exhausted" -> optimal/infeasible) is the
+# usual one, not an invariant: see the ``SolveResult.termination`` comment for
+# the known exits where the two disagree.
 #: The convergence test (absolute OR relative gap) was met.
 TERMINATION_GAP = "gap"
 #: Every node of the tree was fathomed or proved; the search ran to completion.

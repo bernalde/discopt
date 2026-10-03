@@ -7,6 +7,17 @@ from typing import Optional
 import numpy as np
 
 
+class PounceOptionError(ValueError):
+    """POUNCE refused a solver option the caller passed (#1585).
+
+    A ``ValueError`` (the caller's input is wrong), given its own type so that the
+    branch-and-bound node handlers -- which keep a node alive through an ordinary
+    POUNCE failure by reporting it as ``ERROR`` -- can let THIS one through. A bad
+    option is not a node outcome: every node would fail the same way, and
+    swallowing it silently drops the option the caller asked for (CLAUDE.md §3).
+    """
+
+
 class SolveStatus(Enum):
     """Terminal status of a solve (optimal, infeasible, unbounded, ...)."""
 

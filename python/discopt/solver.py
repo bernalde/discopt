@@ -64,6 +64,7 @@ from discopt.modeling.core import (
     Model,
     SolveResult,
     VarType,
+    objective_sense_sign,
 )
 from discopt.modeling.core import repr_space_cutoff as _repr_space_cutoff
 from discopt.solver_tuning import current as _tuning
@@ -74,6 +75,7 @@ from discopt.solver_tuning import saturate_role2 as _role2_saturate
 from discopt.solver_tuning import set_current as _set_tuning
 from discopt.solvers import (
     POUNCE_BOUND_RELAX_FACTOR,
+    PounceOptionError,
     SolveStatus,
     pounce_incumbent_options,
     pounce_option_defaults,
@@ -6732,7 +6734,13 @@ def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
 _TERMINATION_FROM_LIMIT_STATUS = frozenset({"time_limit", "node_limit", "iteration_limit"})
 
 
-def _stamp_reported_gap(result, objective: float, bound: float, abs_gap_tol: float) -> None:
+def _stamp_reported_gap(
+    result,
+    objective: float,
+    bound: float,
+    abs_gap_tol: float,
+    is_maximize: Optional[bool] = None,
+) -> None:
     """Report a solve's gap on the convergence test's own arithmetic, on EVERY exit.
 
     #1243 already derives ``solver_stats["gap_criterion"]`` from the returned
@@ -6786,10 +6794,26 @@ def _stamp_reported_gap(result, objective: float, bound: float, abs_gap_tol: flo
       test_amp_integration.py::test_zero_upper_bound_reports_no_relative_gap,
       which an earlier version of this function regressed.
 
+    * A materially INVERTED pair keeps the route's own value (#1590 review N2).
+      The formula is symmetric in the pair, so a bound that crosses the
+      incumbent by 1% would read ``0.01`` -- indistinguishable from an honest
+      open gap -- and would overwrite the ``1.0`` OA/GDPopt deliberately report
+      for "nothing proved" (``_gap.optimality_gap``). Crossing is judged on the
+      shared scale-aware slack (:func:`discopt.solvers._gap.bound_inversion_tolerance`
+      at the judged absolute tolerance), in the model's sense, so rounding noise
+      is still reconciled. With the sense unknown (``is_maximize=None``) no
+      crossing can be judged and the pair is left as the route reported it.
+
     Pure reporting: the gap never feeds certification, which runs
     :func:`_gap_values_converged` on the pair itself.
     """
     if result.gap is None:
+        return
+    if is_maximize is None:
+        return
+    slack = _gap_mod.bound_inversion_tolerance(float(bound), float(objective), abs_gap_tol)
+    crossing = float(objective) - float(bound) if is_maximize else float(bound) - float(objective)
+    if crossing > slack:
         return
     gap = _gap_mod.reported_gap(objective, bound, abs_tol=abs_gap_tol)
     if gap is not None:
@@ -10119,7 +10143,11 @@ def _stamp_layer_timing(fn: _F) -> _F:
                     result.solver_stats = stats
                 stats["gap_criterion"] = _crit
             # #1585: one gap formula on every exit (see _stamp_reported_gap).
-            _stamp_reported_gap(result, _o, _b, _gap_tols[1])
+            _stamp_model = args[0] if args else kwargs.get("model")
+            _stamp_max: Optional[bool] = None
+            if isinstance(_stamp_model, Model):
+                _stamp_max = objective_sense_sign(_stamp_model) < 0
+            _stamp_reported_gap(result, _o, _b, _gap_tols[1], is_maximize=_stamp_max)
         # #1585: a route that has not recorded why it stopped but whose STATUS
         # names a budget stopped on that budget -- the status IS the reason. A
         # driver-set reason is never overridden, and nothing else is inferred
@@ -23808,6 +23836,10 @@ def _solve_node_nlp_pounce(
                 constraint_bounds=constraint_bounds,
                 options=attempt_opts,
             )
+        except PounceOptionError:
+            # #1590 review N1: a refused caller option is not a node outcome --
+            # every node would fail the same way. Refuse the SOLVE, loudly.
+            raise
         except Exception as e:  # noqa: BLE001 - see below
             # #1520: kept as a sound fallback. POUNCE's native layer can raise
             # rather than return a status; ``ERROR`` leaves the node unsettled.
