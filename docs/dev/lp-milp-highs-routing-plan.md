@@ -1461,8 +1461,17 @@ runs, load <= 1.15): native/std median ratio **0.805**, geomean 0.876, faster on
 37/59 (sign test p = 0.067), total **168.6 s -> 112.1 s**. By family (geomean /
 total ratio): set cover 0.54 / 0.54, facility location 0.69 / 0.55, ReLU depth 2
 0.91 / 0.71, ReLU depth 1 0.94 / 0.77, knapsack 0.82 / 0.91, lot sizing 1.04 / 0.99,
-ReLU depth 3 1.30 / 1.11 (n = 5). **What would change the route:** implement native
-rows for the MILP `run` only, behind a default-off flag, keep `StdForm` for every
-LP and check, and graduate on a §5 panel over a broader MILP set than these
-generated families (the in-repo `.nl` corpus has no pure MILP; MIPLIB is not
-reachable from the benchmark host).
+ReLU depth 3 1.30 / 1.11 (n = 5).
+
+**Decision (owner, 2026-10-03): not planned; #1600 closed as not planned.** The route
+keeps `StdForm` for MILP solves. Reasons: certification is already at parity with
+OMLT+HiGHS on the motivating class (same instances, 0/14 objective disagreements),
+so only wall time is at stake, and per instance it goes both ways; the aggregate
+gain is noisy (ratios 0.33-4.5, p = 0.067, two families neutral or slower) and is
+dominated by set cover; and it would put a second model representation on a route
+whose rule is "what HiGHS solved is exactly what discopt verified". **What would
+reopen it:** MILP wall time on HiGHS-routed models becoming a priority for a real
+workload, or a §5 panel on a broad MILP set (MIPLIB 2017 or the owner's corpus)
+showing a consistent per-instance win. The implementation would then be native rows
+for the MILP `run` only, `StdForm` for every LP / refutation / check, slacks
+recomputed as `b - A x` before verification, behind a default-off flag.
