@@ -10,8 +10,10 @@ adds widths {50, 100} x depths {2, 3}: the per-node FBBT cost class, since the
 expanded view grows with the element count. ``--nl-dir`` adds the scalar-layout
 neutrality check (ON and OFF must agree exactly on every ``.nl`` that finishes).
 
-Per instance, flag OFF then ON, each on a FRESHLY built model (a solve writes
-implied bounds back onto its model), ``deterministic=True``. Checks:
+Per instance, OFF (``=0``, the opt-out) then ON -- the shipped default, so the ON
+arm runs with the variable UNSET, exactly as a user gets it -- each on a FRESHLY
+built model (a solve writes implied bounds back onto its model),
+``deterministic=True``. Checks:
 
 * cert-clean -- when both arms certify, objectives agree; no published bound
   crosses the best incumbent either arm found; every published incumbent
@@ -36,6 +38,14 @@ import time
 import numpy as np
 
 FLAG = "DISCOPT_IN_TREE_ARRAY_ROWS"
+
+
+def _set_arm(flag: str) -> None:
+    """Arm ``"0"`` sets the opt-out; arm ``"1"`` is the default (variable unset)."""
+    if flag == "1":
+        os.environ.pop(FLAG, None)
+    else:
+        os.environ[FLAG] = flag
 
 
 def dispersion(n: int):
@@ -133,7 +143,7 @@ def nl_neutrality(paths, tl: float) -> tuple[int, list[str]]:
     for p in paths:
         out = {}
         for f in ("0", "1"):
-            os.environ[FLAG] = f
+            _set_arm(f)
             r = from_nl(str(p)).solve(time_limit=tl, deterministic=True)
             out[f] = r
         r0, r1 = out["0"], out["1"]
@@ -171,7 +181,7 @@ def nl_neutrality(paths, tl: float) -> tuple[int, list[str]]:
 def solve(build, flag: str, tl: float):
     from discopt.validation.feasibility import verify_point
 
-    os.environ[FLAG] = flag
+    _set_arm(flag)
     m = build()
     t0 = time.perf_counter()
     r = m.solve(time_limit=tl, deterministic=True)

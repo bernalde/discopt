@@ -16,6 +16,7 @@ import inspect
 import logging
 import math
 import os
+import re as _re
 import sys
 import threading
 import time
@@ -2392,13 +2393,23 @@ def _note_array_rows(delta: dict) -> None:
         _IN_TREE_ARRAY_ROW_CALLS += 1
     if key != "expanded" and outcome not in _IN_TREE_ARRAY_ROWS_DECLINED_SEEN:
         _IN_TREE_ARRAY_ROWS_DECLINED_SEEN.add(outcome)
-        logger.warning(
-            "in-tree FBBT array-row expansion (DISCOPT_IN_TREE_ARRAY_ROWS) %s; %s (#1568). "
-            "Sound -- a missing reduction, not a wrong bound.",
-            outcome,
-            "those rows kept their proxy (hull) form"
+        # DEBUG, not WARNING: with the expansion default-ON (#1568 graduation) a
+        # model holding an operation with no per-element form (``maximum``,
+        # ``minimum``, ``norm1``, ``sign``, ...) reaches this on every solve, and
+        # nothing is wrong -- those rows simply keep the pre-#1568 aggregate form.
+        # A whole-view decline (the 250k-instruction budget) loses every row's
+        # expansion, so it gets INFO. The kernel's reason names internal
+        # expression-node ids; strip them.
+        reason = _re.sub(r"node \d+: ", "", outcome.partition(":")[2].strip())
+        logger.log(
+            logging.INFO if key == "declined" else logging.DEBUG,
+            "Per-node bound tightening %s: %s. Those constraints are tightened in "
+            "their aggregate (whole-array) form -- a weaker reduction, never a wrong "
+            "bound (#1568; DISCOPT_IN_TREE_ARRAY_ROWS).",
+            "could not split some array-valued constraints into per-element rows"
             if key == "partial"
-            else "the proxy view ran instead",
+            else "kept every array-valued constraint in aggregate form",
+            reason,
         )
 
 

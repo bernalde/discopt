@@ -10,6 +10,8 @@ expands each array row into one scalar row per element.
 
 from __future__ import annotations
 
+import re
+
 import discopt.modeling as dm
 import numpy as np
 import pytest
@@ -272,3 +274,175 @@ def test_on_box_is_never_looser_than_off_and_keeps_every_feasible_point():
         checks += 4 * pt.size
     assert checks == 80 * 4 * 22
     assert strictly_tighter > 0  # the comparison is not vacuous
+
+
+def _op_cases():
+    """Array-row shapes beyond the sigmoid layer, each as ``(name, build, sample)``.
+
+    ``build()`` returns a model whose rows are ``out == expr`` over array
+    variables; ``sample(rng)`` returns a FEASIBLE point as ``{name: array}``
+    (inputs drawn in their bounds, outputs computed forward). Outputs get wide
+    bounds so the drawn point is always inside the root box.
+    """
+    rng0 = np.random.default_rng(7)
+    a = rng0.normal(size=(3, 4))
+    c = rng0.normal(size=2)
+    w = rng0.normal(size=(3, 2))
+    big = 50.0
+
+    def matmul():
+        m = dm.Model("matmul")
+        x = m.continuous("x", shape=(4,), lb=-1, ub=1)
+        y = m.continuous("y", shape=(3,), lb=-big, ub=big)
+        m.subject_to(y - a @ x == 0)
+        m.minimize(dm.sum(y))
+        return m
+
+    def matmul_sample(rng):
+        x = rng.uniform(-1, 1, 4)
+        return {"x": x, "y": a @ x}
+
+    def matvec_var():
+        m = dm.Model("matvec_var")
+        xm = m.continuous("X", shape=(3, 2), lb=-1, ub=1)
+        y = m.continuous("y", shape=(3,), lb=-big, ub=big)
+        m.subject_to(y - xm @ c == 0)
+        m.minimize(dm.sum(y))
+        return m
+
+    def matvec_var_sample(rng):
+        xm = rng.uniform(-1, 1, (3, 2))
+        return {"X": xm, "y": xm @ c}
+
+    def slicing():
+        m = dm.Model("slicing")
+        x = m.continuous("x", shape=(5,), lb=-1, ub=2)
+        y = m.continuous("y", shape=(3,), lb=-big, ub=big)
+        m.subject_to(y - x[1:4] * x[0:3] == 0)
+        m.minimize(dm.sum(y))
+        return m
+
+    def slicing_sample(rng):
+        x = rng.uniform(-1, 2, 5)
+        return {"x": x, "y": x[1:4] * x[0:3]}
+
+    def broadcast():
+        m = dm.Model("broadcast")
+        u = m.continuous("u", shape=(3,), lb=-1, ub=1)
+        xm = m.continuous("X", shape=(3, 2), lb=0.5, ub=2)
+        ym = m.continuous("Y", shape=(3, 2), lb=-big, ub=big)
+        m.subject_to(ym - u[:, None] * xm == 0)
+        m.minimize(dm.sum(ym))
+        return m
+
+    def broadcast_sample(rng):
+        u = rng.uniform(-1, 1, 3)
+        xm = rng.uniform(0.5, 2, (3, 2))
+        return {"u": u, "X": xm, "Y": u[:, None] * xm}
+
+    def axis_sum():
+        m = dm.Model("axis_sum")
+        xm = m.continuous("X", shape=(3, 2), lb=-1, ub=1)
+        y = m.continuous("y", shape=(3,), lb=-big, ub=big)
+        m.subject_to(y - dm.sum(xm * w, axis=1) == 0)
+        m.minimize(dm.sum(y))
+        return m
+
+    def axis_sum_sample(rng):
+        xm = rng.uniform(-1, 1, (3, 2))
+        return {"X": xm, "y": (xm * w).sum(axis=1)}
+
+    def partial_view():
+        # An expandable exp row next to a refused ``maximum`` row: per-row mode.
+        m = dm.Model("partial_view")
+        x = m.continuous("x", shape=(3,), lb=-1, ub=1)
+        y = m.continuous("y", shape=(3,), lb=-big, ub=big)
+        u = m.continuous("u", shape=(3,), lb=-2, ub=2)
+        v = m.continuous("v", shape=(3,), lb=-big, ub=big)
+        m.subject_to(y - dm.exp(x) * x == 0)
+        m.subject_to(v - dm.maximum(u, 0.5) == 0)
+        m.minimize(dm.sum(y) + dm.sum(v))
+        return m
+
+    def partial_view_sample(rng):
+        x = rng.uniform(-1, 1, 3)
+        u = rng.uniform(-2, 2, 3)
+        return {"x": x, "y": np.exp(x) * x, "u": u, "v": np.maximum(u, 0.5)}
+
+    return [
+        ("matmul", matmul, matmul_sample),
+        ("matvec_var", matvec_var, matvec_var_sample),
+        ("slicing", slicing, slicing_sample),
+        ("broadcast", broadcast, broadcast_sample),
+        ("axis_sum", axis_sum, axis_sum_sample),
+        ("partial_view", partial_view, partial_view_sample),
+    ]
+
+
+@pytest.mark.parametrize("case", _op_cases(), ids=lambda c: c[0])
+def test_differential_bound_across_array_ops(case):
+    """§5 differential test beyond the sigmoid layer: matmul (constant and
+    variable matrix), slicing, broadcasting, axis sums, and a hybrid partial view.
+    Per random node box around a feasible point: ON box within OFF box, and the
+    point inside both (no valid point cut)."""
+    name, build, sample = case
+    m = build()
+    r = model_to_repr(m, getattr(m, "_builder", None))
+    root_lb, root_ub = _box(m)
+    rng = np.random.default_rng(sum(map(ord, name)))
+    checks = strictly_tighter = 0
+    n_boxes = 60
+    for _ in range(n_boxes):
+        pts = sample(rng)
+        pt = np.concatenate([np.ravel(np.asarray(pts[v.name], dtype=float)) for v in m._variables])
+        assert np.all(root_lb <= pt) and np.all(pt <= root_ub), name
+        lb = root_lb + (pt - root_lb) * rng.uniform(0, 1, size=pt.size)
+        ub = pt + (root_ub - pt) * rng.uniform(0, 1, size=pt.size)
+        off = r.in_tree_presolve(lb.copy(), ub.copy(), 0, 1, expand_array_rows=False)
+        on = r.in_tree_presolve(lb.copy(), ub.copy(), 0, 1, expand_array_rows=True)
+        if name == "partial_view":
+            assert str(on["array_rows"]).startswith("partial:"), on["array_rows"]
+        else:
+            assert on["array_rows"] == "expanded", (name, on["array_rows"])
+        assert not off["infeasible"] and not on["infeasible"], name
+        on_lb, on_ub = np.asarray(on["lb"]), np.asarray(on["ub"])
+        off_lb, off_ub = np.asarray(off["lb"]), np.asarray(off["ub"])
+        assert np.all(on_lb >= off_lb - 1e-9) and np.all(on_ub <= off_ub + 1e-9), name
+        assert np.all(on_lb <= pt + 1e-7) and np.all(pt <= on_ub + 1e-7), name
+        assert np.all(off_lb <= pt + 1e-7) and np.all(pt <= off_ub + 1e-7), name
+        strictly_tighter += int(np.any(on_lb > off_lb + 1e-9) or np.any(on_ub < off_ub - 1e-9))
+        checks += 6 * pt.size
+    assert checks == n_boxes * 6 * len(root_lb)
+    assert strictly_tighter > 0, name  # the expansion actually changed something
+
+
+def test_unexpandable_row_default_solve_emits_no_warning(monkeypatch, caplog):
+    """Default-ON: a model with a row ``expand`` refuses (``maximum``) must not
+    WARN on an ordinary solve -- it is a missing reduction, not a fault -- and the
+    note it does log names no internal expression-node id."""
+    import logging
+
+    import discopt.solver as S
+
+    monkeypatch.delenv(FLAG, raising=False)
+    S._IN_TREE_ARRAY_ROWS_DECLINED_SEEN.clear()
+    m = dm.Model("max_row")
+    x = m.continuous("x", shape=(3,), lb=-2, ub=2)
+    y = m.continuous("y", shape=(3,), lb=-10, ub=10)
+    m.subject_to(y - dm.maximum(x, 0.5) == 0)
+    m.subject_to(dm.sum(x * x) >= 1.0)
+    m.minimize(dm.sum(y) + dm.sum(x * x))
+    with caplog.at_level(logging.DEBUG):
+        res = m.solve(time_limit=20)
+    assert res.objective is not None
+    ours = [rec for rec in caplog.records if "DISCOPT_IN_TREE_ARRAY_ROWS" in rec.getMessage()]
+    assert ours, "the partial-expansion note was never logged: the refused row never ran"
+    for rec in ours:
+        assert rec.levelno < logging.WARNING, rec.getMessage()
+        assert not re.search(r"node \d+", rec.getMessage()), rec.getMessage()
+    warned = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING and "array" in rec.getMessage().lower()
+    ]
+    assert not warned, warned

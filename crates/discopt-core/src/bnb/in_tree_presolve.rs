@@ -498,7 +498,9 @@ pub fn scalarize_for_fbbt(model: &ModelRepr) -> Result<ScalarFbbtView, String> {
 
 /// `DISCOPT_IN_TREE_ARRAY_ROWS` -- **default ON** since the #1568 graduation
 /// panel (CLAUDE.md §5); `=0` (or `false`/`off`/`no`) is the opt-out and
-/// restores the legacy proxy view exactly.
+/// restores the legacy proxy view exactly. Every other value -- unset, empty,
+/// `1`, or anything unrecognised -- means ON: only an explicit opt-out turns the
+/// expansion off, so a typo cannot silently disable it.
 ///
 /// ON: [`run_in_tree_presolve_scalar`] hands FBBT [`expand_rows_for_fbbt`]'s
 /// view, in which every array-valued constraint row is one scalar row per
