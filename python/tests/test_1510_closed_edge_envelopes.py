@@ -1,19 +1,21 @@
-"""Closed lower domain edge envelopes for asin/acos/acosh (issue #1510, item 3).
+"""Closed lower domain edge envelopes for asin/acos/acosh (issue #1510, item 3),
+extended to xlogx/entropy and sqrt (#1242).
 
 ``uniform_relax._UNIVARIATE_FN``'s domain guard admitted ``hi = +1`` for
 ``asin``/``acos`` but demanded ``lo > -1`` (and ``lo > 1`` for ``acosh``), so a box
 whose argument starts exactly at the closed lower edge -- the box holding an edge
 optimum (#1492) -- got no envelope at all, only the aux column's interval floor.
 ``DISCOPT_CLOSED_EDGE_ENVELOPES`` admits the edge (an outward-rounded ``lo``
-within 1e-12 below it reads as the edge); it graduated default-ON, and ``=0``
+within the argument's rounding scale -- at least 1e-12 -- below it reads as the
+edge); it graduated default-ON, and ``=0``
 keeps the legacy interval floor. This file locks the CLAUDE.md section-5
 properties for that bound-changing gate:
 
 1. **Unset is ON**, ``=0`` is the legacy path, and the flag is a no-op on a box
    that does not touch an edge (or reaches genuinely outside the domain).
-2. **Soundness -- no feasible point is cut**: every row of the flag-ON relaxation
-   holds at the exact lifted graph point ``(t, f(t))``, densely sampled over the
-   box including the edge itself.
+2. **Soundness -- no feasible point is cut**: every row AND column bound of the
+   flag-ON relaxation holds at the exact lifted graph point ``(t, f(t))``,
+   densely sampled over the box including the edge itself.
 3. **Differential bound**: over a sweep of objective directions, flag-ON bound
    ``>=`` flag-OFF bound AND ``<=`` the true optimum over the same fixed box, with
    at least one direction strictly improved (the gate is not a no-op).
@@ -34,6 +36,17 @@ pytestmark = [pytest.mark.relaxation]
 
 FLAG = "DISCOPT_CLOSED_EDGE_ENVELOPES"
 
+
+def _xlogx_np(t):
+    """``t ln t`` with its continuous extension ``0`` at ``t = 0`` (nan below)."""
+    t = np.asarray(t, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(t == 0.0, 0.0, t * np.log(t))
+
+
+#: The lower bound interval arithmetic gives ``1 - y`` over ``y in [0, 1]``.
+_AFFINE_ROUNDED_ZERO = 1.0 + np.nextafter(-1.0, -2.0)
+
 #: ``(label, atom, numpy f, lo, hi)`` -- boxes that START at a closed lower edge.
 EDGE_CASES = [
     ("asin[-1,0]", dm.asin, np.arcsin, -1.0, 0.0),
@@ -47,6 +60,23 @@ EDGE_CASES = [
     # edge (``asin(x - 1)`` over ``x in [0, 1]``); read as the edge.
     ("asin[-1-ulp,0]", dm.asin, np.arcsin, np.nextafter(-1.0, -2.0), 0.0),
     ("acosh[1-ulp,2]", dm.acosh, np.arccosh, np.nextafter(1.0, 0.0), 2.0),
+    # #1242: ``xlogx`` (the ``entropy`` atom) is finite at its closed edge 0
+    # (``0 ln 0 = 0``) but ``dom_ok`` demanded ``lo > 0``; and ``1 - y`` over
+    # ``y in [0, 1]`` arrives as ``lo = -2.2e-16`` (``-1 * [0, 1]`` is rounded
+    # outward), which also defeated ``sqrt``'s ``lo >= 0``.
+    ("xlogx[0,1]", dm.xlogx, _xlogx_np, 0.0, 1.0),
+    ("xlogx[0,0.2]", dm.xlogx, _xlogx_np, 0.0, 0.2),
+    ("xlogx[0,1e-6]", dm.xlogx, _xlogx_np, 0.0, 1e-6),
+    ("xlogx[-2.2e-16,1]", dm.xlogx, _xlogx_np, _AFFINE_ROUNDED_ZERO, 1.0),
+    ("xlogx[-ulp,3]", dm.xlogx, _xlogx_np, np.nextafter(0.0, -1.0), 3.0),
+    ("sqrt[-2.2e-16,1]", dm.sqrt, np.sqrt, _AFFINE_ROUNDED_ZERO, 1.0),
+    ("sqrt[-ulp,4]", dm.sqrt, np.sqrt, np.nextafter(0.0, -1.0), 4.0),
+    # #1242 review: the rounding error scales with the argument. ``K - K*y`` at
+    # ``K = 1e4`` arrives as ``lo = -1.8e-12`` (``-1.2e-10`` at ``1e6``), past an
+    # absolute 1e-12, so the tolerance is the argument's own rounding scale.
+    ("xlogx[-1.8e-12,1e4]", dm.xlogx, _xlogx_np, -1.8e-12, 1e4),
+    ("sqrt[-1.2e-10,1e6]", dm.sqrt, np.sqrt, -1.2e-10, 1e6),
+    ("acosh[1-1.2e-10,1e6]", dm.acosh, np.arccosh, 1.0 - 1.2e-10, 1e6),
 ]
 
 #: Boxes where the flag must change nothing: interior boxes, the already-admitted
@@ -62,6 +92,16 @@ NOOP_CASES = [
     ("acos[-0.5,1]", dm.acos, np.arccos, -0.5, 1.0),
     ("acosh[1.5,3]", dm.acosh, np.arccosh, 1.5, 3.0),
     ("acosh[0.999,2]", dm.acosh, np.arccosh, 0.999, 2.0),
+    # sqrt's exact edge was already admitted; a box genuinely below 0 keeps the floor.
+    ("sqrt[0,1]", dm.sqrt, np.sqrt, 0.0, 1.0),
+    ("sqrt[-1e-9,1]", dm.sqrt, np.sqrt, -1e-9, 1.0),
+    ("xlogx[-1e-9,1]", dm.xlogx, _xlogx_np, -1e-9, 1.0),
+    ("xlogx[0.1,2]", dm.xlogx, _xlogx_np, 0.1, 2.0),
+    # ...but a rounding-SCALED tolerance is still a rounding tolerance: these sit
+    # ~1000x further below the edge than evaluating the argument could round.
+    ("xlogx[-1e-9,1e4]", dm.xlogx, _xlogx_np, -1e-9, 1e4),
+    ("sqrt[-1e-6,1e6]", dm.sqrt, np.sqrt, -1e-6, 1e6),
+    ("acosh[1-1e-6,1e6]", dm.acosh, np.arccosh, 1.0 - 1e-6, 1e6),
 ]
 
 
@@ -180,6 +220,9 @@ def test_no_graph_point_is_cut(flag, label, atom, fnp, lo, hi):
     for k in range(1, 40):
         d = 0.5 * 2.0**-k
         ts += [lo + d * (hi - lo), hi - d * (hi - lo)]
+    # The column bounds are part of the relaxation too: ``_pin_closed_edge_aux``
+    # (#1242) narrows the aux column, so a graph point must also lie inside them.
+    bnds = np.asarray(rel.model._bounds, dtype=float)
     checked = 0
     for t in ts:
         if not (lo <= t <= hi):
@@ -188,9 +231,13 @@ def test_no_graph_point_is_cut(flag, label, atom, fnp, lo, hi):
             fval = float(fnp(t))
         if not np.isfinite(fval):
             continue
-        resid = A @ _graph_point(rel, t, fval) - b
+        z = _graph_point(rel, t, fval)
+        resid = A @ z - b
         viol = float(np.max(resid / np.maximum(1.0, np.abs(b))))
         assert viol <= 1e-9, f"{label}: graph point t={t!r} cut by {viol:.3e}"
+        slack = 1e-9 * np.maximum(1.0, np.abs(z))
+        assert np.all(z >= bnds[:, 0] - slack), f"{label}: t={t!r} below a column bound"
+        assert np.all(z <= bnds[:, 1] + slack), f"{label}: t={t!r} above a column bound"
         checked += 1
     assert checked >= 400, f"{label}: only {checked} graph points evaluated"
 
@@ -200,9 +247,14 @@ def test_bound_tightens_and_never_crosses(flag, label, atom, fnp, lo, hi):
     """``bound_ON >= bound_OFF`` and ``bound_ON <= true box optimum`` over 32
     normalized objective directions; at least one direction strictly improves."""
     # The graph over the DOMAIN part of the box (an outward-rounded ``lo`` one ulp
-    # outside it has no graph point there).
+    # outside it has no graph point there). ``round(lo, 6)`` is the edge itself
+    # (every edge here is an integer, and every edge case's ``lo`` is within
+    # rounding of it), which a grid from a ``lo`` that sits outside would otherwise
+    # step over.
     with np.errstate(invalid="ignore"):
-        grid = np.append(np.linspace(lo, hi, 200001), np.nextafter(lo, hi))
+        grid = np.append(
+            np.linspace(lo, hi, 200001), [np.nextafter(lo, hi), float(np.round(lo, 6))]
+        )
         fv = fnp(grid)
     keep = np.isfinite(fv)
     grid, fv = grid[keep], fv[keep]
@@ -253,3 +305,80 @@ def test_affine_argument_reaching_the_edge_is_enveloped(flag):
     opt = -math.pi / 2
     assert a1.shape[0] > a0.shape[0]
     assert off - 1e-9 <= on <= opt + 1e-9, (off, on, opt)
+
+
+@pytest.mark.parametrize(
+    "label,atom,true_min",
+    [("xlogx(1-y)", dm.xlogx, -1.0 / np.e), ("sqrt(1-y)", dm.sqrt, 0.0)],
+)
+def test_root_lp_of_an_affine_edge_argument_is_bounded(flag, label, atom, true_min):
+    """#1242: ``min atom(1 - y)`` over ``y in [0, 1]``. The argument's interval is
+    ``[-2.2e-16, 1 + 2.2e-16]``; without the edge the atom got no envelope AND an
+    unbounded aux column, the root LP came back ``unbounded``, and the solver
+    dropped the McCormick relaxer for the WHOLE tree (``_mc_mode = "none"``) --
+    the entropy acceptance solve then converged only first-order and could not
+    certify to 1e-9. With the edge the aux column is also pinned to the image of
+    the clamped argument, so the safe LP bound certifies."""
+    from discopt._relax.mccormick_lp import MccormickLPRelaxer
+
+    def solve():
+        m = dm.Model()
+        y = m.continuous("y", lb=0.0, ub=1.0)
+        m.minimize(atom(1 - y))
+        return MccormickLPRelaxer(m).solve_at_node(np.array([0.0]), np.array([1.0]))
+
+    flag("0")
+    off = solve()
+    flag(None)
+    on = solve()
+    assert off.status != "optimal" and off.lower_bound is None, (off.status, off.lower_bound)
+    assert on.status == "optimal", on.status
+    assert on.lower_bound is not None and np.isfinite(on.lower_bound)
+    assert on.lower_bound <= true_min + 1e-12, (on.lower_bound, true_min)
+    assert on.lower_bound >= true_min - 1e-9, "edge envelope bound is needlessly loose"
+
+
+@pytest.mark.parametrize("K", [1e4, 1e6])
+@pytest.mark.parametrize(
+    "label,build,true_min",
+    [
+        ("xlogx(K-K*y)", lambda y, K: dm.xlogx(K - K * y), -1.0 / np.e),
+        ("sqrt(K-K*y)", lambda y, K: dm.sqrt(K - K * y), 0.0),
+        ("acosh(1+K-K*y)", lambda y, K: dm.acosh(1 + K - K * y), 0.0),
+        ("asin(y-1) via K", lambda y, K: dm.asin((K * y - K) / K), -np.pi / 2),
+    ],
+)
+def test_root_lp_of_a_scaled_edge_argument_is_bounded(flag, K, label, build, true_min):
+    """#1242 review: outward rounding of ``K - K*y`` is ``O(K * eps)`` below the
+    edge (``-1.8e-12`` at ``K = 1e4``, ``-1.2e-10`` at ``1e6``). An absolute 1e-12
+    clamp tolerance declined it and the root LP came back unbounded again; the
+    tolerance now scales with the argument's own rounding."""
+    from discopt._relax.mccormick_lp import MccormickLPRelaxer
+
+    flag(None)
+    m = dm.Model()
+    y = m.continuous("y", lb=0.0, ub=1.0)
+    m.minimize(build(y, K))
+    on = MccormickLPRelaxer(m).solve_at_node(np.array([0.0]), np.array([1.0]))
+    assert on.status == "optimal", (label, K, on.status)
+    assert on.lower_bound is not None and np.isfinite(on.lower_bound)
+    assert on.lower_bound <= true_min + 1e-12, (on.lower_bound, true_min)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("K", [1e4, 1e6])
+def test_scaled_binary_mixture_certifies(flag, K):
+    """End to end: ``min xlogx(K y) + xlogx(K - K y) + 3K y (1 - y)`` certifies at
+    ``K = 1e4`` and ``1e6`` with a bound at or below the true optimum (from a dense
+    grid; the optimum is interior, so the grid minimum is within 1e-6 relative)."""
+    flag(None)
+    m = dm.Model()
+    y = m.continuous("y", lb=0.0, ub=1.0)
+    m.minimize(dm.xlogx(K * y) + dm.xlogx(K - K * y) + 3 * K * y * (1 - y))
+    res = m.solve(time_limit=120)
+    g = np.linspace(0.0, 1.0, 4_000_001)
+    opt = float(np.min(_xlogx_np(K * g) + _xlogx_np(K - K * g) + 3 * K * g * (1 - g)))
+    assert res.status == "optimal", res.status
+    assert res.bound is not None and np.isfinite(res.bound)
+    assert res.bound <= opt + 1e-7 * (1 + abs(opt)), (res.bound, opt)
+    assert abs(res.objective - opt) <= 1e-4 * (1 + abs(opt)), (res.objective, opt)

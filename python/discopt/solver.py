@@ -573,6 +573,10 @@ _POUNCE_BATCH_MIN_VARS = 50
 # budget. Nodes that start fully past the deadline are skipped (see the serial
 # loop), so at most one node per batch can overrun by this floor.
 _DEADLINE_NODE_FLOOR_S = 0.1
+
+#: Wall budget of the in-loop incumbent-cutoff OBBT (Phase C), clamped to the
+#: remaining ``time_limit`` at the call site (#1565).
+_PERIODIC_OBBT_BUDGET_S = 5.0
 # Dense-Jacobian compilation guard. ``NLPEvaluator.evaluate_jacobian`` uses
 # ``jax.jit(jax.jacfwd(...))`` — a forward-mode dense Jacobian whose compiled XLA
 # program replicates the whole constraint system once per input variable. For a
@@ -6078,6 +6082,28 @@ def _gap_converged(tree, gap_tolerance: float, abs_gap_tol: float = _DEFAULT_ABS
     return _gap_values_converged(ub, lb, gap_tolerance, abs_gap_tol)
 
 
+def _tree_drained(tree) -> bool:
+    """Whether the tree has no open node left -- the EXHAUSTION half of
+    ``tree.is_finished()`` only.
+
+    ``TreeManager::is_finished`` (``tree_manager.rs``) is also true when the tree's
+    own relative gap ``(inc - glb) / max(1, |inc|)`` drops below a hard-coded
+    ``1e-8``, with nodes still open. That shortcut ignores the caller's
+    ``gap_tolerance``/``abs_gap_tolerance``: a solve asking for ``1e-9`` stopped at a
+    gap of 3.8e-9 (#1242's entropy acceptance model, 79 nodes, 4 still open), and
+    :func:`_tree_exhausted_with_proof` then read the stopped tree as an EXHAUSTED one
+    and labelled it ``optimal`` -- a certificate only #1383's final re-check
+    withdrew. At any tolerance ``>= 1e-8`` (the defaults are ``1e-4``/``1e-6``)
+    :func:`_gap_converged` fires on every state the shortcut does, so the loops
+    are unchanged there; below it the caller's tolerance is now the one obeyed.
+
+    The loops call this after ``process_evaluated``, so ``pending_results`` is
+    empty and ``open_nodes == 0`` together with ``is_finished()`` is exactly the
+    Rust ``open_count() == 0 && pending_results.is_empty()`` arm.
+    """
+    return bool(tree.is_finished()) and int(tree.stats()["open_nodes"]) == 0
+
+
 def _tree_exhausted_with_proof(tree) -> bool:
     """``tree.is_finished()`` as an optimality proof, i.e. no unproven removal.
 
@@ -6093,7 +6119,7 @@ def _tree_exhausted_with_proof(tree) -> bool:
     The MILP driver applies the same rule (``milp_driver.rs``,
     ``decide_status``).
     """
-    if not tree.is_finished():
+    if not _tree_drained(tree):
         return False
     stats = tree.stats()
     if bool(stats.get("bound_unresolved", False)):
@@ -10918,7 +10944,9 @@ def solve_model(
             try:
                 from discopt._relax.symbolic.cut_recognizer import recognize_and_inject
 
-                _n_struct_cuts = recognize_and_inject(model)
+                # #1565: bounded by the solve clock. On expiry the recognizer
+                # raises before injecting anything, so the model is unchanged.
+                _n_struct_cuts = recognize_and_inject(model, deadline=_deadline_exhausted)
                 if _n_struct_cuts:
                     logger.info(
                         "Structure-cut presolve: injected %d square-difference-network "
@@ -10928,14 +10956,26 @@ def solve_model(
             except ImportError:
                 pass  # optional [sympy] extra not installed -> skip silently
             except Exception as _sc_exc:
-                # #1514: narrowed. The recognizer's documented declines are a model
-                # outside its translator (``SymbolicTranslationError``), a chain it
-                # cannot solve symbolically (``CutDerivationError``) and SymPy's own
-                # "cannot solve/derive" (``NotImplementedError``, which
-                # ``EnvelopeDerivationError`` subclasses). Anything else is a defect.
-                if not _structure_cut_declined(_sc_exc):
-                    raise
-                logger.debug("structure-cut presolve declined: %s", _sc_exc)
+                from discopt._relax.symbolic.cut_recognizer import RecognizerDeadline
+
+                if isinstance(_sc_exc, RecognizerDeadline):
+                    # #1565: abstention for want of time is logged, not silent
+                    # (the #1456 convention): the relaxation below is built
+                    # without whatever cuts the recognizer might have derived.
+                    logger.info(
+                        "structure-cut presolve abandoned: %s; no cuts injected, the "
+                        "model is unchanged (#1565)",
+                        _sc_exc,
+                    )
+                elif _structure_cut_declined(_sc_exc):
+                    # #1514: narrowed. The recognizer's documented declines are a
+                    # model outside its translator (``SymbolicTranslationError``),
+                    # a chain it cannot solve symbolically (``CutDerivationError``)
+                    # and SymPy's own "cannot solve/derive" (``NotImplementedError``,
+                    # which ``EnvelopeDerivationError`` subclasses).
+                    logger.debug("structure-cut presolve declined: %s", _sc_exc)
+                else:
+                    raise  # anything else is a defect (#1514)
 
     # G-convexity transformation-cut presolve (#181, DISCOPT_G_CONVEX_CUTS,
     # default-OFF). A *bound-changing* capability (CLAUDE.md §5): recognizes
@@ -13889,6 +13929,25 @@ def solve_model(
         # The convex NLP may fail to certify for two reasons handled here.
         from discopt._relax.factorable_reform import has_clearable_denominator
 
+        # #1565: the denominator clear below is the same per-constraint rewrite
+        # as the presolve factorable pass and is bounded by the same clock. On
+        # expiry it returns the model untouched (its "nothing to clear" answer),
+        # so this branch is not taken; the abstention is logged here because the
+        # once-per-solve presolve summary has already been written.
+        _clear_hook = _presolve_deadline.abandon_hook("factorable-clear")
+        _clear_logged: set[str] = set()
+
+        def _clear_expired() -> bool:
+            if not _clear_hook():
+                return False
+            if "factorable-clear" not in _clear_logged:
+                _clear_logged.add("factorable-clear")
+                logger.info(
+                    "denominator clearing abandoned mid-traversal: time limit spent; "
+                    "the model is left unchanged (#1565)"
+                )
+            return True
+
         if _model_contains_nonsmooth_node(model):
             # (1) Non-smooth objective/constraints (abs/min/max): a smooth
             # gradient-based solver oscillates at the kink (e.g. min |x| over
@@ -13906,7 +13965,8 @@ def solve_model(
             _pure_continuous_force_spatial = True
             # Fall through to the spatial B&B below.
         elif has_clearable_denominator(model) and (
-            (cleared := factorable_reformulate(model, clear_only=True)) is not model
+            (cleared := factorable_reformulate(model, clear_only=True, deadline=_clear_expired))
+            is not model
         ):
             # (2) An ill-conditioned division whose denominator reaches toward
             # zero (like st_e17's 0.2458*x0**2/x1 with x1 down to 1e-5). If the
@@ -18847,7 +18907,14 @@ def solve_model(
         # --- Periodic OBBT with incumbent cutoff (Phase C) ---
         # When a new incumbent is found and bounds are still wide,
         # re-run OBBT with the incumbent objective as a cutoff.
-        if _incumbent_improved and n_vars <= 200:
+        # #1565: the phase's 5 s budget is clamped to what is left of ``time_limit``
+        # and the phase is not launched once the budget is spent. Before this the
+        # deadline was ``now + 5.0`` regardless of the clock, so an incumbent found
+        # just before the limit let this phase run up to 5 s past it (measured: an
+        # OMLT reduced-space net at ``time_limit=30`` returned at 35.4 s). Skipping or
+        # shortening OBBT only forgoes a tightening -- the box stays valid.
+        _pc_budget = min(_PERIODIC_OBBT_BUDGET_S, _remaining_budget())
+        if _incumbent_improved and n_vars <= 200 and _pc_budget > _DEADLINE_NODE_FLOOR_S:
             incumbent_info = tree.incumbent()
             if incumbent_info is not None:
                 inc_sol, inc_obj = incumbent_info
@@ -18869,7 +18936,7 @@ def solve_model(
                         ub=np.array(ub),
                         rounds=2,
                         incumbent_cutoff=float(inc_obj),
-                        deadline=_role2_deadline(time.perf_counter() + 5.0),
+                        deadline=_role2_deadline(time.perf_counter() + _pc_budget),
                         time_limit_per_lp=0.1,
                         prefer_pounce=nlp_solver == "pounce",
                     )
@@ -19124,7 +19191,7 @@ def solve_model(
         iteration += 1
 
         # Check termination
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -22705,7 +22772,7 @@ def _solve_nlp_bb(
         iteration += 1
 
         # Check termination
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -30551,7 +30618,7 @@ def _solve_milp_bb(
                     _root_glb_rigorous = _root_glb_internal
 
         iteration += 1
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break
@@ -31449,7 +31516,7 @@ def _solve_miqp_bb(
                     _root_glb_rigorous = _root_glb_internal
 
         iteration += 1
-        if tree.is_finished():
+        if _tree_drained(tree):
             break
         if _gap_converged(tree, gap_tolerance, abs_gap_tol):
             break

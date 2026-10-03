@@ -164,6 +164,45 @@ def div_up(a: float, b: float) -> float:
     return q if s is not None and s <= 0 else next_up(q)
 
 
+def _sqrt_err_sign(x: float, s: float) -> int | None:
+    """Sign of ``x - s*s`` for ``s = RN(sqrt(x))``; ``None`` when not decidable exactly.
+
+    ``s*s = p + e`` exactly (TwoProduct) and ``x - p`` is exact (Sterbenz: ``p`` is
+    within a factor two of ``x``), so ``x - s*s = (x - p) - e`` is computed exactly.
+    """
+    p = s * s
+    e = _prod_err(s, s, p)
+    if e is None:
+        return None
+    r = (x - p) - e
+    if r == 0.0:
+        return 0
+    return 1 if r > 0.0 else -1
+
+
+def sqrt_down(x: float) -> float:
+    """``sqrt(x)`` rounded toward ``-inf`` (``x >= 0``); mirrors ``directed.rs``."""
+    s = math.sqrt(x)
+    if not math.isfinite(s) or x == 0.0:
+        return s
+    sign = _sqrt_err_sign(x, s)
+    if sign is None:
+        return max(next_down(s), 0.0)
+    # x - s*s < 0 means s overshoots the true root.
+    return next_down(s) if sign < 0 else s
+
+
+def sqrt_up(x: float) -> float:
+    """``sqrt(x)`` rounded toward ``+inf`` (``x >= 0``); mirrors ``directed.rs``."""
+    s = math.sqrt(x)
+    if not math.isfinite(s) or x == 0.0:
+        return s
+    sign = _sqrt_err_sign(x, s)
+    if sign is None:
+        return next_up(s)
+    return next_up(s) if sign > 0 else s
+
+
 def lib_down(v: float) -> float:
     """Widen a libm result down by :data:`LIB_ULPS` ulps plus one (non-finite passes)."""
     if not math.isfinite(v):

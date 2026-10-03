@@ -65,6 +65,7 @@ from discopt.mpec import carry_complementarities
 
 from .gdp_reformulate import (
     _bound_expression,
+    _BoundMemo,
     _collect_variables,
     _is_linear,
     bound_expression_error,
@@ -220,26 +221,47 @@ def _liftable_call_power_base(expr: Expression, model: Model) -> tuple[FunctionC
 _DEEP_RECURSION_SIZE_GATE = 700
 
 
+def _expr_node_count_children(node: Expression) -> tuple[Expression, ...]:
+    if isinstance(node, BinaryOp):
+        return (node.left, node.right)
+    if isinstance(node, UnaryOp):
+        return (node.operand,)
+    if isinstance(node, FunctionCall):
+        return tuple(node.args)
+    if isinstance(node, SumExpression):
+        return (node.operand,)
+    if isinstance(node, SumOverExpression):
+        return tuple(node.terms)
+    return ()
+
+
 def _expr_node_count(expr: Expression) -> int:
     """Count the nodes in *expr* iteratively (so this measurement never itself
-    recurses into the very depth it is trying to size)."""
-    count = 0
-    stack: list[Expression] = [expr]
+    recurses into the very depth it is trying to size).
+
+    The count is of the expression *as a tree* (a shared subexpression counts
+    once per occurrence), which is what the recursion-headroom gates were sized
+    against. #1565: it is computed bottom-up over the DAG -- ``size(n) = 1 +
+    sum(size(child))``, memoised by node identity -- instead of by visiting every
+    occurrence, which was exponential on a reduced-space NN embedding. Same
+    number, linear time.
+    """
+    sizes: dict[int, int] = {}
+    held: list[Expression] = []  # keep every sized node alive: ids cannot recycle
+    stack: list[tuple[Expression, bool]] = [(expr, False)]
     while stack:
-        node = stack.pop()
-        count += 1
-        if isinstance(node, BinaryOp):
-            stack.append(node.left)
-            stack.append(node.right)
-        elif isinstance(node, UnaryOp):
-            stack.append(node.operand)
-        elif isinstance(node, FunctionCall):
-            stack.extend(node.args)
-        elif isinstance(node, SumExpression):
-            stack.append(node.operand)
-        elif isinstance(node, SumOverExpression):
-            stack.extend(node.terms)
-    return count
+        node, expanded = stack.pop()
+        nid = id(node)
+        if nid in sizes:
+            continue
+        children = _expr_node_count_children(node)
+        if not expanded and children:
+            stack.append((node, True))
+            stack.extend((c, False) for c in children if id(c) not in sizes)
+            continue
+        sizes[nid] = 1 + sum(sizes[id(c)] for c in children)
+        held.append(node)
+    return sizes[id(expr)]
 
 
 def _max_expr_node_count(model: Model) -> int:
@@ -419,12 +441,43 @@ def _structural_key(expr: Expression, pins: list) -> tuple:
     return walk(expr)
 
 
+class _LiftAbandoned(Exception):
+    """The solve clock ran out inside one constraint's lift (#1565).
+
+    Private to this module: raised only by :meth:`_Lifter.tick` and caught only
+    by :func:`_factorable_reformulate_inner`, which then discards everything the
+    lifter built and returns the model it was given -- the same wholesale
+    abandonment the per-constraint #1456 check performs, reached from deeper in
+    the traversal. It is never a defect signal, so catching it hides nothing.
+    """
+
+
+# How many lift-walker visits pass between two consultations of the deadline.
+# The walkers are cheap per visit; the expensive steps (a convexity
+# classification, an aux bound) consult it unconditionally.
+_LIFT_DEADLINE_STRIDE = 256
+
+
 class _Lifter:
     """Allocates monomial auxiliary variables ``w == leaf**k`` on *model*,
     deduplicating by (flat_index, exponent)."""
 
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, deadline: Optional[Callable[[], bool]] = None):
         self.model = model
+        # #1565: the #1456 deadline, consulted *inside* a constraint's lift. A
+        # single reduced-space NN constraint can hold the whole network, so a
+        # per-constraint check alone cannot stop a lift that never reaches the
+        # next constraint.
+        self._deadline = deadline
+        self._ticks = 0
+        # #1565: ``_should_lift_call_arg`` per call node, keyed by ``id`` and
+        # holding the node so the id cannot be recycled while the lifter lives.
+        # The verdict reads only the node and the bounds of the variables in it,
+        # neither of which the lift changes, so a memo hit returns exactly what
+        # a recomputation would.
+        self._call_arg_memo: dict[int, tuple[Expression, Expression | None]] = {}
+        # #1565: ``_scan_for_liftable_call_power`` verdicts (pure, node-held).
+        self.call_power_memo: dict[int, tuple[Expression, bool]] = {}
         self._cache: dict[tuple[int, int], Variable] = {}
         # Keyed by an EXACT structural key (:func:`_structural_key`), never a bare
         # ``id()`` of an expression node and never ``repr()``:
@@ -452,6 +505,26 @@ class _Lifter:
         # ``_lift_zero_spanning_factors_enabled``). Populated only when the flag
         # is on, so the default reform is byte-identical.
         self.zero_spanning_factor_auxes: set[str] = set()
+
+    def tick(self, *, force: bool = False) -> None:
+        """Charge one walker visit; raise :class:`_LiftAbandoned` once the clock
+        is spent. ``force`` consults the deadline now (before an expensive step)
+        rather than at the next stride boundary."""
+        if self._deadline is None:
+            return
+        self._ticks += 1
+        if (force or self._ticks % _LIFT_DEADLINE_STRIDE == 0) and self._deadline():
+            raise _LiftAbandoned(f"time limit spent after {self._ticks} lift visits")
+
+    def call_arg_to_lift(self, call: Expression) -> Expression | None:
+        """Memoised :func:`_should_lift_call_arg` (see ``_call_arg_memo``)."""
+        hit = self._call_arg_memo.get(id(call))
+        if hit is not None:
+            return hit[1]
+        self.tick(force=True)
+        arg = _should_lift_call_arg(call, self.model)
+        self._call_arg_memo[id(call)] = (call, arg)
+        return arg
 
     def monomial(self, leaf: Expression, flat_index: int, exp: int) -> Variable | None:
         """Return an aux variable equal to ``leaf**exp`` (creating it on first
@@ -504,6 +577,7 @@ class _Lifter:
         (:func:`_is_integer_valued_affine`), so the type is exact, never a
         restriction. A cached aux is returned as it was created.
         """
+        self.tick(force=True)
         key = (_structural_key(expr, self._key_pins), lb_floor)
         cached = self._expr_cache.get(key)
         if cached is not None:
@@ -778,6 +852,7 @@ def _prelift_blowup_products(expr: Expression, model: Model, lifter: "_Lifter") 
     integer-valued (``y - c`` with ``y`` integer, ``c`` integral) gets an
     ``INTEGER`` aux, so the lift keeps the integrality the factor had.
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
         translated = (
             expr.op == "*"
@@ -864,6 +939,12 @@ def _prelift_call_powers(expr: Expression, model: Model, lifter: "_Lifter") -> E
     dental power with a relaxable monomial.
     """
     if not _lift_loose_products_enabled():
+        return expr
+    lifter.tick()
+    # #1565: a subtree with no call power is returned unchanged by this walker
+    # (identity-preserving, no lifter call), so skipping it is exact -- and the
+    # memoised scan answers that once per shared node instead of once per path.
+    if not _scan_for_liftable_call_power(expr, model, lifter.call_power_memo):
         return expr
     if isinstance(expr, BinaryOp):
         call_power = _liftable_call_power_base(expr, model)
@@ -992,6 +1073,7 @@ def _lift_expr(expr: Expression, model: Model, lifter: _Lifter) -> Expression:
     to bilinear form via monomial aux variables.  Identity-preserving: returns
     the same object when nothing changed, so untouched subtrees are unaffected.
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
         if expr.op == "*":
             decomp = _decompose_poly_product(expr, model)
@@ -1042,7 +1124,7 @@ def _lift_expr(expr: Expression, model: Model, lifter: _Lifter) -> Expression:
         # which is feasibility-preserving and lets the univariate sqrt envelope
         # apply.  Gated by ``_should_lift_call_arg`` so a node already proven convex
         # (an affine 2-norm) keeps its tight envelope rather than being downgraded.
-        arg = _should_lift_call_arg(expr, model)
+        arg = lifter.call_arg_to_lift(expr)
         if arg is not None:
             lb_floor = 0.0 if expr.func_name == "sqrt" else None
             t = lifter.expression(distribute_products(arg), lb_floor=lb_floor)
@@ -1085,6 +1167,7 @@ def _lift_objective_atoms(expr: Expression, model: Model, lifter: "_Lifter") -> 
     interval (e.g. an unbounded variable), so the rewrite is never unsound — at
     worst the term stays dropped, exactly as before.
     """
+    lifter.tick()
     if isinstance(expr, BinaryOp):
         if (
             expr.op == "**"
@@ -1127,7 +1210,9 @@ def _lift_objective_atoms(expr: Expression, model: Model, lifter: "_Lifter") -> 
     return expr
 
 
-def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, float]:
+def _denominator_sign_slack(
+    denom: Expression, model: Model, memo: _BoundMemo | None = None
+) -> tuple[float, float]:
     """#1397: how much of each ``_bound_expression(denom)`` endpoint could be round-off.
 
     Returned as ``(lo_slack, hi_slack)`` in the denominator's own units so each adds
@@ -1148,28 +1233,48 @@ def _denominator_sign_slack(denom: Expression, model: Model) -> tuple[float, flo
     feasibility tolerance sound: an over-stated ``dmin`` would under-scale that body
     and let a gross violation slip under the tolerance.
     """
-    err_lo, err_hi = bound_expression_error(denom, model)
+    err_lo, err_hi = bound_expression_error(denom, model, memo)
     return (
         float(err_lo) if np.isfinite(err_lo) else np.inf,
         float(err_hi) if np.isfinite(err_hi) else np.inf,
     )
 
 
-def _find_clearable_denominator(expr: Expression, model: Model):
+def _find_clearable_denominator(
+    expr: Expression,
+    model: Model,
+    memo: _BoundMemo | None = None,
+    visited: dict[int, Expression] | None = None,
+):
     """Return the denominator ``D`` of the first division term ``N/D`` in
     *expr*'s additive structure whose ``D`` is non-constant and sign-definite
     over the variable box, as ``(D, sign, dmin)`` where ``sign`` is +1/-1 and
-    ``dmin = min |D|`` over the box.  ``None`` if no such division exists."""
+    ``dmin = min |D|`` over the box.  ``None`` if no such division exists.
+
+    #1565: linear in DAG size. *memo* shares every interval and interval error
+    across the denominators examined (and, from :func:`_clear_divisions`, across
+    its passes over one box). *visited* records each node already searched: the
+    search returns at the first hit, so a node seen before is one whose search
+    already came back ``None`` and would again -- skipping it is exact. It maps
+    ``id`` to the node itself so an address cannot be recycled mid-search.
+    """
+    if memo is None:
+        memo = _BoundMemo()
+    if visited is None:
+        visited = {}
+    if id(expr) in visited:
+        return None
+    visited[id(expr)] = expr
     if isinstance(expr, BinaryOp):
         if expr.op in ("+", "-"):
-            found = _find_clearable_denominator(expr.left, model)
+            found = _find_clearable_denominator(expr.left, model, memo, visited)
             if found is not None:
                 return found
-            return _find_clearable_denominator(expr.right, model)
+            return _find_clearable_denominator(expr.right, model, memo, visited)
         if expr.op == "/":
             d = expr.right
             if not isinstance(d, Constant):
-                lo, hi = _bound_expression(d, model)
+                lo, hi = _bound_expression(d, model, memo)
                 # #1397: ``_ZERO_MARGIN`` alone assumes ``lo``/``hi`` are exact.
                 # They are not -- ``_bound_expression`` is plain float interval
                 # arithmetic with no outward rounding -- and clearing a denominator
@@ -1182,15 +1287,15 @@ def _find_clearable_denominator(expr: Expression, model: Model):
                 # 1e-9 margin, while its true infimum is ``-0.5``; the gate cleared
                 # it at every M from 1e16 to 1e18. An O(1) denominator is
                 # unaffected: its error is 0.0 (declared bounds are exact floats).
-                lo_slack, hi_slack = _denominator_sign_slack(d, model)
+                lo_slack, hi_slack = _denominator_sign_slack(d, model, memo)
                 if lo > _ZERO_MARGIN + lo_slack:
                     return d, 1, lo - lo_slack
                 if hi < -_ZERO_MARGIN - hi_slack:
                     return d, -1, -hi - hi_slack
             # Search the numerator for a nested division.
-            return _find_clearable_denominator(expr.left, model)
+            return _find_clearable_denominator(expr.left, model, memo, visited)
     if isinstance(expr, UnaryOp) and expr.op == "neg":
-        return _find_clearable_denominator(expr.operand, model)
+        return _find_clearable_denominator(expr.operand, model, memo, visited)
     return None
 
 
@@ -1235,8 +1340,12 @@ def _clear_divisions(body: Expression, sense: str, model: Model):
     ever makes the feasibility test stricter, never looser.
     """
     scale = 1.0
+    # #1565: one interval memo for every pass. The box is fixed for the whole
+    # call (clearing builds expressions; it never touches a variable bound), and
+    # the nodes a later pass bounds are the same objects an earlier pass did.
+    memo = _BoundMemo()
     for _ in range(8):  # bounded: each pass clears one denominator family
-        found = _find_clearable_denominator(body, model)
+        found = _find_clearable_denominator(body, model, memo)
         if found is None:
             break
         denom, sign, dmin = found
@@ -1412,22 +1521,38 @@ def _scan_for_liftable_call(expr: Expression, model: Model) -> bool:
     return False
 
 
-def _scan_for_liftable_call_power(expr: Expression, model: Model) -> bool:
+def _scan_for_liftable_call_power(
+    expr: Expression, model: Model, memo: dict[int, tuple[Expression, bool]] | None = None
+) -> bool:
     """True if *expr* contains an integer power ``g(x)**n`` (n >= 2) of a univariate
     transcendental call — the TD-A lift target. Scans the *pre-distribute* tree
     (``distribute_products`` would collapse ``g(x)**2`` into ``g·g`` and hide it).
+
+    #1565: memoised by node identity (the node is held, so its ``id`` cannot be
+    recycled), so a shared subexpression is scanned once. The verdict is a pure
+    function of the node, so a memo hit is exactly the recomputed answer. It
+    descends the same edges ``_prelift_call_powers`` does, which is what lets that
+    walker skip a subtree this scan clears.
     """
+    if memo is None:
+        memo = {}
+    hit = memo.get(id(expr))
+    if hit is not None:
+        return hit[1]
     if _liftable_call_power_base(expr, model) is not None:
-        return True
-    if isinstance(expr, BinaryOp):
-        return _scan_for_liftable_call_power(expr.left, model) or _scan_for_liftable_call_power(
-            expr.right, model
-        )
-    if isinstance(expr, UnaryOp):
-        return _scan_for_liftable_call_power(expr.operand, model)
-    if isinstance(expr, FunctionCall):
-        return any(_scan_for_liftable_call_power(a, model) for a in expr.args)
-    return False
+        found = True
+    elif isinstance(expr, BinaryOp):
+        found = _scan_for_liftable_call_power(
+            expr.left, model, memo
+        ) or _scan_for_liftable_call_power(expr.right, model, memo)
+    elif isinstance(expr, UnaryOp):
+        found = _scan_for_liftable_call_power(expr.operand, model, memo)
+    elif isinstance(expr, FunctionCall):
+        found = any(_scan_for_liftable_call_power(a, model, memo) for a in expr.args)
+    else:
+        found = False
+    memo[id(expr)] = (expr, found)
+    return found
 
 
 def _scan_for_liftable_fractional_power(expr: Expression, model: Model) -> bool:
@@ -1948,9 +2073,10 @@ def _factorable_reformulate_inner(
     clear_only: bool = False,
     deadline: Optional[Callable[[], bool]] = None,
 ) -> Model:
-    # #1520: no except. Every decline is an explicit ``return model`` (no work, the
-    # deadline, the soundness gates); the old ``except Exception: return model``
-    # could only hide a defect in the rewrite as "nothing to reformulate".
+    # #1520: no catch-all. Every decline is an explicit ``return model`` (no work,
+    # the deadline, the soundness gates); the old ``except Exception: return model``
+    # could only hide a defect in the rewrite as "nothing to reformulate". The one
+    # ``except`` below catches only the private ``_LiftAbandoned`` sentinel.
     if not _has_factorable_work_inner(model, deadline=deadline):
         return model
 
@@ -1960,8 +2086,43 @@ def _factorable_reformulate_inner(
     new_model._rebuild_name_index()  # keep the name cache in sync (M7)
     new_model._objective = model._objective
 
-    lifter = _Lifter(new_model)
+    lifter = _Lifter(new_model, deadline=deadline)
+    # #1565: the deadline is also consulted inside a constraint's lift (see
+    # ``_Lifter.tick``); on expiry everything built so far is dropped, exactly as
+    # the per-constraint check below drops it.
+    try:
+        rebuilt = _rebuild_and_lift(model, new_model, lifter, clear_only, deadline)
+    except _LiftAbandoned:
+        return model
+    if rebuilt is None:
+        return model
 
+    # Defining equalities for the aux variables come first so downstream
+    # bound propagation sees them early.
+    new_model._constraints = lifter.aux_constraints + rebuilt
+    # R4: surface the zero-spanning product-factor auxes (if any were tagged
+    # under the flag) so the solver can keep them branchable. Always set the
+    # attribute (empty by default) for a stable, easy-to-read contract.
+    new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
+    # Complementarity provenance (#1147). The lifts rewrite constraint
+    # *bodies*; the relation's source operands are untouched and still read
+    # the shared Variable objects, so the relation set forwards intact.
+    carry_complementarities(model, new_model, pass_name="factorable reformulation")
+    carry_validation_guards(model, new_model)  # #1498
+    return new_model
+
+
+def _rebuild_and_lift(
+    model: Model,
+    new_model: Model,
+    lifter: _Lifter,
+    clear_only: bool,
+    deadline: Optional[Callable[[], bool]],
+) -> list[Constraint] | None:
+    """The rebuild loop of :func:`_factorable_reformulate_inner`: returns the
+    rebuilt constraints (and lifts the objective of *new_model* in place), or
+    ``None`` when the per-constraint deadline fired. ``_LiftAbandoned`` from
+    inside a lift propagates to the caller."""
     rebuilt: list[Constraint] = []
     for c in model._constraints:
         # #1456 item 2. Wholesale abandonment: ``new_model`` and everything
@@ -1969,7 +2130,7 @@ def _factorable_reformulate_inner(
         # caller gets the model it passed in. A partial rewrite would be a
         # third state nothing downstream is written against.
         if deadline is not None and deadline():
-            return model
+            return None
         if not isinstance(c, Constraint):
             rebuilt.append(c)  # pass through anything exotic untouched
             continue
@@ -2017,16 +2178,4 @@ def _factorable_reformulate_inner(
 
             new_model._objective = Objective(lifted_obj, new_model._objective.sense)
 
-    # Defining equalities for the aux variables come first so downstream
-    # bound propagation sees them early.
-    new_model._constraints = lifter.aux_constraints + rebuilt
-    # R4: surface the zero-spanning product-factor auxes (if any were tagged
-    # under the flag) so the solver can keep them branchable. Always set the
-    # attribute (empty by default) for a stable, easy-to-read contract.
-    new_model._zero_spanning_factor_auxes = set(lifter.zero_spanning_factor_auxes)
-    # Complementarity provenance (#1147). The lifts rewrite constraint
-    # *bodies*; the relation's source operands are untouched and still read
-    # the shared Variable objects, so the relation set forwards intact.
-    carry_complementarities(model, new_model, pass_name="factorable reformulation")
-    carry_validation_guards(model, new_model)  # #1498
-    return new_model
+    return rebuilt
