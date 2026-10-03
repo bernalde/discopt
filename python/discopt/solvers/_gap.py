@@ -105,6 +105,51 @@ def optimality_gap(
     return abs_gap / max(abs(ub), abs(lb), denom_floor)
 
 
+#: Floor on the reported gap's denominator. Identical to the convergence test's
+#: (``solver._gap_values_converged``): a relative gap relative to the objective
+#: however small it is (#1263), never the absolute gap in disguise.
+REPORTED_GAP_DENOM_FLOOR = 1e-10
+
+
+def reported_gap(
+    objective: Optional[float],
+    bound: Optional[float],
+    *,
+    abs_tol: Optional[float] = None,
+) -> Optional[float]:
+    """The ONE formula for ``SolveResult.gap`` (#1585).
+
+    ``|objective - bound| / max(|objective|, |bound|, 1e-10)`` -- the
+    convergence test's own arithmetic (``solver._gap_values_converged`` /
+    ``_gap_criterion``), so a caller's ``r.gap <= gap_tolerance`` agrees with the
+    solver's verdict on every exit, optimal or limit. ``0.0`` when ``abs_tol`` is
+    given and ``|objective - bound| <= abs_tol``: the absolute arm closed the gap,
+    and the relative number degenerates near a zero optimum (see
+    ``solver._stamp_reported_gap``). ``None`` when either value is missing,
+    non-finite or at the ``1e20`` "no bound" sentinel.
+
+    Both values are in the result's own sense (a MAXIMIZE bound sits above its
+    incumbent); the formula is symmetric in the pair, so no sense is needed.
+
+    Before #1585 a limit exit reported ``|o - b| / max(1, |o|)`` (#933) while an
+    optimal exit reported this formula (#1386), so the same pair yielded two
+    numbers depending on why the solve stopped -- and below unit scale the floored
+    one UNDERSTATES the gap the convergence test sees.
+    """
+    if objective is None or bound is None:
+        return None
+    o = float(objective)
+    b = float(bound)
+    if not (math.isfinite(o) and math.isfinite(b)):
+        return None
+    if abs(o) >= BOUND_INF or abs(b) >= BOUND_INF:
+        return None
+    diff = abs(o - b)
+    if abs_tol is not None and diff <= abs_tol:
+        return 0.0
+    return diff / max(abs(o), abs(b), REPORTED_GAP_DENOM_FLOOR)
+
+
 def master_gap_tolerance(
     gap_tolerance: float,
     incumbent: Optional[float],

@@ -471,7 +471,9 @@ def _unlift_result(result: SolveResult, source: Model, lifted: Model) -> SolveRe
         # tolerance). Weakening a bound to the verified objective is always valid.
         bound = max(bound, obj) if maximize else min(bound, obj)
         result.bound = bound
-        result.gap = abs(obj - bound) / max(1.0, abs(obj))
+        from discopt.solvers._gap import reported_gap
+
+        result.gap = reported_gap(obj, bound)  # #1585: the one SolveResult.gap formula
     return result
 
 
