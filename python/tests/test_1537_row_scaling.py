@@ -14,19 +14,16 @@ families, each row scaled by its own seeded log-uniform factor in 10^[-3,3] and
   hi``. A row-scaled copy computes the pin as ``(s*rhs - s*c)/(s*a)``, one ulp off
   the unscaled value, which is how 4stufen with rows scaled in 10^[-3,3] crashed
   ``Model.solve``.
-* **A scale-dependent conditioning guard** (fixed in ``milp_relaxation``).
-  ``sanitize_relaxation_for_conditioning`` dropped any relaxation row with an entry
-  of magnitude >= 1e10 before the fallback root-bound solve. That is a statement
-  about how the row was *written*, not about the constraint: ex14_1_9 with its two
-  rows multiplied by 8.14 and 3.66 pushed a 2.02e9 coefficient to 1.64e10, the row
-  was dropped, the fallback bound fell to -1.07e6 and the certificate the unscaled
-  model earns (bound 0.0) was lost. An over-cap row is now divided by the power of
-  two that brings it under the cap (exact, so the same constraint) and dropped
-  unless every nonzero is still at least the 1e-9 floor afterwards. (The first
-  version of the rescue checked only entries that started above the floor, so a
-  row already holding a sub-floor entry was kept where it used to be dropped and
-  the in-house simplex returned a false LP bound on it -- PR #1594 review; pinned
-  by ``test_sanitizer_rescue_never_keeps_a_sub_floor_entry``.)
+* **A scale-dependent conditioning guard** (``milp_relaxation``; NOT fixed --
+  xfail, see #1595). ``sanitize_relaxation_for_conditioning`` drops any relaxation
+  row with an entry of magnitude >= 1e10 before the fallback root-bound solve. That
+  is a statement about how the row was *written*: ex14_1_9 with its two rows
+  multiplied by 8.14 and 3.66 pushes a 2.02e9 coefficient to 1.64e10, the row is
+  dropped, the fallback bound falls to -1.07e6 and the certificate the unscaled
+  model earns (bound 0.0) is lost. An exact power-of-two "rescue" of over-cap rows
+  was tried and withdrawn in the PR #1594 review: it lands the row's largest entry
+  in [5e9, 1e10), where the in-house simplex returns false LP bounds (#1595) on
+  rows that main drops. A lost certificate is acceptable; a false bound is not.
 """
 
 from __future__ import annotations
@@ -39,8 +36,6 @@ import pytest
 import scipy.sparse as sp
 from _invariance import _rebuild
 from discopt._relax.milp_relaxation import (
-    _RELAX_NUMERIC_CAP,
-    _RESCUE_FLOOR,
     MilpRelaxationModel,
     sanitize_relaxation_for_conditioning,
 )
@@ -104,62 +99,56 @@ def test_row_scaled_pin_solves_like_the_unscaled_model(scale):
 
 
 # --------------------------------------------------------------------------- #
-# The fallback-bound sanitizer: an over-cap row is rescued by an exact power-of-two
-# scaling instead of being dropped, so the decision is row-scale invariant.
+# The fallback-bound sanitizer: over-cap rows are dropped (sound), even though that
+# makes the fallback bound depend on row scaling. See the module docstring.
 # --------------------------------------------------------------------------- #
 
-# ex14_1_9's relaxation row 12 as the base model writes it (max 2.02e9, min 3.4e-3,
-# a dynamic range of 6e11): kept as written at every scale below.
-_EX14_ROW = np.array([4.51007e6, 0.0033557, -2.02051e9, -1.0])
-_EX14_RHS = 0.664
 
-
-def _relax(rows, rhs):
-    rows = np.atleast_2d(np.asarray(rows, dtype=np.float64))
-    n = rows.shape[1]
+def _lp(rows, c, bounds):
     return MilpRelaxationModel(
-        c=np.zeros(n),
-        A_ub=sp.csr_matrix(rows),
-        b_ub=np.asarray(rhs, dtype=np.float64),
-        bounds=[(-1.0, 1.0)] * n,
+        c=np.asarray(c, dtype=np.float64),
+        A_ub=sp.csr_matrix(np.atleast_2d(np.asarray(rows, dtype=np.float64))),
+        b_ub=np.zeros(np.atleast_2d(rows).shape[0]),
+        bounds=bounds,
     )
 
 
-@pytest.mark.parametrize("scale", [1.0, 4.9, 8.14, 1e3, 3.7e6, 1e9])
-def test_sanitizer_keeps_a_row_whatever_its_scale(scale):
-    """Before the fix a scale that pushed the 2.02e9 entry past 1e10 dropped the row."""
-    out = sanitize_relaxation_for_conditioning(_relax(scale * _EX14_ROW, [scale * _EX14_RHS]))
-    assert out._A_ub is not None and out._A_ub.shape[0] == 1, "row dropped"
-    row = np.asarray(out._A_ub.todense()).ravel()
-    assert np.abs(row).max() < _RELAX_NUMERIC_CAP and abs(out._b_ub[0]) < _RELAX_NUMERIC_CAP
-    # The kept row is the input row times a power of two: the same constraint.
-    ratio = row / (scale * _EX14_ROW)
-    assert np.all(ratio == ratio[0]) and out._b_ub[0] / (scale * _EX14_RHS) == ratio[0]
-    assert np.log2(ratio[0]) == np.round(np.log2(ratio[0]))
-
-
-def test_sanitizer_still_drops_the_rows_the_guard_exists_for():
-    """A bound-derived 1e20 entry beside a unit aux coefficient spans more than
-    cap / floor: no exact rescaling keeps both representable, so it is dropped."""
-    out = sanitize_relaxation_for_conditioning(
-        _relax([[1e20, -1.0], [1.0, 1.0], [np.inf, 1.0]], [0.0, 1.0, 0.0])
-    )
-    rows = np.asarray(out._A_ub.todense())
-    assert rows.shape[0] == 1 and np.array_equal(rows[0], [1.0, 1.0])
-    assert 1e20 / 1.0 > _RELAX_NUMERIC_CAP / _RESCUE_FLOOR
+@pytest.mark.parametrize("small", [-9e-10, -1e-6, -1.0])
+def test_sanitizer_drops_over_cap_rows_the_simplex_mishandles(small):
+    """PR #1594 review witnesses. ``1.5e10*x + small*y <= 0``, x in [0, 1], y >= 0,
+    min -x: the true LP minimum is -1. The withdrawn rescue rescaled the row to
+    ``[7.5e9, small/2]`` and kept it; on that row the in-house simplex returns the
+    false bound 0.0 (#1595). Main and this branch drop it, and the bound is -1."""
+    rel = _lp([[1.5e10, small]], [-1.0, 0.0], [(0.0, 1.0), (0.0, np.inf)])
+    out = sanitize_relaxation_for_conditioning(rel)
+    assert out._A_ub is None or out._A_ub.shape[0] == 0, "over-cap row kept"
+    res = out.solve(backend="simplex")
+    assert res.status == "optimal"
+    assert res.objective <= -1.0 + 1e-9  # a valid lower bound for the min
 
 
 def test_sanitizer_leaves_rows_under_the_cap_untouched():
     rows = np.array([[3.0, -1e9, 1e-31], [1.0, 2.0, 0.0]])
-    out = sanitize_relaxation_for_conditioning(_relax(rows, [5.0, 7.0]))
+    rel = MilpRelaxationModel(
+        c=np.zeros(3),
+        A_ub=sp.csr_matrix(rows),
+        b_ub=np.array([5.0, 7.0]),
+        bounds=[(-1.0, 1.0)] * 3,
+    )
+    out = sanitize_relaxation_for_conditioning(rel)
     assert np.array_equal(np.asarray(out._A_ub.todense()), rows)
     assert np.array_equal(out._b_ub, [5.0, 7.0])
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1595: the fallback sanitizer drops the scaled over-cap row; keeping it "
+    "needs the in-house simplex to be sound on entries >= ~1e9 first",
+)
 def test_row_scaled_ex14_1_9_keeps_its_certificate():
     """The end-to-end witness: ex14_1_9 with its two rows scaled by 8.14 and 3.66
-    (the probe's seeded per-row factors) reported ``feasible``, bound -1.07e6, while
-    the unscaled model certifies 0.0 -- the fallback root bound lost the scaled row."""
+    (the probe's seeded per-row factors) reports ``feasible``, bound -1.07e6, while
+    the unscaled model certifies 0.0 -- the fallback root bound loses the scaled row."""
     path = os.path.join(os.path.dirname(__file__), "data", "minlplib_nl", "ex14_1_9.nl")
     base_model = dm.from_nl(path)
     scaled = _rebuild(base_model, lambda v: np.zeros(v.lb.shape), 1.0, "ex14_rows")
@@ -174,33 +163,3 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
     assert base.gap_certified
     assert other.gap_certified, (other.status, other.bound)
     assert other.objective == pytest.approx(base.objective, abs=1e-6)
-
-
-def test_sanitizer_rescue_never_keeps_a_sub_floor_entry():
-    """PR #1594 review witness. ``1.5e10*x - 9e-10*y <= 0``, x in [0, 1], y >= 0,
-    min -x: the true LP minimum is -1 (y grows until the row holds). The over-cap
-    row cannot be brought under the cap with every nonzero >= 1e-9 (the -9e-10 is
-    already below it), so it must be dropped, as before #1537. The first rescue
-    checked only the entries that started above the floor and kept the row, on
-    which the in-house simplex returned the false bound 0.0."""
-    rel = MilpRelaxationModel(
-        c=np.array([-1.0, 0.0]),
-        A_ub=sp.csr_matrix(np.array([[1.5e10, -9e-10]])),
-        b_ub=np.array([0.0]),
-        bounds=[(0.0, 1.0), (0.0, np.inf)],
-    )
-    out = sanitize_relaxation_for_conditioning(rel)
-    assert out._A_ub is None or out._A_ub.shape[0] == 0, "sub-floor row kept"
-    res = out.solve(backend="simplex")
-    assert res.status == "optimal"
-    # A valid lower bound for the min: never above the true optimum -1.
-    assert res.objective <= -1.0 + 1e-9
-
-
-def test_sanitizer_rescue_keeps_rows_whose_every_entry_clears_the_floor():
-    """The complement: the same shape with the small entry at 1e-6 rescales exactly."""
-    out = sanitize_relaxation_for_conditioning(_relax([[1.5e10, -1e-6]], [0.0]))
-    row = np.asarray(out._A_ub.todense()).ravel()
-    assert row.shape == (2,) and np.all(np.abs(row) >= _RESCUE_FLOOR)
-    ratio = row / np.array([1.5e10, -1e-6])
-    assert ratio[0] == ratio[1] and np.log2(ratio[0]) == np.round(np.log2(ratio[0]))

@@ -124,13 +124,6 @@ _MAX_FINITE_DOMAIN_TRIG_TABLE_VALUES = 256
 # from 1e11 down to 1e6 on the affected instances.
 _RELAX_NUMERIC_CAP = 1e10
 
-# Smallest entry ``sanitize_relaxation_for_conditioning`` may create when it rescues
-# an over-cap row by an exact power-of-two scaling (#1537). HiGHS treats matrix
-# entries at or below ``small_matrix_value`` (default 1e-9) as zero; zeroing an entry
-# of a relaxation row is not a relaxation, so a rescue that would push any entry
-# below this is refused and the row is dropped instead (the pre-#1537 behaviour).
-_RESCUE_FLOOR = 1e-9
-
 # Equilibrate the lifted relaxation before an external LP/MILP solve when its
 # coefficient dynamic range exceeds this (matches the Rust simplex's own scaling
 # trigger). The lifted McCormick rows of a product over a wide variable box mix
@@ -1166,12 +1159,15 @@ def sanitize_relaxation_for_conditioning(
     therefore remains a valid lower bound for a minimization (weaker, never
     higher than the true optimum):
 
-    1. Drop any constraint row whose coefficient or RHS is non-finite, or whose
-       coefficient or RHS has magnitude >= ``_RELAX_NUMERIC_CAP`` and cannot be
-       brought under it by an exact power-of-two row scaling that leaves every
-       nonzero at least ``_RESCUE_FLOOR`` (#1537: a rescued row is the same constraint,
-       so the decision no longer depends on how a row was scaled). Removing a
-       constraint enlarges the feasible set; rescaling one leaves it unchanged.
+    1. Drop any constraint row whose coefficient or RHS is non-finite or has
+       magnitude >= ``_RELAX_NUMERIC_CAP``. Removing a constraint enlarges the
+       feasible set. (The drop depends on how a row was scaled: ex14_1_9 with its
+       rows multiplied by 8.14 and 3.66 loses a row and its certificate. An exact
+       power-of-two "rescue" of over-cap rows was tried for #1537 and withdrawn in
+       the PR #1594 review: it lands the row's largest entry in [cap/2, cap), where
+       the in-house simplex returns false LP bounds (#1595) -- see
+       ``test_sanitizer_drops_over_cap_rows_the_simplex_mishandles``. Losing a
+       certificate is acceptable; feeding a known-unsound engine is not.)
     2. Clamp any variable bound of magnitude >= ``_RELAX_NUMERIC_CAP`` to +/-inf.
        Widening a variable's box enlarges the feasible set. (A clamped objective
        variable can make the LP unbounded -> bound becomes -inf/None, still sound.)
@@ -1191,51 +1187,6 @@ def sanitize_relaxation_for_conditioning(
         keep = np.isfinite(b) & (np.abs(b) < cap)
         if bad_nz.any():
             keep[row_of_nz[bad_nz]] = False
-        # #1537: rescue before dropping. A row's absolute magnitude is not a property
-        # of the relaxation -- ``s * (a.x) <= s * b`` is the same constraint for every
-        # ``s > 0`` -- so the absolute cap alone made the fallback bound depend on how
-        # the user scaled a row (ex14_1_9 with one row multiplied by 8.14 pushed a
-        # 2.02e9 coefficient over the cap, lost the row and the certificate). Divide
-        # such a row by the power of two that brings its largest entry (and RHS) under
-        # the cap -- exact in binary floating point, so the constraint is bit-for-bit
-        # the same set -- and keep it only when every nonzero is at least
-        # ``_RESCUE_FLOOR`` after scaling (an LP backend may zero smaller entries, and
-        # zeroing an entry is not a relaxation). A row whose entries span
-        # more than ``cap / _RESCUE_FLOOR`` -- the bound-derived 1e11..1e37 envelope
-        # coefficients this guard exists for, beside unit aux coefficients -- has no
-        # such scaling and is dropped exactly as before. Non-finite rows are dropped,
-        # and rows under the cap are not touched.
-        rescued = 0
-        if not keep.all():
-            A = A.copy()
-            b = b.copy()
-            for i in np.flatnonzero(~keep):
-                lo, hi = A.indptr[i], A.indptr[i + 1]
-                d = A.data[lo:hi]
-                if not (np.isfinite(d).all() and np.isfinite(b[i])):
-                    continue
-                ad = np.abs(d)
-                top = max(float(ad.max()) if ad.size else 0.0, abs(float(b[i])))
-                k = math.frexp(top / cap)[1]  # top * 2**-k < cap
-                scale = math.ldexp(1.0, -k)
-                sd = d * scale
-                # Every stored nonzero must clear the floor after scaling -- including
-                # one that was already below it. A sub-floor entry kept in a row that
-                # the cap would otherwise drop is exactly what the in-house simplex
-                # mishandles (PR #1594 review: ``1.5e10*x - 9e-10*y <= 0`` gave a
-                # false LP bound of 0.0 against a true -1).
-                nz = ad > 0.0
-                if np.all(np.abs(sd[nz]) >= _RESCUE_FLOOR):
-                    A.data[lo:hi] = sd
-                    b[i] = b[i] * scale
-                    keep[i] = True
-                    rescued += 1
-            if rescued:
-                logger.debug(
-                    "relaxation conditioning: rescaled %d over-cap constraint row(s) by a "
-                    "power of two",
-                    rescued,
-                )
         if not keep.all():
             logger.debug(
                 "relaxation conditioning: dropped %d catastrophic constraint row(s)",
