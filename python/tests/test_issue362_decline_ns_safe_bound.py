@@ -65,6 +65,16 @@ def _load_decline_lp():
     return d["c"], A, d["b_ub"], bounds, float(d["obj_offset"][0])
 
 
+# The vendored LP was captured under the pre-#1537 equilibration factors, which
+# is what makes both in-house attempts fail and drives the generic-path chain
+# these tests exercise.  Under the #1537 row pre-pass
+# (``DISCOPT_LP_ROW_PRESCALE``, default ON) the first in-house attempt solves
+# this LP to a verified optimum by itself, so the chain is never reached.  The
+# chain tests therefore pin the legacy factors;
+# ``test_decline_lp_row_prescale_certifies_directly`` covers the new arm.
+_PRESCALE = "DISCOPT_LP_ROW_PRESCALE"
+
+
 def _solve_decline_lp():
     from discopt._relax.milp_relaxation import MilpRelaxationModel
 
@@ -76,6 +86,7 @@ def _solve_decline_lp():
 def test_decline_lp_flag_on_surfaces_ns_safe_bound(monkeypatch):
     """Flag ON: the generic-path optimal result carries the stashed NS safe
     bound (fails before the #362 fix: ``safe_bound=None`` → node declined)."""
+    monkeypatch.setenv(_PRESCALE, "0")
     monkeypatch.setenv(_FLAG, "1")
     res = _solve_decline_lp()
     assert res.status == "optimal", f"vendored LP must solve optimal, got {res.status}"
@@ -97,12 +108,37 @@ def test_decline_lp_flag_on_surfaces_ns_safe_bound(monkeypatch):
 def test_decline_lp_flag_disabled_restores_legacy_baseline(monkeypatch):
     """Flag disabled (=0, the graduation escape hatch): the generic path reports
     no certificate — the pre-#362 legacy search is reachable and unchanged."""
+    monkeypatch.setenv(_PRESCALE, "0")
     monkeypatch.setenv(_FLAG, "0")
     res = _solve_decline_lp()
     assert res.status == "optimal"
     assert res.safe_bound is None, (
         f"flag disabled must leave the generic path certificate-free, got {res.safe_bound!r}"
     )
+
+
+@pytest.mark.parametrize("ns_flag", ["0", "1"])
+def test_decline_lp_row_prescale_certifies_directly(monkeypatch, ns_flag):
+    """#1537: under the row pre-pass the in-house simplex solves the vendored
+    LP to a verified optimum on its own, so the result carries a certificate
+    whatever the #362 flag says. The certificate must stay sound: a valid
+    bound never exceeds the LP optimum."""
+    from discopt._rust import profile_counters_py, profile_reset_py
+
+    monkeypatch.setenv("DISCOPT_PROFILE", "1")
+    monkeypatch.setenv(_PRESCALE, "1")
+    monkeypatch.setenv(_FLAG, ns_flag)
+    profile_reset_py()
+    res = _solve_decline_lp()
+    counters = dict(profile_counters_py())
+    assert res.status == "optimal"
+    assert res.safe_bound is not None and math.isfinite(res.safe_bound)
+    assert res.safe_bound <= _NODE_LP_OPT + 1e-9, (
+        f"UNSOUND: safe bound {res.safe_bound!r} exceeds the LP optimum {_NODE_LP_OPT}"
+    )
+    assert res.safe_bound >= _NODE_LP_OPT - 1e-6, f"certificate loose: {res.safe_bound!r}"
+    # The certificate comes from the in-house solve, not the #362 NS stash.
+    assert counters.get("WarmVerdictOptimal", 0) + counters.get("LpVerdictOptimal", 0) >= 1
 
 
 @pytest.mark.slow

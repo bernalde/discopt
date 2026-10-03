@@ -1312,7 +1312,7 @@ pub fn solve_milp_node_hooked(
 /// product (see `presolve::contrib`).
 ///
 /// With `DISCOPT_LP_ROW_PRESCALE=1` (#1537) the equilibration first divides each
-/// row by an exact power of two near its largest magnitude, so the guard judges
+/// row by an exact power of two near its geometric-mean magnitude, so the guard judges
 /// the same row-normalised matrix (and rhs) that the column sweep's noise filter
 /// sees. The row-relative test is unchanged by that (it is invariant under row
 /// scaling); the column-relative test and the rhs scale are the ones that move.
@@ -1364,7 +1364,14 @@ fn has_unscalable_tiny_entry_with(
             if a == 0.0 || (a >= MAX_LINE_RANGE * row_max[i] && a >= MAX_LINE_RANGE * col_max[j]) {
                 continue;
             }
-            if open || a * reach > TINY_ENTRY_ROW_TOL * (rs[i] * b[i]).abs().max(1.0) {
+            // The rhs floor: `1` in the caller's units with the flag off (the
+            // pre-#1537 guard, bit-identical); with it on, the row's own largest
+            // scaled magnitude, so the floor moves with the row and the verdict is
+            // row-scale invariant. (A literal `1` after the geometric-mean pre-pass
+            // would sit at the row's geometric mean instead -- a different, row-
+            // dependent threshold that withdrew the #1509 surrogate's certificate.)
+            let floor = if prescale { row_max[i] } else { 1.0 };
+            if open || a * reach > TINY_ENTRY_ROW_TOL * (rs[i] * b[i]).abs().max(floor) {
                 return true;
             }
         }

@@ -69,7 +69,8 @@ pub(crate) const MAX_LINE_RANGE: f64 = 1e-10;
 /// row's other entries, e.g. a slack's `1`, cap the row factor), and the #1296
 /// guard in the MILP driver correctly withdraws every certificate: m3 and flay03m
 /// with rows scaled in 10^[-6,6] lost theirs this way. The pre-pass first divides
-/// every row by the power of two nearest its largest magnitude, which is an exact
+/// every row by the power of two nearest the geometric mean of its extreme
+/// magnitudes (one row sweep, see [`row_prescale_factors`]), which is an exact
 /// reformulation (only exponents shift), so the column sweep compares entries on a
 /// row-scale-invariant footing.
 ///
@@ -147,22 +148,52 @@ fn parse_row_prescale_flag(raw: &str) -> Result<bool, String> {
     }
 }
 
-/// Power-of-two row-normalisation factors: `r_i = 2^k` nearest `1 / max_j |a_ij|`
-/// (`1` for an empty row). Every factor is an exact power of two, so `r_i a_ij`
-/// and `r_i b_i` are exact and the scaled row is the same constraint. Shared by
-/// [`equilibrate`] and the MILP driver's #1296 noise-floor guard, which must judge
-/// entries on the matrix the equilibration actually sees.
+/// Power-of-two row-normalisation factors: `r_i = 2^k` nearest
+/// `1 / sqrt(lo_i * hi_i)`, where `hi_i` is row `i`'s largest magnitude and
+/// `lo_i = max(min_j |a_ij|, MAX_LINE_RANGE * hi_i)` is its smallest *clamped* to
+/// the noise floor (`1` for an empty row). Every factor is an exact power of two,
+/// so `r_i a_ij` and `r_i b_i` are exact and the scaled row is the same
+/// constraint; and the factor of a row multiplied by `s` is the old factor divided
+/// by `s` (up to the power-of-two rounding), so the column sweep that follows sees
+/// a row-scale-invariant matrix. Shared by [`equilibrate`] and the MILP driver's
+/// #1296 noise-floor guard, which must judge entries on the matrix the
+/// equilibration actually sees.
+///
+/// Why the clamped geometric mean, and neither of the two simpler choices (#1537
+/// review, both measured):
+/// - **Max** (`lo = hi`) divides a big-M row `x - 1e12 z + s = 0` by `2^40`. The
+///   single-entry columns of `x` and the slack then scale back up by `2^40`, so
+///   `x`'s scaled box is `[0, 9e-12]`, under the simplex's primal tolerance, and
+///   the MILP driver returned `x = 10, z = 0`: a row violation of 10 in original
+///   units. (Filtering the noise out of `lo` is the same choice here: the `1`s are
+///   below `1e-10 * 1e12`, so `lo = hi`.) The clamp divides by `2^23` instead and
+///   every column lands near `1`, as on the legacy path.
+/// - **Unclamped** geometric mean (`lo = min`) lets a `1e-16` float-noise entry
+///   inflate its row by `2^27`; the noise entry then sits inside the column
+///   sweep's range in its column and over-scales that column
+///   (`noise_entry_does_not_overscale_column`).
+///
+/// The pre-pass is only the sweeps' starting point; they keep their noise floor.
 pub(crate) fn row_prescale_factors(sp: &SparseCols, m: usize) -> Vec<f64> {
     let (_, row_idx, vals) = sp.raw();
-    let mut rmax = vec![0.0f64; m];
+    let mut rhi = vec![0.0f64; m];
+    let mut rlo = vec![f64::INFINITY; m];
     for (&i, &v) in row_idx.iter().zip(vals) {
         let av = v.abs();
-        if av > rmax[i] {
-            rmax[i] = av;
+        if av > 0.0 {
+            rhi[i] = rhi[i].max(av);
+            rlo[i] = rlo[i].min(av);
         }
     }
-    rmax.iter()
-        .map(|&h| if h > 0.0 { nearest_pow2(1.0 / h) } else { 1.0 })
+    (0..m)
+        .map(|i| {
+            if rhi[i] > 0.0 {
+                let lo = rlo[i].max(rhi[i] * MAX_LINE_RANGE);
+                nearest_pow2(1.0 / (lo * rhi[i]).sqrt())
+            } else {
+                1.0
+            }
+        })
         .collect()
 }
 
@@ -212,12 +243,32 @@ impl Scaling {
     /// to [`Self::from_matrix`] (zeros never affect a line's significant min/max),
     /// with no dense `m·n` materialization anywhere on the path.
     pub fn from_sparse(sp: &SparseCols, m: usize, n: usize) -> Option<Scaling> {
+        Self::from_sparse_with(sp, m, n, row_prescale_enabled())
+    }
+
+    /// [`Self::from_sparse`] with the #1537 row pre-pass chosen explicitly.
+    pub(crate) fn from_sparse_with(
+        sp: &SparseCols,
+        m: usize,
+        n: usize,
+        prescale: bool,
+    ) -> Option<Scaling> {
         let (lo, hi) = sp.value_range();
         if hi == 0.0 || hi / lo <= SCALE_TRIGGER {
             return None;
         }
-        let (row, col) = equilibrate(sp, m, n);
+        let (row, col) = equilibrate_with(sp, m, n, prescale);
         Some(Scaling { row, col, m, n })
+    }
+
+    /// The pre-#1537 (no row pre-pass) factors for the *original* matrix `sp`, when
+    /// they differ from `self` -- the alternative scaling the failure-triggered
+    /// retry in `dual::solve_lp_warm_csc_inner` tries before the #649 unscaled
+    /// retry. `None`
+    /// when `self` was not built with the pre-pass, or the pre-pass changed nothing.
+    pub(crate) fn legacy_alternative(&self, sp: &SparseCols) -> Option<Scaling> {
+        let legacy = Self::from_sparse_with(sp, self.m, self.n, false)?;
+        (legacy.row != self.row || legacy.col != self.col).then_some(legacy)
     }
 
     /// Scale a CSC matrix in place by the same `R A C` factors — the sparse
@@ -662,10 +713,22 @@ mod tests {
             let (mant, _) = frexp(ri);
             assert_eq!(mant, 0.5, "{ri} is not a power of two");
         }
-        // Row 0's largest entry 1e5 lands within a factor sqrt(2) of 1; row 1's
-        // largest entry is the slack's 1, so its factor is 1.
-        assert!((r[0] * 1e5 - 1.0).abs() <= std::f64::consts::SQRT_2 - 1.0 + 1e-12);
-        assert_eq!(r[1], 1.0);
+        // Factors are the pow2 nearest 1/sqrt(lo*hi) per row: row 0 spans
+        // [1, 1e5] (the slack's 1 is its smallest), row 1 spans [1e-6, 1].
+        let sq2 = std::f64::consts::SQRT_2;
+        let g0 = r[0] * (1e5f64).sqrt();
+        let g1 = r[1] * (1e-6f64).sqrt();
+        assert!((1.0 / sq2 - 1e-12..=sq2 + 1e-12).contains(&g0), "{r:?}");
+        assert!((1.0 / sq2 - 1e-12..=sq2 + 1e-12).contains(&g1), "{r:?}");
+        // Row-scale invariance: scaling row 0 by 2^7 divides its factor by 2^7.
+        let mut w = WITNESS;
+        for k in 0..4 {
+            w[k] *= 128.0;
+        }
+        let r2 = row_prescale_factors(&SparseCols::from_dense(&w, 2, 4), 2);
+        // Row 0 now spans [128, 1.28e7]; the slack entry scaled too.
+        assert_eq!(r2[0] * 128.0, r[0]);
+        assert_eq!(r2[1], r[1]);
         // An empty row keeps factor 1.
         let empty = SparseCols::from_dense(&[0.0, 0.0, 3.0, 0.0], 2, 2);
         assert_eq!(row_prescale_factors(&empty, 2)[0], 1.0);

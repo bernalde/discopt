@@ -473,6 +473,43 @@ fn solve_lp_warm_csc_inner(
             // scaling lost. No allocation on the success path (the common case).
             if matches!(sol.status, LpStatus::Numerical | LpStatus::IterLimit) {
                 scaling.unscale_cols(&mut sp); // exact pow2 → original matrix
+
+                // #1537: the row pre-pass is the same kind of heuristic. On hda's
+                // row-filtered root LP (m=2906) the pre-passed factors have the
+                // same scaled range (1e5.8) as the legacy ones, yet walk a pivot
+                // path whose Forrest-Tomlin updates fail (growth / tiny pivot) and
+                // end `Numerical`, while the legacy factors solve it in 2472 pivots
+                // to HiGHS's optimum; under power-of-two row rescalings of hda the
+                // reverse happens just as often. Neither factor set dominates, so
+                // a pre-pass failure is retried once on the legacy factors before
+                // the unscaled retry -- with the same soundness argument: only a
+                // terminal verdict that passed its own audit replaces a failure.
+                if let Some(legacy) = scaling.legacy_alternative(&sp) {
+                    crate::profile::incr(crate::profile::Ctr::PrescaleLegacyRetries);
+                    legacy.scale_cols(&mut sp);
+                    let mut alt = solve_csc_core(
+                        &sp,
+                        m,
+                        n,
+                        &legacy.scale_c(c),
+                        &legacy.scale_lower(l),
+                        &legacy.scale_upper(u),
+                        &legacy.scale_b(b),
+                        start,
+                        opts,
+                    );
+                    legacy.unscale_cols(&mut sp); // exact pow2 → original matrix
+                    if matches!(
+                        alt.status,
+                        LpStatus::Optimal | LpStatus::Infeasible | LpStatus::Unbounded
+                    ) {
+                        crate::profile::incr(crate::profile::Ctr::PrescaleLegacyRescues);
+                        legacy.unscale_x(&mut alt.x);
+                        legacy.unscale_dual(&mut alt.dual);
+                        legacy.unscale_ray(&mut alt.ray);
+                        return alt;
+                    }
+                }
                 let alt = solve_csc_core(&sp, m, n, c, l, u, b, start, opts);
                 if matches!(
                     alt.status,
