@@ -87,7 +87,9 @@ def fbbt_box(model: Model, *, max_iter: int = 20, tol: float = 1e-9) -> BoundTig
     """
     from discopt._rust import model_to_repr
 
-    repr_ = model_to_repr(model)
+    # The builder carries a fast-API model's variables and rows; without it the
+    # repr misses them (every other ``model_to_repr`` call site passes it).
+    repr_ = model_to_repr(model, getattr(model, "_builder", None))
     n_blocks = repr_.n_var_blocks
     shapes = repr_.var_shapes()
     sizes = _block_sizes(shapes)

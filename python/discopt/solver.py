@@ -28,6 +28,7 @@ from typing import (
     Callable,
     NamedTuple,
     Optional,
+    Sequence,
     TypeGuard,
     TypeVar,
     Union,
@@ -20357,6 +20358,124 @@ def _tangent_box_bound(value: float, grad: np.ndarray, s: np.ndarray, lo, hi) ->
     return total
 
 
+class _CertificateShapeError(ValueError):
+    """A certificate input whose shape contradicts the problem it certifies.
+
+    A defect in the caller, never a property of the model, so the convex fast
+    path re-raises it instead of withholding the certificate with a warning
+    (CLAUDE.md §7: a broad ``except`` must not turn "this path is broken" into
+    "this point is not certifiable").
+    """
+
+
+def _outward_tangent_bound(
+    value: float,
+    value_mag: float,
+    n_value_terms: int,
+    grad: np.ndarray,
+    s: np.ndarray,
+    lo,
+    hi,
+    eval_mag: float = 0.0,
+) -> float:
+    """:func:`_tangent_box_bound` rounded DOWN by its own floating-point error (#1605).
+
+    ``value`` is a computed sum of ``n_value_terms`` terms whose absolute values sum
+    to ``value_mag`` (``f(s) + lam . c(s) - shift``); the tangent adds one term per
+    non-zero slope. A float sum of ``N`` terms is within ``(N - 1) u sum|t_k|`` of
+    the exact sum (any summation order), and each tangent term ``g_j (t_j - s_j)``
+    carries two more roundings, so subtracting ``2 (N + 4) eps sum|t_k|`` moves the
+    bound below the exact value of the expression it evaluates. Without it a bound
+    that is tight to rounding can sit an ulp ABOVE the optimum (105_011 with rows
+    x1e4: 3 ulp).
+
+    ``eval_mag`` charges the evaluation of ``f``, ``c`` and the slope at ``s``:
+    ``sum_j |s_j| (|df/dx_j| + sum_r |lam_r| |dc_r/dx_j|)``. Under the backward-error
+    model of a function evaluation (the computed value and gradient are exact at a
+    point within a relative ``O(eps)`` of ``s``) moving the tangent's anchor from
+    that point back to ``s`` costs at most ``O(eps)`` times this sum. It is the
+    term that matters when ``s`` is large: 105_011 translated by 1e3 evaluates
+    ``exp(x - 1002)`` at ``x ~ 1e3``, where forming ``x - 1002`` alone loses
+    ``1e3 eps``, and the bound sat 3e-14 above the exact optimum without it. It is
+    a model of the evaluation, not an interval enclosure; the multiplier
+    ``2 (N + 4)`` leaves it a wide margin (the measured crossing is ~1/600 of the
+    charge on that instance).
+    """
+    b = _tangent_box_bound(value, grad, s, lo, hi)
+    if not np.isfinite(b):
+        return b
+    g = np.asarray(grad, dtype=np.float64)
+    nz = g != 0.0
+    target = np.where(g > 0.0, np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64))
+    terms = g[nz] * (target[nz] - np.asarray(s, dtype=np.float64)[nz])
+    mag = abs(float(value)) + float(value_mag) + float(np.sum(np.abs(terms))) + float(eval_mag)
+    k = int(n_value_terms) + int(np.count_nonzero(nz)) + 4
+    return float(b - 2.0 * k * np.finfo(np.float64).eps * mag)
+
+
+def _evaluation_magnitude(
+    s: np.ndarray, grad_f: np.ndarray, jac, lam_r: Optional[np.ndarray]
+) -> float:
+    """``sum_j |s_j| (|df/dx_j| + sum_r |lam_r| |dc_r/dx_j|)`` for
+    :func:`_outward_tangent_bound`'s evaluation charge (#1605). ``jac`` may be
+    dense or sparse; ``None`` (with ``lam_r``) when there are no rows."""
+    a = np.abs(np.asarray(grad_f, dtype=np.float64)).ravel()
+    if jac is not None and lam_r is not None and lam_r.size > 0:
+        a = a + np.asarray(abs(jac).T @ np.abs(lam_r), dtype=np.float64).ravel()
+    return float(np.abs(np.asarray(s, dtype=np.float64)).ravel() @ a)
+
+
+def _certificate_box(
+    x: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    implied_box: Optional[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """The box the rigorous tangent bound is minimized over (#1605).
+
+    The tangent bound ``min_box L_r`` is a valid bound over ANY box that contains
+    the feasible set, so the declared box may be intersected with an implied one
+    (FBBT: ``x^2 + y^2 <= 1`` gives ``|x| <= 1``). On a free variable that is the
+    difference between a residual slope of rounding size times the 9.999e19 default
+    box -- which the bound reads as finite (#850) -- and the same slope times the
+    width the constraints actually allow. ``x`` is kept inside: an incumbent
+    feasible to tolerance may sit an ulp outside the exact implied box, and
+    widening a superset of the feasible set keeps it one.
+    """
+    if implied_box is None:
+        return lb, ub
+    ilb = np.asarray(implied_box[0], dtype=np.float64).ravel()
+    iub = np.asarray(implied_box[1], dtype=np.float64).ravel()
+    if ilb.shape != lb.shape or iub.shape != ub.shape:
+        raise _CertificateShapeError(
+            f"implied box shapes {ilb.shape}/{iub.shape} != declared box {lb.shape}"
+        )
+    if np.any(np.isnan(ilb)) or np.any(np.isnan(iub)):
+        raise _CertificateShapeError("implied box has NaN entries")
+    lo = np.minimum(np.maximum(lb, ilb), x)
+    hi = np.maximum(np.minimum(ub, iub), x)
+    return lo, hi
+
+
+def _fbbt_implied_box(model: Model, n: int) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """The FBBT box of ``model`` for :func:`_certificate_box`, or ``None``.
+
+    Reuses :func:`discopt.tightening.fbbt_box` (the outward-rounded Rust FBBT that
+    already feeds certified LP bounds), whose box contains every feasible point.
+    ``None`` when FBBT reports the box empty: the NLP returned a point, so the
+    certificate falls back on the declared box rather than reason from a
+    contradiction.
+    """
+    from discopt.tightening import fbbt_box
+
+    box = fbbt_box(model)
+    if box.infeasible:
+        return None
+    if box.lb.size != n or box.ub.size != n:
+        raise _CertificateShapeError(f"FBBT box has {box.lb.size} entries, problem has {n}")
+    return box.lb, box.ub
+
+
 def _convex_nlp_certificate(
     evaluator: "NLPEvaluator",
     x: np.ndarray,
@@ -20367,6 +20486,7 @@ def _convex_nlp_certificate(
     cu: np.ndarray,
     obj_internal: Optional[float],
     gap_tolerance: float = 1e-6,
+    implied_box: Optional[tuple[np.ndarray, np.ndarray]] = None,
 ) -> Optional[_ConvexNLPCertificate]:
     """Recompute the *unscaled* KKT optimality residuals of a convex single-NLP.
 
@@ -20436,6 +20556,11 @@ def _convex_nlp_certificate(
     incumbent when one is within reach) and at Newton-refined support points. It
     charges every complementarity term and every stationarity residual; a gap it
     does not close is withheld.
+
+    ``implied_box`` (#1605), when given, is a box containing the feasible set (the
+    caller's FBBT box); the rigorous bound is minimized over its intersection with
+    ``[lb, ub]`` (:func:`_certificate_box`). The witness searches and the residuals
+    still use ``[lb, ub]``.
     """
     m = evaluator.n_constraints
     n = evaluator.n_variables
@@ -20716,6 +20841,8 @@ def _convex_nlp_certificate(
             witnesses.append(x + min(probed_p)[1] * d_p)
             witnesses.append(y_pv)
 
+    # #1605: the rigorous bound below is minimized over the implied box.
+    lb_t, ub_t = _certificate_box(x, lb, ub, implied_box)
     if not witnesses:
         return _no_witness_certificate(
             evaluator,
@@ -20723,8 +20850,8 @@ def _convex_nlp_certificate(
             lam,
             cons,
             grad,
-            lb,
-            ub,
+            lb_t,
+            ub_t,
             cl,
             cu,
             obj_internal,
@@ -20740,8 +20867,8 @@ def _convex_nlp_certificate(
         cons,
         grad,
         jtlam,
-        lb,
-        ub,
+        lb_t,
+        ub_t,
         cl,
         cu,
         obj_internal,
@@ -20845,19 +20972,34 @@ def _rigorous_bound_parts(
     cu: np.ndarray,
     obj_internal: Optional[float],
     witnesses: list[np.ndarray],
+    supports: Sequence[np.ndarray] = (),
 ) -> tuple[float, Optional[np.ndarray], float]:
     """``(bound, best_x, best_f)`` of the rigorous first-order certificate (#1499).
 
-    ``bound`` is the best tangent box bound of ``L_r`` over ``x`` and the witnesses
-    (``-inf`` when none is finite); ``best_x``/``best_f`` the best feasible point
-    among the witnesses that beats ``x`` (``None``/``f(x)`` if none does). See
-    :func:`_rigorous_convex_certificate` for why the bound is valid.
+    ``bound`` is the best tangent box bound of ``L_r`` over ``x``, the witnesses
+    and the ``supports`` (``-inf`` when none is finite), rounded outward by its own
+    arithmetic (:func:`_outward_tangent_bound`); ``best_x``/``best_f`` the best
+    feasible point among them that beats ``x`` (``None``/``f(x)`` if none does).
+    A witness counts as feasible within ``max(viol(x), 1e-9)``; a support point (a
+    Newton step on ``L_r``, which heads for the minimizer of the Lagrangian, not
+    of ``f`` on the feasible set) only within ``viol(x)`` itself -- the 1e-9 floor
+    is absolute in the row's units, and on rows scaled by 1e-4 it admitted a
+    Newton point 1e-5 outside the user's constraint, super-optimal, as the
+    incumbent (#1605). See :func:`_rigorous_convex_certificate` for why the bound
+    is valid.
     """
     m = cons.size
     n = x.size
     lam_r, shift, lo, hi, _viol, viol_tol, f_x = _relaxed_lagrangian_setup(
         evaluator, x, lam, cons, lb, ub, cl, cu, obj_internal
     )
+    viol_x = _viol(cons)
+    if m > 0:
+        side = np.where(lam_r > 0.0, cu, np.where(lam_r < 0.0, cl, 0.0))
+        shift_mag = float(np.sum(np.abs(lam_r[lam_r != 0.0] * side[lam_r != 0.0])))
+    else:
+        shift_mag = 0.0
+    n_val = 2 * m + 2
 
     def _support(s: np.ndarray) -> tuple[float, float, Optional[np.ndarray]]:
         """(tangent box bound of L_r at s, f(s), constraint values at s)."""
@@ -20867,28 +21009,40 @@ def _rigorous_bound_parts(
             c_s = np.asarray(evaluator.evaluate_constraints(s), dtype=np.float64)
             j_s = _cert_jacobian(evaluator, s, m, n)
             val = f_s + float(lam_r @ c_s) - shift
+            mag = abs(f_s) + float(np.abs(lam_r) @ np.abs(c_s)) + shift_mag
+            e_mag = _evaluation_magnitude(s, g_s, j_s, lam_r)
             g_s = g_s + np.asarray(j_s.T @ lam_r, dtype=np.float64).ravel()
         else:
             c_s = None
             val = f_s
-        return _tangent_box_bound(val, g_s, s, lo, hi), f_s, c_s
+            mag = abs(f_s)
+            e_mag = _evaluation_magnitude(s, g_s, None, None)
+        return _outward_tangent_bound(val, mag, n_val, g_s, s, lo, hi, e_mag), f_s, c_s
 
-    bound = _tangent_box_bound(
-        f_x + (float(lam_r @ cons) - shift if m > 0 else 0.0),
-        _lagrangian_grad(evaluator, x, grad, lam_r, m, n),
-        x,
-        lo,
-        hi,
-    )
+    if m > 0:
+        val_x = f_x + float(lam_r @ cons) - shift
+        mag_x = abs(f_x) + float(np.abs(lam_r) @ np.abs(cons)) + shift_mag
+        jac_x = _cert_jacobian(evaluator, x, m, n)
+        g_x = (
+            np.asarray(grad, dtype=np.float64)
+            + np.asarray(jac_x.T @ lam_r, dtype=np.float64).ravel()
+        )
+        e_mag_x = _evaluation_magnitude(x, grad, jac_x, lam_r)
+    else:
+        val_x, mag_x = f_x, abs(f_x)
+        g_x = np.asarray(grad, dtype=np.float64)
+        e_mag_x = _evaluation_magnitude(x, grad, None, None)
+    bound = _outward_tangent_bound(val_x, mag_x, n_val, g_x, x, lo, hi, e_mag_x)
     best_x: Optional[np.ndarray] = None
     best_f = f_x
-    for s in witnesses:
-        s = np.clip(np.asarray(s, dtype=np.float64), lo, hi)
-        b_s, f_s, c_s = _support(s)
-        bound = max(bound, b_s)
-        feasible = c_s is None or (np.all(np.isfinite(c_s)) and _viol(c_s) <= viol_tol)
-        if feasible and np.isfinite(f_s) and f_s < best_f:
-            best_x, best_f = s, f_s
+    for pts, tol in ((witnesses, viol_tol), (supports, viol_x)):
+        for s in pts:
+            s = np.clip(np.asarray(s, dtype=np.float64), lo, hi)
+            b_s, f_s, c_s = _support(s)
+            bound = max(bound, b_s)
+            feasible = c_s is None or (np.all(np.isfinite(c_s)) and _viol(c_s) <= tol)
+            if feasible and np.isfinite(f_s) and f_s < best_f:
+                best_x, best_f = s, f_s
     if not np.isfinite(bound):
         bound = -np.inf
     return float(bound), best_x, float(best_f)
@@ -20957,7 +21111,12 @@ def _no_witness_certificate(
        slope on a coordinate whose box is ``2e6`` wide is already ``5e-4`` -- and is
        tight at the minimizer of ``L_r``, which a Newton step reaches to rounding;
     3. the same with repaired multipliers (:func:`_repaired_multipliers`), for the
-       slope a primal step cannot remove (a coordinate with no curvature).
+       slope a primal step cannot remove (a coordinate with no curvature), and
+    4. with the multipliers of the active rows only (:func:`_active_row_multipliers`),
+       for the complementarity an IPM leaves on inactive rows.
+
+    The box is the caller's certificate box (:func:`_certificate_box`), which may be
+    tighter than the declared one.
 
     The bound is published only when it closes the gap to the best feasible point
     found under the published-pair criterion :func:`_gap_values_converged`.
@@ -20998,7 +21157,7 @@ def _no_witness_certificate(
     newton = _newton_support_points(evaluator, x, lam, cons, grad, lb, ub, cl, cu, obj_internal)
     if newton:
         bound_n, best_x_n, best_f_n = _rigorous_bound_parts(
-            evaluator, x, lam, cons, grad, lb, ub, cl, cu, obj_internal, polish + newton
+            evaluator, x, lam, cons, grad, lb, ub, cl, cu, obj_internal, polish, newton
         )
         if np.isfinite(best_f_n) and best_f_n <= best_f:
             best_x, best_f = best_x_n, best_f_n
@@ -21017,12 +21176,21 @@ def _no_witness_certificate(
     # and take the tangent bound again (with fresh Newton points under it).
     s_pt = newton[-1] if newton else x
     lam_fix = _repaired_multipliers(evaluator, s_pt, lam, cons, lb, ub, cl, cu, obj_internal)
-    if lam_fix is not None:
-        newton_fix = _newton_support_points(
-            evaluator, x, lam_fix, cons, grad, lb, ub, cl, cu, obj_internal
+    # 4. The multipliers of the rows active at ``x`` only (#1605). An IPM leaves
+    # ~1e-8 on every inactive row, and with no active row at all the least-squares
+    # repair has nothing to solve for, so ``lam_fix`` keeps paying that ``lam``
+    # times a slack of 1e3 (nlp_cvx_002_011 shifted by 1e3: 5.9e-5 at an optimum
+    # of 0). Zero is a sign-consistent multiplier, so this is as valid as any.
+    lam_act = _active_row_multipliers(lam, cons, cl, cu)
+    candidates = [c for c in (lam_fix, lam_act) if c is not None]
+    if lam_fix is not None and lam_act is not None and np.array_equal(lam_fix, lam_act):
+        candidates = [lam_fix]
+    for lam_c in candidates:
+        newton_c = _newton_support_points(
+            evaluator, x, lam_c, cons, grad, lb, ub, cl, cu, obj_internal
         )
         bound_f, best_x_f, best_f_f = _rigorous_bound_parts(
-            evaluator, x, lam_fix, cons, grad, lb, ub, cl, cu, obj_internal, polish + newton_fix
+            evaluator, x, lam_c, cons, grad, lb, ub, cl, cu, obj_internal, polish, newton_c
         )
         if np.isfinite(best_f_f) and best_f_f < best_f:
             best_x, best_f = best_x_f, best_f_f
@@ -21034,6 +21202,30 @@ def _no_witness_certificate(
             return _cert(bound_r)
 
     return unbounded
+
+
+def _active_row_multipliers(
+    lam: np.ndarray, cons: np.ndarray, cl: np.ndarray, cu: np.ndarray
+) -> Optional[np.ndarray]:
+    """``lam`` with every entry on a row inactive at ``x`` set to zero (#1605).
+
+    A row is active when its slack on the side its multiplier selects is within
+    ``1e-6 (1 + |side|)``. Zeroing keeps the sign (zero is sign-consistent), so the
+    result is as valid a multiplier for the tangent bound as ``lam``. ``None``
+    without rows or when nothing would change.
+    """
+    m = cons.size
+    if m == 0:
+        return None
+    lam_a = np.asarray(lam, dtype=np.float64).copy()
+    side = np.where(lam_a > 0.0, cu, np.where(lam_a < 0.0, cl, 0.0))
+    with np.errstate(invalid="ignore"):
+        slack = np.abs(np.where(lam_a != 0.0, side - cons, 0.0))
+    inactive = (lam_a != 0.0) & ~(slack <= 1e-6 * (1.0 + np.abs(side)))
+    if not np.any(inactive):
+        return None
+    lam_a[inactive] = 0.0
+    return lam_a
 
 
 def _repaired_multipliers(
@@ -21156,7 +21348,7 @@ def _support_hessian(evaluator, x: np.ndarray, lam_h: np.ndarray, n: int):
         cols = np.asarray(cols, dtype=np.int64)
         vals = np.asarray(values(x, 1.0, lam_h), dtype=np.float64).ravel()
         if vals.size != rows.size:
-            raise ValueError(f"Hessian values {vals.size} != structure {rows.size}")
+            raise _CertificateShapeError(f"Hessian values {vals.size} != structure {rows.size}")
         if np.any(rows < cols):
             # Not a lower triangle: take the entries as given (full storage).
             return _sps.csr_matrix((vals, (rows, cols)), shape=(n, n))
@@ -21195,7 +21387,8 @@ def _newton_support_points(
     the step solves ``H_FF d = -g_F`` (least squares when dense, a ``1e-12``
     relative diagonal shift when sparse, since a convex ``H_FF`` may be singular)
     and is clipped to the box. These points are only *support* points for the
-    tangent bound of the convex ``L_r`` (and incumbent candidates if feasible), so
+    tangent bound of the convex ``L_r`` (and incumbent candidates if no more
+    violated than ``x``, see :func:`_rigorous_bound_parts`), so
     the Hessian and the step affect the bound's tightness, never its validity.
     Empty when the evaluator has no usable Hessian or it is not finite.
     """
@@ -21212,7 +21405,7 @@ def _newton_support_points(
         return []
     sparse = _sp_issparse(H)
     if H.shape != (n, n):
-        raise ValueError(f"Hessian shape {H.shape} != {(n, n)}")
+        raise _CertificateShapeError(f"Hessian shape {H.shape} != {(n, n)}")
     h_vals = H.data if sparse else H
     if not np.all(np.isfinite(h_vals)):
         return []
@@ -21278,9 +21471,12 @@ def _cert_jacobian(evaluator, x: np.ndarray, m: int, n: int):
 
         out = _sps.csr_matrix(jac, dtype=np.float64)
         if out.shape != (m, n):
-            raise ValueError(f"Jacobian shape {out.shape} != {(m, n)}")
+            raise _CertificateShapeError(f"Jacobian shape {out.shape} != {(m, n)}")
         return out
-    return np.asarray(jac, dtype=np.float64).reshape(m, n)
+    out = np.asarray(jac, dtype=np.float64)
+    if out.size != m * n:
+        raise _CertificateShapeError(f"Jacobian has {out.size} entries, expected {(m, n)}")
+    return out.reshape(m, n)
 
 
 def _build_pounce_warm_start(evaluator, state: dict):
@@ -21615,7 +21811,10 @@ def _solve_continuous(
                 np.asarray(_cu_g, dtype=np.float64),
                 nlp_result.objective,
                 gap_tolerance=gap_tolerance,
+                implied_box=_fbbt_implied_box(model, int(evaluator.n_variables)),
             )
+        except _CertificateShapeError:
+            raise  # a defect in the certificate's inputs, not an uncertifiable point
         except Exception as _cert_exc:  # pragma: no cover - defensive
             # A failure to *evaluate* the certificate cannot be allowed to crash an
             # otherwise-successful solve; withholding the certificate is the safe
@@ -26646,6 +26845,35 @@ def _qp_objective_at_point(
     return expanded
 
 
+def _qp_reduced_costs_at(
+    x: np.ndarray,
+    Q: np.ndarray,  # noqa: N803
+    c: np.ndarray,
+    A_ub,  # noqa: N803
+    A_eq,  # noqa: N803
+    row_dual: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    """HiGHS-convention reduced costs ``Qx + c - A^T y`` at ``x`` (#1605).
+
+    ``y`` is ``row_dual`` in the backend's layout (``A_ub`` rows, then ``A_eq``).
+    ``None`` without row duals, as the backend's own reduced costs would be.
+    """
+    blocks = [B for B in (A_ub, A_eq) if B is not None and B.shape[0] > 0]
+    m = sum(B.shape[0] for B in blocks)
+    if m > 0 and (row_dual is None or np.asarray(row_dual).size != m):
+        return None
+    xs = np.asarray(x, dtype=np.float64)
+    rc = np.asarray(np.asarray(Q, dtype=np.float64) @ xs, dtype=np.float64).ravel()
+    rc = rc + np.asarray(c, dtype=np.float64).ravel()
+    y = np.asarray(row_dual, dtype=np.float64).ravel() if m > 0 else np.zeros(0)
+    k = 0
+    for B in blocks:
+        r = B.shape[0]
+        rc = rc - np.asarray(B.T @ y[k : k + r], dtype=np.float64).ravel()
+        k += r
+    return rc
+
+
 class _QPCertEvaluator:
     """Minimal evaluator for :func:`_convex_nlp_certificate` on a matrix-form QP (#1596).
 
@@ -26792,6 +27020,7 @@ def _qp_convex_certificate(
         cu,
         evaluator.evaluate_objective(xs),
         gap_tolerance=gap_tolerance,
+        implied_box=_fbbt_implied_box(model, n),
     )
     if (
         cert is None
@@ -26969,6 +27198,7 @@ def _solve_qp_matrix(
         # unconverged supports it. Otherwise the point is an uncertified incumbent.
         qp_bound: Optional[float] = objective
         qp_certified = True
+        reduced_costs = result.reduced_costs
         if integrality is None:
             qp_cert = _qp_convex_certificate(
                 model,
@@ -27000,6 +27230,13 @@ def _solve_qp_matrix(
                     objective = float(qp_cert.better_obj)
                     if sense == ObjectiveSense.MAXIMIZE:
                         objective = -objective
+                    # #1605: the backend's reduced costs describe the point it
+                    # returned. Recompute them at the adopted one with the same
+                    # row duals (HiGHS convention: rc = Qx + c - A^T y), as the
+                    # NLP route refits its duals after a #1499 swap.
+                    reduced_costs = _qp_reduced_costs_at(
+                        x_flat, Q_orig, c_orig, A_ub, A_eq, result.dual_values
+                    )
                 qp_bound = -b_int if sense == ObjectiveSense.MAXIMIZE else b_int
 
         n_eq_rows = A_eq.shape[0] if A_eq is not None else 0
@@ -27008,7 +27245,7 @@ def _solve_qp_matrix(
             cd, bdl, bdu = _lp_qp_unpack_duals(
                 model,
                 row_dual=result.dual_values,
-                col_dual=result.reduced_costs,
+                col_dual=reduced_costs,
                 n_eq=n_eq_rows,
                 n_ub=n_ub_rows,
                 n_orig=n_orig,
@@ -27060,6 +27297,10 @@ def _solve_qp_matrix(
             gap=(
                 result.gap
                 if integrality is not None and result.gap is not None
+                # #1605: the near-zero contract of the NLP route -- a relative gap
+                # is undefined at a ~0 incumbent (``None``, not ``0.0``).
+                else None
+                if _optimal_relative_gap(objective) is None
                 else _relative_gap_from_objective_bound(objective, qp_bound)
             ),
             x=_unpack_solution(model, x_flat),
