@@ -202,6 +202,29 @@ def _normalise_bounds(
     return lb, ub
 
 
+def _optimal_exit_bound_gap(objective: float, bound: Optional[float]) -> tuple[float, float]:
+    """The ``(bound, gap)`` pair to publish on a Gurobi ``OPTIMAL`` exit (#1627).
+
+    Gurobi reports ``OPTIMAL`` once the MIP gap is within ``MIPGap`` (set from
+    ``gap_tolerance`` in :func:`_build_model`), NOT gap zero, so substituting the
+    incumbent for the dual bound over-states the bound by up to that tolerance -- a
+    "bound" above the true optimum, published with ``gap=0.0``. The same defect was
+    fixed in ``milp_simplex._certified_bound`` (#1141) and in ``lp_spatial_bb``
+    (#1627). Publish Gurobi's own ``ObjBound`` instead, capped at the incumbent (a
+    bound that crosses the incumbent is not a bound). Only when Gurobi exposes no
+    ``ObjBound`` -- a continuous LP or convex QP, which it solves to optimality by
+    strong duality and for which the attribute does not exist -- is the incumbent
+    itself the proven bound.
+    """
+    from discopt.solvers._gap import reported_gap
+
+    if bound is None:
+        return float(objective), 0.0
+    certified = min(float(bound), float(objective))
+    gap = reported_gap(objective, certified)
+    return certified, (0.0 if gap is None else gap)
+
+
 def _status_map(GRB) -> dict[int, SolveStatus]:
     mapping = {
         GRB.OPTIMAL: SolveStatus.OPTIMAL,
@@ -501,12 +524,13 @@ def solve_milp(
 
         if status == SolveStatus.OPTIMAL:
             assert objective is not None and x_val is not None
+            opt_bound, opt_gap = _optimal_exit_bound_gap(objective, bound)
             return MILPResult(
                 status=status,
                 x=x_val,
                 objective=objective,
-                bound=objective,
-                gap=0.0,
+                bound=opt_bound,
+                gap=opt_gap,
                 node_count=node_count,
                 wall_time=wall_time,
                 solution_pool=pool_x,
@@ -694,12 +718,13 @@ def solve_milp_with_lazy_cuts(
 
         if status == SolveStatus.OPTIMAL:
             assert objective is not None and x_val is not None
+            opt_bound, opt_gap = _optimal_exit_bound_gap(objective, bound)
             return MILPResult(
                 status=status,
                 x=x_val,
                 objective=objective,
-                bound=objective,
-                gap=0.0,
+                bound=opt_bound,
+                gap=opt_gap,
                 node_count=node_count,
                 wall_time=wall_time,
                 callback_stats=callback_stats,
@@ -810,12 +835,13 @@ def solve_qp(
                 rc = _safe_attr(x, "RC")
                 reduced_costs = np.asarray(rc, dtype=np.float64).ravel() if rc is not None else None
 
+            opt_bound, opt_gap = _optimal_exit_bound_gap(objective, bound)
             return QPResult(
                 status=status,
                 x=x_val,
                 objective=objective,
-                bound=objective,
-                gap=0.0,
+                bound=opt_bound,
+                gap=opt_gap,
                 dual_values=row_duals,
                 reduced_costs=reduced_costs,
                 node_count=node_count,
@@ -930,12 +956,13 @@ def solve_qcp(
 
         if status == SolveStatus.OPTIMAL:
             assert objective is not None and x_val is not None
+            opt_bound, opt_gap = _optimal_exit_bound_gap(objective, bound)
             return QPResult(
                 status=status,
                 x=x_val,
                 objective=objective,
-                bound=objective,
-                gap=0.0,
+                bound=opt_bound,
+                gap=opt_gap,
                 node_count=node_count,
                 iterations=iters,
                 wall_time=wall_time,

@@ -1376,3 +1376,256 @@ def test_model_solve_gurobi_huge_finite_bound_is_optimal_not_unbounded(sense):
 
     assert result.status == "optimal"
     assert result.x["x"] == pytest.approx(-1e16, rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# #1627: Gurobi reports OPTIMAL once the MIP gap is within ``MIPGap`` (set from
+# ``gap_tolerance``), not at gap zero. Publishing ``bound = objective`` there puts the
+# "dual bound" up to the tolerance past the true optimum, with ``gap = 0``.
+# ---------------------------------------------------------------------------
+
+
+def _fake_gurobi_milp(obj_val, obj_bound):
+    class FakeGRB:
+        CONTINUOUS = "C"
+        BINARY = "B"
+        INTEGER = "I"
+        MINIMIZE = 1
+        INFINITY = 1e100
+        OPTIMAL = 2
+        INFEASIBLE = 3
+        UNBOUNDED = 5
+        INF_OR_UNBD = 4
+        ITERATION_LIMIT = 7
+        TIME_LIMIT = 9
+
+    class FakeEnv:
+        def __init__(self, empty=True):
+            pass
+
+        def setParam(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def dispose(self):
+            pass
+
+    class FakeMVar:
+        __array_priority__ = 1000
+        X = np.array([1.0])
+
+        def __rmatmul__(self, _other):
+            return 0.0
+
+    class FakeModel:
+        Status = FakeGRB.OPTIMAL
+        NodeCount = 3
+        Runtime = 0.0
+        SolCount = 1
+        ObjVal = obj_val
+        ObjBound = obj_bound
+        MIPGap = 1e-4
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def setParam(self, *_args):
+            pass
+
+        def addMVar(self, **_kwargs):
+            return FakeMVar()
+
+        def setObjective(self, *_args):
+            pass
+
+        def optimize(self):
+            pass
+
+        def dispose(self):
+            pass
+
+    return types.SimpleNamespace(Env=FakeEnv, Model=FakeModel), FakeGRB
+
+
+def test_gurobi_milp_optimal_within_tolerance_publishes_objbound(monkeypatch):
+    """#1627: the wrapper publishes Gurobi's ObjBound, not the incumbent."""
+    fake_gp, fake_grb = _fake_gurobi_milp(obj_val=49.6188, obj_bound=49.6142)
+    monkeypatch.setattr(gurobi_backend, "_load_gurobi", lambda: (fake_gp, fake_grb))
+
+    result = gurobi_backend.solve_milp(
+        c=np.array([1.0]),
+        bounds=[(0.0, 1.0)],
+        integrality=np.array([1], dtype=np.int32),
+    )
+
+    assert result.status == SolveStatus.OPTIMAL
+    assert result.objective == pytest.approx(49.6188)
+    assert result.bound == pytest.approx(49.6142)
+    assert result.gap == pytest.approx(0.0046 / 49.6188)
+
+
+def _maximize_milp_with_constant(monkeypatch):
+    _install_fake_rust_classifier(monkeypatch, "milp")
+    from discopt._relax import problem_classifier
+
+    m = dm.Model("gurobi_1627_milp")
+    y = m.integer("y", lb=0, ub=10)
+    m.maximize(y + 50)
+    lp_data = problem_classifier.LPData(
+        c=np.array([-1.0]),
+        A_eq=np.zeros((0, 1)),
+        b_eq=np.zeros(0),
+        x_l=np.array([0.0]),
+        x_u=np.array([10.0]),
+        obj_const=-50.0,
+    )
+    monkeypatch.setattr(problem_classifier, "extract_lp_data", lambda _model: lp_data)
+    return m
+
+
+def test_gurobi_milp_optimal_within_tolerance_maps_engine_bound(monkeypatch):
+    """#1627, model level: maximize y + 50; Gurobi stops OPTIMAL at incumbent 8 with
+    dual bound 8.004 (internal min: objective -8, bound -8.004). The published upper
+    bound must be 58.004, not the incumbent 58."""
+    import discopt.solver as solver
+
+    m = _maximize_milp_with_constant(monkeypatch)
+
+    def fake_solve_milp(**_kwargs):
+        return MILPResult(
+            status=SolveStatus.OPTIMAL,
+            x=np.array([8.0]),
+            objective=-8.0,
+            bound=-8.004,
+            gap=0.0005,
+            node_count=7,
+        )
+
+    monkeypatch.setattr(gurobi_backend, "solve_milp", fake_solve_milp)
+    monkeypatch.setattr(solver, "_mip_recover_relaxation_duals", lambda *_a, **_k: (None,) * 3)
+
+    result = solver._solve_milp_gurobi(m, t_start=0.0, time_limit=1.0)
+
+    assert result.status == "optimal"
+    assert result.objective == pytest.approx(58.0)
+    assert result.bound == pytest.approx(58.004)
+    assert result.gap == pytest.approx(0.004 / 58.004)
+
+
+def test_gurobi_milp_optimal_bound_never_crosses_incumbent(monkeypatch):
+    """A Gurobi bound a hair past the incumbent at its own tolerance is capped."""
+    import discopt.solver as solver
+
+    m = _maximize_milp_with_constant(monkeypatch)
+
+    def fake_solve_milp(**_kwargs):
+        return MILPResult(
+            status=SolveStatus.OPTIMAL,
+            x=np.array([8.0]),
+            objective=-8.0,
+            bound=-7.9999999,
+            gap=0.0,
+            node_count=7,
+        )
+
+    monkeypatch.setattr(gurobi_backend, "solve_milp", fake_solve_milp)
+    monkeypatch.setattr(solver, "_mip_recover_relaxation_duals", lambda *_a, **_k: (None,) * 3)
+
+    result = solver._solve_milp_gurobi(m, t_start=0.0, time_limit=1.0)
+
+    assert result.status == "optimal"
+    assert result.bound == pytest.approx(58.0)
+    assert result.bound >= result.objective
+
+
+def test_gurobi_miqp_optimal_within_tolerance_maps_engine_bound(monkeypatch):
+    """#1627 on the MIQP route (``_solve_qp_matrix`` with integrality)."""
+    import discopt.solver as solver
+    from discopt._relax import problem_classifier
+
+    m = dm.Model("gurobi_1627_miqp")
+    y = m.integer("y", lb=0, ub=2)
+    m.maximize(7 - (y - 1) ** 2)
+
+    qp_data = problem_classifier.QPData(
+        Q=np.array([[2.0]]),
+        c=np.array([-2.0]),
+        A_eq=np.zeros((0, 1)),
+        b_eq=np.zeros(0),
+        x_l=np.array([0.0]),
+        x_u=np.array([2.0]),
+        obj_const=-6.0,
+    )
+    monkeypatch.setattr(problem_classifier, "extract_qp_data", lambda _model: qp_data)
+
+    def fake_solve_qp(**_kwargs):
+        return QPResult(
+            status=SolveStatus.OPTIMAL,
+            x=np.array([1.0]),
+            objective=-1.0,
+            bound=-1.0005,
+            gap=0.0005,
+            node_count=5,
+        )
+
+    monkeypatch.setattr(gurobi_backend, "solve_qp", fake_solve_qp)
+    monkeypatch.setattr(solver, "_mip_recover_relaxation_duals", lambda *_a, **_k: (None,) * 3)
+
+    result = solver._solve_qp_gurobi(m, t_start=0.0, time_limit=1.0)
+
+    assert result.status == "optimal"
+    assert result.objective == pytest.approx(7.0)
+    assert result.bound == pytest.approx(7.0005)
+    assert result.gap == pytest.approx(0.0005 / 7.0005)
+
+
+def test_gurobi_qcp_optimal_within_tolerance_maps_engine_bound(monkeypatch):
+    """#1627 on the (MI)QCP route."""
+    import discopt.solver as solver
+    from discopt._relax import problem_classifier
+
+    m = dm.Model("gurobi_1627_qcp")
+    x = m.continuous("x", lb=-2, ub=2)
+    m.maximize(x)
+    m.subject_to(x**2 <= 1)
+
+    qcp_data = problem_classifier.QCPData(
+        Q=np.zeros((1, 1)),
+        c=np.array([-1.0]),
+        A_ub=np.zeros((0, 1)),
+        b_ub=np.zeros(0),
+        A_eq=np.zeros((0, 1)),
+        b_eq=np.zeros(0),
+        quadratic_constraints=(
+            problem_classifier.QuadraticConstraintData(
+                Q=np.array([[2.0]]),
+                c=np.array([0.0]),
+                sense="<=",
+                rhs=1.0,
+            ),
+        ),
+        x_l=np.array([-2.0]),
+        x_u=np.array([2.0]),
+        obj_const=0.0,
+    )
+    monkeypatch.setattr(problem_classifier, "extract_qcp_data", lambda _model: qcp_data)
+
+    def fake_solve_qcp(**_kwargs):
+        return QPResult(
+            status=SolveStatus.OPTIMAL,
+            x=np.array([0.9999]),
+            objective=-0.9999,
+            bound=-1.0,
+            gap=1e-4,
+        )
+
+    monkeypatch.setattr(gurobi_backend, "solve_qcp", fake_solve_qcp)
+
+    result = solver._solve_qcp_gurobi(m, t_start=0.0)
+
+    assert result.status == "optimal"
+    assert result.objective == pytest.approx(0.9999)
+    assert result.bound == pytest.approx(1.0)
+    assert result.gap == pytest.approx(1e-4)
