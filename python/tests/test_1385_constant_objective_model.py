@@ -158,12 +158,24 @@ def test_minimize_refuses_a_vector_constant_at_the_boundary():
 
 @pytest.mark.smoke
 def test_helper_declines_a_non_finite_constant():
+    """Pins the *helper's* defensive check, as for the vector case above.
+
+    Since #1628 ``minimize`` refuses a non-finite constant, so the invalid
+    objective is installed directly (the way internal machinery could reach the
+    solver). The helper assertion is unchanged; the boundary refusal is pinned too.
+    """
+    from discopt.modeling.core import Objective, ObjectiveSense
     from discopt.solver import _constant_objective_result
 
     for bad in (math.inf, -math.inf, math.nan):
         m = Model()
-        m.minimize(bad)
+        m._objective = Objective(Constant(bad), ObjectiveSense.MINIMIZE)
         assert _constant_objective_result(m, 0.0) is None, f"accepted {bad!r}"
+
+        fresh = Model()
+        with pytest.raises(ValueError, match="non-finite constant objective"):
+            fresh.minimize(bad)
+        assert fresh._objective is None
 
 
 @pytest.mark.smoke
