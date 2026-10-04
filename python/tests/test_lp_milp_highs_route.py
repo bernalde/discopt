@@ -636,9 +636,12 @@ def test_row_rhs_at_the_infinity_sentinel_is_an_error_not_a_crash(highs):
     assert res.objective is None
 
 
-def test_milp_highs_would_perturb_gets_no_answer_from_it(highs):
-    """Below ``small_matrix_value`` HiGHS solves a different MILP, and neither its
-    infeasible label nor its tree bound can be re-derived for the real one."""
+def test_milp_sub_threshold_entry_is_absorbed_into_the_row_range(highs):
+    """Below ``small_matrix_value`` HiGHS would silently drop an entry and solve a
+    different MILP. Since #1617 the route absorbs each such term into the row as
+    an interval over the column's box (a sound relaxation), so the tree bound and
+    an infeasible label stay valid for the real model and the incumbent is still
+    verified against the original rows."""
     m = dm.Model("milp_sub_threshold_coef")
     x = m.integer("x", lb=0, ub=10)
     y = m.continuous("y", lb=0.0, ub=1.0)
@@ -646,8 +649,10 @@ def test_milp_highs_would_perturb_gets_no_answer_from_it(highs):
     m.minimize(x + y)
     res = m.solve(time_limit=20)
     assert _on_highs_route(res)
-    assert res.status == "error" and not res.gap_certified
-    assert res.objective is None
+    assert res.status == "optimal", (res.status, res.error)
+    assert res.objective == pytest.approx(1.0, abs=1e-6)
+    assert res.bound is not None and res.bound <= res.objective + 1e-9
+    assert float(res.x["x"]) + 1e-13 * float(res.x["y"]) >= 1 - 1e-9
 
 
 def test_issue_1229_instance_returns_a_feasible_point_on_the_highs_route():

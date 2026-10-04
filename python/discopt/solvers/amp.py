@@ -2294,7 +2294,10 @@ def _solve_amp_impl(
     milp_solver : str, default "auto"
         MILP backend for AMP master relaxations and MILP-based bound
         tightening. Choose ``"auto"``, ``"pounce"``,
-        ``"simplex"``, or ``"gurobi"`` (HiGHS was removed, issue #356). The
+        ``"simplex"``, ``"gurobi"``, or ``"highs"``. HiGHS left every default and
+        fallback order in #356; ``"highs"`` is the explicit opt-in master engine of
+        #1060 (no fallback: a missing ``highspy`` is an error), accepted here since
+        #1617 because :meth:`Model.solve`'s docstring already promised it. The
         explicit Gurobi option uses
         discopt's global AMP algorithm with Gurobi as the matrix MILP subsolver;
         it does not translate general nonlinear expressions into Gurobi
@@ -2341,7 +2344,7 @@ def _solve_amp_impl(
     convhull_mode = _normalize_convhull_formulation(convhull_formulation)
     if convhull_ebd and convhull_mode != "sos2":
         raise ValueError("convhull_ebd requires convhull_formulation='sos2' or the 'lambda' alias.")
-    _valid_milp_solvers = {"auto", "pounce", "simplex", "gurobi"}
+    _valid_milp_solvers = {"auto", "pounce", "simplex", "gurobi", "highs"}
     if milp_solver not in _valid_milp_solvers:
         raise ValueError(
             f"Unknown milp_solver={milp_solver!r}. Choose one of {sorted(_valid_milp_solvers)}."

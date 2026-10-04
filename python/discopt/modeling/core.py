@@ -7086,6 +7086,23 @@ class Model:
         --------
         >>> m.if_then(y[0], [x[0] >= 10, x[1] <= 50], name="unit0_active")
         """
+        # #1617: a ``BooleanVar`` (from :meth:`boolean`) is backed by a binary
+        # Variable; use it. Any other logical expression has no single 0/1 column to
+        # act as the indicator -- refuse here, at the call, rather than with a
+        # ``float()`` TypeError deep inside ``solve()``.
+        if isinstance(indicator, BooleanVar):
+            indicator = indicator.variable
+        elif isinstance(indicator, LogicalExpression):
+            raise TypeError(
+                "if_then: the indicator must be a binary variable or a BooleanVar, not "
+                f"the logical expression {indicator!r}; state it with "
+                "m.logical(expr.implies(...)) or introduce a BooleanVar for it."
+            )
+        elif not isinstance(indicator, Expression):
+            raise TypeError(
+                "if_then: the indicator must be a binary variable or a BooleanVar, got "
+                f"{type(indicator).__name__}."
+            )
         for k, c in enumerate(then_constraints):
             c.name = f"{name}_then_{k}" if name else None
             # Store as indicator constraint; Rust presolve will handle
