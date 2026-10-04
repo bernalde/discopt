@@ -567,6 +567,13 @@ def solve_benders(
             _add_feas_cut(blk, res[3], res[4], res[5])
 
     best_ub = np.inf
+    # #1611 D-29: the best master dual bound seen over the run. Every master
+    # solve's bound is a valid lower bound (cuts are valid underestimators), but
+    # purging stale cuts (T2.3) WEAKENS the master, so the bound of a later -- in
+    # particular the final -- master solve can sit below one already proved. The
+    # loop used to certify ``optimal`` against the pre-purge bound and then report
+    # the post-purge one: ``optimal`` with a 2.2e-3 relative gap. Report the best.
+    best_lb = -np.inf
     incumbent_full: np.ndarray | None = None
     status = "iteration_limit"
     stall = 0  # consecutive non-separating iterations (T0.4 progress guard)
@@ -634,6 +641,10 @@ def solve_benders(
             x_center = x_hat.copy()  # first stabilization centre (T2.2)
         lb = mres.bound if mres.bound is not None else mres.objective
         lower_bound = (float(lb) + lin.c_offset) if lb is not None else None
+        if lower_bound is not None and not np.any(eta_vec <= cfg.eta_floor + 1.0):
+            # Same eta-floor guard as the final bound below (T0.5): while a
+            # block's eta sits on the floor the master value is not a bound.
+            best_lb = max(best_lb, lower_bound)
 
         results = _recourse_all(x_hat)
         if any(r is not None and r[0] == "recourse_fail" for r in results):
@@ -687,8 +698,8 @@ def solve_benders(
             if stall >= 2:
                 break
 
-        if np.isfinite(best_ub) and lower_bound is not None:
-            gap = relative_gap(best_ub, lower_bound)
+        if np.isfinite(best_ub) and np.isfinite(best_lb):
+            gap = relative_gap(best_ub, best_lb)
             if gap <= cfg.gap_tolerance:
                 status = "optimal"
                 break
@@ -709,10 +720,19 @@ def solve_benders(
                 logger.warning("Benders eta floor still active; withholding bound.")
                 bound = None
 
+    if np.isfinite(best_lb):
+        bound = best_lb if bound is None else max(bound, best_lb)
+
     if status == "infeasible":
         return SolveResult(status="infeasible", wall_time=time.time() - t0, gap_certified=True)
 
     objective = None if not np.isfinite(best_ub) else best_ub
+    # The certificate is the reported (objective, bound) pair: ``optimal`` only
+    # when that pair closes the gap, never on a bound the result does not carry.
+    if status == "optimal" and (
+        objective is None or bound is None or relative_gap(objective, bound) > cfg.gap_tolerance
+    ):
+        status = "iteration_limit"
     # Promote to optimal if the final master bound already meets the incumbent.
     if status == "iteration_limit" and objective is not None and bound is not None:
         if relative_gap(objective, bound) <= cfg.gap_tolerance:
