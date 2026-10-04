@@ -6911,6 +6911,23 @@ def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
 _TERMINATION_FROM_LIMIT_STATUS = frozenset({"time_limit", "node_limit", "iteration_limit"})
 
 
+def _presolve_infeasible_fields(proof: str) -> dict:
+    """Provenance for an ``infeasible`` proved by presolve, before any search (#1618 C-17).
+
+    Such a result has ``node_count=0`` and used to carry no route and no
+    termination reason at all, so a caller could not tell "presolve proved it"
+    from "the tree drained" or from a route that never reported. ``termination``
+    is :data:`discopt.status.TERMINATION_PRESOLVE`; ``algorithm_route`` names the
+    pass that produced the proof.
+    """
+    from discopt import status as _st
+
+    return {
+        "termination": _st.TERMINATION_PRESOLVE,
+        "algorithm_route": f"presolve: infeasibility proved by {proof}",
+    }
+
+
 def _stamp_reported_gap(
     result,
     objective: float,
@@ -7078,7 +7095,14 @@ def _format_bad_bound_entries(
     """
     bad_vars: list[str] = []
     offset = 0
+    free_by_construction: set[str] = getattr(model, "_free_by_construction", set())
     for v in model._variables:
+        if v.name in free_by_construction:
+            # Created free by discopt (e.g. CVaR's eta), not declared by the
+            # user; "declare tighter bounds" is not an action they can take.
+            logger.debug("large-bound check: %s is free by construction", v.name)
+            offset += v.size
+            continue
         lb_flat = np.asarray(flat_lb[offset : offset + v.size], dtype=np.float64)
         ub_flat = np.asarray(flat_ub[offset : offset + v.size], dtype=np.float64)
         for j in range(v.size):
@@ -11845,6 +11869,9 @@ def solve_model(
         )
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields(
+                f"nonlinear bound tightening of the declared box ({nonlinear_infeasibility})"
+            ),
             wall_time=time.perf_counter() - _solve_t0,
             gap_certified=True,
         )
@@ -14815,6 +14842,7 @@ def solve_model(
         wall_time = time.perf_counter() - t_start
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields("root FBBT"),
             objective=None,
             bound=None,
             gap=None,
@@ -14840,6 +14868,7 @@ def solve_model(
         wall_time = time.perf_counter() - t_start
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields("root nonlinear forward-substitution tightening"),
             objective=None,
             bound=None,
             gap=None,
@@ -14961,6 +14990,7 @@ def solve_model(
             wall_time = time.perf_counter() - t_start
             return SolveResult(
                 status="infeasible",
+                **_presolve_infeasible_fields("root OBBT"),
                 objective=None,
                 bound=None,
                 gap=None,
@@ -22305,6 +22335,7 @@ def _solve_continuous(
         wall_time = time.perf_counter() - t_start
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields("nonlinear bound tightening"),
             wall_time=wall_time,
             gap_certified=True,
             jax_time=jax_time,
@@ -22603,6 +22634,8 @@ def _solve_continuous(
     # bogus incumbent never propagates. This only ever removes a bad incumbent;
     # the path carries no valid dual bound when it is not "optimal", so refusing
     # here can never loosen a bound below truth (soundness is untouched).
+    _last_iterate: Optional[dict] = None
+    _last_iterate_violation: Optional[float] = None
     if x_dict is not None and nlp_result.x is not None:
         from discopt._relax.primal_heuristics import passes_false_primal_screen
 
@@ -22612,6 +22645,27 @@ def _solve_continuous(
                 "withholding the incumbent — no feasible solution was found.",
                 status,
                 obj_val,
+            )
+            # #1618 B-18: the withheld point is still the solver's final iterate,
+            # which a real-time-iteration / NMPC caller needs. Hand it back in a
+            # field that is never an incumbent (``x`` stays None, so the #815
+            # invariant "x is feasible" holds), with its max violation beside it.
+            _last_iterate = x_dict
+            _li = np.asarray(nlp_result.x, dtype=np.float64)
+            _cl_li, _cu_li = _infer_constraint_bounds(model, evaluator)
+            _g_li = (
+                np.asarray(evaluator.evaluate_constraints(_li), dtype=np.float64)
+                if evaluator.n_constraints
+                else np.zeros(0)
+            )
+            _last_iterate_violation = float(
+                max(
+                    0.0,
+                    float(np.max(np.asarray(_cl_li) - _g_li)) if _g_li.size else 0.0,
+                    float(np.max(_g_li - np.asarray(_cu_li))) if _g_li.size else 0.0,
+                    float(np.max(np.asarray(raw_lb, dtype=np.float64) - _li)),
+                    float(np.max(_li - np.asarray(raw_ub, dtype=np.float64))),
+                )
             )
             obj_val = None
             x_dict = None
@@ -22686,6 +22740,8 @@ def _solve_continuous(
         kkt=nlp_result.kkt,
         solve_report=nlp_result.solve_report,
         error=_error_reason if status == "error" else None,
+        last_iterate=_last_iterate,
+        last_iterate_violation=_last_iterate_violation,
     )
 
 
@@ -23143,6 +23199,7 @@ def _solve_nlp_bb(
         wall_time = time.perf_counter() - t_start
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields("root FBBT"),
             objective=None,
             bound=None,
             gap=None,
@@ -25860,6 +25917,152 @@ def _scalar_constraint_layout(
     return eq_names, ub_info
 
 
+#: Above this many dense Jacobian entries the row-matching dual layout is not
+#: attempted (it builds the constraint Jacobian densely); duals are then reported
+#: only through the scalar layout, exactly as before #1618.
+_ROW_MATCH_MAX_ENTRIES = 20_000_000
+
+
+def _matched_row_constraint_duals(
+    model: Model,
+    *,
+    row_dual: np.ndarray,
+    A_ub: Optional[np.ndarray],
+    b_ub: Optional[np.ndarray],
+    A_eq: Optional[np.ndarray],
+    b_eq: Optional[np.ndarray],
+    n_orig: int,
+) -> Optional[dict[str, np.ndarray]]:
+    """Named constraint duals by matching each solved row to its source constraint.
+
+    #1618 B-21a/B-19b. The scalar layout (:func:`_scalar_constraint_layout`)
+    assumes "one Python constraint = one row, equalities first, declared order"
+    and refuses everything else, so a single vector-bodied constraint, a fast
+    ``Model.constraint`` family or an ``add_linear_constraints`` block nulled
+    *every* dual. Which order the extractor emits builder rows in also depends on
+    which extraction rung ran, so no order can be assumed here.
+
+    Instead each row the LP/QP actually solved (``a x <= b`` in ``A_ub``,
+    ``a x = b`` in ``A_eq``, original columns only) is identified *by content*:
+    it must equal ``s * (J_k x)`` with right-hand side ``s * (bound_k - g_k(0))``
+    for exactly one evaluator row ``k`` (``J`` the constant Jacobian, ``s = ±1``).
+    The evaluator's ``constraint_row_map`` then names ``k`` -- a Python
+    constraint by ``con.name`` (or ``c{i}``, its position, as the scalar layout
+    does), a builder row by its own name (``fam_0``, ``Ab_1``), an array body
+    element-wise in C order.
+
+    Fails closed per constraint: a constraint any of whose rows matches no
+    solved row, or more than one, or whose solved row matches more than one
+    constraint (duplicate rows -- the dual split between them is arbitrary), is
+    omitted rather than given a guessed value. Returns ``None`` when nothing can
+    be named.
+
+    Sign convention (``SolveResult.constraint_duals``): the backend's row dual
+    ``rd`` gives the row multiplier ``ν = -rd >= 0`` for ``a x <= b``. Every
+    inequality in the evaluator is stored as ``body <= 0``, so ``μ = ν`` for it
+    whatever orientation the extractor chose; an equality's multiplier is
+    ``λ = -s·rd``, ``s`` mapping the solved row onto ``body = 0``.
+    """
+    # Dense, 2-D, validated (CLAUDE.md: never ``np.asarray`` a scipy matrix).
+    A_ub = None if A_ub is None else _dense_A(A_ub)
+    A_eq = None if A_eq is None else _dense_A(A_eq)
+    n_ub = 0 if A_ub is None else int(A_ub.shape[0])
+    n_eq = 0 if A_eq is None else int(A_eq.shape[0])
+    if (n_ub and b_ub is None) or (n_eq and b_eq is None):
+        return None
+    if row_dual.size != n_ub + n_eq or n_ub + n_eq == 0:
+        return None
+    ev = _make_evaluator(model)
+    m_ev = int(ev.n_constraints)
+    if m_ev == 0 or m_ev * n_orig > _ROW_MATCH_MAX_ENTRIES:
+        return None
+    if int(ev.n_variables) != n_orig:
+        return None
+    x0 = np.zeros(n_orig, dtype=np.float64)
+    J = ev.evaluate_jacobian(x0)
+    J = np.asarray(J.toarray() if hasattr(J, "toarray") else J, dtype=np.float64)
+    g0 = np.asarray(ev.evaluate_constraints(x0), dtype=np.float64).reshape(-1)
+    # Row bounds from the row map itself: ``_infer_constraint_bounds`` covers only
+    # ``model._constraints``, not the builder rows the evaluator appends (#840).
+    row_map = ev.constraint_row_map()
+    cl = np.full(m_ev, np.nan)
+    cu = np.full(m_ev, np.nan)
+    for start, stop, con in row_map:
+        lo, hi = {"<=": (-np.inf, 0.0), "==": (0.0, 0.0), ">=": (0.0, np.inf)}[con.sense]
+        cl[start:stop] = lo
+        cu[start:stop] = hi
+    if J.shape != (m_ev, n_orig) or g0.size != m_ev or np.isnan(cl).any():
+        return None
+
+    def _close(a: np.ndarray, b: np.ndarray) -> bool:
+        return bool(np.allclose(a, b, rtol=1e-9, atol=1e-12))
+
+    # Candidates by sparsity pattern, so the match is not O(rows^2) dense compares.
+    by_support: dict[tuple, list[int]] = {}
+    for k in range(m_ev):
+        by_support.setdefault(tuple(np.flatnonzero(J[k] != 0.0)), []).append(k)
+
+    # Non-None whenever the matching count is nonzero (checked above).
+    b_ub_v = np.zeros(0) if b_ub is None else np.asarray(b_ub, dtype=np.float64).reshape(-1)
+    b_eq_v = np.zeros(0) if b_eq is None else np.asarray(b_eq, dtype=np.float64).reshape(-1)
+    if b_ub_v.size != n_ub or b_eq_v.size != n_eq:
+        return None
+    solved: list[tuple[np.ndarray, float, bool]] = []  # (a, b, is_eq)
+    if A_ub is not None:
+        for j in range(n_ub):
+            solved.append((np.asarray(A_ub[j, :n_orig], np.float64), float(b_ub_v[j]), False))
+    if A_eq is not None:
+        for i in range(n_eq):
+            solved.append((np.asarray(A_eq[i, :n_orig], np.float64), float(b_eq_v[i]), True))
+
+    row_value: dict[int, float] = {}
+    bad_rows: set[int] = set()
+    for r, (a, b, is_eq) in enumerate(solved):
+        hits: list[tuple[int, float]] = []
+        for k in by_support.get(tuple(np.flatnonzero(a != 0.0)), []):
+            for s in (1.0, -1.0):
+                if not _close(a, s * J[k]):
+                    continue
+                if is_eq:
+                    ok = cl[k] == cu[k] and _close(np.array(b), np.array(s * (cl[k] - g0[k])))
+                elif s > 0:
+                    ok = np.isfinite(cu[k]) and _close(np.array(b), np.array(cu[k] - g0[k]))
+                else:
+                    ok = np.isfinite(cl[k]) and _close(np.array(b), np.array(-(cl[k] - g0[k])))
+                if ok:
+                    hits.append((k, s))
+        if len(hits) != 1:
+            bad_rows.update(k for k, _ in hits)
+            continue
+        k, s = hits[0]
+        if k in row_value:
+            bad_rows.add(k)  # two solved rows for one source row (e.g. a split range)
+            continue
+        rd = float(row_dual[r])
+        row_value[k] = (-s * rd) if is_eq else -rd
+
+    con_index = {id(c): i for i, c in enumerate(model._constraints)}
+    out: dict[str, np.ndarray] = {}
+    claimed: set[str] = set()
+    for start, stop, con in row_map:
+        idx = con_index.get(id(con))
+        name = con.name if con.name else (f"c{idx}" if idx is not None else None)
+        if not name or name in claimed:
+            if name:
+                out.pop(name, None)  # duplicate name: neither value is identifiable
+            continue
+        claimed.add(name)
+        rows = range(start, stop)
+        if any(k in bad_rows or k not in row_value for k in rows):
+            continue
+        vals = np.array([row_value[k] for k in rows], dtype=np.float64)
+        shape = tuple(getattr(con.body, "shape", ()) or ())
+        if int(np.prod(shape)) != vals.size or (shape == (1,) and vals.size == 1):
+            shape = () if vals.size == 1 else (vals.size,)
+        out[name] = vals.reshape(shape)
+    return out or None
+
+
 def _lp_qp_unpack_duals(
     model: Model,
     *,
@@ -25868,6 +26071,10 @@ def _lp_qp_unpack_duals(
     n_eq: int,
     n_ub: int,
     n_orig: int,
+    A_ub: Optional[np.ndarray] = None,
+    b_ub: Optional[np.ndarray] = None,
+    A_eq: Optional[np.ndarray] = None,
+    b_eq: Optional[np.ndarray] = None,
 ) -> tuple[
     Optional[dict[str, np.ndarray]],
     Optional[dict[str, np.ndarray]],
@@ -25894,16 +26101,32 @@ def _lp_qp_unpack_duals(
     any entry may be ``None`` if the underlying solver did not return that
     family of multipliers, or the row layout cannot be mapped (vector body,
     extractor mismatch, etc.).
+
+    When the solved matrices are passed (``A_ub``/``b_ub``/``A_eq``/``b_eq``) and
+    the scalar layout does not apply -- an array-bodied constraint, a fast
+    family, an ``add_linear_constraints`` block -- rows are named by content via
+    :func:`_matched_row_constraint_duals` (#1618 B-21a/B-19b). Bound duals do not
+    depend on the row layout and are reported either way.
     """
     layout = _scalar_constraint_layout(model)
-    if layout is None:
-        return None, None, None
-    eq_names, ub_info = layout
-    if len(eq_names) != n_eq or len(ub_info) != n_ub:
-        return None, None, None
+    if layout is not None:
+        eq_names, ub_info = layout
+        if len(eq_names) != n_eq or len(ub_info) != n_ub:
+            layout = None
 
     constraint_duals: Optional[dict[str, np.ndarray]] = None
-    if row_dual is not None and row_dual.size == n_ub + n_eq:
+    if layout is None:
+        if row_dual is not None and (A_ub is not None or A_eq is not None):
+            constraint_duals = _matched_row_constraint_duals(
+                model,
+                row_dual=np.asarray(row_dual, dtype=np.float64),
+                A_ub=A_ub,
+                b_ub=b_ub,
+                A_eq=A_eq,
+                b_eq=b_eq,
+                n_orig=n_orig,
+            )
+    elif row_dual is not None and row_dual.size == n_ub + n_eq:
         # HiGHS reports row duals as ∂obj/∂b. The reported convention (see
         # SolveResult.constraint_duals) is μ ≥ 0 for both "<=" and ">=" rows, so
         # we negate for "<=" and "==" rows. For ">=" the
@@ -26138,6 +26361,10 @@ def _mip_recover_relaxation_duals(
         n_eq=n_eq_rows,
         n_ub=n_ub_rows,
         n_orig=n_orig,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
     )
 
     # Zero out bound multipliers on the fix-bounds of integer columns; they
@@ -26834,6 +27061,10 @@ def _solve_lp_matrix(
             n_eq=n_eq_rows,
             n_ub=n_ub_rows,
             n_orig=n_orig,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
         )
 
         sr = SolveResult(
@@ -28151,6 +28382,10 @@ def _solve_qp_matrix(
                 n_eq=n_eq_rows,
                 n_ub=n_ub_rows,
                 n_orig=n_orig,
+                A_ub=A_ub,
+                b_ub=b_ub,
+                A_eq=A_eq,
+                b_eq=b_eq,
             )
         else:
             # MIQP: HiGHS doesn't expose MIP duals. Recover by re-solving the
@@ -31108,6 +31343,9 @@ def _highs_decomposed_duals(model: Model, n_orig: int, sf, row_dual, col_dual):
     eq = np.flatnonzero(~is_ub)
     y = np.asarray(row_dual, dtype=np.float64)
     rd = np.concatenate([sign[ub] * y[ub], y[eq]])
+    # #1618 B-21: the projection itself, so a layout the scalar unpacker cannot
+    # map (vector / builder rows) is matched row-by-row against the evaluator.
+    A_ub, b_ub, A_eq, b_eq = _decompose_eq_slack_form(sf.A, sf.b, n_orig, sf.n - n_orig, sf.xu)
     return _lp_qp_unpack_duals(
         model,
         row_dual=rd,
@@ -31115,6 +31353,10 @@ def _highs_decomposed_duals(model: Model, n_orig: int, sf, row_dual, col_dual):
         n_eq=int(eq.size),
         n_ub=int(ub.size),
         n_orig=n_orig,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
     )
 
 
@@ -33386,6 +33628,7 @@ def _solve_miqp_bb(
         wall_time = time.perf_counter() - t_start
         return SolveResult(
             status="infeasible",
+            **_presolve_infeasible_fields("root FBBT"),
             objective=None,
             bound=None,
             gap=None,

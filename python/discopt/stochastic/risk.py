@@ -67,9 +67,17 @@ class CVaR(RiskMeasure):
     def build(self, model, first_stage_cost, scenario_costs, probs) -> Expression:
         inv = 1.0 / (1.0 - self.alpha)
         eta = model.continuous(f"{self.prefix}_eta")  # VaR (free)
+        # η is free by construction (it is the VaR, which may take any sign); no
+        # finite bound is sound once parameters or the box change after build.
+        # Register it so the user-facing large-bounds warning, whose remedy is
+        # "declare tighter bounds", does not blame the user for it (#1618 X-29b).
+        if not hasattr(model, "_free_by_construction"):
+            model._free_by_construction = set()
+        model._free_by_construction.add(eta.name)
         tail_pairs: list[tuple[float, Expression]] = []
         for s, (c, p) in enumerate(zip(scenario_costs, probs)):
             u = model.continuous(f"{self.prefix}_u{s}", lb=0.0)
+            model._free_by_construction.add(u.name)  # shortfall: no sound upper bound
             model.subject_to(u >= c - eta, name=f"{self.prefix}_shortfall{s}")
             tail_pairs.append((float(p) * inv, u))
         return cast(Expression, first_stage_cost + eta + _weighted_sum(tail_pairs))

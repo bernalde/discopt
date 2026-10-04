@@ -4268,6 +4268,14 @@ class SolveResult:
         True if the reported optimality gap is mathematically certified.
         False when NLP-BB is used on a nonconvex problem (heuristic mode),
         where the NLP objective is not a valid lower bound.
+
+        On ``status="infeasible"`` there is no gap: ``gap_certified=True``
+        there means the *infeasibility* is proved (by presolve, an exhausted
+        tree, or an LP/QP Farkas certificate) and is not a heuristic verdict;
+        ``objective``, ``bound`` and ``gap`` are ``None``. It is the only status
+        allowed to be certified without both ends of a gap (see
+        ``_NON_GAP_CERTIFICATE_STATUSES``). ``termination`` and
+        ``algorithm_route`` say which machinery produced the proof.
     bound_valid : bool
         True if ``bound`` is a valid global dual bound — a lower bound on the
         global optimum for a MINIMIZE model, an upper bound for a MAXIMIZE one —
@@ -4323,7 +4331,9 @@ class SolveResult:
         Why an algorithm other than the default branch-and-bound ran, when the
         solver chose it automatically (#1059). ``None`` when no automatic
         routing happened -- either the caller named ``solver=`` explicitly, or
-        the router declined and the default path ran.
+        the router declined and the default path ran. When presolve proves the
+        model infeasible before any search, it is ``"presolve: infeasibility
+        proved by <pass>"`` and ``termination == "presolve"`` (#1618 C-17).
     """
 
     status: str
@@ -4480,7 +4490,9 @@ class SolveResult:
     #   open gap -- the #933 vocabulary, unchanged), so ``status="feasible"``
     #   alone does not say WHETHER a budget stopped the search, nor which; this
     #   field does, on every branch-and-bound / MILP route;
-    # - ``"interrupted"``: a user/debugger stop.
+    # - ``"interrupted"``: a user/debugger stop;
+    # - ``"presolve"``: presolve proved ``infeasible`` before any search ran
+    #   (``node_count == 0``; ``algorithm_route`` names the pass, #1618 C-17).
     #
     # ``None`` means the route records no reason (a direct NLP/LP solve that is not
     # a search, or a route that has not been taught the field).
@@ -4538,6 +4550,16 @@ class SolveResult:
     # correct solver code; it exists so such a bug cannot silently escape as a
     # false result (regression guard for the #770/#772 class).
     incumbent_verification_failed: bool = False
+
+    # #1618 B-18: the local NLP solver's final iterate when it was WITHHELD from
+    # ``x`` because it failed the feasibility screen (#815) -- e.g. an
+    # ``iteration_limit`` exit of a real-time-iteration / NMPC step. Never an
+    # incumbent: ``x``/``objective`` stay ``None``, and nothing (bound, gap,
+    # certificate) is derived from it. ``last_iterate_violation`` is its max
+    # constraint/bound violation in the declared model. ``None`` when ``x`` was
+    # reported, or the route keeps no iterate.
+    last_iterate: Optional[dict[str, np.ndarray]] = None
+    last_iterate_violation: Optional[float] = None
 
     # LLM explanation (populated if llm=True)
     _explanation: Optional[str] = None
@@ -5455,6 +5477,11 @@ class Model:
         self._block_labels_con: dict = {}
         # Named index sets registered via ``set()`` (see ``discopt.modeling.sets``).
         self._sets: list = []
+        # Names of variables discopt itself created as mathematically free
+        # (e.g. the CVaR value-at-risk ``eta``). The user never declared them, so
+        # the "very large or infinite declared bounds" warning -- whose remedy is
+        # "declare tighter bounds" -- does not name them (#1618 X-29b).
+        self._free_by_construction: set = set()
         # Linear constraint blocks emitted directly into the Rust builder
         # (fast-API ``add_linear_constraints`` and the indexed fast path). Each
         # entry is ``(A_csr, x, sense, b, name)``. Kept so .nl export and

@@ -94,7 +94,54 @@ def solve_with_report(problem: Any, *args: Any, **kwargs: Any) -> tuple[Any, dic
         path = os.path.join(tmp, "report.json")
         x, info = problem.solve(*args, report_path=path, report_detail=_REPORT_DETAIL, **kwargs)
         report = _read_report(path)
+    if report is not None:
+        label_declined_retry(report)
     return x, info, report
+
+
+#: ``statistics`` keys that, after a declined gh#884 retry, POUNCE fills from the
+#: retry although the solution and every ``final_*`` metric are the base attempt's.
+_RETRY_COUNT_KEYS = (
+    "iteration_count",
+    "num_obj_evals",
+    "num_constr_evals",
+    "num_obj_grad_evals",
+    "num_constr_jac_evals",
+    "num_hess_evals",
+)
+
+
+def label_declined_retry(report: dict) -> None:
+    """Label, in place, the counts a declined dual-divergence retry left in ``report``.
+
+    #1618 B-05c. When POUNCE's gh#884 dual-divergence guard fires it re-solves,
+    and when it declines the retry it reports the *base* attempt's answer. The
+    report it writes (and the ``info`` dict) is then mixed: ``solution`` and every
+    ``final_*`` metric are the base attempt's, but ``iteration_count``, the
+    evaluation counts and the ``iterations`` trajectory are the retry's. Measured
+    on the issue's toll-pricing MPEC with POUNCE 0.12.0: the log prints "Number of
+    Iterations....: 64" for the base attempt and "15" for the retry, then "gh#884
+    dual-divergence retry: declined ... the base attempt's answer is the one
+    reported", and the report carries ``iteration_count`` 15, 16 trajectory rows
+    and ``final_dual_inf`` 1.89e3 (the base attempt's; the retry ended "Solved To
+    Acceptable Level" with unscaled KKT error 1.69e-5).
+
+    The base attempt's counts are not in the report, so they cannot be
+    restored here (that needs POUNCE to emit per-attempt statistics). The mixed
+    document is left as POUNCE wrote it and labelled: ``statistics["counts_attempt"]``
+    names the attempt the counts and trajectory describe, and
+    ``statistics["solution_attempt"]`` the one the answer comes from. Only the
+    declined case is labelled -- the only one measured.
+    """
+    stats = report.get("statistics")
+    if not isinstance(stats, dict):
+        return
+    if stats.get("dual_divergence_signature") is True and (
+        stats.get("dual_divergence_retry_promoted") is False
+    ):
+        stats["counts_attempt"] = "declined_retry"
+        stats["solution_attempt"] = "base"
+        stats["counts_attempt_keys"] = [k for k in _RETRY_COUNT_KEYS if k in stats] + ["iterations"]
 
 
 def _read_report(path: str) -> Optional[dict]:

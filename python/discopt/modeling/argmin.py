@@ -73,6 +73,11 @@ Soundness gates (all refuse rather than approximate)
   is the refusal mechanism (the same choice :func:`implicit` documents).
 * A degenerate active set (an active inequality or bound whose multiplier is ~0)
   -- ``dx*/dp`` is only one-sided there.  Warned once per block, not silenced.
+  This includes a *weakly active* bound or inequality that an interior-point
+  solve leaves a barrier's width off its bound with an equally tiny multiplier
+  (neither the slack nor the multiplier is clearly nonzero, so the active set
+  is ambiguous).  Every solve records ``degenerate`` and the offending
+  ``weakly_active_bounds`` / ``weakly_active_rows`` in ``last_solve_info()``.
 
 The derivative is exact under the standard sIPOPT assumptions: LICQ at the inner
 solution, strict complementarity, and an active set that is locally constant in the
@@ -123,6 +128,15 @@ KKT_RESIDUAL_TOL = 1e-4
 #: An active row whose multiplier is below this is degenerate (strict
 #: complementarity fails) -> warn: the sensitivity is one-sided there.
 COMPLEMENTARITY_TOL = 1e-8
+
+#: A bound (or inequality row) whose primal slack is below
+#: ``WEAKLY_ACTIVE_TOL * (1 + |bound|)`` AND whose multiplier is below
+#: ``WEAKLY_ACTIVE_TOL * (1 + max|grad f|)`` is *weakly active*: the IPM cannot
+#: tell whether it binds, so the active set -- and with it dx*/dp -- is
+#: ambiguous there (#1618 B-10: a generator at Pmin=20 sat 3.3e-5 off its bound
+#: with a 2.2e-6 multiplier; the primal-dual classifier called it free and the
+#: sensitivity was returned with no warning).
+WEAKLY_ACTIVE_TOL = 1e-4
 
 #: Smallest eigenvalue of the reduced Hessian allowed by ``verify_minimizer``.
 CURVATURE_TOL = -1e-6
@@ -555,6 +569,43 @@ def _build_layer(
         )
         if not degenerate:
             degenerate = bool(np.any((at_bound > 0.5) & (zl + zu < COMPLEMENTARITY_TOL)))
+        # Weakly active: slack AND multiplier both tiny, so the classifier above
+        # could have gone either way.  Checked independently of the at_bound /
+        # active masks -- a weakly active bound is usually classified *free*.
+        mult_tol = WEAKLY_ACTIVE_TOL * scale
+        weak_lo = (
+            np.isfinite(lb)
+            & (
+                np.abs(x - lb)
+                <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(np.where(np.isfinite(lb), lb, 0.0)))
+            )
+            & (zl <= mult_tol)
+        )
+        weak_hi = (
+            np.isfinite(ub)
+            & (
+                np.abs(ub - x)
+                <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(np.where(np.isfinite(ub), ub, 0.0)))
+            )
+            & (zu <= mult_tol)
+        )
+        weak_bounds = np.flatnonzero(weak_lo | weak_hi)
+        if m:
+            row_bnd = np.where(slack_lo <= slack_hi, cl, cu)
+            row_bnd = np.where(np.isfinite(row_bnd), row_bnd, 0.0)
+            weak_rows = np.flatnonzero(
+                (cl != cu)
+                & (row_slack <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(row_bnd)))
+                & (np.abs(lam) <= mult_tol)
+            )
+        else:
+            weak_rows = np.zeros(0, dtype=int)
+        if weak_bounds.size or weak_rows.size:
+            degenerate = True
+        if state["last"] is not None:
+            state["last"]["degenerate"] = degenerate
+            state["last"]["weakly_active_bounds"] = [int(i) for i in weak_bounds]
+            state["last"]["weakly_active_rows"] = [int(i) for i in weak_rows]
         if degenerate:
             _warn_once(
                 "argmin(): the inner solution has a degenerate active set (an "

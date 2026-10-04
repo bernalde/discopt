@@ -90,9 +90,13 @@ def solve_lshaped(
     model.first_stage(*first_stage_vars)
 
     from discopt.decomposition import detect_decomposition
+    from discopt.decomposition.structure import benders_view
 
     fs_names = [v.name for v in first_stage_vars]
-    structure = detect_decomposition(model, complicating=fs_names)
+    # The solvers read only ``complicating_vars``; the *returned* structure is the
+    # Benders view (first stage removed), so it reports the per-scenario blocks
+    # the solve actually splits into rather than one connected component (#1618).
+    structure = benders_view(model, detect_decomposition(model, complicating=fs_names))
 
     result = None
     if solve:
