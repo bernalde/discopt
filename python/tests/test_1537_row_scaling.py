@@ -241,30 +241,170 @@ def test_row_scaled_m3_certifies_on_the_highs_master(monkeypatch):
 
 
 def test_row_scaled_flay03m_admits_no_infeasible_incumbent(monkeypatch):
-    """flay03m with rows scaled in 10^[-6,6]. OA's fixed-NLP subproblem returned
+    """flay03m with rows scaled in 10^[-6,6], on the UNequilibrated fixed NLP
+    (``DISCOPT_OA_NLP_ROW_EQUILIBRATE=0``). OA's fixed-NLP subproblem returned
     iteration-limited points at objectives 39.10 and 27.16 (optimum 48.99) that
     violate a row scaled by ~5e-6 by ~3e-5 -- inside the old absolute ``1e-4``
     screen, about 6.5 in the row's own units. Admitted as the incumbent, the 27.16
-    point ended OA with the master bound above it; the route withdrew both, fell
-    back, and the spatial path published no bound in its remaining 25 s.
+    point ended OA with the master bound above it.
 
-    Candidates are now judged by the exit gate's verifier (``verify_point``, keyed
-    on each row's scale). Anti-vacuity (CLAUDE.md §6): the trace must show that
-    gate refusing candidates, or this instance no longer reaches it."""
+    Candidates are judged by the exit gate's verifier (``verify_point``, keyed on
+    each row's scale). Equilibration (default-ON) makes every fixed NLP here
+    converge, so the gate has nothing to refuse; the flag is switched off to keep
+    feeding it the unconverged points it exists for. Anti-vacuity (CLAUDE.md §6):
+    the trace must show the gate refusing candidates.
+
+    This pins soundness, not a certificate: without equilibration the outcome
+    depended on the platform (macOS certified after 7 refusals, Linux CI fell back
+    uncertified), which is what the equilibration test below fixes."""
+    monkeypatch.setenv("DISCOPT_OA_NLP_ROW_EQUILIBRATE", "0")
+    res = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30, solver="mip-nlp")
+    summary = (res.mip_nlp_trace or {}).get("summary", {})
+    why = (res.status, res.gap_certified, res.bound, res.objective, summary)
+    assert summary.get("rejected_incumbent_count", 0) > 0, why
+    # minlplib.solu: flay03m =opt= 48.98979486 (minimize). No super-optimal
+    # incumbent and no bound above the optimum.
+    assert res.objective is not None, why
+    assert res.objective >= 48.98979486 - 1e-4, why
+    assert res.bound is None or res.bound <= 48.98979486 + 1e-6, why
+
+
+def _fixed_nlp_statuses(monkeypatch):
+    """Record the status of every fixed-integer NLP (``scale_tol=True``) OA solves."""
+    import discopt.solvers.oa as oa
+
+    seen: list[str] = []
+    real = oa._solve_nlp_attempt
+
+    def spy(*args, **kwargs):
+        attempt = real(*args, **kwargs)
+        if kwargs.get("scale_tol"):
+            seen.append(str(attempt.status).rsplit(".", 1)[-1])
+        return attempt
+
+    monkeypatch.setattr(oa, "_solve_nlp_attempt", spy)
+    return seen
+
+
+def test_row_equilibrated_fixed_nlp_converges_and_certifies_flay03m(monkeypatch):
+    """The fixed-integer NLP is solved on row-equilibrated constraints
+    (``_RowEquilibratedEvaluator``). Before: on flay03m at 10^[-6,6] 11 of 18 fixed
+    NLPs on the default route stopped at ``ITERATION_LIMIT`` (133 of 139 on the
+    explicit mip-nlp path, and 12 of 19 with ``max_iter=3000``), the exit gate
+    refused 7 candidates, and the route certified on macOS but fell back uncertified
+    on Linux CI. After: every fixed NLP converges and the route certifies, with a
+    bound within 1e-6 relative of the optimum (48.98507 before)."""
     monkeypatch.delenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", raising=False)
+    monkeypatch.setenv("DISCOPT_OA_NLP_ROW_EQUILIBRATE", "1")
+    seen = _fixed_nlp_statuses(monkeypatch)
     res = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30)
-    trace = res.mip_nlp_trace or {}
     route = res.algorithm_route or ""
-    # Everything a CI-only failure needs to be diagnosed from the log alone.
-    why = (res.status, res.gap_certified, res.bound, res.objective, route, trace.get("summary"))
-    if "fell back" in route:
-        # The merged fallback result carries no OA trace, so re-run the route alone
-        # and attach ITS trace: that is where the reason it did not certify lives.
-        alone = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30, solver="mip-nlp")
-        why += ((alone.mip_nlp_trace or {}).get("summary"),)
-    assert trace.get("summary", {}).get("rejected_incumbent_count", 0) > 0, why
+    why = (res.status, res.gap_certified, res.bound, res.objective, route, seen)
+    assert seen, "no fixed-integer NLP was solved"  # anti-vacuity (CLAUDE.md §6)
+    assert all(s == "OPTIMAL" for s in seen), why
     assert "fell back" not in route, why
-    assert res.gap_certified, (res.status, res.bound, route)
+    assert res.gap_certified, why
     # minlplib.solu: flay03m =opt= 48.98979486 (minimize). Never above it.
-    assert res.bound <= 48.98979486 + 1e-6, res.bound
-    assert res.objective == pytest.approx(48.98979486, rel=1e-4)
+    assert res.bound <= 48.98979486 + 1e-6, why
+    assert res.bound >= 48.98979486 * (1 - 1e-6), why
+    assert res.objective == pytest.approx(48.98979486, rel=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# The row-equilibrated evaluator itself.
+# --------------------------------------------------------------------------- #
+
+
+class _ToyEvaluator:
+    """g(x) = [1e-6 * x0**2 + 1e-3 * x1 - 1e-3, 1e5 * (x0 - x1)], body-rhs form."""
+
+    n_variables = 2
+    n_constraints = 2
+
+    def __init__(self, bounds=((-1e20, 0.0), (0.0, 0.0))):
+        self._cl = np.array([b[0] for b in bounds])
+        self._cu = np.array([b[1] for b in bounds])
+
+    def evaluate_constraints(self, x):
+        return np.array([1e-6 * x[0] ** 2 + 1e-3 * x[1] - 1e-3, 1e5 * (x[0] - x[1])])
+
+    def evaluate_jacobian(self, x):
+        return np.array([[2e-6 * x[0], 1e-3], [1e5, -1e5]])
+
+    def jacobian_structure(self):
+        return np.array([0, 0, 1, 1]), np.array([0, 1, 0, 1])
+
+    def evaluate_jacobian_values(self, x):
+        return self.evaluate_jacobian(x).ravel()
+
+    def evaluate_lagrangian_hessian(self, x, obj_factor, lagrange):
+        return np.array([[2e-6 * lagrange[0], 0.0], [0.0, 0.0]])
+
+    def evaluate_hessian_values(self, x, obj_factor, lagrange):
+        return np.array([2e-6 * lagrange[0]])
+
+
+def _bounds_of(ev):
+    return ev._cl, ev._cu
+
+
+def test_row_equilibration_is_exactly_a_row_scaling(monkeypatch):
+    import discopt.solvers.nlp_ipopt as nlp_ipopt
+    from discopt.solvers.oa import _RowEquilibratedEvaluator
+
+    monkeypatch.setattr(nlp_ipopt, "_infer_constraint_bounds", _bounds_of)
+    ev = _ToyEvaluator()
+    x0 = np.array([2.0, 0.5])
+    w = _RowEquilibratedEvaluator.wrap(ev, x0)
+    assert w is not None
+    # 1 / max_j |J_ij(x0)| is (1e3, 1e-5); only ever scaled up, so row 1 keeps 1.
+    s = np.array([1e3, 1.0])
+    x = np.array([0.3, -0.7])
+    lam = np.array([2.0, -3.0])
+    assert np.allclose(w.evaluate_constraints(x), s * ev.evaluate_constraints(x), rtol=1e-15)
+    assert np.allclose(w.evaluate_jacobian(x), s[:, None] * ev.evaluate_jacobian(x))
+    assert np.allclose(
+        w.evaluate_jacobian_values(x), (s[:, None] * ev.evaluate_jacobian(x)).ravel()
+    )
+    # Lagrangian of the scaled rows with lam == Lagrangian of the originals with s*lam.
+    assert np.allclose(w.evaluate_hessian_values(x, 1.0, lam), [2e-6 * s[0] * lam[0]])
+    assert np.allclose(w.unscale_multipliers(lam), s * lam)
+    # Everything else is forwarded untouched.
+    assert w.n_variables == 2 and w.n_constraints == 2
+
+
+def test_row_equilibration_refuses_a_nonzero_row_bound(monkeypatch):
+    """Scaling a row without its bound would change the feasible set."""
+    import discopt.solvers.nlp_ipopt as nlp_ipopt
+    from discopt.solvers.oa import _RowEquilibratedEvaluator
+
+    monkeypatch.setattr(nlp_ipopt, "_infer_constraint_bounds", _bounds_of)
+    ev = _ToyEvaluator(bounds=((-1e20, 0.0), (0.0, 2.5)))
+    assert _RowEquilibratedEvaluator.wrap(ev, np.array([2.0, 0.5])) is None
+    # The 1e20 sentinel is an infinite bound, not a finite non-zero one.
+    assert _RowEquilibratedEvaluator.wrap(_ToyEvaluator(), np.array([2.0, 0.5])) is not None
+
+
+def test_row_equilibration_clamps_and_skips_degenerate_rows(monkeypatch):
+    import discopt.solvers.nlp_ipopt as nlp_ipopt
+    from discopt.solvers.oa import _NLP_ROW_SCALE_CLAMP, _RowEquilibratedEvaluator
+
+    monkeypatch.setattr(nlp_ipopt, "_infer_constraint_bounds", _bounds_of)
+    # At x0 = (0, 0) row 0's gradient is (0, 1e-3) and row 1's is 1e5: s = (1e3, 1).
+    w = _RowEquilibratedEvaluator.wrap(_ToyEvaluator(), np.zeros(2))
+    assert np.allclose(w._s, [1e3, 1.0])
+
+    class Big(_ToyEvaluator):
+        def evaluate_jacobian(self, x):
+            return np.array([[1e3, 0.0], [0.0, 1e5]])
+
+    # Every row already at or above unit norm: nothing to scale, no wrapper.
+    assert _RowEquilibratedEvaluator.wrap(Big(), np.zeros(2)) is None
+
+    class Tiny(_ToyEvaluator):
+        def evaluate_jacobian(self, x):
+            return np.array([[1e-12, 0.0], [0.0, 0.0]])
+
+    w = _RowEquilibratedEvaluator.wrap(Tiny(), np.zeros(2))
+    assert w._s[0] == _NLP_ROW_SCALE_CLAMP  # clamped, not 1e12
+    assert w._s[1] == 1.0  # zero gradient: left alone

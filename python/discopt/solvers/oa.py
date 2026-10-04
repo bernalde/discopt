@@ -1615,6 +1615,124 @@ def _nlp_scaled_tol(evaluator, x0) -> Optional[float]:
     return _NLP_DEFAULT_TOL * max(f0, _NLP_TOL_SCALE_FLOOR)
 
 
+#: Ceiling on a row-equilibration factor. A row whose gradient nearly vanishes
+#: at the start point would otherwise be scaled by ``1/tiny``.
+_NLP_ROW_SCALE_CLAMP = 1e8
+
+#: A row bound at or beyond this magnitude is the ``1e20`` infinity sentinel.
+_NLP_INF_BOUND = 1e19
+
+
+def _nlp_row_equilibration_enabled() -> bool:
+    """``DISCOPT_OA_NLP_ROW_EQUILIBRATE``: row-equilibrate the fixed-integer NLP.
+
+    Default-ON; ``=0`` restores the unscaled subsolve. See
+    :class:`_RowEquilibratedEvaluator` for the measurement.
+    """
+    return os.environ.get("DISCOPT_OA_NLP_ROW_EQUILIBRATE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+class _RowEquilibratedEvaluator:
+    """An NLP evaluator whose constraint row ``i`` is ``s_i * g_i(x)``.
+
+    ``s_i = 1 / max_j |dg_i/dx_j(x0)|``, fixed at the start point and clamped to
+    ``[1, C]`` with ``C =`` :data:`_NLP_ROW_SCALE_CLAMP`; a row with a zero or
+    non-finite gradient keeps ``s_i = 1``. Rows are only ever scaled UP. That is
+    the half POUNCE lacks (below), and it only tightens a row's tolerance in its
+    original units: a scaled-down row's ``tol`` would loosen by its norm, and the
+    point would then fail ``verify_point`` in the original units. Measured: the
+    two-sided version (``[1/C, C]``) lost the certificate of ``portfol_roundlot``
+    unscaled on the route panel (``feasible`` at 20 s against ``optimal`` in
+    13.0 s); one-sided, it certifies in 13.0 s again. Only the subsolver sees this
+    evaluator: the objective, ``_is_primal_feasible`` and the exit gate's
+    ``verify_point`` all judge the returned point against the ORIGINAL rows.
+
+    Why (#1537). POUNCE's gradient-based scaling (Ipopt's default) only scales a
+    row DOWN, when its gradient exceeds ``nlp_scaling_max_gradient``; a row whose
+    coefficients are ``1e-6`` is passed through as it is, and the multiplier it
+    needs is ``~1e6`` times larger than its neighbours'. Measured on ``flay03m``
+    with each row multiplied by ``10**U(-6, 6)``, ``solver="mip-nlp"``, T=30: the
+    fixed NLP returned ``OPTIMAL`` 6 times and ``ITERATION_LIMIT`` 133 times, and
+    raising ``max_iter`` from 200 to 3000 still left 12 of 19 at the limit -- a
+    conditioning failure, not a budget one. Equilibrated: 226 of 226 ``OPTIMAL``
+    and no candidate refused by the exit gate. On the default convex route the
+    same instance certifies in 9 MILPs (10/10 NLPs optimal, bound 48.98979484
+    against an optimum of 48.98979486), where it had certified only on macOS
+    after refusing 7 unconverged candidates, and fell back uncertified on Linux.
+
+    Row bounds are ``0``/``+-inf`` for every row OA builds (``body - rhs``), so
+    scaling a row leaves its bounds unchanged; :meth:`wrap` refuses (returns
+    ``None``) when a finite row bound is non-zero rather than scale a row and not
+    its bound. Multipliers come back in scaled units: with ``g' = s * g`` the
+    Lagrangian term ``lam' * g'`` is ``(s * lam') * g``, so
+    :meth:`unscale_multipliers` returns ``s * lam'``.
+    """
+
+    def __init__(self, evaluator, scales: np.ndarray) -> None:
+        self._ev = evaluator
+        self._s = scales
+        self._jac_rows: Optional[np.ndarray] = None
+
+    @classmethod
+    def wrap(cls, evaluator, x0: np.ndarray) -> Optional["_RowEquilibratedEvaluator"]:
+        m = int(getattr(evaluator, "n_constraints", 0) or 0)
+        if m == 0:
+            return None
+        from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
+
+        cl, cu = _infer_constraint_bounds(evaluator)
+        # ``-1e20``/``1e20`` is the infinite-bound sentinel, not a finite bound.
+        for b in (cl, cu):
+            finite = np.isfinite(b) & (np.abs(b) < _NLP_INF_BOUND)
+            if np.any(b[finite] != 0.0):
+                return None
+        J = evaluator.evaluate_jacobian(np.asarray(x0, dtype=np.float64))
+        J = J.toarray() if hasattr(J, "toarray") else np.asarray(J, dtype=np.float64)
+        if J.shape[0] != m:
+            return None
+        norms = np.abs(J).max(axis=1) if J.size else np.zeros(m)
+        ok = np.isfinite(norms) & (norms > 0.0)
+        scales = np.ones(m)
+        scales[ok] = np.clip(1.0 / norms[ok], 1.0, _NLP_ROW_SCALE_CLAMP)
+        if np.all(scales == 1.0):
+            return None
+        return cls(evaluator, scales)
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def unscale_multipliers(self, lam):
+        if lam is None:
+            return None
+        lam = np.asarray(lam, dtype=np.float64)
+        return self._s * lam if lam.shape == self._s.shape else lam
+
+    def evaluate_constraints(self, x):
+        return self._s * np.asarray(self._ev.evaluate_constraints(x), dtype=np.float64)
+
+    def evaluate_jacobian(self, x):
+        J = self._ev.evaluate_jacobian(x)
+        if hasattr(J, "multiply"):
+            return J.multiply(self._s[:, None]).tocsr()
+        return self._s[:, None] * np.asarray(J, dtype=np.float64)
+
+    def evaluate_jacobian_values(self, x):
+        if self._jac_rows is None:
+            self._jac_rows = np.asarray(self._ev.jacobian_structure()[0], dtype=np.int64)
+        return np.asarray(self._ev.evaluate_jacobian_values(x)) * self._s[self._jac_rows]
+
+    def evaluate_lagrangian_hessian(self, x, obj_factor, lagrange):
+        return self._ev.evaluate_lagrangian_hessian(x, obj_factor, self._s * np.asarray(lagrange))
+
+    def evaluate_hessian_values(self, x, obj_factor, lagrange):
+        return self._ev.evaluate_hessian_values(x, obj_factor, self._s * np.asarray(lagrange))
+
+
 def _time_left(t_start: float, time_limit: float) -> float:
     """Unfloored seconds left before ``t_start + time_limit`` (negative once past)."""
     return float(time_limit) - (time.perf_counter() - float(t_start))
@@ -1684,7 +1802,17 @@ def _solve_nlp_attempt(
                 opts["tol"] = tol
         if max_wall_time is not None:
             opts["max_wall_time"] = max(float(max_wall_time), _NLP_WALL_FLOOR_S)
-        result = solve_nlp(evaluator, x0, options=opts)
+        # The incumbent-producing subsolve sees equilibrated rows (#1537); every
+        # judgement of the returned point below stays on the original evaluator.
+        scaled = (
+            _RowEquilibratedEvaluator.wrap(evaluator, x0)
+            if scale_tol and _nlp_row_equilibration_enabled()
+            else None
+        )
+        nlp_ev: Any = scaled if scaled is not None else evaluator
+        result = solve_nlp(nlp_ev, x0, options=opts)
+        if scaled is not None and getattr(result, "multipliers", None) is not None:
+            result.multipliers = scaled.unscale_multipliers(result.multipliers)
 
         from discopt.solvers import SolveStatus
 
