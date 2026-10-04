@@ -22,6 +22,7 @@ from discopt.solver import _convex_minlp_auto_route, _convex_minlp_route_enabled
 NL_DIR = Path(__file__).parent / "data" / "minlplib_nl"
 
 ROUTE_ENV = "DISCOPT_CONVEX_MINLP_ROUTE"
+MASTER_ENV = "DISCOPT_CONVEX_ROUTE_OA_MASTER"
 
 
 def _load(name: str) -> Model:
@@ -71,59 +72,57 @@ class TestRouteGates:
 
     def test_fires_on_convex_minlp(self, monkeypatch):
         monkeypatch.setenv(ROUTE_ENV, "1")
+        monkeypatch.delenv(MASTER_ENV, raising=False)
         method, reason, opts = _convex_minlp_auto_route(_load("gbd"))
-        # `"oa"` since #1141: see `test_the_route_never_names_an_optional_backend`
-        # for why, and performance-plan §25.11 for the panel that chose it over
-        # `lp_nlp_bb` on the in-house master.
+        # `"oa"` since #1141 (performance-plan §25.11 chose it over `lp_nlp_bb`).
         assert method == "oa"
         assert "certified convex" in reason
-        # The route names NO backend (#1141). An empty options dict resolves
-        # through the MIP-NLP layer's own `"auto"` default to the in-house
-        # simplex master. See the next test for why naming one was wrong.
-        assert opts == {}
+        # HiGHS master by default since performance-plan §25.13; the reason says so.
+        assert opts == {"milp_solver": "highs"}
+        assert "master=highs" in reason
 
-    def test_the_route_never_names_an_optional_backend(self, monkeypatch):
-        """#1141: the default route must not depend on an opt-in dependency.
-
-        Between 2026-08-29 and 2026-08-31 this route pinned
-        ``{"milp_solver": "highs"}``, so the default *algorithm* for a whole
-        problem class changed with whether ``highspy`` happened to be installed
-        (with it, ``lp_nlp_bb``/highs; without it, a silent fall back to
-        ``"oa"``). ``_resolve_lp_nlp_bb_backend`` forbids exactly this one layer
-        down -- ``"auto"`` deliberately does not pick HiGHS -- and the router
-        overrode it from above.
-
-        Asserting on the value rather than the absence of a key: a route that
-        starts naming `"gurobi"` would be the same defect wearing a different
-        name.
-        """
+    def test_auto_is_the_in_house_master_opt_out(self, monkeypatch):
+        """``DISCOPT_CONVEX_ROUTE_OA_MASTER=auto`` restores the #1141 route
+        byte for byte: same method, and NO backend key, so the MIP-NLP layer's
+        own ``"auto"`` resolves to the in-house simplex master."""
         monkeypatch.setenv(ROUTE_ENV, "1")
-        for name in ("gbd", "st_miqp1", "alan"):
-            _method, _reason, opts = _convex_minlp_auto_route(_load(name))
-            assert "milp_solver" not in opts, f"{name}: route pinned a backend: {opts}"
+        monkeypatch.setenv(MASTER_ENV, "auto")
+        for name in ("gbd", "st_miqp1"):
+            method, reason, opts = _convex_minlp_auto_route(_load(name))
+            assert method == "oa", (name, reason)
+            assert opts == {}, f"{name}: opt-out still named a backend: {opts}"
+            assert "master=in-house" in reason
 
-    def test_the_route_is_unchanged_when_highspy_cannot_be_imported(self, monkeypatch):
-        """No HiGHS anywhere, same route -- it does not participate any more.
+    def test_an_unknown_master_raises(self, monkeypatch):
+        """A typo must not silently pick an engine."""
+        monkeypatch.setenv(ROUTE_ENV, "1")
+        monkeypatch.setenv(MASTER_ENV, "gurobi")
+        with pytest.raises(ValueError, match="DISCOPT_CONVEX_ROUTE_OA_MASTER"):
+            _convex_minlp_auto_route(_load("gbd"))
 
-        This is the test that would have caught the coupling: before #1141 the
-        same model routed to ``"oa"`` here and to ``lp_nlp_bb`` with highspy
-        present.
-        """
+    def test_missing_highspy_is_a_loud_broken_install(self, monkeypatch):
+        """highspy is a core dependency since #1229, so its absence is a broken
+        install -- the route raises, as the pure LP/MILP route does, instead of
+        silently choosing another engine (the #1141 defect: the default
+        algorithm must never change with what happens to be importable). The
+        ``auto`` opt-out does not need highspy and still routes."""
         monkeypatch.setenv(ROUTE_ENV, "1")
         import builtins
 
         real_import = builtins.__import__
 
         def _no_highs(name, *a, **kw):
-            if name == "discopt.solvers.milp_highs" or name == "highspy":
+            if name == "highspy":
                 raise ImportError("highspy is not installed")
             return real_import(name, *a, **kw)
 
         monkeypatch.setattr(builtins, "__import__", _no_highs)
-        method, reason, opts = _convex_minlp_auto_route(_load("gbd"))
-        assert method == "oa"
-        assert "certified convex" in reason
-        assert opts == {}
+        monkeypatch.delenv(MASTER_ENV, raising=False)
+        with pytest.raises(ImportError, match="highspy"):
+            _convex_minlp_auto_route(_load("gbd"))
+        monkeypatch.setenv(MASTER_ENV, "auto")
+        method, _reason, opts = _convex_minlp_auto_route(_load("gbd"))
+        assert method == "oa" and opts == {}
 
     def test_declines_pure_continuous(self, monkeypatch):
         """A convex NLP is already served by the continuous convex fast path."""
@@ -199,3 +198,39 @@ class TestRouteDispatch:
         m = _load("gbd")
         result = m.solve(time_limit=30)
         assert result.algorithm_route is None
+
+
+@pytest.mark.unit
+class TestRoutedMasterEngine:
+    """End to end: the engine the route names is the one the OA master runs on."""
+
+    @staticmethod
+    def _count_highs_calls(monkeypatch):
+        import discopt.solvers.milp_highs as milp_highs
+
+        calls = []
+        real = milp_highs.solve_milp
+
+        def _counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        monkeypatch.setattr(milp_highs, "solve_milp", _counting)
+        return calls
+
+    @pytest.mark.parametrize("master, expect_highs", [(None, True), ("auto", False)])
+    def test_default_solve_runs_the_master_on_the_named_engine(
+        self, monkeypatch, master, expect_highs
+    ):
+        monkeypatch.setenv(ROUTE_ENV, "1")
+        if master is None:
+            monkeypatch.delenv(MASTER_ENV, raising=False)
+        else:
+            monkeypatch.setenv(MASTER_ENV, master)
+        calls = self._count_highs_calls(monkeypatch)
+        m = _load("gbd")
+        r = m.solve(time_limit=60)
+        assert r.algorithm_route is not None and r.algorithm_route.startswith("mip-nlp/oa")
+        assert r.status == "optimal" and r.gap_certified
+        assert r.objective == pytest.approx(2.2, abs=1e-6)
+        assert (len(calls) > 0) is expect_highs, (master, len(calls))

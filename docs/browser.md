@@ -35,7 +35,10 @@ Two differences are worth knowing before you compare numbers with a desktop run.
 routes pure LP and MILP models to HiGHS; `highspy` has no WebAssembly build, so
 the page sets `DISCOPT_LP_MILP_BACKEND=rust`, which is discopt's own supported
 opt-out. Both routes return discopt-verified certificates, but they are different
-engines and may report different node counts and timings for the same model.
+engines and may report different node counts and timings for the same model. For
+the same reason the page sets `DISCOPT_CONVEX_ROUTE_OA_MASTER=auto`, so the
+outer-approximation master of a convex MINLP is solved by the in-house simplex
+rather than HiGHS.
 
 **There are no threads.** WebAssembly in this configuration has no pthreads, so
 the parallel node waves fall back to the serial path they already had. Results

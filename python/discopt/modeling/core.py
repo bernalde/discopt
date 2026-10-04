@@ -4417,7 +4417,8 @@ class SolveResult:
     # ``None`` means no automatic routing took place — either the caller named a
     # solver explicitly, or the router declined and the default path ran. When
     # populated it is a human-readable reason, e.g.
-    # ``"mip-nlp/oa: minlp certified convex at the root (DISCOPT_CONVEX_MINLP_ROUTE)"``.
+    # ``"mip-nlp/oa: minlp certified convex at the root (DISCOPT_CONVEX_MINLP_ROUTE;
+    # master=highs)"``.
     algorithm_route: Optional[str] = None
 
     # Why the search stopped (#1585) -- orthogonal to ``status``, which says what

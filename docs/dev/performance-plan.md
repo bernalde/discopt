@@ -4583,6 +4583,7 @@ Outcome, up front:
 | `DISCOPT_OA_INFEASIBLE_NOGOOD` | **stays OFF** | §25.7 |
 | `DISCOPT_ROOT_CUT_DEADLINE` (§24's) | **default ON** | §25.9 |
 | convex route target: HiGHS → `"oa"` | **retargeted** | §25.10–25.11 |
+| routed OA master: in-house → HiGHS (`DISCOPT_CONVEX_ROUTE_OA_MASTER`) | **default `highs`**, `auto` opt-out | §25.13 |
 
 ### 25.1 The capability
 
@@ -5223,6 +5224,144 @@ to budget policy, guard calibration and master speed in turn, and each was
 falsified. What ended it was instrumenting the driver to ask the matrix directly
 whether the returned point satisfied its own rows — a question with a yes/no
 answer, unlike "is the master too slow". Reach for the invariant check earlier.
+
+### 25.13 The routed OA master moves to HiGHS (2026-10-04)
+
+The route's target stays `"oa"` (§25.11); what changes is the engine under its
+MILP master. `_convex_minlp_auto_route` now names `milp_solver="highs"`, selected
+by `DISCOPT_CONVEX_ROUTE_OA_MASTER` (default `highs`; `auto` restores the in-house
+simplex master this route has used since §25.11; any other value raises).
+
+**Why §25.10's objection no longer applies.** §25.10 took HiGHS off the route on
+policy, not measurement: `highspy` was an opt-in package, so the default
+algorithm for a whole problem class changed silently with whether it happened to
+be installed. Both halves of that have since expired. #1229 made `highspy>=1.10`
+a **core** dependency (the pure LP/MILP route already requires it), so its
+absence is a broken install, not a configuration; and the selector does not
+probe for it — `highs` calls `lp_milp_highs.require_highspy()`, which raises. No
+install takes a different algorithm without being told. §25.11's own panel had
+the HiGHS route ahead (26/26 certified in 35.6 s against `"oa"`'s 24/26 in
+118.7 s); the policy, not the numbers, kept it off.
+
+**Soundness does not depend on the engine.** OA reads only
+`master_result.bound`, and on HiGHS that is `info.mip_dual_bound` — never the
+master's incumbent (`milp_highs.py`). A time-limited master therefore hands OA a
+valid lower bound on the same terms as the in-house one.
+
+#### The panels
+
+`discopt_benchmarks/scripts/convex_route_oa_master_panel.py`: plain
+`Model.solve(time_limit=30)` with no kwargs, so the #1066 guard, the decision
+point (CC-1143) and the spatial fallback all participate; arms set by the real
+environment variable, interleaved per instance; the route counted as having
+fired only when `algorithm_route` names that arm's master. Every incumbent is
+re-verified with `verify_point`; every bound is checked against `minlplib.solu`
+and against every arm's verified incumbent. The script exits non-zero if any
+solve raised, any check failed, or either arm's route never fired. 14-core box;
+load 6–9 throughout from a pinned browser helper, identical across interleaved
+arms (CLAUDE.md §9 — recorded, not hidden).
+
+**In-repo corpus**, the 26 instances the router diverts, rows additionally
+multiplied by `10^U(-s, s)` (seeded per file) to probe the #1537 row-scale
+sensitivity:
+
+| span `s` | `auto` (in-house) | `highs` | highs vs auto |
+|---|---|---|---|
+| 0 | 26/26, 58.9 s | 26/26, 66.0 s | ±0 |
+| 3 | 24/26, 84.1 s | 25/26, 62.0 s | +`portfol_roundlot` |
+| 6 | 20/26, 248.8 s | 22/26, 142.1 s | +`cvxnonsep_psig40r`, +`m3` |
+
+Route fired 73/73 in each arm; **453 executed bound checks, 0 violations, 0
+errors**; no certificate lost at any span. **Retraction:** the first run of this
+panel credited HiGHS with `+tls2` at span 0 (25/26 vs 26/26). `tls2` certifies
+in ~27.7 s in *both* arms of the final run — at the edge of the 30 s budget — so
+that row was budget-edge noise, not an engine effect; span 0 is a tie.
+
+**`syn`/`rsyn` (MINLPLib snapshot, 51 routed)** — the class the route exists for
+and which the in-repo corpus does not contain (CC-1143's lesson):
+
+| configuration | `auto` (in-house) | `highs` | route fired (each arm) |
+|---|---|---|---|
+| `DISCOPT_CONVEX_KERNEL=0` | 22/51, 51 incumbents, 893.6 s | **31/51**, 51 incumbents, **632.0 s** | 51/51 |
+| default (kernel ON) | 20/51, 21 incumbents, 1040.0 s | 20/51, 21 incumbents, 1040.3 s | 4/51 |
+
+Kernel off, HiGHS gains nine certificates (`rsyn0820m`, `rsyn0830m`,
+`rsyn0840m`, `syn20m03m`, `syn20m04m`, `syn30m02m`, `syn30m03m`,
+`syn30m04m`, `syn40m02m`) and loses none. **306 + 182 executed bound checks, 0
+violations, 0 errors** across the two runs.
+
+#### A false "rejection" the fallback was hiding
+
+The first in-repo run of this panel was clean by every check and still wrong
+about four rows. On `st_test1`, `nvs12` (span 3), `cvxnonsep_psig30` and
+`clay0303hfsg` (span 6) the HiGHS arm's route string read
+`raised RuntimeError: HiGHS rejected the master model -> fell back`: OA never
+ran, the spatial fallback certified, and the row scored as a HiGHS success.
+
+HiGHS had not rejected anything. `passModel` returns `kWarning` when it **drops**
+matrix entries with `|a_ij| <= small_matrix_value` (1e-9) — here OA cut
+coefficients of 1e-12 to 1e-9 — and `milp_highs.solve_milp` read every non-`kOk`
+status as a rejection. Reading it as success instead would have been worse: a
+dropped term silently changes an OA cut, the term-deletion defect of §69/§71.
+The lazy path had been fixed for exactly this under #1066 (`_prepare_cut_row`:
+power-of-two rescale, else drop on the valid side and loosen the right-hand
+side, else refuse); the whole-model path that plain OA rebuilds every iteration
+never got it. `_fit_rows_to_window` now applies the same fitting to every row of
+the master that holds such an entry; rows without one pass bit-for-bit, and an
+equality row is only ever rescaled (exact) or refused.
+
+The re-run then exposed the window's other edge. On `clay0303hfsg` at span 6
+the row scaling pushes OA cut coefficients to ~1.6e22, and HiGHS answers
+`|a_ij| >= large_matrix_value` (1e15) with `kError` — a genuine refusal, but one
+of a row that is trivially fixable. `_prepare_cut_row` only ever scaled *up*;
+it now scales an oversize row *down* by a power of two (exact, both sides), and
+`_fit_rows_to_window` triggers on either edge. After both fixes the probe
+captures **0** rejections on the four rows, `st_test1` certifies on the route
+itself, `clay0303hfsg` at span 6 runs OA to its check-in, and the in-repo
+numbers above are from the final re-run.
+
+#### The kernel starves the route on `syn`/`rsyn` — and a panel retracted
+
+The first `syn`/`rsyn` panel of this experiment reported HiGHS and in-house
+**tied** at 23/51 with identical walls (1937.7 / 1939.0 s at 60 s). **Retracted:
+it measured nothing.** The native convex kernel (`_convex_kernel.try_convex_solve`)
+runs before `solve_model` and takes `min(time_limit, DISCOPT_CONVEX_KERNEL_BUDGET)`
+— the whole budget for any `time_limit <= 120` (the #1422/#1440 allocation). On
+the 30 of 51 instances it cannot certify it leaves `solve_model` ~0 s, the
+convexity proof then hits an expired deadline (`ConvexityBudgetExceeded` →
+"convexity unproven"), and the route never fires; both arms were the same
+kernel run. The panel had no firing counter, so it read as a tie. The shipped
+script counts firings per arm and fails a run where either arm's count is zero,
+and the `syn`/`rsyn` panels above run with the kernel both off and on.
+
+So on the **default configuration** this change reaches `syn`/`rsyn` only where
+the kernel leaves time, which on this population is **4 of 51** instances (`rsyn0810m`, `synthes1–3`) — and there the
+two arms tie. That is a
+separate defect — the kernel's allocation, which #1440 left explicitly
+unresolved when it closed (its two obvious repairs, a fractional cap and
+abandon-on-no-incumbent, are already falsified by #911 and #1422) — and it is
+filed as #1624 with this measurement, because it needs its own §5 panel
+over the kernel-eligible corpus, not a rider on this one.
+
+#### Who pays
+
+One wall regression, measured and kept: `portfol_roundlot` (span 0) goes
+**0.90 s → 13.11 s, still certified**. Its master is flat — the bound sits at
+~0.0282902 from the first iteration — with many integer assignments tied at the
+optimum. HiGHS breaks the tie toward assignments whose NLPs are poor, OA misses
+the guard's check-in, and the spatial fallback certifies. The same instance at
+span 3 goes the other way (in-house `feasible` at 10.3 s, HiGHS `optimal` in
+0.20 s): tie-breaking on a flat master is engine-sensitive, not engine-biased.
+
+**Status: default `highs`**, `DISCOPT_CONVEX_ROUTE_OA_MASTER=auto` the opt-out
+and the in-house path intact. The browser build (`crates/discopt-wasm`) has no
+`highspy` wheel and sets `auto` explicitly in `web/worker.js`, beside its existing
+`DISCOPT_LP_MILP_BACKEND=rust` — the smoke suite's browser-environment test caught
+the MINLP example raising `HighsUnavailable` before that line existed. This is an opt-out for a shipped default (CLAUDE.md
+§5, "out of scope"), so it adds no row to the flag-retirement audit. What would
+change it: the in-house master closing the gap §25.11 measured — at which point
+`auto` would also bring fractional-node separation (§25.4), which HiGHS cannot
+host.
 
 ## CC-1143 The convex-MINLP route's abstain cost: three hypotheses falsified, one survived
 

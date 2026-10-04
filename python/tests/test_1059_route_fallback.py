@@ -312,9 +312,15 @@ class TestFallbackEndToEnd:
         assert result.objective == pytest.approx(2.925, abs=1e-3)
 
     def test_the_fallback_is_visible_on_the_result(self, monkeypatch):
-        """A fallback solve must not read as one that was never routed."""
+        """A fallback solve must not read as one that was never routed.
+
+        ``cvxnonsep_nsig30``, not ``alan``: the #1352 syntactic-objective gate
+        stopped routing ``alan`` at all, so this asserted on ``None``. On both OA
+        masters ``cvxnonsep_nsig30`` reaches the decision point uncertified and
+        falls back (route panel, 2026-10-04).
+        """
         monkeypatch.setenv(ROUTE_ENV, "1")
-        result = _load("alan").solve(time_limit=60.0)
+        result = _load("cvxnonsep_nsig30").solve(time_limit=30.0)
         assert result.algorithm_route is not None
         assert "mip-nlp/oa" in result.algorithm_route
         assert "fell back" in result.algorithm_route
