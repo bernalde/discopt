@@ -330,7 +330,6 @@ class TestFallbackEndToEnd:
         monkeypatch.delenv(ROUTE_ENV, raising=False)
         result = _load("alan").solve(time_limit=60.0)
         # #1614: the default path names its engine; it must not be the auto-route.
-        assert result.algorithm_route is not None
-        assert "mip-nlp/oa" not in result.algorithm_route, result.algorithm_route
+        assert (result.algorithm_route or "").startswith("miqp-bb:"), result.algorithm_route
         assert result.gap_certified is True
         assert result.objective == pytest.approx(2.925, abs=1e-3)

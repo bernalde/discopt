@@ -186,8 +186,7 @@ class TestRouteDispatch:
         m = _load("gbd")
         result = m.solve(solver="bb", time_limit=30)
         # #1614: every route now names itself; the auto-route must not be it.
-        assert result.algorithm_route is not None
-        assert "mip-nlp/oa" not in result.algorithm_route, result.algorithm_route
+        assert (result.algorithm_route or "").startswith("miqp-bb:"), result.algorithm_route
 
     def test_auto_route_is_recorded_on_the_result(self, monkeypatch):
         """The routing decision must be visible, not silent."""
@@ -204,8 +203,7 @@ class TestRouteDispatch:
         result = m.solve(time_limit=30)
         # #1614: the default path names its own engine instead of leaving None;
         # the opt-out must still keep the solve off the auto-route.
-        assert result.algorithm_route is not None
-        assert "mip-nlp/oa" not in result.algorithm_route, result.algorithm_route
+        assert (result.algorithm_route or "").startswith("miqp-bb:"), result.algorithm_route
 
 
 @pytest.mark.unit
