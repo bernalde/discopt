@@ -254,3 +254,93 @@ def test_x29b_cvar_auxiliaries_do_not_trigger_large_bound_warning():
         res = m.solve()
     assert res.status == "optimal"
     assert not [str(x.message) for x in w if "large" in str(x.message).lower()]
+
+
+# --- A-09: an unbounded LP on the POUNCE route reports ``unbounded`` -------------
+
+
+def _blend(unbounded: bool):
+    ron = [93, 70, 98, 92, 96]
+    rvp = [52.0, 11, 3.5, 7, 4.6]
+    sul = [10.0, 5, 1, 20, 6]
+    sg = [0.584, 0.664, 0.81, 0.745, 0.7]
+    cost = [45, 70, 98, 92, 105]
+    m = dm.Model("blend")
+    ub = np.inf if unbounded else 1000.0
+    x = {(i, j): m.continuous(f"x{i}{j}", lb=0, ub=ub) for i in range(5) for j in range(2)}
+    for j, rm in enumerate([91, 96]):
+        m.subject_to(sum((ron[i] - rm) * x[i, j] for i in range(5)) >= 0)
+        m.subject_to(sum((rvp[i] ** 1.25 - 9**1.25) * x[i, j] for i in range(5)) <= 0)
+        m.subject_to(sum(sg[i] * (sul[i] - 10) * x[i, j] for i in range(5)) <= 0)
+    m.maximize(sum(([110, 122][j] - cost[i]) * x[i, j] for i in range(5) for j in range(2)))
+    return m, x
+
+
+def test_a09_unbounded_blend_lp_is_unbounded_on_pounce():
+    m, _ = _blend(unbounded=True)
+    r = m.solve(solver="pounce")
+    assert r.status == "unbounded", (r.status, r.error)
+
+
+def test_a09_bounded_blend_lp_is_not_unbounded_on_pounce():
+    m, _ = _blend(unbounded=False)
+    r = m.solve(solver="pounce")
+    assert r.status == "optimal", (r.status, r.error)
+
+
+def test_a09_infeasible_lp_is_not_unbounded_on_pounce():
+    m, x = _blend(unbounded=True)
+    m.subject_to(x[0, 0] + x[1, 1] >= 10)
+    m.subject_to(x[0, 0] + x[1, 1] <= 5)
+    r = m.solve(solver="pounce")
+    assert r.status != "unbounded", (r.status, r.error)
+    assert r.status in ("infeasible", "error"), (r.status, r.error)
+
+
+# --- B-05c: a declined dual-divergence retry's counts are labelled ---------------
+
+
+def _toll():
+    t0 = np.array([10.0, 12.0, 20.0])
+    cap = np.array([1000.0, 1500.0, 800.0])
+    demand, vot = 2500.0, 0.25
+    m = dm.Model("toll")
+    tau = m.continuous("tau", lb=0, ub=10)
+    x = [m.continuous(f"x{a}", lb=0, ub=demand) for a in range(3)]
+    z = [m.continuous(f"z{a}", lb=0, ub=100) for a in range(3)]
+    pi = m.continuous("pi", lb=0, ub=100)
+    for a in range(3):
+        m.subject_to(
+            t0[a] * (1 + 0.15 * (x[a] / cap[a]) ** 4) + (tau / vot if a == 1 else 0) - pi - z[a]
+            == 0
+        )
+        m.subject_to(x[a] * z[a] == 0, name=f"pair{a}")
+    m.subject_to(sum(x) == demand)
+    m.maximize(tau * x[1])
+    start = {tau: 1.0, pi: 15.0, **{v: demand / 3 for v in x}, **{v: 1.0 for v in z}}
+    return m, start
+
+
+def test_b05c_declined_retry_counts_are_labelled():
+    m, start = _toll()
+    r = m.solve(solver="pounce", initial_solution=start)
+    stats = r.solve_report["statistics"]
+    # The measured case: POUNCE's gh#884 guard fired and declined its retry.
+    assert stats["dual_divergence_signature"] is True
+    assert stats["dual_divergence_retry_promoted"] is False
+    assert stats["counts_attempt"] == "declined_retry"
+    assert stats["solution_attempt"] == "base"
+    assert "iteration_count" in stats["counts_attempt_keys"]
+    assert "iterations" in stats["counts_attempt_keys"]
+
+
+def test_b05c_label_only_on_declined_retry():
+    from discopt.solvers._pounce_report import label_declined_retry
+
+    for sig, promoted in ((False, False), (True, True), (None, None)):
+        rep: dict = {"statistics": {"iteration_count": 3}}
+        if sig is not None:
+            rep["statistics"]["dual_divergence_signature"] = sig
+            rep["statistics"]["dual_divergence_retry_promoted"] = promoted
+        label_declined_retry(rep)
+        assert "counts_attempt" not in rep["statistics"]

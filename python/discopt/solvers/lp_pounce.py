@@ -300,13 +300,24 @@ def _certify_unbounded_ray(
         np.zeros(n),
         opts,
     )
-    if res.status != SolveStatus.OPTIMAL or res.objective is None:
-        return False
     threshold = -_RAY_COST_TOL * max(1.0, float(np.max(np.abs(c))) if n else 1.0)
-    if not res.objective < threshold or res.x is None:
-        return False
-    d = np.asarray(res.x, dtype=np.float64)[:n]
-    return _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi)
+    if (
+        res.status == SolveStatus.OPTIMAL
+        and res.objective is not None
+        and res.objective < threshold
+        and res.x is not None
+    ):
+        d = np.asarray(res.x, dtype=np.float64)[:n]
+        if _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi):
+            return True
+    # #1618 A-09: the interior-point ray LP returns an *interior* optimum of the
+    # cone LP -- every column strictly inside its box, ~1e-8 off the faces -- whose
+    # support is the whole cone, and the exact step can then reject it although a
+    # ray exists (the 10-column gasoline-blending LP: ray-LP optimum -136.7, ``d``
+    # refused). A vertex of the same LP has a minimal support. HiGHS (simplex with
+    # crossover) proposes one, and the identical exact check decides it, so this
+    # second candidate can only supply a proof, never loosen one.
+    return _ray_verified_exactly_highs(c, A_ray, cl_ray, cu_ray, d_lo, d_hi)
 
 
 def _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi) -> bool:
@@ -330,11 +341,8 @@ def _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi) -> bool:
     ``(0, 1)``, ``Qd = 0``) came back ``d = (-1.0e-8, 1.0)`` and lost its
     ``UNBOUNDED`` verdict to ``ERROR``.
     """
-    import scipy.sparse as sp
+    from discopt.solvers.lp_milp_highs import RAY_REL, primal_ray_verified
 
-    from discopt.solvers.lp_milp_highs import INF, RAY_REL, StdForm, primal_ray_verified
-
-    n = len(c)
     m = A_ray.shape[0]
     # Restore the declared direction box (Ipopt relaxes every bound by
     # ``bound_relax_factor``), then drop what is left below the solve's own
@@ -343,8 +351,6 @@ def _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi) -> bool:
     d_scale = float(np.max(np.abs(d))) if d.size else 0.0
     if d_scale > 0.0:
         d = np.where(np.abs(d) <= _RAY_DIRT_TOL * d_scale, 0.0, d)
-    xl = np.where(d_lo < 0.0, -INF, 0.0)
-    xu = np.where(d_hi > 0.0, INF, 0.0)
     s = np.asarray(A_ray @ d, dtype=np.float64) if m else np.zeros(0)
     # A row the ray LP holds at 0 comes back with interior-point round-off of either
     # sign; left in place, a +1e-9 on a ``<= 0`` row fails the sign screen before the
@@ -352,17 +358,48 @@ def _ray_verified_exactly(d, c, A_ray, cl_ray, cu_ray, d_lo, d_hi) -> bool:
     # step then demands ``(A d')_i = 0`` exactly — stricter, never looser.
     if m:
         s = np.where(np.abs(s) <= RAY_REL * (np.abs(A_ray) @ np.abs(d)), 0.0, s)
+    sf = _ray_std_form(c, A_ray, cl_ray, cu_ray, d_lo, d_hi)
+    return primal_ray_verified(np.concatenate([d, s]), sf)
+
+
+def _ray_std_form(c, A_ray, cl_ray, cu_ray, d_lo, d_hi):
+    """The recession system ``A d - s = 0`` in standard form, one slack per row,
+    each column and slack open exactly on the sides the cone leaves open."""
+    import scipy.sparse as sp
+
+    from discopt.solvers.lp_milp_highs import INF, StdForm
+
+    n = len(c)
+    m = A_ray.shape[0]
+    xl = np.where(d_lo < 0.0, -INF, 0.0)
+    xu = np.where(d_hi > 0.0, INF, 0.0)
     s_lo = np.where(cl_ray > -_INF, 0.0, -INF)
     s_hi = np.where(cu_ray < _INF, 0.0, INF)
     A_std = sp.hstack([sp.csc_matrix(A_ray.reshape(m, n)), -sp.identity(m, format="csc")])
-    sf = StdForm.from_arrays(
+    return StdForm.from_arrays(
         np.concatenate([np.asarray(c, dtype=np.float64), np.zeros(m)]),
         A_std,
         np.zeros(m),
         np.concatenate([xl, s_lo]),
         np.concatenate([xu, s_hi]),
     )
-    return primal_ray_verified(np.concatenate([d, s]), sf)
+
+
+def _ray_verified_exactly_highs(c, A_ray, cl_ray, cu_ray, d_lo, d_hi) -> bool:
+    """A HiGHS vertex of the ray LP, decided by the same exact check (#1618 A-09).
+
+    :func:`~discopt.solvers.lp_milp_highs.recession_ray` solves ``min c'd`` over the
+    standard form's cone with the unit box; its candidate (structural columns and
+    slacks together) goes to ``primal_ray_verified`` unchanged. ``False`` when HiGHS
+    finds no negative-cost vertex or the exact step refuses it.
+    """
+    from discopt.solvers.lp_milp_highs import primal_ray_verified, recession_ray
+
+    sf = _ray_std_form(c, A_ray, cl_ray, cu_ray, d_lo, d_hi)
+    d = recession_ray(sf, time_limit=None)
+    if d is None:
+        return False
+    return primal_ray_verified(d, sf)
 
 
 def _settle_ambiguous_unbounded(
