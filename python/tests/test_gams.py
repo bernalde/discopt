@@ -471,7 +471,10 @@ class TestGamsLagLead:
 
 
 class TestGamsSemicont:
-    def test_semicont_warns(self):
+    # These asserted the old approximation (a warning, then a plain variable
+    # with `lo` applied, which made x = 0 infeasible). #1613: the reader now
+    # lowers `x = 0 or lo <= x <= up` exactly; see test_1613_exporter_fidelity.
+    def test_semicont_is_exact(self):
         src = textwrap.dedent("""\
             Semicont Variable x ;
             Free Variable z ;
@@ -482,12 +485,12 @@ class TestGamsSemicont:
             Model m / all / ;
             Solve m using MINLP minimizing z ;
         """)
-        with pytest.warns(UserWarning, match="Semicontinuous.*approximated"):
-            m = parse_gams(src)
+        m = parse_gams(src)
         var_map = {v.name: v for v in m._variables}
         assert var_map["x"].var_type == dm.VarType.CONTINUOUS
+        assert m.solve().objective == pytest.approx(0.0, abs=1e-7)  # x = 0
 
-    def test_semiint_warns(self):
+    def test_semiint_is_exact(self):
         src = textwrap.dedent("""\
             Semiint Variable n ;
             Free Variable z ;
@@ -498,10 +501,10 @@ class TestGamsSemicont:
             Model m / all / ;
             Solve m using MINLP minimizing z ;
         """)
-        with pytest.warns(UserWarning, match="Semi-integer.*approximated"):
-            m = parse_gams(src)
+        m = parse_gams(src)
         var_map = {v.name: v for v in m._variables}
         assert var_map["n"].var_type == dm.VarType.INTEGER
+        assert m.solve().objective == pytest.approx(0.0, abs=1e-7)  # n = 0
 
 
 # ── Initial value (.l) tests ──────────────────────────────────

@@ -319,6 +319,26 @@ enum Emit {
     Text(String),
 }
 
+/// Operands of the maximal `+` chain rooted at `root`, left to right.
+///
+/// Walks only through `OP_ADD` nodes, with an explicit stack (the chain can be
+/// as deep as the sum is long); any other node is an operand. Two operands means
+/// `root` is a lone binary `+`.
+fn add_chain_leaves(prog: &ScalarProgram, root: i64) -> Vec<i64> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let i = n as usize;
+        if prog.op[i] == OP_ADD {
+            stack.push(prog.b[i]);
+            stack.push(prog.a[i]);
+        } else {
+            leaves.push(n);
+        }
+    }
+    leaves
+}
+
 /// Emit one expression tree in `.nl` prefix notation.
 ///
 /// Fallible: a function code this writer has no opcode for is a **refusal**, so
@@ -345,6 +365,21 @@ fn write_expr(
         match op {
             OP_CONST => out.push_str(&format!("n{}\n", py_float(prog.k[i]))),
             OP_VAR => out.push_str(&format!("v{}\n", remap[prog.k[i] as usize])),
+            OP_ADD
+                if prog.op[prog.a[i] as usize] == OP_ADD
+                    || prog.op[prog.b[i] as usize] == OP_ADD =>
+            {
+                // A chain of three or more `+` is ONE n-ary sum (`o54`), not
+                // `n - 1` nested `o0`: the chain's depth is linear in its length
+                // (a `sum()` body, the split's refolded nonlinear terms, a matmul
+                // row) and overflowed downstream recursive `.nl` readers
+                // (#1613 B-15b). Mirrors `nl.py::_write_expr`.
+                let leaves = add_chain_leaves(prog, node);
+                out.push_str(&format!("o{NL_SUMLIST}\n{}\n", leaves.len()));
+                for t in leaves.iter().rev() {
+                    stack.push(Emit::Node(*t));
+                }
+            }
             OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_POW => {
                 let code = match op {
                     OP_ADD => NL_ADD,

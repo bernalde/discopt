@@ -19,6 +19,7 @@ from discopt.export._common import (
     binary_box_is_default,
     builder_objective,
     iter_builder_linear_rows,
+    legal_unique_names,
     refuse_non_algebraic_relations,
 )
 from discopt.export._extract import (
@@ -67,7 +68,9 @@ def to_mps(model: Model, path: str | Path | None = None) -> str | None:
     # by name rather than die on ``con.body`` in the row loop below (#1218).
     refuse_non_algebraic_relations(model, "MPS")
     flat_vars = flatten_variables(model)
-    var_names = [name for name, _, _, _, _ in flat_vars]
+    # Whitespace-tokenised format: names are made legal AND distinct, or a
+    # reader sees a different model (#1613 C-03a). See `legal_unique_names`.
+    var_names = legal_unique_names([name for name, _, _, _, _ in flat_vars], "mps")
 
     lines: list[str] = []
 
@@ -92,17 +95,20 @@ def to_mps(model: Model, path: str | Path | None = None) -> str | None:
         # See the same expansion in `lp.py`: one array-valued body is many rows.
         bodies = scalarize_body(con.body)
         for k, body in enumerate(bodies):
-            row_name = _sanitize_name(base if len(bodies) == 1 else f"{base}_{k}")
+            row_name = base if len(bodies) == 1 else f"{base}_{k}"
             lin, const = extract_linear_terms(body, flat_vars, model_vars=mvars)
             constraint_row_names.append(row_name)
             row_senses.append(con.sense)
             con_data.append((lin, -const))
     for j, brow in enumerate(iter_builder_linear_rows(model)):
-        row_name = _sanitize_name(brow.name if brow.name else f"B{j}")
+        row_name = brow.name if brow.name else f"B{j}"
         constraint_row_names.append(row_name)
         row_senses.append(brow.sense)
         con_data.append((dict(brow.coeffs), brow.rhs))
 
+    # `OBJ` is reserved so a constraint named `OBJ` cannot merge into the
+    # objective row.
+    constraint_row_names = legal_unique_names(constraint_row_names, "mps", (obj_row_name,))
     for row_name, sense in zip(constraint_row_names, row_senses):
         if sense == "<=":
             lines.append(f" L  {row_name}")
@@ -159,7 +165,8 @@ def to_mps(model: Model, path: str | Path | None = None) -> str | None:
     # Track which variables are integer/binary for MARKER sections
     int_marker_open = False
 
-    for j, (vname, vtype, _, _, _) in enumerate(flat_vars):
+    for j, (_raw_name, vtype, _, _, _) in enumerate(flat_vars):
+        vname = var_names[j]
         is_int = vtype in (VarType.BINARY, VarType.INTEGER)
 
         # Open integer marker if needed
@@ -197,7 +204,7 @@ def to_mps(model: Model, path: str | Path | None = None) -> str | None:
 
     # BOUNDS
     lines.append("BOUNDS")
-    for vname, vtype, _shape, lb, ub in flat_vars:
+    for vname, (_raw_name, vtype, _shape, lb, ub) in zip(var_names, flat_vars):
         lb_val = float(lb)
         ub_val = float(ub)
 
@@ -289,11 +296,6 @@ def to_mps(model: Model, path: str | Path | None = None) -> str | None:
         Path(path).write_text(mps_str)
         return None
     return mps_str
-
-
-def _sanitize_name(name: str) -> str:
-    """Sanitize a name for MPS format (replace spaces/special chars)."""
-    return name.replace(" ", "_").replace("-", "_")
 
 
 def _fmt(value: float) -> str:

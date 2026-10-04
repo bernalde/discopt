@@ -53,6 +53,29 @@ from discopt.modeling.core import (
 )
 
 
+def _is_add(*nodes: Expression) -> bool:
+    """True if any of *nodes* is a binary ``+`` (so its parent heads a 3+ chain)."""
+    return any(isinstance(n, BinaryOp) and n.op == "+" for n in nodes)
+
+
+def _add_chain(root: Expression) -> list[Expression]:
+    """Operands of the maximal ``+`` chain rooted at *root*, left to right.
+
+    Walks only through ``BinaryOp("+")`` nodes, with an explicit stack (the
+    chain can be as deep as the sum is long); any other node is an operand.
+    """
+    leaves: list[Expression] = []
+    stack: list[Expression] = [root]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, BinaryOp) and n.op == "+":
+            stack.append(n.right)
+            stack.append(n.left)
+        else:
+            leaves.append(n)
+    return leaves
+
+
 def to_nl(
     model: Model,
     path: Union[str, Path, None] = None,
@@ -1501,6 +1524,16 @@ class _NLWriter:
                         continue
                     raise ValueError(f"Cannot resolve indexed expression: {node}")
                 buf.write(f"v{vi}\n")
+            elif isinstance(node, BinaryOp) and node.op == "+" and _is_add(node.left, node.right):
+                # A chain of three or more `+` is ONE n-ary sum (`o54`), not
+                # `n - 1` nested `o0`: the chain's depth is linear in its length
+                # (a `sum()` body, `_split_expr`'s refolded nonlinear terms, a
+                # matmul row) and overflowed downstream recursive `.nl` readers
+                # (#1613 B-15b). The Rust writer (`nl_writer.rs`) does the same;
+                # the two are diffed byte for byte.
+                leaves = _add_chain(node)
+                buf.write(f"o{_OP_SUMLIST}\n{len(leaves)}\n")
+                stack.extend(reversed(leaves))
             elif isinstance(node, BinaryOp):
                 op_map = {
                     "+": _OP_ADD,
