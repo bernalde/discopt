@@ -257,6 +257,11 @@ def test_row_scaled_flay03m_admits_no_infeasible_incumbent(monkeypatch):
     route = res.algorithm_route or ""
     # Everything a CI-only failure needs to be diagnosed from the log alone.
     why = (res.status, res.gap_certified, res.bound, res.objective, route, trace.get("summary"))
+    if "fell back" in route:
+        # The merged fallback result carries no OA trace, so re-run the route alone
+        # and attach ITS trace: that is where the reason it did not certify lives.
+        alone = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30, solver="mip-nlp")
+        why += ((alone.mip_nlp_trace or {}).get("summary"),)
     assert trace.get("summary", {}).get("rejected_incumbent_count", 0) > 0, why
     assert "fell back" not in route, why
     assert res.gap_certified, (res.status, res.bound, route)
