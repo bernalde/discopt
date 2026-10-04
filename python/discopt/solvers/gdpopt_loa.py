@@ -15,6 +15,7 @@ import numpy as np
 from discopt.modeling.core import (
     Constraint,
     Model,
+    ObjectiveSense,
     SolveResult,
     VarType,
 )
@@ -136,6 +137,18 @@ def solve_gdpopt_loa(
     )
     obj_is_linear = obj_coeffs is not None
     master_bound_valid = obj_is_linear or oa_convexity.objective_is_convex
+    # #1611 C-11: the evaluator works in minimization convention -- it negates a
+    # MAXIMIZE objective -- so the NLP subproblems, the objective OA cuts, LB and
+    # UB below all live in ``min -f``. Put the linear master objective in the same
+    # convention (as ``oa._decompose_model`` does), and un-negate the objective and
+    # bound at the return sites with ``obj_sign``. Without this the master
+    # minimized ``+f`` while the subproblems minimized ``-f``, and the result
+    # carried the internal (negated) bound on the wrong side of the incumbent.
+    maximize = _raw_obj is not None and _raw_obj.sense == ObjectiveSense.MAXIMIZE
+    obj_sign = -1.0 if maximize else 1.0
+    if maximize and obj_coeffs is not None:
+        _c_vec, _c_off = obj_coeffs
+        obj_coeffs = (-_c_vec, -_c_off)
 
     if n_cons > 0 and not all(oa_rows.convex_mask):
         logger.warning(
@@ -192,6 +205,17 @@ def solve_gdpopt_loa(
     all_binary_discrete = _discrete_vars_all_binary(int_indices, lb, ub)
     no_good_configs: list[tuple[int, ...]] = []
 
+    # #1611 C-11: integer configurations whose fixed-integer NLP already returned
+    # a point. Re-solving one adds the same OA cuts at the same point, so the
+    # master proposes it again forever: the loop can only spin to the time limit.
+    # Measured on the C-11 synthesis model the NLP point violates its linear rows
+    # by ~1e-6 (the NLP's own feasibility tolerance), so its objective sits 3.8e-5
+    # past the exact master bound, the gap reads as a crossed certificate (1.0),
+    # and LOA re-solved the same configuration for the full 30 s. A re-proposal
+    # carries no new information; stop (certification is still decided only by
+    # the gap below, never by this exit).
+    solved_int_configs: set[tuple[int, ...]] = set()
+
     # #756: terminal state must distinguish a rigorous infeasibility proof from a
     # limit exhaustion. A timeout / iteration-cap / non-infeasible master verdict is
     # NOT an infeasibility proof and must never be certified as ``infeasible``.
@@ -244,6 +268,17 @@ def solve_gdpopt_loa(
             break
 
         x_master = master_result.x[:n_vars]
+        master_config = _int_config_key(x_master, int_indices)
+        if master_config in solved_int_configs:
+            if master_bound_valid and master_result.bound is not None:
+                LB = max(LB, master_result.bound)
+            logger.info(
+                "LOA: master re-proposed the already-solved integer configuration %s "
+                "at iteration %d; no new cuts can be generated, stopping",
+                master_config,
+                iteration,
+            )
+            break
         # Valid LB comes from the master's dual ``bound`` only, never the
         # incumbent ``objective`` (an upper bound on a limited master solve).
         if master_bound_valid and master_result.bound is not None:
@@ -260,6 +295,7 @@ def solve_gdpopt_loa(
         x_nlp = _solve_nlp_subproblem(evaluator, sub_lb, sub_ub, nlp_solver)
 
         if x_nlp is not None:
+            solved_int_configs.add(master_config)
             obj_nlp = float(evaluator.evaluate_objective(x_nlp))
             if obj_nlp < UB:
                 UB = obj_nlp
@@ -345,7 +381,7 @@ def solve_gdpopt_loa(
     # 9. Build result
     wall_time = time.perf_counter() - t_start
     gap = _compute_gap(LB, UB)
-    bound = LB if master_bound_valid and LB > -1e19 else None
+    bound = obj_sign * LB if master_bound_valid and LB > -1e19 else None
     reported_gap = gap if bound is not None and UB < 1e19 else None
 
     # C-35: unresolved configurations mean the search is incomplete — we did not
@@ -361,7 +397,7 @@ def solve_gdpopt_loa(
         x_dict = _build_x_dict(incumbent, reformulated)
         return SolveResult(
             status=status,
-            objective=incumbent_obj,
+            objective=None if incumbent_obj is None else obj_sign * incumbent_obj,
             bound=bound,
             gap=reported_gap,
             x=x_dict,

@@ -9019,6 +9019,12 @@ class Model:
             # silently shrinking a limit the user stated outright — and an external
             # MILP/QP backend has no use for this fallback anyway.
             and solver is None
+            # #1611 D-25: an explicitly requested decomposition (Lagrangian, Benders,
+            # ...) is the caller's chosen algorithm. When it returned no incumbent the
+            # fallback used to re-solve with the LP-per-node B&B and report THAT as
+            # ``optimal`` -- ignoring ``max_nodes`` and hiding that the requested
+            # method never produced the answer. The decomposition's own result stands.
+            and not kwargs.get("decomposition")
             # The engine branches on integer PRODUCTS in constraint rows; a box-only
             # model gives it nothing to work with, and the primary solves such a
             # model directly.
