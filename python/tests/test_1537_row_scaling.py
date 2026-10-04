@@ -378,3 +378,25 @@ def test_row_equilibration_clamps_and_skips_degenerate_rows(monkeypatch):
     w = _RowEquilibratedEvaluator.wrap(Tiny(), np.zeros(2))
     assert w._s[0] == _NLP_ROW_SCALE_CLAMP  # clamped, not 1e12
     assert w._s[1] == 1.0  # zero gradient: left alone
+
+
+@pytest.mark.parametrize("span", [0.0, 3.0])
+def test_tls2_route_certifies_over_nlp_unresolved_configurations(monkeypatch, span):
+    """tls2 on the OA route: the master closes ``LB = UB = 5.3`` in well under a
+    second, but most fixed NLPs end in ``error`` on infeasible assignments, and
+    C-35 withheld the certificate whenever any configuration was unresolved. The
+    route returned ``feasible`` and the spatial fallback spent ~25 s re-proving
+    the instance unscaled, and ran out of budget with rows scaled in 10^[-3,3].
+
+    The bound covers those configurations (they are cut only by valid
+    linearizations; see ``_unresolved_configs_block_certificate``), so it now
+    certifies. Anti-vacuity (CLAUDE.md §6): the run must still contain an
+    unresolved configuration, or it no longer exercises this path."""
+    monkeypatch.delenv("DISCOPT_OA_UNRESOLVED_BLOCKS_CERT", raising=False)
+    res = _per_row_scaled("tls2.nl", span).solve(time_limit=30, solver="mip-nlp")
+    trace = res.mip_nlp_trace or {}
+    assert trace["summary"]["unresolved_integer_config_count"] > 0, trace["summary"]
+    assert res.gap_certified, (res.status, res.bound, trace.get("termination_reason"))
+    # minlplib.solu: tls2 =opt= 5.3 (minimize). Never above it.
+    assert res.bound <= 5.3 + 1e-6, res.bound
+    assert res.objective == pytest.approx(5.3, rel=1e-4)

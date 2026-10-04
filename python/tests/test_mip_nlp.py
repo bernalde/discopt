@@ -978,19 +978,17 @@ def test_mip_nlp_shot_convex_bounding_skips_nonrigorous_no_good_cuts(monkeypatch
     assert trace["iterations"][1]["convex_bounding"]["integer_cut_excluded_count"] == 0
     assert trace["iterations"][1]["convex_bounding"]["global_cut_count"] == 0
     assert trace["summary"]["unresolved_integer_config_count"] == 1
-    assert trace["bound_validity"] == "uncertified"
+    # #1537: the convex-bounding problem excluded the unresolved ``y = 0`` by no
+    # cut at all (``integer_cut_excluded_count == 0`` above), so its 0.0 is a valid
+    # bound over every configuration -- it is the true optimum of ``min y`` s.t.
+    # ``x**2 >= 1``. It is published as one, consistently in ``bound`` and the
+    # trace (#1105). The gap stays open against the incumbent 1.0, so nothing is
+    # certified: the unresolved configuration is exactly where the better point is.
+    assert trace["bound_validity"] == "global"
     assert trace["final_lb"] == pytest.approx(0.0)
     assert trace["heuristic_lb"] == pytest.approx(0.0)
     assert result.status == "feasible"
-    # #1105: the general ``bound`` field no longer contradicts the validity
-    # signal published beside it. With an unresolved integer configuration the
-    # trace says ``bound_validity="uncertified"`` / ``master_bound_valid=False``,
-    # so ``bound`` is withheld and the master number stays available as the
-    # diagnostic ``trace["final_lb"]``/``["heuristic_lb"]`` asserted above. This
-    # test previously pinned the contradiction (``bound=0.0`` beside
-    # ``bound_validity="uncertified"``) that #1105 was filed about.
-    assert result.bound is None
-    assert result.gap is None
+    assert result.bound == pytest.approx(0.0)
     assert result.gap_certified is False
     assert result.objective == pytest.approx(1.0)
 
