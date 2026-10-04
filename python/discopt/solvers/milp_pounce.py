@@ -77,6 +77,7 @@ def solve_milp(
     integrality: Optional[np.ndarray] = None,
     time_limit: Optional[float] = None,
     gap_tolerance: float = 1e-4,
+    max_nodes: int = 100_000,
 ) -> MILPResult:
     """Solve ``min c^T x`` over the MILP via the self-hosted B&B (POUNCE).
 
@@ -84,6 +85,11 @@ def solve_milp(
     ``bounds`` default to ``(0, +inf)`` per variable when ``None``;
     ``integrality[j] == 1`` marks variable ``j`` integer (all continuous when
     ``None``).
+
+    ``max_nodes`` is the B&B node budget -- a deterministic stop, unlike
+    ``time_limit``, so a caller that needs a load-independent result (a test)
+    can bound the search by work instead of wall clock. The default is the
+    budget this driver always used; the other matrix backends already take it.
     """
     import discopt.modeling as dm
     from discopt.solver import _solve_milp_bb
@@ -131,7 +137,7 @@ def solve_milp(
         gap_tolerance,
         16,  # batch_size
         "best_first",  # strategy
-        100_000,  # max_nodes
+        int(max_nodes),
         t0,
         prefer_pounce=True,
     )
