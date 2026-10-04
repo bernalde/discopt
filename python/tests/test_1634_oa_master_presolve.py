@@ -265,6 +265,31 @@ def test_lp_nlp_bb_early_exit_cannot_restore_an_unconfirmed_bound(monkeypatch):
     assert r.mip_nlp_trace["termination_reason"] == "early_exit_unconfirmed"
 
 
+def test_lp_nlp_bb_early_exit_confirmed_by_a_bound_a_hair_lower(monkeypatch):
+    """The presolve-free cross-solve lands a hair below the check-in reading on
+    ordinary B&B noise (it did on the Linux CI runner). A bound that still passes
+    the gap test confirms the stop; only it -- never the higher check-in value --
+    is reported."""
+    real = MH._cross_check_lazy_master
+    fired = []
+
+    def nudged(h, highspy, status, bound, time_left, objective=None):
+        status, bound, diag = real(h, highspy, status, bound, time_left, objective=objective)
+        if bound is not None:
+            bound -= 1e-9
+            fired.append(bound)
+        return status, bound, diag
+
+    monkeypatch.setattr(MH, "_cross_check_lazy_master", nudged)
+    r = _lp_nlp_bb(_early_exit_model())
+    stats = r.mip_nlp_trace["summary"]["callback_stats"]
+    assert fired, "the lazy-master cross-check never ran"
+    assert stats["early_exit_unconfirmed"] is False, stats
+    assert r.gap_certified
+    assert r.bound is not None and r.bound <= fired[-1] + 1e-12, (r.bound, fired)
+    assert r.objective == pytest.approx(0.008, abs=1e-6)
+
+
 def test_lp_nlp_bb_early_exit_still_certifies_when_confirmed():
     """Without a fault the cross-check confirms the check-in bound and the early exit
     certifies as before."""

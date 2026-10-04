@@ -6376,7 +6376,19 @@ def solve_lp_nlp_bb(
     early_exit_unconfirmed = False
     if converged_at[0] is not None and cross_check is not None:
         confirmed = _master_bound_internal(master_result.bound)
-        if confirmed is None or confirmed < converged_at[0]:
+        # Confirmed means the cross-checked bound *itself* passes the gap test the
+        # stop was taken on -- not that it equals the check-in reading to the last
+        # bit (a presolve-free re-solve lands a hair lower on ordinary B&B noise;
+        # an exact ``<`` here threw away valid certificates on the Linux runner).
+        # Either way only the cross-checked bound is reported below, never the
+        # higher check-in value.
+        if (
+            confirmed is not None
+            and incumbent_obj is not None
+            and _compute_gap(confirmed, incumbent_obj) <= gap_tolerance
+        ):
+            converged_at[0] = min(converged_at[0], confirmed)
+        else:
             logger.warning(
                 "lp_nlp_bb: early-exit check-in bound %.12g not confirmed by the "
                 "presolve-free cross-solve (%s); the stop is not reported as "
