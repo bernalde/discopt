@@ -67,6 +67,30 @@ RAY_REL = 1e-9
 RAY_CLEAN = 1e-14
 #: HiGHS stores ``mip_max_nodes`` as a 32-bit int (probe: ``10**12`` -> kError).
 _MAX_NODES_CAP = 2**31 - 1
+#: HiGHS ``presolve_rule_off`` bit for ``kPresolveRuleParallelRowsAndCols`` (rule 13 of
+#: ``PresolveRuleType`` in ``lp_data/HConst.h``; HiGHS logs it as "Rule 13 (bit 8192):
+#: Parallel rows and columns"). The MILP route switches that rule off (#1634).
+#:
+#: Its parallel-column dominance test (``HPresolve::detectParallelRowsAndCols``) decides
+#: "these two columns cost the same" by ``|c_col * colScale - c_dup| <=
+#: dual_feasibility_tolerance``, an ABSOLUTE 1e-7 on a cost measured per unit of the
+#: duplicate column, where ``colScale = a_dup / a_col`` is the ratio of the two columns'
+#: coefficients. On the tie branch it then fixes the integer column at whichever bound the
+#: other column can compensate for -- the direction the tie makes free and the true cost
+#: does not. The route's own slack ``a x + s = b`` (cost 0, coefficient 1) is parallel to
+#: every column once presolve leaves a single row, so a coefficient ratio of 4.9e5 turns
+#: a real 0.0064-per-unit cost into 1.3e-8 per unit of ``s``: a "tie". Measured on the
+#: #1634 seed-181 witness: at presolve step 5 HiGHS fixed ``x2 = 3`` (cost 0.0064 each),
+#: certified 0.02082 with the true optimum 0.00801 strictly feasible (slack >= 72), and
+#: every guard here passed. With this bit off all three #1634 witnesses certify the true
+#: optimum and the generator panel recorded in the PR has no false certificate.
+#:
+#: Not a tolerance tweak: a smaller ``dual_feasibility_tolerance`` only moves the ratio at
+#: which the same absolute test misfires. The reduction is unsound on badly scaled columns
+#: and the route has no way to re-derive a bound HiGHS's presolve took away, so it is off.
+_PRESOLVE_RULE_PARALLEL_ROWS_AND_COLS = 1 << 13
+#: Every ``presolve_rule_off`` bit the MILP route sets.
+MILP_PRESOLVE_RULE_OFF = _PRESOLVE_RULE_PARALLEL_ROWS_AND_COLS
 #: The only terminal statuses a limit can produce.
 _LIMIT_STATUSES = ("kTimeLimit", "kIterationLimit", "kSolutionLimit", "kInterrupt")
 
@@ -1580,8 +1604,9 @@ def solve_milp_std(
 ) -> HighsOutcome:
     """Solve the MILP ``sf`` under the §3.2 contract, with the route's own
     under-scaled logical columns rescaled exactly first (#1537,
-    :func:`logical_column_scales`); see :func:`_solve_milp_std`."""
-    f = logical_column_scales(sf, n_struct)
+    :func:`logical_column_scales`), and every certificate held against a second,
+    presolve-free HiGHS solve (#1634, :func:`_cross_check_presolve`); see
+    :func:`_solve_milp_std`."""
     kw: dict[str, Any] = dict(
         time_limit=time_limit,
         gap_tolerance=gap_tolerance,
@@ -1591,6 +1616,16 @@ def solve_milp_std(
         n_struct=n_struct,
         root_check=root_check,
     )
+    out = _solve_milp_scaled(sf, **kw)
+    if out.gap_certified and out.status in ("optimal", "infeasible"):
+        return _cross_check_presolve(sf, out, kw)
+    return out
+
+
+def _solve_milp_scaled(sf: StdForm, *, presolve: bool = True, **kw: Any) -> HighsOutcome:
+    """:func:`_solve_milp_std` with the #1537 logical rescaling and its #1621 cross-check."""
+    kw = dict(kw, presolve=presolve)
+    f = logical_column_scales(sf, kw["n_struct"])
     if f is None:
         return _solve_milp_std(sf, **kw)
     t0 = time.perf_counter()
@@ -1694,6 +1729,174 @@ def _cross_check_rescaled(
     return plain
 
 
+def _withdraw(out: HighsOutcome, why: str) -> HighsOutcome:
+    """#1634: strip a HiGHS MILP certificate the presolve cross-check could not confirm.
+
+    Mirrors ``decertify_root_check`` (#1309/#1320): ``optimal`` keeps its verified
+    incumbent as an uncertified ``feasible`` over the NS-safe root bound; ``infeasible``
+    has no incumbent and becomes ``error``.
+    """
+    out.labels["milp/certificate"] = "declined"
+    out.gap_certified = False
+    out.message = f"HiGHS MILP certificate withdrawn: {why} (#1634)"
+    if out.status == "optimal":
+        out.status = "feasible"
+        out.bound = out.root_bound
+        if out.bound is not None and out.objective is not None:
+            out.bound = min(out.bound, out.objective)
+    else:
+        out.status, out.bound = "error", None
+    out.labels["milp/bound_provenance"] = "root-ns" if out.bound is not None else "none"
+    return out
+
+
+def _cross_check_presolve(sf: StdForm, out: HighsOutcome, kw: dict[str, Any]) -> HighsOutcome:
+    """#1634: hold a HiGHS MILP certificate against a second, presolve-free solve.
+
+    HiGHS's MIP presolve and tree decide on ABSOLUTE tolerances (1e-7 on costs, 1e-6
+    on rows). On a badly scaled MILP those stop meaning what they say, and HiGHS then
+    prunes a strictly feasible optimum and certifies the wrong value with every route
+    guard passing: #1634's witnesses certified 0.02082 against a true 0.00801 (slack
+    >= 72). One mechanism is pinned -- the parallel-column rule, now off
+    (:data:`MILP_PRESOLVE_RULE_OFF`) -- but measured on the #1634 generator panel the
+    class is wider than one rule: with it off, an always-on reduction still cut the
+    optimum (6-column panel seed 965, at the first presolve step), and with presolve
+    off entirely HiGHS's own tree did (seed 298). Neither configuration is sound on
+    its own on this class; on the panel they never failed on the same instance.
+
+    So the primary result is held against the other configuration's VERIFIED
+    incumbent, the #1509/#1621 falsifier: a verified point refutes ``infeasible``, and
+    a verified point below the certified bound by more than the route's equality
+    yardstick (``CERT_ABS + CERT_REL |bound|``) refutes ``optimal``. A refuted
+    certificate is declined loudly: the best verified point is published as
+    ``feasible`` with the NS-safe root bound, never the presolve-free solve's own
+    certificate -- on an instance where two HiGHS configurations disagree neither has
+    earned one. An unrefuted certificate must still be CONFIRMED by the cross-solve
+    (:func:`_weaker_bound`); one that cannot run for want of budget is withdrawn (#1309).
+    The budget already spent is the primary solve's ``wall_time``.
+    """
+    kw = dict(kw)
+    if kw["time_limit"] is not None:
+        kw["time_limit"] = max(0.0, float(kw["time_limit"]) - float(out.wall_time))
+        if kw["time_limit"] <= 0.0:
+            out.stats["milp/presolve_cross_check_skipped"] = 1.0
+            return _withdraw(
+                out, "no time budget left to cross-check it against a presolve-free solve"
+            )
+    cross = _solve_milp_scaled(sf, presolve=False, **kw)
+    out.stats["milp/presolve_cross_check_ran"] = 1.0
+    out.stats["milp/presolve_cross_check_time"] = float(cross.wall_time)
+    pt = _verified_mip_point(sf, cross.x)
+    refuted = None
+    if pt is not None:
+        if out.status == "infeasible":
+            refuted = f"a verified point of objective {pt[1]:.12g} exists"
+        else:
+            claim = out.bound if out.bound is not None else out.objective
+            if claim is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
+                refuted = f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
+    if refuted is None or pt is None:
+        return _weaker_bound(out, cross, kw)
+    logger.warning(
+        "HiGHS MILP route: the %s certificate is refuted by a presolve-free HiGHS solve "
+        "(%s); reporting the verified point uncertified (#1634)",
+        out.status,
+        refuted,
+    )
+    x, obj = pt
+    mine = _verified_mip_point(sf, out.x)
+    if mine is not None and mine[1] < obj:
+        x, obj = mine
+    # Both root bounds are NS-safe lower bounds of ``sf``; the larger is still valid.
+    roots = [b for b in (out.root_bound, cross.root_bound) if b is not None]
+    bound = min(max(roots), obj) if roots else None
+    stats = {**cross.stats, **out.stats, "milp/presolve_certificate_refuted": 1.0}
+    labels = {
+        **cross.labels,
+        **out.labels,
+        "milp/certificate": "declined",
+        "milp/bound_provenance": "root-ns" if bound is not None else "none",
+        "milp/presolve_certificate_refuted": f"{out.status}: {refuted}",
+    }
+    return HighsOutcome(
+        "feasible",
+        x=x,
+        objective=obj,
+        bound=bound,
+        gap_certified=False,
+        message=(
+            f"HiGHS MILP {out.status} certificate refuted by a presolve-free solve: "
+            f"{refuted} (#1634)"
+        ),
+        highs_status=out.highs_status,
+        node_count=out.node_count + cross.node_count,
+        iterations=out.iterations + cross.iterations,
+        root_bound=bound,
+        root_time=out.root_time,
+        wall_time=out.wall_time + cross.wall_time,
+        stats=stats,
+        labels=labels,
+    )
+
+
+def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) -> HighsOutcome:
+    """#1634: a certificate stands only if the presolve-free solve AGREES with it.
+
+    Agreement means the cross-solve reached the same certified verdict (``infeasible``
+    for ``infeasible``; a certified ``optimal`` for ``optimal``). A cross-solve with no
+    verdict -- an error, a limit, a rejected incumbent -- is the #1309 case: the check
+    that exists to catch a false certificate produced nothing, so the certificate is
+    withdrawn rather than standing on the absence of evidence. Measured on the panel
+    (6-column seed 965) this is not hypothetical: the presolved bound sat 3e-6 above the
+    enumerated optimum, and the presolve-free solve's kOptimal incumbent failed the
+    route's row re-verification, so the falsifier had no point to hold up.
+
+    When both are certified ``optimal``, the WEAKER of the two bounds is published.
+
+    A point can only refute a bound by more than the equality yardstick; a bound that is
+    wrong by less (or one the cross-solve's incumbent, itself stopped at the route's gap
+    tolerance, does not reach) survives the falsifier. Measured on the panel (6-column
+    seed 965): the presolved bound sat 3e-6 above the enumerated optimum while the
+    presolve-free bound was below it. The two configurations failed on disjoint
+    instances, so ``min`` of the two bounds is valid whenever either one is -- the
+    certificate then rests on the claim of whichever configuration is right. The gap is
+    re-tested against the route's own stop rule; a gap the weaker bound reopens is
+    declined, not certified.
+    """
+    if not (cross.gap_certified and cross.status == out.status):
+        out.stats["milp/presolve_cross_check_no_verdict"] = 1.0
+        out.labels["milp/presolve_cross_status"] = cross.status
+        return _withdraw(
+            out,
+            f"the presolve-free cross-solve did not confirm it (status {cross.status}: "
+            f"{cross.message or 'no message'})",
+        )
+    if out.status != "optimal" or out.bound is None or cross.bound is None:
+        return out
+    out.stats["milp/presolve_cross_bound"] = float(cross.bound)
+    if cross.bound >= out.bound:
+        return out
+    out.bound = min(cross.bound, out.objective) if out.objective is not None else cross.bound
+    out.labels["milp/bound_provenance"] = "min(presolved, presolve-free)"
+    out.stats["milp/presolve_cross_bound_lowered"] = 1.0
+    if out.objective is None:
+        return out
+    gap = max(0.0, out.objective - out.bound)
+    abs_tol = kw.get("abs_gap_tolerance")
+    closed = gap <= (1e-6 if abs_tol is None else abs_tol) or (
+        gap / max(abs(out.objective), abs(out.bound), 1e-10) <= kw["gap_tolerance"]
+    )
+    if not closed:
+        out.gap_certified = False
+        out.status = "feasible"
+        out.labels["milp/certificate"] = "declined"
+        out.message = (
+            "HiGHS MILP: the presolve-free cross-solve's bound reopens the gap, so the "
+            "result is not certified (#1634)"
+        )
+    return out
+
+
 def _solve_milp_std(
     sf: StdForm,
     *,
@@ -1704,8 +1907,12 @@ def _solve_milp_std(
     initial_point: Optional[np.ndarray] = None,
     n_struct: Optional[int] = None,
     root_check: bool = True,
+    presolve: bool = True,
 ) -> HighsOutcome:
     """Solve the MILP ``sf`` under the §3.2 contract.
+
+    ``presolve=False`` switches HiGHS's presolve off; it is the second solve of the
+    #1634 cross-check (:func:`_cross_check_presolve`), not a user option.
 
     ``abs_gap_tolerance`` is ``Model.solve``'s absolute convergence tolerance
     (#1243), mapped onto HiGHS's ``mip_abs_gap``. The mapping is faithful:
@@ -1779,7 +1986,12 @@ def _solve_milp_std(
         ("mip_max_nodes", int(min(max(int(max_nodes), 0), _MAX_NODES_CAP))),
         ("mip_feasibility_tolerance", 1e-6),
         ("primal_feasibility_tolerance", 1e-7),
+        # #1634: HiGHS's parallel-column presolve fixes integers on an absolute
+        # cost-tie test that bad coefficient ratios defeat; see the constant.
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),
     ]
+    if not presolve:
+        opts.append(("presolve", "off"))
     if rem is not None:
         opts.append(("time_limit", float(rem)))
     h = _new_highs(highspy, opts)

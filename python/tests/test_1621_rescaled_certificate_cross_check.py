@@ -181,6 +181,11 @@ def test_cross_check_refutes_a_rescaled_certificate(monkeypatch, M):  # noqa: N8
     """With the rescaling forced exactly as before #1621, the rescaled form certifies
     the issue's false answers; the cross-check must refute and discard them."""
     monkeypatch.setattr(L, "logical_column_scales", _legacy_scales)
+    # #1634 switched HiGHS's parallel-column presolve rule off, which changes which of
+    # the route's falsifiers catches M = 1e10 (the #1634 presolve cross-check does,
+    # and the result is still declined). Pin the pre-#1634 presolve so this test keeps
+    # exercising the #1621 cross-check it is about.
+    monkeypatch.setattr(L, "MILP_PRESOLVE_RULE_OFF", 0)
     r = _blend(M).solve(time_limit=60)
     st = r.solver_stats or {}
     assert st.get("route/lp_milp_backend") == 1.0

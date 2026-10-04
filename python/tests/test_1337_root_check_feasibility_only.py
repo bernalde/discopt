@@ -184,8 +184,10 @@ def test_the_recheck_asks_a_zero_objective_question(monkeypatch):
     sf = _integral_conflict_sf([0.0, -1.0], [5.0, 1e20])
     solve_milp_std(sf, time_limit=60.0, gap_tolerance=1e-4, max_nodes=10_000)
 
-    assert len(seen) == 2, f"expected the root solve then the re-check, got {len(seen)}"
-    first, second = seen
+    # Each HiGHS MILP solve does the root solve then the re-check; the #1634
+    # presolve-free cross-solve repeats that pair, so the first pair is the one here.
+    assert len(seen) in (2, 4), f"expected root solve + re-check per MILP solve, got {len(seen)}"
+    first, second = seen[:2]
     assert np.any(first.c != 0.0), "the first solve must carry the real objective"
     assert np.all(second.c == 0.0), "the re-check must drop the objective"
     assert second.obj_const == 0.0
