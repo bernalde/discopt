@@ -67,6 +67,7 @@ from discopt.modeling.core import (
     Model,
     SolveResult,
     VarType,
+    _solve_leaves_model_unchanged,
     objective_sense_sign,
 )
 from discopt.modeling.core import repr_space_cutoff as _repr_space_cutoff
@@ -10413,6 +10414,7 @@ def _refusing_on_callback_failure(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+@_solve_leaves_model_unchanged
 @_refusing_on_callback_failure
 @_scoped_fallback_warnings
 @_stamp_layer_timing
@@ -22662,9 +22664,12 @@ def _solve_nlp_bb(
     # feasible point, so no incumbent is ever cut (and the #779 guard verifies
     # the final incumbent against the pristine pre-solve model regardless).
     # Write-back honors the #772 lessons: each cut is a NEW Constraint with the
-    # full row folded into the body and ``rhs=0.0``. The applied cuts remain in
-    # the model after the solve (valid rows; keeps result.constraint_duals
-    # aligned). A documented decline degrades to the flag-off path (#1514).
+    # full row folded into the body and ``rhs=0.0``. The cuts live only for
+    # the duration of the solve: ``_solve_leaves_model_unchanged`` (#1610)
+    # restores the caller's constraint list on exit, so the cut rows' duals
+    # appear in ``result.constraint_duals`` under their anonymous ``c{idx}``
+    # keys (idx past the user's rows). A documented decline degrades to the
+    # flag-off path (#1514).
     _root_cut_bound: Optional[float] = None
     _root_cut_count = 0
     # Top-level solves only: RENS/local-branching sub-solves recurse into this

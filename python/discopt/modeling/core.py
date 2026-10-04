@@ -5156,6 +5156,100 @@ def _counts_solve_depth(fn):
     return wrapper
 
 
+#: ``id()`` of every model a solve on the stack has already taken ownership of
+#: (#1610). A ContextVar for the same reason as :data:`_SOLVE_DEPTH`.
+_SOLVE_OWNED_MODELS: _contextvars.ContextVar[frozenset[int]] = _contextvars.ContextVar(
+    "discopt_solve_owned_models", default=frozenset()
+)
+
+
+@_contextlib.contextmanager
+def _solve_owns_model(model: "Model") -> "Iterator[bool]":
+    """Lend ``model`` to the solver for one solve; hand it back unchanged (#1610).
+
+    The solve path uses the caller's ``Model`` as its working copy. Root FBBT
+    writes the box it tightened into ``v.lb``/``v.ub``
+    (``_apply_flat_bounds_to_model`` before the factorable lift, the node and
+    root reduction passes, ...), ``DISCOPT_COEF_TIGHTEN`` replaces big-M rows in
+    ``model._constraints``, and the structure-cut presolve appends auxiliary
+    columns and rows. Each write is valid *for that solve* and wrong after it: a
+    tightening derived from ``x <= p`` at ``p = 8`` survived as a declared
+    ``x.ub == 8``, so the re-solve at ``p = 10`` returned ``x = 8`` labelled
+    ``optimal``.
+
+    Fixing the write sites one at a time would not fix the class -- there are
+    dozens, and the next pass to write the model would bring the defect back.
+    This is the one boundary every solve crosses. On entry it records the
+    caller's variables and their boxes (fix stack included, via
+    :meth:`Model.saved_bounds`), the constraint list, the objective, the name set
+    and the builder-resident rows; on exit -- exceptions included -- it puts
+    every one of them back. Inside, the solve uses the model exactly as before,
+    so the solve itself is bound-neutral by construction.
+
+    Re-entrant per model: a nested ``Model.solve``/``solve_model`` on a model an
+    outer solve already holds is part of that solve and must keep seeing its
+    working state, so only the outermost entry snapshots and restores. Yields
+    whether this entry is the owner.
+    """
+    owned = _SOLVE_OWNED_MODELS.get()
+    if id(model) in owned:
+        yield False
+        return
+    token = _SOLVE_OWNED_MODELS.set(owned | {id(model)})
+    vars_entry = list(model._variables)
+    cons_entry = list(model._constraints)
+    objective_entry = model._objective
+    names_entry = set(model._names)
+    blocks_entry = list(model._builder_linear_blocks)
+    try:
+        with model.saved_bounds(vars_entry):
+            yield True
+    finally:
+        try:
+            grew = len(model._variables) != len(vars_entry) or any(
+                a is not b for a, b in zip(model._variables, vars_entry)
+            )
+            # In place, not rebound: a caller may hold the list object itself.
+            model._variables[:] = vars_entry
+            model._constraints[:] = cons_entry
+            model._objective = objective_entry
+            model._names.clear()
+            model._names.update(names_entry)
+            blocks_changed = len(model._builder_linear_blocks) != len(blocks_entry) or any(
+                a is not b for a, b in zip(model._builder_linear_blocks, blocks_entry)
+            )
+            if blocks_changed:
+                model._builder_linear_blocks[:] = blocks_entry
+            if model._builder is not None and (grew or blocks_changed):
+                # The Rust builder cannot drop a column or a row; rebuild it from
+                # the restored Python-side records (the path ``clone`` uses).
+                model._replay_builder()
+        finally:
+            _SOLVE_OWNED_MODELS.reset(token)
+
+
+def _solve_leaves_model_unchanged(fn):
+    """Run ``fn(model, ...)`` under :func:`_solve_owns_model` (#1610).
+
+    The result's ``_problem_fingerprint`` -- what ``Model.sensitivity()`` checks
+    a stored solution against -- is stamped inside the solve, on the working
+    state. Once the caller's model is restored the result is about *that*
+    problem, so the owner re-stamps it there.
+    """
+
+    @_functools.wraps(fn)
+    def wrapper(model, *args, **kwargs):
+        with _solve_owns_model(model) as owner:
+            result = fn(model, *args, **kwargs)
+        if owner and getattr(result, "_problem_fingerprint", None) is not None:
+            from discopt._evaluator_cache import solution_state_fingerprint
+
+            setattr(result, "_problem_fingerprint", solution_state_fingerprint(model))
+        return result
+
+    return wrapper
+
+
 def _post_solve_abs_gap_tol(result: "SolveResult", abs_gap_tolerance: Optional[float]) -> float:
     """The absolute gap tolerance a post-solve gap recomputation reports at (#1585).
 
@@ -7638,6 +7732,7 @@ class Model:
     # ── Solve ──
 
     @_counts_solve_depth
+    @_solve_leaves_model_unchanged
     def solve(
         self,
         time_limit: float = 3600,
