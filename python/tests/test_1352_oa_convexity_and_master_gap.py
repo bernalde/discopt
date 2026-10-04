@@ -297,5 +297,15 @@ def test_oa_closes_when_fixed_nlp_is_scale_aware(monkeypatch):
 
     monkeypatch.setenv("DISCOPT_OA_NLP_SCALED_TOL", "0")
     legacy = solve_oa(_markowitz(10, 3, 3)[0], time_limit=60)
-    assert legacy.status == "feasible"  # the stall this fixes; the opt-out keeps it
+    # The opt-out's stall sits on a razor's edge, not a margin: measured locally (stable
+    # across 3 repeats, 12 round-off perturbations of the data, time limits 0.5-8 s) it
+    # ends ``feasible`` with gap 1.0438e-6 against GAP_ABS_TOL = 1e-6 -- 4% over. On CI
+    # the identical tree went green on 340a244b and red (``optimal``) on 2d2fe75c, so the
+    # legacy verdict is runner-dependent. What this test pins is that the *scaled* arm
+    # closes (above); for the legacy arm it pins soundness: it either stalls, or it
+    # closes to the true optimum with a valid bound.
+    assert legacy.status in ("feasible", "optimal"), legacy.status
     assert legacy.bound <= MARKOWITZ_10_3_3_OPT + 1e-9
+    if legacy.status == "optimal":
+        assert abs(legacy.objective - MARKOWITZ_10_3_3_OPT) <= 1e-6
+        assert legacy.objective - legacy.bound <= 1e-6 + 1e-12
