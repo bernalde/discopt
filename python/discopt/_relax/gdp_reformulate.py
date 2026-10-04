@@ -16,6 +16,7 @@ original model is returned unchanged (zero overhead).
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import numpy as np
@@ -207,6 +208,24 @@ def reformulate_gdp(
         var = Variable(name, VarType.CONTINUOUS, (size,), 0.0, 1.0, new_model)
         new_model._variables.append(var)
         return var
+
+    # #1615 C-10a: indicator constraints -- ``Model.if_then`` and the blocks
+    # ``Model.add_disjunction`` lowers to ``if_then`` + ``exactly(1)`` -- are always
+    # lowered by big-M (or multiple big-M); the hull / simplex reformulations
+    # apply only to ``either_or`` disjunctions. Say so rather than let a caller
+    # believe ``gdp_method="hull"`` reached them.
+    if method in ("hull", "simplex"):
+        _n_ind = sum(1 for c in model._constraints if isinstance(c, _IndicatorConstraint))
+        if _n_ind:
+            warnings.warn(
+                f"gdp_method={method!r} does not apply to the {_n_ind} indicator "
+                "constraint(s) in this model (Model.if_then, and the Disjunct blocks "
+                "of Model.add_disjunction, which lower to if_then): they are "
+                "reformulated by big-M. Only Model.either_or disjunctions take the "
+                f"{method!r} reformulation.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # In auto mode, ask the F1 advisor for a per-disjunction
     # recommendation up front; if any disjunction (or indicator) is

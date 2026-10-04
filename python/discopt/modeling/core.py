@@ -7994,9 +7994,18 @@ class Model:
             constraints; a mismatch raises ``ValueError`` rather than starting
             from a partially filled point.
         skip_convex_check : bool, default False
-            If True, skip automatic convexity detection for continuous
-            problems. When False (default), convex NLPs are solved with
-            a single NLP call (no B&B), guaranteeing global optimality.
+            If True, skip automatic convexity detection **and the global
+            search** for a purely continuous model: it is solved with a single
+            *local* NLP call, with no spatial branch-and-bound. The result is
+            therefore uncertified -- ``status="feasible"`` (never
+            ``"optimal"``), ``bound=None``, ``node_count=0`` -- and on a
+            nonconvex model it can be a local, non-global optimum (#1615
+            B-02a). Leave it False (default) for a global solve: a model proved
+            convex is then solved with a single certified NLP call, and any
+            other model gets spatial branch-and-bound. On a model with integer
+            variables the solve is still branch-and-bound; the flag disables the
+            convexity-gated routes (the convex MINLP and GP auto-routes) and the
+            "nonconvex model under NLP-BB" warning.
         nlp_bb : bool or None, default None
             Nonlinear Branch & Bound mode. When ``None`` (default),
             auto-selects NLP-BB for convex MINLPs and spatial B&B
@@ -8825,11 +8834,16 @@ class Model:
         # ``incumbent_callback``, and it runs OUTSIDE ``solve_model``, so neither the
         # dispatch refusal nor the unscreened-point backstop there could see a
         # certified result it returned. Leave callback solves to the default path.
+        # #1615 C-10b: the kernel lowers every disjunction by big-M
+        # (``_convex_kernel._build``), so a caller who asked for another GDP
+        # reformulation would get big-M with the option silently ignored. Leave
+        # such solves to the default path, which honours ``gdp_method``.
         if (
             not skip_convex_check
             and solver is None
             and lazy_constraints is None
             and incumbent_callback is None
+            and kwargs.get("gdp_method", "big-m") == "big-m"
         ):
             _ck_res = None
             try:

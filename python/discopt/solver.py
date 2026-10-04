@@ -1064,6 +1064,7 @@ def _native_kernel_feature_safe(
     incumbent_callback,
     node_callback,
     kwargs,
+    search_levers=(),
 ) -> bool:
     """Whether the native spatial kernel may take over this solve (#789).
 
@@ -1101,9 +1102,49 @@ def _native_kernel_feature_safe(
     # An explicit per-solve tuning object may enable/disable levers whose
     # solver_stats a caller inspects (e.g. cut-inherit pool stats); the kernel
     # emits none of those, so route explicit-tuning solves to the Python engine.
-    if kwargs.get("tuning") is not None:
+    # #1615 D-03: ``_scoped_tuning`` pops ``tuning`` out of ``kwargs`` before the
+    # solve body runs, so the ``kwargs`` test alone was dead; read the scope flag.
+    if kwargs.get("tuning") is not None or _EXPLICIT_TUNING.get():
+        return False
+    # #1615 D-01/D-02/D-08/D-13: search levers the kernel does not read. The kernel
+    # runs its own fixed best-first search over its own McCormick relaxation with
+    # its own root presolve, so a caller who sets any of these away from its
+    # default would otherwise get the kernel's search with the option silently
+    # ignored. Route to the Python engine, which honours them.
+    if search_levers:
         return False
     return True
+
+
+def _native_kernel_ignored_levers(
+    *,
+    strategy,
+    rlt,
+    partitions,
+    presolve,
+    in_tree_presolve_stride,
+    kwargs,
+) -> list[str]:
+    """Names of explicitly-set search options the native kernel would ignore (#1615).
+
+    Each is compared against its ``solve_model`` default: the default *is* what the
+    kernel does (or is the "let the solver decide" value), so only a departure from
+    it is a request the kernel cannot honour.
+    """
+    levers = []
+    if strategy != "best_first":
+        levers.append("strategy")
+    if not (isinstance(rlt, str) and rlt == "auto"):
+        levers.append("rlt")
+    if partitions:
+        levers.append("partitions")
+    if not presolve:
+        levers.append("presolve")
+    if in_tree_presolve_stride != 1:
+        levers.append("in_tree_presolve_stride")
+    if kwargs.get("obbt_at_root", True) is False:
+        levers.append("obbt_at_root")
+    return levers
 
 
 def _root_lp_probe_tight_enabled() -> bool:
@@ -6808,6 +6849,39 @@ def _warn_abs_gap_not_loosened(abs_gap_tolerance: Optional[float], gap_tolerance
     )
 
 
+#: ``solve_model``'s ``gap_tolerance`` default; a larger value is an explicit request
+#: to stop earlier on the relative gap.
+_DEFAULT_REL_GAP_TOL = 1e-4
+
+
+def _warn_kernel_gap_tolerance_absolute(gap_tolerance: float) -> None:
+    """Say so when the native kernel did not honour a LOOSER relative gap (#1615 D-12).
+
+    The kernel fathoms only when ``bound >= incumbent - gap_tolerance`` (absolute)
+    AND the abs-or-relative test holds, so a relative ``gap_tolerance`` above the
+    default never stops it early the way the documented relative criterion -- and
+    the Python engine -- would (Haverly 3: 13 nodes at 0.2 against a root gap of
+    6.7%). Giving the kernel a relative arm is a certificate-semantics change for
+    every kernel solve and needs its own panel, so this declares the drop rather
+    than changing it. Tightening below the default is honoured (the absolute arm
+    is then the stricter one) and is not reported.
+    """
+    if float(gap_tolerance) <= _DEFAULT_REL_GAP_TOL:
+        return
+    import warnings
+
+    warnings.warn(
+        f"The native spatial kernel applied gap_tolerance={gap_tolerance!r} as an "
+        "ABSOLUTE tolerance (it stops only when bound and incumbent are within "
+        f"{gap_tolerance!r} in objective units), not as the relative gap it is "
+        "documented as, so the looser relative tolerance did not stop the search "
+        "early. Set DISCOPT_NATIVE_SPATIAL_KERNEL=0 to run the Python engine, which "
+        "applies gap_tolerance relatively.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
     """The absolute gap tolerance a solve runs at, validated.
 
@@ -9799,6 +9873,12 @@ def _scoped_role1_deadline(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+# #1615 D-03: whether the active solve scope was given an explicit ``tuning=``.
+_EXPLICIT_TUNING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "discopt_explicit_tuning", default=False
+)
+
+
 def _scoped_tuning(fn: _F) -> _F:
     """Publish the ``tuning`` kwarg as the active :class:`SolverTuning` for the
     call, then restore the previous context. Relaxer read sites consult
@@ -9820,10 +9900,16 @@ def _scoped_tuning(fn: _F) -> _F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        token = _enter_tuning_scope(kwargs.pop("tuning", None))
+        _explicit = kwargs.pop("tuning", None)
+        token = _enter_tuning_scope(_explicit)
+        # #1615 D-03: the pop above hides ``tuning`` from ``fn``'s ``kwargs``, so
+        # ``_native_kernel_feature_safe`` could never see it. Record "an explicit
+        # tuning was requested" (inherited by nested solves) where it can.
+        explicit_token = _EXPLICIT_TUNING.set(_explicit is not None or _EXPLICIT_TUNING.get())
         try:
             return fn(*args, **kwargs)
         finally:
+            _EXPLICIT_TUNING.reset(explicit_token)
             _reset_tuning(token)
 
     return cast(_F, wrapper)
@@ -14614,6 +14700,14 @@ def solve_model(
         incumbent_callback=incumbent_callback,
         node_callback=node_callback,
         kwargs=kwargs,
+        search_levers=_native_kernel_ignored_levers(
+            strategy=strategy,
+            rlt=rlt,
+            partitions=partitions,
+            presolve=presolve,
+            in_tree_presolve_stride=in_tree_presolve_stride,
+            kwargs=kwargs,
+        ),
     ):
         _native_result = _try_native_spatial_kernel(
             model,
@@ -14637,6 +14731,7 @@ def solve_model(
             source=((_prereform_model, _prereform_nvars) if _prereform_model is not None else None),
         )
     if _native_result is not None:
+        _warn_kernel_gap_tolerance_absolute(gap_tolerance)
         return _native_result
 
     # --- #654: deadline-exhausted short-circuit before the spatial search build ---
@@ -22403,6 +22498,17 @@ def _solve_pounce_route(
         from discopt.solvers import convex_ipm_pounce as _cvx
 
         is_lp = pclass == ProblemClass.LP
+        # #1615 B-01b: the convex lp-ipm/qp-ipm arm is a cold matrix solve; it does
+        # not thread a starting point through, so an ``initial_solution`` /
+        # ``warm_start`` the caller passed would be dropped without a word. The NLP
+        # arm below does use them, so this warning is specific to the convex arm.
+        # ``Model.solve`` turns a warm start's primal half into ``initial_point``
+        # too, so name the option the caller actually passed.
+        _dropped_starts = (
+            ["warm_start"]
+            if warm_start is not None
+            else (["initial_solution"] if initial_point is not None else [])
+        )
         # Options are validated against the engine that actually runs (#1585). An
         # LP is always the convex engine, so refuse before solving. A QP is routed
         # to qp-ipm only once ``solve_qp`` has proved its Hessian PSD; an indefinite
@@ -22454,6 +22560,15 @@ def _solve_pounce_route(
             outcome = None
             pclass = ProblemClass.NLP  # fall to the NLP arm below
         if pclass != ProblemClass.NLP:
+            if _dropped_starts:
+                warnings.warn(
+                    f"solver='pounce' ignores {_dropped_starts[0]} on this "
+                    f"{'LP' if is_lp else 'convex QP'}: POUNCE's "
+                    f"{'lp-ipm' if is_lp else 'qp-ipm'} route starts cold (the starting "
+                    "point only takes effect on the NLP interior-point arm).",
+                    UserWarning,
+                    stacklevel=3,
+                )
             wall = time.perf_counter() - t_start
             if isinstance(outcome, _DeferredUnbounded):
                 result = SolveResult(
