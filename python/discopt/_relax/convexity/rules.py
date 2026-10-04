@@ -994,6 +994,21 @@ def _classify_division(
             sign_mul(sign_from_value(c), recip_sign),
         )
 
+    # Collinear linear-fractional quotient (#1611 D-31): an affine numerator that
+    # is an exact multiple of the denominator's variable part, ``num = alpha*den
+    # + beta``, makes the quotient ``alpha + beta/den`` -- the reciprocal rule
+    # above with a constant shift. ``c*F/(F + a)`` (a saturating rate) is the
+    # common spelling. A general ratio of two affine forms is only quasi-linear,
+    # so the variable parts must agree EXACTLY; any other quotient falls through.
+    if (
+        model is not None
+        and left.curvature == Curvature.AFFINE
+        and right.curvature == Curvature.AFFINE
+    ):
+        lf = _collinear_linear_fractional(expr, model, cache, right.sign)
+        if lf is not None:
+            return lf
+
     # Quadratic-over-affine with positive denominator (quad-over-linear).
     if model is not None:
         from .patterns import classify_division_pattern
@@ -1004,6 +1019,49 @@ def _classify_division(
 
     # General quotient — no sound curvature verdict.
     return ExprInfo(Curvature.UNKNOWN, sign_mul(left.sign, sign_reciprocal(right.sign)))
+
+
+def _collinear_linear_fractional(
+    expr: BinaryOp, model: Model, cache: dict, den_sign: Sign
+) -> Optional[ExprInfo]:
+    """Curvature of ``num/den`` when ``num = alpha*den + beta`` exactly (#1611 D-31).
+
+    Then ``num/den = alpha + beta/den`` on a strictly signed ``den``: with
+    ``den > 0`` the term ``beta/den`` is convex for ``beta > 0`` and concave for
+    ``beta < 0`` (``1/u`` is convex and nonincreasing on ``u > 0``); with
+    ``den < 0`` the verdicts swap. ``beta == 0`` gives the constant ``alpha``.
+    Returns ``None`` -- no claim -- unless both sides are scalar affine forms,
+    the denominator's sign is PROVEN strict, and the numerator's coefficient
+    vector equals ``alpha`` times the denominator's bit for bit.
+    """
+    n_vars = sum(v.size for v in model._variables)
+    num = extract_affine(expr.left, model, n_vars)
+    den = extract_affine(expr.right, model, n_vars)
+    if num is None or den is None:
+        return None
+    num_c, num_k = num
+    den_c, den_k = den
+    if not (np.all(np.isfinite(num_c)) and np.all(np.isfinite(den_c))):
+        return None
+    if not (np.isfinite(num_k) and np.isfinite(den_k)):
+        return None
+    support = np.flatnonzero(den_c)
+    if support.size == 0:
+        return None  # constant denominator: the scaling rule's case, not this one
+    pivot = int(support[np.argmax(np.abs(den_c[support]))])
+    alpha = float(num_c[pivot] / den_c[pivot])
+    if not np.array_equal(num_c, alpha * den_c):
+        return None
+    beta = float(num_k - alpha * den_k)
+    if not np.isfinite(beta):
+        return None
+    sign = den_sign if is_strict(den_sign) else _refine_sign(expr.right, model, cache, den_sign)
+    if not is_strict(sign):
+        return None
+    if beta == 0.0:
+        return ExprInfo(Curvature.AFFINE, Sign.UNKNOWN)
+    convex = (beta > 0.0) == is_pos(sign)
+    return ExprInfo(Curvature.CONVEX if convex else Curvature.CONCAVE, Sign.UNKNOWN)
 
 
 def _classify_power(

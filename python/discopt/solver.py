@@ -15374,6 +15374,10 @@ def solve_model(
     _nonrigorous_fathom = False
     #: node id -> how many times `lazy_constraints` requeued it (#1365 cap).
     _lazy_requeues: dict[int, int] = {}
+    # #1611 D-30: the model's verified HiGHS standard form, built on the first
+    # failed node of a fully linear model (see ``_linear_node_lp_rescue``).
+    # ``False`` = not applicable (nonlinear model, or a lifted variable layout).
+    _lp_rescue_sf: Any = None
     # #467 sub-bug #3: set True when the ROOT batch (iteration 0 — the whole
     # feasible region) is rigorously proven infeasible (every root node carries a
     # ``node_infeasible_mask`` empty-box / empty-relaxation certificate — the same
@@ -18148,6 +18152,43 @@ def solve_model(
                         _adaptive_nlp_state["eff_stride"] = _new_stride
                         _adaptive_nlp_state["no_improve"] = 0
         jax_time += time.perf_counter() - t_jax_start
+
+        # #1611 D-30: on a fully linear model (a MILP that reached this tree
+        # because it carries a lazy_constraints / incumbent / cut callback) every
+        # node relaxation is an LP. A node whose NLP-solver attempt failed is
+        # re-solved as that LP by HiGHS under the verified-certificate contract:
+        # a verified Farkas ray fathoms it RIGOROUSLY, a Neumaier-Shcherbina bound
+        # replaces the sentinel. Without this the failure was a non-rigorous
+        # fathom whose pop-time floor capped the dual bound for the rest of the
+        # solve (Benders master on 8 binaries: exhausted tree, bound 354.7 vs
+        # optimum 410.3, status "feasible"). A node the LP cannot settle keeps
+        # the sentinel and the C-1 sweep below handles it exactly as before.
+        if _lp_rescue_sf is not False:
+            for i in range(n_batch):
+                if result_lbs[i] < _SENTINEL_THRESHOLD or node_infeasible_mask[i]:
+                    continue
+                _rem_lp = _deadline - time.perf_counter()
+                if _rem_lp <= 0.0:
+                    break
+                if _lp_rescue_sf is None:
+                    _lp_rescue_sf = _linear_rescue_std_form(model, n_vars)
+                    if _lp_rescue_sf is False:
+                        break
+                _rk_lp, _rv_lp, _rx_lp = _linear_node_lp_rescue(
+                    _lp_rescue_sf,
+                    n_vars,
+                    _cut_pool,
+                    np.asarray(batch_lb[i], dtype=np.float64),
+                    np.asarray(batch_ub[i], dtype=np.float64),
+                    time_limit=_rem_lp,
+                )
+                if _rk_lp == "infeasible":
+                    node_infeasible_mask[i] = True
+                    result_feas[i] = False
+                elif _rk_lp == "bound":
+                    result_lbs[i] = _rv_lp
+                    result_sols[i] = _rx_lp
+                    result_feas[i] = False
 
         # C-1 (path-agnostic, covers convex + nonconvex, batch + serial): any node
         # entering the tree with the failure sentinel but WITHOUT a rigorous
@@ -30922,6 +30963,86 @@ def _highs_std_form(model: Model):
     if sf.n < n_orig:
         raise ValueError(f"standard form has {sf.n} columns for {n_orig} model variables")
     return lp_data, n_orig, sf
+
+
+def _linear_rescue_std_form(model: Model, n_vars: int):
+    """The verified standard form for ``_linear_node_lp_rescue``, or ``False``.
+
+    #1611 D-30. Applicable only when the model is exactly linear (so the node
+    relaxation IS this LP plus the node box and the pool cuts) and the spatial
+    tree's variable layout is the model's own (``n_vars`` structural columns,
+    no lifted auxiliaries the standard form would not carry).
+    """
+    if not _milp_is_exactly_linear(model):
+        return False
+    _, n_orig, sf = _highs_std_form(model)
+    if n_orig != n_vars:
+        return False
+    return sf
+
+
+def _linear_node_lp_rescue(sf, n_struct: int, cut_pool, node_lb, node_ub, *, time_limit):
+    """Re-solve one node of a fully linear model as a HiGHS LP (#1611 D-30).
+
+    The node LP is ``sf`` with the first ``n_struct`` columns intersected with
+    the node box and each pool cut ``a @ x  sense  rhs`` appended as the row
+    ``a @ x - s = rhs`` with a fresh slack ``s`` bounded by the sense. Returns
+    ``("infeasible", None, None)`` on a verified Farkas certificate (or an empty
+    box), ``("bound", lb, x)`` when HiGHS returned a Neumaier-Shcherbina safe
+    bound and a point, and ``("none", None, None)`` otherwise -- the caller then
+    keeps the node's sentinel. Nothing is inferred from an unverified outcome.
+    """
+    import scipy.sparse as _sp
+
+    from discopt.solvers.lp_milp_highs import INF, StdForm, solve_lp_std
+
+    lb = np.maximum(np.asarray(sf.xl, dtype=np.float64).copy(), -INF)
+    ub = np.minimum(np.asarray(sf.xu, dtype=np.float64).copy(), INF)
+    nl = np.asarray(node_lb, dtype=np.float64)[:n_struct]
+    nu = np.asarray(node_ub, dtype=np.float64)[:n_struct]
+    lb[:n_struct] = np.maximum(lb[:n_struct], np.where(np.isfinite(nl), nl, -INF))
+    ub[:n_struct] = np.minimum(ub[:n_struct], np.where(np.isfinite(nu), nu, INF))
+    if np.any(lb > ub):
+        return "infeasible", None, None
+
+    A = sf.A
+    b = np.asarray(sf.b, dtype=np.float64)
+    c = np.asarray(sf.c, dtype=np.float64)
+    if cut_pool is not None and len(cut_pool) > 0:
+        A_c, b_c, senses = cut_pool.to_constraint_arrays()
+        if A_c.shape[1] != n_struct:
+            return "none", None, None
+        k = A_c.shape[0]
+        A_c_full = _sp.hstack(
+            [
+                _sp.csc_matrix(A_c),
+                _sp.csc_matrix((k, sf.n - n_struct)),
+                -_sp.identity(k, format="csc"),
+            ]
+        )
+        A = _sp.vstack([_sp.hstack([A, _sp.csc_matrix((sf.m, k))]), A_c_full], format="csc")
+        s_lo = np.empty(k)
+        s_hi = np.empty(k)
+        for j, sense in enumerate(senses):
+            if sense == ">=":
+                s_lo[j], s_hi[j] = 0.0, INF
+            elif sense == "<=":
+                s_lo[j], s_hi[j] = -INF, 0.0
+            elif sense == "==":
+                s_lo[j], s_hi[j] = 0.0, 0.0
+            else:
+                raise ValueError(f"unknown cut sense {sense!r}")
+        b = np.concatenate([b, np.asarray(b_c, dtype=np.float64)])
+        c = np.concatenate([c, np.zeros(k)])
+        lb = np.concatenate([lb, s_lo])
+        ub = np.concatenate([ub, s_hi])
+    node_sf = StdForm.from_arrays(c, A, b, lb, ub, float(sf.obj_const), None)
+    out = solve_lp_std(node_sf, time_limit=time_limit)
+    if out.status == "infeasible":
+        return "infeasible", None, None
+    if out.bound is not None and np.isfinite(out.bound) and out.x is not None:
+        return "bound", float(out.bound), np.asarray(out.x, dtype=np.float64)[:n_struct]
+    return "none", None, None
 
 
 def _highs_decomposed_duals(model: Model, n_orig: int, sf, row_dual, col_dual):
