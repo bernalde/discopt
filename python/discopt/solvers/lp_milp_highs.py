@@ -997,6 +997,48 @@ def box_dual_violation(sf: StdForm, x: np.ndarray, row_dual: np.ndarray) -> floa
     return float((v / scale).max()) if v.size else 0.0
 
 
+def root_pair_ns_gap(sf: StdForm, x: np.ndarray, row_dual: np.ndarray) -> Optional[float]:
+    """Rigorous duality gap of HiGHS's own root primal/dual pair, in objective units.
+
+    ``cᵀx + obj_const - NS(ŷ)`` where ``NS`` is the Neumaier--Shcherbina safe bound over
+    the DECLARED box (no FBBT box, no exact dual correction: the question is whether
+    HiGHS's arithmetic certifies the LP, not whether a certificate can be built some
+    other way) and ``ŷ`` is HiGHS's row dual with one sign repair: on a column with a
+    single entry ``a_ij`` whose reduced cost points at an infinite side (``d_j < 0`` with
+    ``xu_j = inf``, or ``d_j > 0`` with ``xl_j = -inf``) -- a slack whose row dual came
+    back with the wrong sign at round-off level -- ``ŷ_i`` is set to ``c_j / a_ij``, which
+    makes that reduced cost exactly zero. ``NS`` is a valid lower bound for ANY dual, so
+    the repair cannot make the bound wrong; it only moves the round-off from a column NS
+    cannot charge (infinite box) onto columns it can, where it is charged in full.
+
+    The gap is ``>= 0`` up to NS's outward rounding whenever ``x`` is feasible, and it
+    bounds how far ``x`` can be from the LP optimum. ``None`` means the NS bound is
+    ``-inf`` (a violated reduced cost on an open side the repair cannot reach).
+
+    #1612: this is the scale-aware form of the #1410 check. A per-column relative
+    violation divides by ``|c_j| + (|A|ᵀ|y|)_j``, which collapses to round-off itself on a
+    slack whose row dual is round-off zero (``c_j = 0``, ``y_i = 1e-14``) and reports a
+    "violation" of 1.0 on a perfectly solved set-cover LP. Measured: the gap here is
+    ``6.5e-11`` on that LP and ``2.1e-12`` on the knapsack whose 6.8e-14 violation also
+    tripped the check, against ``0.0221`` on the #1410 matrix, whose LP HiGHS mis-solved.
+    """
+    xv = np.asarray(x, dtype=np.float64).ravel()
+    y = np.array(row_dual, dtype=np.float64).ravel()
+    A = sp.csc_matrix(sf.A)  # noqa: N806
+    A.eliminate_zeros()
+    nnz = np.diff(A.indptr)
+    for j in np.flatnonzero(nnz == 1):
+        k = A.indptr[j]
+        i, a = int(A.indices[k]), float(A.data[k])
+        d = float(sf.c[j]) - a * y[i]
+        if (sf.xu[j] >= INF and d < 0.0) or (sf.xl[j] <= -INF and d > 0.0):
+            y[i] = float(sf.c[j]) / a
+    ns = ns_bound(y, sf)
+    if ns is None:
+        return None
+    return float(sf.c @ xv) + sf.obj_const - ns
+
+
 def dual_violation_tolerance(sf: StdForm) -> float:
     """Round-off bound on :func:`box_dual_violation` for ``sf``.
 
@@ -2075,14 +2117,32 @@ def _solve_milp_std(
             dual_tol = dual_violation_tolerance(sf)
             stats["milp/root_dual_violation"] = dual_viol
             if dual_viol > dual_tol:
-                stats["milp/root_dual_unverified"] = 1.0
-                decertify_root_check(
-                    f"the root LP's own primal/dual pair is dual-infeasible by "
-                    f"{dual_viol:.3g} relative (round-off bound {dual_tol:.3g}), so "
-                    f"HiGHS's arithmetic on this matrix does not certify the LPs it "
-                    f"solves in the tree"
-                )
-                return done(out)
+                # #1612: the per-column relative test is a sufficient condition, not
+                # the question. The question is whether HiGHS's own pair certifies the
+                # root LP, and that is decided rigorously by charging every violated
+                # reduced cost over the declared box (NS): if the safe bound from
+                # HiGHS's duals meets its own primal objective within the route's LP
+                # certificate yardstick, the LP is provably solved to that tolerance --
+                # in objective units, the units the MILP gap is certified in -- and the
+                # violation was round-off. On #1410 the same gap is 0.0221: HiGHS
+                # mis-solved the LP, and that is still refused.
+                ns_gap = root_pair_ns_gap(sf, lp.x, lp.row_dual)
+                lp_obj = float(sf.c @ lp.x) + sf.obj_const
+                ns_thr = CERT_ABS + CERT_REL * abs(lp_obj)
+                stats["milp/root_dual_ns_gap"] = float("inf") if ns_gap is None else ns_gap
+                if ns_gap is not None and ns_gap <= ns_thr:
+                    stats["milp/root_dual_certified_by_ns"] = 1.0
+                else:
+                    stats["milp/root_dual_unverified"] = 1.0
+                    gap_txt = "unbounded (-inf NS bound)" if ns_gap is None else f"{ns_gap:.3g}"
+                    decertify_root_check(
+                        f"the root LP's own primal/dual pair is dual-infeasible by "
+                        f"{dual_viol:.3g} relative (round-off bound {dual_tol:.3g}) and "
+                        f"its NS-safe duality gap is {gap_txt} (yardstick {ns_thr:.3g}), "
+                        f"so HiGHS's arithmetic on this matrix does not certify the LPs "
+                        f"it solves in the tree"
+                    )
+                    return done(out)
         if out.bound is None and out.status != "optimal":
             # No tree bound yet (limit hit before the root finished): the NS root
             # bound is a valid one, so report it rather than nothing.

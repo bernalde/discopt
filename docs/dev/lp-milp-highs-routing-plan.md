@@ -1475,3 +1475,26 @@ workload, or a §5 panel on a broad MILP set (MIPLIB 2017 or the owner's corpus)
 showing a consistent per-instance win. The implementation would then be native rows
 for the MILP `run` only, `StdForm` for every LP / refutation / check, slacks
 recomputed as `b - A x` before verification, behind a default-off flag.
+
+**2026-10-04 — #1612: the #1410 root-dual check refused correctly solved LPs; it now
+asks the rigorous question when its per-column test fails.** The #1410 test divides each
+reduced-cost violation by `|c_j| + (|A|ᵀ|y|)_j`. On a slack (`c_j = 0`) whose row dual is
+round-off zero that scale *is* round-off, so a `1e-14` wrong-signed dual reads as a
+relative violation of `1.0`: 15 of 40 seeded 120x60 set covers (all coefficients 1,
+costs 2-4) were downgraded to `feasible` with the root LP bound. A knapsack's `6.8e-14`
+tripped the `4.3e-14` round-off bound the same way. The per-column test stays as a
+sufficient condition; when it fails, `root_pair_ns_gap` charges every violated reduced
+cost over the declared box (NS, no FBBT box, no exact correction) after one sign repair
+-- a wrong-signed reduced cost on an open singleton column is zeroed by setting its row
+dual to `c_j / a_ij`, which NS cannot otherwise charge and which cannot make NS invalid
+(NS is a lower bound for any dual) -- and the root pair passes iff that gap is within
+`CERT_ABS + CERT_REL|obj|`, the route's LP certificate yardstick, in objective units.
+Measured gap: `5.5e-11 .. 9.1e-11` on the set covers, `2.1e-12` on the knapsack, and
+`0.0221` on the #1410 matrix (HiGHS mis-solved its LP), which is still refused. A/B over
+760 seeded MILPs (600 badly scaled 5x2 integer programs at cost scale 1 and 1e-3, 60
+well-scaled 6x3, 60 knapsacks with a DP oracle, 40 set covers): certified 738 -> 753,
+all 15 gains set covers, and the false-certificate count identical on both arms (10,
+all in the badly scaled family, the dual check passing on every one before and after:
+filed as #1634). The issue's X-30d witness is a different mechanism (HiGHS's own dual
+bound sits `1e-6` above the strictly feasible optimum, exactly at the abs tolerance, and
+the #1551 evaluation-error check then withdraws it) and is not changed here.
