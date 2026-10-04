@@ -56,6 +56,14 @@ def coef_tighten_enabled() -> bool:
     the run: add an ``ARMS`` entry in ``generality_sweep.GRADUATION_ARMS`` so
     ``graduation_gate.py`` drives it.
 
+    *Scope note (#1610 C-14, 2026-10-04).* The panel above predates two scope
+    changes: the pass now reads rows over flat slots (array blocks and
+    vector-valued bodies, which it previously declined outright), and it writes
+    the discrete bounds its propagation proves (implied fixings) instead of
+    discarding them. The in-repo corpus is all scalar ``.nl``, so the first
+    change is invisible to it; a re-run of the graduation panel must include
+    array-built models.
+
     Its Stage-2 verdict document (``docs/dev/issue-282-stage2-verdict.md``)
     reports ``syn40m`` +2608 → +1145 % and 52-62 rows tightened on the ``rsyn*``
     family, where the root barely moves. What that document FALSIFIES is
@@ -257,28 +265,6 @@ def tighten_root_bounds_with_fbbt(
 # tightened coefficients actually reach the relaxation.
 
 
-def _extract_row(model: Model, con, n: int):
-    """Return ``(coeffs, const)`` for a linear constraint body, or ``None``.
-
-    ``coeffs`` is a dense length-``n`` float vector over flat scalar-variable
-    slots; ``const`` is the free term. ``None`` when the body is non-linear or
-    otherwise not extractable — such rows are left untouched.
-    """
-    from discopt._relax.problem_classifier import (  # local import: heavy _relax dep
-        _extract_linear_coefficients,
-        _NotLinearError,
-    )
-
-    try:
-        coeffs, const = _extract_linear_coefficients(con.body, model, n)
-    except _NotLinearError:
-        return None
-    except Exception as exc:  # pragma: no cover - defensive; skip unparsable rows
-        logger.debug("coef-tighten: row extraction failed: %s", exc)
-        return None
-    return np.asarray(coeffs, dtype=np.float64), float(const)
-
-
 def _strong_block_bounds(model: Model, time_limit_ms: int) -> tuple[np.ndarray, np.ndarray] | None:
     """Block-aligned tightened bounds from the root presolve orchestrator.
 
@@ -353,12 +339,207 @@ def _cheap_block_bounds(model: Model) -> tuple[np.ndarray, np.ndarray] | None:
     return lbs, ubs
 
 
-def _rebuild_linear_body(blocks, coeffs: np.ndarray, const: float):
-    """Rebuild ``Σ coeffs[j]·var_j (+const)`` as a modeling expression."""
+class _FlatLayout:
+    """Flat scalar-slot view of a model's variable blocks (#1610 C-14).
+
+    Slot ``j`` is element ``j - offset[b]`` (row-major) of block ``b``, the same
+    order ``_extract_linear_coefficients_sparse``, ``_extract_variable_info`` and
+    the tree use. Before #1610 the pass declined on any model with a ``size > 1``
+    block, so a model written with ``shape=(T,)`` variables got no tightening at
+    all while the identical scalar model did.
+    """
+
+    def __init__(self, model: Model) -> None:
+        from discopt.modeling.core import VarType
+
+        self.blocks = list(model._variables)
+        sizes = [int(b.size) for b in self.blocks]
+        self.offsets = np.concatenate(([0], np.cumsum(sizes))).astype(np.int64)
+        self.n = int(self.offsets[-1])
+        self.block_of = np.repeat(np.arange(len(self.blocks), dtype=np.int64), sizes)
+        if self.n:
+            self.lb = np.concatenate(
+                [np.asarray(b.lb, dtype=np.float64).ravel() for b in self.blocks]
+            )
+            self.ub = np.concatenate(
+                [np.asarray(b.ub, dtype=np.float64).ravel() for b in self.blocks]
+            )
+        else:
+            self.lb = np.zeros(0)
+            self.ub = np.zeros(0)
+        # Match the DISCRETE types explicitly. (#770 tested ``"IN" in vtype`` —
+        # which also matches "contINuous", so a continuous variable whose bounds
+        # happen to be [0, 1] was treated as binary.)
+        disc = [b.var_type in (VarType.BINARY, VarType.INTEGER) for b in self.blocks]
+        self.discrete = np.repeat(np.asarray(disc, dtype=bool), sizes)
+
+    def slot_expr(self, j: int):
+        """The modeling expression for flat slot ``j`` (a scalar variable or ``x[i]``)."""
+        b = int(self.block_of[j])
+        var = self.blocks[b]
+        if var.size == 1 and var.shape in ((), (1,)):
+            return var if var.shape == () else var[0]
+        local = j - int(self.offsets[b])
+        idx = np.unravel_index(local, var.shape)
+        if len(idx) == 1:
+            return var[int(idx[0])]
+        return var[tuple(int(i) for i in idx)]
+
+    def block_hull_to_flat(self, blk_lb: np.ndarray, blk_ub: np.ndarray):
+        """Broadcast block-level bounds to every element of the block.
+
+        Rust FBBT carries one interval per block, seeded from the element-wise
+        union of the block's bounds (C-31), so it is a valid outer bound for
+        every element; intersecting it with the element bounds is sound.
+        """
+        return blk_lb[self.block_of], blk_ub[self.block_of]
+
+
+class _LinRow:
+    """One scalar linear row ``Σ terms[j]·x_j + const ⋈ 0`` and where it came from."""
+
+    __slots__ = ("ci", "elem", "n_elem", "terms", "const", "sense", "name", "changed")
+
+    def __init__(self, ci, elem, n_elem, terms, const, sense, name):
+        self.ci = ci
+        self.elem = elem
+        self.n_elem = n_elem
+        self.terms = terms
+        self.const = const
+        self.sense = sense
+        self.name = name
+        self.changed = False
+
+
+def _collect_linear_rows(model: Model, n: int) -> list[_LinRow]:
+    """Every scalar linear row of ``model``, fanning vector-valued bodies out per element.
+
+    A body the scalar extractor refuses because it is vector-valued
+    (``x <= 1000 * y`` over ``shape=(T,)`` blocks) is expanded with
+    :func:`discopt.export._arrays.scalarize_body` — the row-major expansion the
+    ``.nl`` writer and the AD tape use — and each element is extracted on its
+    own. Non-linear elements are skipped, never guessed.
+    """
+    from discopt._relax.problem_classifier import (  # local import: heavy _relax dep
+        _extract_linear_coefficients_sparse,
+        _NotLinearError,
+    )
+    from discopt.export._arrays import needs_scalarize, scalarize_body
+
+    rows: list[_LinRow] = []
+    for ci, con in enumerate(model._constraints):
+        sense = getattr(con, "sense", None)
+        if sense not in ("<=", ">=", "=="):
+            continue
+        name = getattr(con, "name", None)
+        try:
+            terms, const = _extract_linear_coefficients_sparse(con.body, model, n)
+        except _NotLinearError:
+            terms = None
+        if terms is not None:
+            rows.append(_LinRow(ci, 0, 1, dict(terms), float(const), sense, name))
+            continue
+        if not needs_scalarize(con.body):
+            continue  # genuinely non-linear scalar body
+        elems = scalarize_body(con.body)
+        for e_idx, e_body in enumerate(elems):
+            try:
+                terms, const = _extract_linear_coefficients_sparse(e_body, model, n)
+            except _NotLinearError:
+                continue
+            rows.append(_LinRow(ci, e_idx, len(elems), dict(terms), float(const), sense, name))
+    return rows
+
+
+def _propagate_linear_rows(
+    rows: list[_LinRow],
+    lb: np.ndarray,
+    ub: np.ndarray,
+    discrete: np.ndarray,
+    *,
+    max_passes: int = 10,
+    int_tol: float = 1e-6,
+) -> bool:
+    """Per-element activity bound propagation over ``rows``, in place; True if infeasible.
+
+    Rust FBBT holds one interval per *block*, so on a ``shape=(T,)`` block it can
+    only report the hull of the elements (``x[3] <= 20`` is invisible when the
+    other elements are capped at 40). This is the textbook single-row
+    propagation (Savelsbergh 1994; Achterberg 2007 §7.1) on flat slots, with
+    integer rounding on discrete slots — the rounding is what turns
+    ``x1 >= 2, x1 <= 40·y1`` into the implied fixing ``y1 = 1`` (#1610 C-14).
+
+    Every derived bound is relaxed outward by ``1e-9·max(1, |v|)`` before it is
+    used, and discrete bounds round with ``int_tol`` slack, so floating-point
+    error can only loosen, never cut.
+    """
+    for _ in range(max_passes):
+        any_change = False
+        for row in rows:
+            items = [(j, a) for j, a in row.terms.items() if abs(a) > 1e-12]
+            if not items:
+                continue
+            # Normalised forms ``a·x <= rhs``; an equality contributes both.
+            forms: list[tuple[float, float]] = []
+            if row.sense in ("<=", "=="):
+                forms.append((1.0, -row.const))
+            if row.sense in (">=", "=="):
+                forms.append((-1.0, row.const))
+            for sgn, rhs in forms:
+                # Minimum activity, counting -inf contributions separately so a
+                # single unbounded term still lets the other terms be bounded.
+                mins: list[float | None] = []
+                n_inf = 0
+                fin_sum = 0.0
+                for j, a in items:
+                    a = sgn * a
+                    v = a * lb[j] if a > 0 else a * ub[j]
+                    if not np.isfinite(v):
+                        n_inf += 1
+                        mins.append(None)
+                    else:
+                        fin_sum += v
+                        mins.append(v)
+                if n_inf > 1:
+                    continue
+                for (j, a0), mj in zip(items, mins):
+                    if n_inf == 1 and mj is not None:
+                        continue  # the residual still contains the unbounded term
+                    resid = fin_sum - (mj if mj is not None else 0.0)
+                    a = sgn * a0
+                    bound = (rhs - resid) / a
+                    if not np.isfinite(bound):
+                        continue
+                    pad = 1e-9 * max(1.0, abs(bound))
+                    if a > 0:
+                        new_ub = bound + pad
+                        if discrete[j]:
+                            new_ub = float(np.floor(new_ub + int_tol))
+                        if new_ub < ub[j] - 1e-9 * max(1.0, abs(ub[j])):
+                            ub[j] = new_ub
+                            any_change = True
+                    else:
+                        new_lb = bound - pad
+                        if discrete[j]:
+                            new_lb = float(np.ceil(new_lb - int_tol))
+                        if new_lb > lb[j] + 1e-9 * max(1.0, abs(lb[j])):
+                            lb[j] = new_lb
+                            any_change = True
+                    if lb[j] > ub[j] + int_tol:
+                        return True
+        if not any_change:
+            break
+    return False
+
+
+def _rebuild_linear_body(layout: _FlatLayout, terms: dict[int, float], const: float):
+    """Rebuild ``Σ terms[j]·x_j (+const)`` as a modeling expression over flat slots."""
     body = None
-    nz = np.nonzero(np.abs(coeffs) > 1e-15)[0]
-    for j in nz:
-        term = float(coeffs[j]) * blocks[j]
+    for j in sorted(terms):
+        c = float(terms[j])
+        if abs(c) <= 1e-15:
+            continue
+        term = c * layout.slot_expr(j)
         body = term if body is None else body + term
     if abs(const) > 1e-15:
         body = float(const) if body is None else body + float(const)
@@ -379,7 +560,7 @@ def tighten_bigm_coefficients(
     Rewrites linear constraint rows that contain a binary variable, shrinking
     the binary's coefficient toward the activity slack of the rest of the row
     (both positive-coefficient Savelsbergh and negative-coefficient fixed-charge
-    cases). Iterates with FBBT bound tightening to a fixed point: each round's
+    cases). Iterates with bound tightening to a fixed point: each round's
     tighter coefficients can tighten bounds, which enables further coefficient
     tightening.
 
@@ -391,31 +572,43 @@ def tighten_bigm_coefficients(
     total number of rows whose coefficients were tightened across all rounds
     (0 when the flag is off or nothing tightens).
 
+    #1610 C-14 widened the scope:
+
+      * **Array blocks.** Rows are read over flat scalar slots, so a model built
+        from ``shape=(T,)`` variables is tightened exactly like its scalar twin.
+        A scalar row over ``x[t]`` is replaced in place; a vector-valued body
+        (``x <= 1000 * y``) is fanned out per element, and each tightened element
+        is APPENDED as its own scalar row — the original vector row stays (it is
+        implied by the appended one), so no constraint index shifts.
+      * **Per-element bounds.** Rust FBBT is block-level, so its bounds are
+        intersected with a per-element linear propagation
+        (:func:`_propagate_linear_rows`).
+      * **Implied fixings.** Discrete bounds the propagation (or root probing)
+        proves — e.g. ``y1 = 1`` from ``x1 >= 2`` and ``x1 <= 40·y1`` — are
+        written to the variable bounds, so they reach the tree instead of being
+        computed and discarded. The write lands on the solve's model, which
+        ``_solve_owns_model`` restores on exit (#1610 C2), so the caller's
+        declared bounds are untouched.
+
     Scope (conservative, sound):
-      * only linear rows with an inequality sense and ≥1 binary,
-      * only rows whose non-binary worst-case activity is finite under the
-        current FBBT bounds (unbounded activity ⇒ skipped, not guessed),
-      * scalar (size-1) variable blocks only.
+      * only linear rows with an inequality sense and ≥1 binary are rewritten,
+      * only rows whose worst-case activity is finite under the current bounds
+        (unbounded activity ⇒ skipped, not guessed),
+      * only discrete bounds are written back; continuous bounds stay internal.
     """
     if not coef_tighten_enabled():
         return 0
 
-    blocks = model._variables
-    # Only operate when every block is a scalar variable — the flat slot j then
-    # equals block j, so bounds/coeffs line up without per-element offsets.
-    if any(getattr(b, "size", 1) != 1 for b in blocks):
+    layout = _FlatLayout(model)
+    n = layout.n
+    if n == 0 or not np.any(layout.discrete):
         return 0
-    n = len(blocks)
+    rows = _collect_linear_rows(model, n)
+    if not any(any(layout.discrete[j] for j in r.terms) for r in rows):
+        return 0
 
-    def is_binary(i: int, lb: float, ub: float) -> bool:
-        # Match the DISCRETE types explicitly. (#770 tested ``"IN" in vtype`` —
-        # which also matches "contINuous", so a continuous variable whose FBBT
-        # bounds happen to be [0, 1] was treated as binary; the y∈{0,1}
-        # equivalence argument then removes its genuinely feasible fractional
-        # values. An integer variable with bounds [0, 1] IS binary-equivalent.)
-        vt = str(getattr(blocks[i], "vtype", getattr(blocks[i], "var_type", ""))).upper()
-        discrete = vt.endswith("BINARY") or vt.endswith("INTEGER")
-        return discrete and lb == 0.0 and ub == 1.0
+    flat_lb = layout.lb.copy()
+    flat_ub = layout.ub.copy()
 
     total_changed = 0
     for _round in range(max_rounds):
@@ -428,30 +621,32 @@ def tighten_bigm_coefficients(
         )
         if fb is None:
             break
-        lb, ub = fb
+        h_lb, h_ub = layout.block_hull_to_flat(*fb)
+        new_lb = np.maximum(flat_lb, h_lb)
+        new_ub = np.minimum(flat_ub, h_ub)
+        new_lb[layout.discrete] = np.ceil(new_lb[layout.discrete] - 1e-6)
+        new_ub[layout.discrete] = np.floor(new_ub[layout.discrete] + 1e-6)
+        if np.any(new_lb > new_ub + 1e-6):
+            break  # infeasible box: leave it to the solver to report
+        if _propagate_linear_rows(rows, new_lb, new_ub, layout.discrete):
+            break
+        flat_lb, flat_ub = new_lb, new_ub
+        lb, ub = flat_lb, flat_ub
+
         round_changed = 0
-        for ci, con in enumerate(model._constraints):
-            sense = getattr(con, "sense", None)
-            if sense not in ("<=", ">="):
+        for row in rows:
+            if row.sense not in ("<=", ">="):
                 continue
-            row = _extract_row(model, con, n)
-            if row is None:
-                continue
-            coeffs, const = row
             # Normalise to ``a·x ≤ rhs`` (fold const into rhs; reflect ≥).
-            a = coeffs.copy()
-            rhs = float(con.rhs) - const
-            sgn = 1.0
-            if sense == ">=":
-                a = -a
-                rhs = -rhs
-                sgn = -1.0
-            nz = [int(j) for j in np.nonzero(np.abs(a) > 1e-12)[0]]
-            bins = [j for j in nz if is_binary(j, lb[j], ub[j])]
+            sgn = -1.0 if row.sense == ">=" else 1.0
+            a = {j: sgn * c for j, c in row.terms.items() if abs(c) > 1e-12}
+            rhs = -sgn * row.const
+            # An integer variable with bounds [0, 1] IS binary-equivalent.
+            bins = [j for j in a if layout.discrete[j] and lb[j] == 0.0 and ub[j] == 1.0]
             if not bins:
                 continue
-            # Worst-case (max) activity of each term over the FBBT box.
-            term_max = {j: max(a[j] * lb[j], a[j] * ub[j]) for j in nz}
+            # Worst-case (max) activity of each term over the box.
+            term_max = {j: max(a[j] * lb[j], a[j] * ub[j]) for j in a}
             if not all(np.isfinite(v) for v in term_max.values()):
                 continue  # unbounded rest activity — cannot tighten yet
             total_max = float(sum(term_max.values()))
@@ -476,32 +671,62 @@ def tighten_bigm_coefficients(
                 total_max = u_rest + term_max[k]
             if not row_changed:
                 continue
-            # Reflect back to the original sense and REPLACE the constraint.
-            # Two hard requirements from the #772 post-mortem (see the section
-            # comment above):
-            #   1. fold the ENTIRE tightened row into the body and keep
-            #      ``rhs = 0.0`` — the normalized-form invariant every consumer
-            #      assumes (writing the slack into ``con.rhs`` is silently
-            #      dropped and RELAXES the row → false primal);
-            #   2. build a NEW Constraint object so the identity-keyed
-            #      evaluator-cache fingerprint changes and no stale compiled
-            #      evaluator keeps serving the old row.
-            # Normalized row is ``a·x ≤ rhs``; in original orientation the body
-            # is ``sgn·(a·x − rhs)`` compared against 0 with the original sense.
-            a_orig = a * sgn
-            new_const = -rhs * sgn
-            new_body = _rebuild_linear_body(blocks, a_orig, new_const)
-            model._constraints[ci] = Constraint(
-                new_body, con.sense, 0.0, getattr(con, "name", None)
-            )
+            # Back to the original orientation: ``sgn·(a·x − rhs) ⋈ 0``.
+            row.terms = {j: sgn * c for j, c in a.items()}
+            row.const = -sgn * rhs
+            row.changed = True
             round_changed += 1
+            if row.n_elem == 1:
+                # Two hard requirements from the #772 post-mortem (see the
+                # section comment above): fold the ENTIRE tightened row into the
+                # body with ``rhs = 0.0``, and build a NEW Constraint object so
+                # the identity-keyed evaluator-cache fingerprint changes.
+                old = model._constraints[row.ci]
+                model._constraints[row.ci] = Constraint(
+                    _rebuild_linear_body(layout, row.terms, row.const),
+                    old.sense,
+                    0.0,
+                    row.name,
+                )
         total_changed += round_changed
         if round_changed == 0:
             break
 
-    if total_changed:
+    # Vector-valued rows: append each tightened element as its own scalar row.
+    # The original vector row stays in place (implied by these), so constraint
+    # indices are unchanged; ``_solve_owns_model`` removes the additions on exit.
+    for row in rows:
+        if row.changed and row.n_elem > 1:
+            model._constraints.append(
+                Constraint(
+                    _rebuild_linear_body(layout, row.terms, row.const),
+                    row.sense,
+                    0.0,
+                    None if row.name is None else f"{row.name}[{row.elem}]",
+                )
+            )
+
+    # Implied fixings: write the discrete bounds proven above to the variables.
+    n_fixed = 0
+    disc_idx = np.nonzero(layout.discrete)[0]
+    tighter = disc_idx[
+        (flat_lb[disc_idx] > layout.lb[disc_idx]) | (flat_ub[disc_idx] < layout.ub[disc_idx])
+    ]
+    if tighter.size:
+        for b in sorted({int(layout.block_of[j]) for j in tighter}):
+            var = layout.blocks[b]
+            sl = slice(int(layout.offsets[b]), int(layout.offsets[b + 1]))
+            new_lb = np.maximum(layout.lb[sl], flat_lb[sl])
+            new_ub = np.minimum(layout.ub[sl], flat_ub[sl])
+            var.lb = new_lb.reshape(var.shape)
+            var.ub = new_ub.reshape(var.shape)
+        n_fixed = int(tighter.size)
+
+    if total_changed or n_fixed:
         logger.info(
-            "Big-M coefficient tightening (DISCOPT_COEF_TIGHTEN): strengthened %d constraint rows",
+            "Big-M coefficient tightening (DISCOPT_COEF_TIGHTEN): strengthened %d "
+            "constraint rows, tightened %d discrete bounds",
             total_changed,
+            n_fixed,
         )
     return total_changed
