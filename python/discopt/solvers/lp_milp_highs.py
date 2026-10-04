@@ -1792,10 +1792,95 @@ def solve_milp_std(
         n_struct=n_struct,
         root_check=root_check,
     )
+    # ``monotonic``, not ``perf_counter``: this clock only budgets the #1612 re-solve,
+    # and must not shift the route's own ``perf_counter`` deadline reads.
+    t0 = time.monotonic()
+    out = _certified_milp(sf, kw)
+    if out.gap_certified and out.status == "optimal":
+        out = _tighten_feasibility_artefact(sf, out, kw, t0)
+    return out
+
+
+def _certified_milp(sf: StdForm, kw: dict[str, Any]) -> HighsOutcome:
+    """One HiGHS MILP solve with every route certificate check (#1537/#1621, #1634)."""
     out = _solve_milp_scaled(sf, **kw)
     if out.gap_certified and out.status in ("optimal", "infeasible"):
         return _cross_check_presolve(sf, out, kw)
     return out
+
+
+def _tighten_feasibility_artefact(
+    sf: StdForm, out: HighsOutcome, kw: dict[str, Any], t0: float
+) -> HighsOutcome:
+    """#1612: re-solve at a tighter feasibility tolerance when HiGHS's tolerance, not its
+    search, is what the certified pair's closure rests on.
+
+    HiGHS accepts an incumbent that violates rows by up to ``mip_feasibility_tolerance``,
+    so its objective ``o_H`` can be better than any truly feasible point with the same
+    integers -- by ``delta = o_fx - o_H``, where ``o_fx`` is the separate fixed-integer
+    LP the #1509 check already solves. HiGHS stops on that incumbent, so its bound
+    carries the same ``delta``. Once ``Model.solve``'s incumbent repair moves the
+    objective back to ``o_fx`` the published gap is ``delta`` wide, and with HiGHS's
+    1e-6 tolerance against the default 1e-6 absolute gap it lands on the stop rule's
+    edge: measured on the issue's interdiction model at ``gap_tolerance=1e-9``,
+    ``delta = 9.99999997e-7`` against ``abs_gap = 1e-6``, and the #1551 evaluation-error
+    check (``1.4e-14``) then withdrew the certificate and the bound.
+
+    The trigger: ``delta > 0`` and the stop rule no longer closes once ``delta`` is
+    charged against the repaired pair a second time -- the margin left is smaller than
+    the tolerance artefact itself, so the closure is the artefact's doing. The whole
+    certified pipeline is then run again at :data:`CROSS_TIGHT_FEAS_TOL`. Its result
+    replaces the primary only if it is a certified ``optimal`` of its own (every route
+    check, the #1634 presolve-free cross-solve included), no verified point of either
+    solve lies below either bound, and the two bounds agree within the #1640 tolerance
+    slack. Anything else -- no budget, no verdict, a disagreement -- returns the
+    primary result unchanged: this never withdraws a certificate.
+    """
+    o_fx = out.stats.get("milp/fixed_int_objective")
+    if o_fx is None or out.objective is None or out.bound is None:
+        return out
+    delta = float(o_fx) - float(out.objective)
+    if not delta > 0.0 or _gap_closed(float(o_fx) + delta, float(out.bound), kw):
+        return out
+    out.stats["milp/feas_artefact_delta"] = delta
+    kw2 = dict(kw, feasibility_tolerance=CROSS_TIGHT_FEAS_TOL)
+    if kw["time_limit"] is not None:
+        kw2["time_limit"] = float(kw["time_limit"]) - (time.monotonic() - t0)
+        if kw2["time_limit"] <= 0.0:
+            out.stats["milp/feas_artefact_tight_skipped"] = 1.0
+            return out
+    tight = _certified_milp(sf, kw2)
+    out.stats["milp/feas_artefact_tight_ran"] = 1.0
+    out.stats["milp/feas_artefact_tight_time"] = float(tight.wall_time)
+    why = None
+    if not (tight.gap_certified and tight.status == "optimal" and tight.bound is not None):
+        why = f"tight re-solve status {tight.status}"
+    else:
+        tb, ob = float(tight.bound), float(out.bound)
+        pts = [float(o_fx)] + [
+            p[1] for p in (_verified_mip_point(sf, out.x), _verified_mip_point(sf, tight.x)) if p
+        ]
+        c_max = float(np.max(np.abs(sf.c))) if sf.c.size else 0.0
+        a_max = float(np.max(np.abs(sf.A.data))) if sf.A.nnz else 0.0
+        slack = CROSS_TIGHT_SHIFT_FACTOR * CROSS_FEAS_TOL * max(1.0, c_max) * max(1.0, a_max)
+        if any(b - p > CERT_ABS + CERT_REL * abs(b) for b in (tb, ob) for p in pts):
+            why = "a verified point lies below one of the two bounds"
+        elif abs(tb - ob) > slack:
+            why = f"bounds {tb:.12g} and {ob:.12g} differ by more than the slack {slack:.3g}"
+    if why is not None:
+        out.labels["milp/feas_artefact_tight_declined"] = why
+        return out
+    tight.stats = {**out.stats, **tight.stats, "milp/feas_artefact_tight_adopted": 1.0}
+    tight.labels = {
+        **out.labels,
+        **tight.labels,
+        "milp/bound_provenance": f"{tight.labels.get('milp/bound_provenance', 'highs-fp')}, "
+        f"mip_feasibility_tolerance={CROSS_TIGHT_FEAS_TOL:g} (#1612)",
+    }
+    tight.node_count += out.node_count
+    tight.iterations += out.iterations
+    tight.wall_time = time.monotonic() - t0
+    return tight
 
 
 def _solve_milp_scaled(sf: StdForm, *, presolve: bool = True, **kw: Any) -> HighsOutcome:
@@ -2139,7 +2224,9 @@ def _tight_cross_bound(
         if kw["time_limit"] <= 0.0:
             out.stats["milp/presolve_cross_tight_skipped"] = 1.0
             return False
-    tight = _solve_milp_scaled(sf, presolve=False, feasibility_tolerance=CROSS_TIGHT_FEAS_TOL, **kw)
+    tight = _solve_milp_scaled(
+        sf, **dict(kw, presolve=False, feasibility_tolerance=CROSS_TIGHT_FEAS_TOL)
+    )
     out.stats["milp/presolve_cross_tight_ran"] = 1.0
     out.stats["milp/presolve_cross_tight_time"] = float(tight.wall_time)
     if not (tight.gap_certified and tight.status == "optimal" and tight.bound is not None):
@@ -2477,6 +2564,10 @@ def _solve_milp_std(
                 )
                 return False
             cands.append(pt)
+            # #1612: the incumbent's own integers, re-optimised by a separate LP; the
+            # distance from HiGHS's objective is what its feasibility tolerance bought
+            # (read by :func:`_tighten_feasibility_artefact`).
+            stats["milp/fixed_int_objective"] = float(pt[1])
         if root_pt is None and lp.status == "optimal" and lp.x is not None and sf.int_idx.size:
             # The root LP point is not itself integer-feasible: its rounding, with the
             # continuous part re-optimised, is the other point an LP buys. Measured on

@@ -8,6 +8,8 @@ to classify problems, then extracts standard-form data using the JAX DAG compile
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import math
 from enum import Enum
@@ -137,6 +139,33 @@ _QP_DENSE_Q_MAX_BYTES = 256 * 1024 * 1024
 # is 91.5 GB, an equal-sized wall to the 91 GB dense Q above. Above this budget the
 # extractors emit scipy CSR and consumers densify through ``dense_A()``.
 _DENSE_A_MAX_BYTES = 256 * 1024 * 1024
+
+# #1619 (A-12): a consumer that handles scipy.sparse end to end can ask for CSR at
+# ANY size, not only beyond the budget above. The budget exists for consumers that
+# densify (``dense_A()``); for one that does not, the dense form is pure cost -- the
+# 2000-row chain LP of #1619 is 96 MB dense for 6,000 nonzeros, and its peak was
+# 541 MB of copies of it. A ContextVar rather than a keyword because the matrix is
+# assembled four rungs down the extraction ladder; the flag is scoped by
+# :func:`sparse_constraint_matrices` and is off everywhere else, so every other
+# caller keeps the dense-under-budget layout exactly.
+_FORCE_SPARSE_A: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "discopt_force_sparse_A", default=False
+)
+
+
+@contextlib.contextmanager
+def sparse_constraint_matrices():
+    """Within this block, constraint matrices are emitted as scipy CSR at any size.
+
+    For a caller whose every consumer of ``A_eq`` / ``A_ub`` is sparse-aware (#1619).
+    The entries are the same COO triples either way; only the container differs.
+    """
+    token = _FORCE_SPARSE_A.set(True)
+    try:
+        yield
+    finally:
+        _FORCE_SPARSE_A.reset(token)
+
 
 # The quadratic/linear coefficients are read off the expression arena, always.
 #
@@ -1191,7 +1220,7 @@ def _materialise_A(
     r = np.asarray(rows, dtype=np.intp)
     c = np.asarray(cols, dtype=np.intp)
     v = np.asarray(vals, dtype=np.float64)
-    if (m * n * 8) <= _DENSE_A_MAX_BYTES:
+    if (m * n * 8) <= _DENSE_A_MAX_BYTES and not _FORCE_SPARSE_A.get():
         A = np.zeros((m, n), dtype=np.float64)
         A[r, c] = v
         return A

@@ -254,6 +254,50 @@ def detect_decomposition(
     )
 
 
+def benders_view(model: Model, structure: DecompositionStructure) -> DecompositionStructure:
+    """The partition a Benders solve actually uses: recourse blocks with the master removed.
+
+    :func:`detect_decomposition` forms blocks as connected components of the
+    non-coupling constraint graph *including* the complicating variables, which
+    is the Lagrangian view.  In a two-stage model every recourse row touches a
+    first-stage variable, so that graph is one component and the structure reads
+    "1 block, not separable" although fixing the first stage splits the recourse
+    per scenario -- which is exactly what ``solve_benders`` does (#1618 X-29a).
+
+    Here the complicating variables are removed before the components are taken.
+    Blocks contain only recourse variables; ``block_of_var`` maps each
+    complicating variable to ``-1`` (the master), as does ``block_of_constraint``
+    for a row touching no recourse variable.  ``is_separable`` is ``True`` iff the
+    recourse splits into >= 2 independent blocks.
+    """
+    var_names = [v.name for v in model._variables]
+    master = set(structure.complicating_vars)
+    sub_names = [nm for nm in var_names if nm not in master]
+    sub_idx = {nm: i for i, nm in enumerate(sub_names)}
+    coupling_set = set(structure.coupling_constraints)
+    cliques = [
+        _vars_in(getattr(c, "body", None), sub_idx) if i not in coupling_set else []
+        for i, c in enumerate(model._constraints)
+    ]
+    block_of, num_blocks = _components(len(sub_names), [c for c in cliques if c])
+    blocks: list[list[str]] = [[] for _ in range(num_blocks)]
+    for i, nm in enumerate(sub_names):
+        blocks[block_of[i]].append(nm)
+    block_of_var = {nm: -1 for nm in master if nm in set(var_names)}
+    block_of_var.update({nm: block_of[i] for i, nm in enumerate(sub_names)})
+    block_of_constraint = [block_of[c[0]] if c else -1 for c in cliques]
+    return DecompositionStructure(
+        blocks=blocks,
+        block_of_var=block_of_var,
+        block_of_constraint=block_of_constraint,
+        complicating_vars=list(structure.complicating_vars),
+        coupling_constraints=list(structure.coupling_constraints),
+        is_separable=num_blocks >= 2,
+        source=structure.source,
+        detection_truncated=structure.detection_truncated,
+    )
+
+
 def flat_bounds(model: Model) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(lb, ub)`` of the flat variable vector in declared order."""
     lbs, ubs = [], []

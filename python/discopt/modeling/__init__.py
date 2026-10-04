@@ -60,10 +60,12 @@ from discopt.modeling.core import (
     acosh,
     asin,
     asinh,
+    # Logical functions
+    at_least,
+    at_most,
     atan,
     atan2,
     atanh,
-    # Logical functions
     atleast,
     atmost,
     bulk_construction_gc,
@@ -111,6 +113,7 @@ from discopt.modeling.core import (
     trunc,
     udf,
     xlogx,
+    xor,
 )
 from discopt.modeling.core import (
     abs_ as abs,
@@ -227,6 +230,9 @@ __all__ = [
     "lnot",
     "atleast",
     "atmost",
+    "at_least",
+    "at_most",
+    "xor",
     "exactly",
     "Set",
     "RangeSet",

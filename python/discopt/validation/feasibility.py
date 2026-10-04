@@ -156,7 +156,13 @@ def jacobian_row_gradient_norms(J) -> np.ndarray:
     but "how far must the point move to satisfy it". Non-finite rows return
     ``inf``, which :func:`feasible_distance_cap` turns into "no cap" — an
     unestimatable gradient must not manufacture a strict test.
+
+    A scipy sparse ``J`` is accepted and never densified (#1619); unstored entries
+    are exactly 0, which can neither raise a row's max nor make it non-finite, so
+    the answer is the dense one.
     """
+    if sparse.issparse(J):
+        return _sparse_row_gradient_norms(J)
     J = np.asarray(J, dtype=np.float64)
     if J.ndim != 2:
         raise ValueError(f"expected a 2-D Jacobian, got shape {J.shape}")
@@ -206,8 +212,16 @@ def improving_gradient_norms(J, x, lb, ub, direction, integer_mask=None) -> np.n
     must increase, ``0`` when the row is not violated (plain sup-norm; the cap is
     irrelevant there). Clipped to :func:`jacobian_row_gradient_norms`, so it can
     only tighten a gate. Non-finite rows return ``inf`` as there.
+
+    A scipy sparse ``J`` is evaluated on its stored entries only (#1619): an
+    unstored ``J_ij`` is exactly 0, so its ``|J_ij| * frac`` term is 0 and it adds
+    nothing to the row's sum. The dense form built an ``(m, n)`` array per
+    intermediate (sign, room, frac, contrib), which made the post-solve screen
+    quadratic in the mesh on DAE models (#1619 B-12a).
     """
-    J = np.asarray(J, dtype=np.float64)
+    sparse_J = sparse.issparse(J)
+    if not sparse_J:
+        J = np.asarray(J, dtype=np.float64)
     if J.ndim != 2:
         raise ValueError(f"expected a 2-D Jacobian, got shape {J.shape}")
     plain = jacobian_row_gradient_norms(J)
@@ -225,6 +239,8 @@ def improving_gradient_norms(J, x, lb, ub, direction, integer_mask=None) -> np.n
     d = np.sign(np.asarray(direction, dtype=np.float64).ravel())
     if d.size != J.shape[0]:
         raise ValueError(f"direction has {d.size} entries for {J.shape[0]} rows")
+    if sparse_J:
+        return _sparse_improving_gradient_norms(J, x, lb, ub, d, integer_mask, plain)
     with np.errstate(invalid="ignore"):
         step = -d[:, None] * np.sign(J)  # sign of the improving move in x_j
         # Each room carries its own round-off allowance. A violation caused only
@@ -289,6 +305,61 @@ def improving_gradient_norms(J, x, lb, ub, direction, integer_mask=None) -> np.n
         contrib = np.abs(J) * frac
     finite = np.isfinite(contrib)
     out = np.minimum(np.where(finite, contrib, 0.0).sum(axis=1), plain)
+    out = np.where(d == 0.0, plain, out)
+    out[~np.isfinite(plain)] = np.inf
+    return np.asarray(out, dtype=np.float64)
+
+
+def _sparse_row_gradient_norms(J) -> np.ndarray:
+    """:func:`jacobian_row_gradient_norms` for a scipy sparse ``J`` (#1619)."""
+    J = sparse.csr_matrix(J, dtype=np.float64)
+    m = J.shape[0]
+    if m == 0:
+        return np.zeros(0, dtype=np.float64)
+    rows = np.repeat(np.arange(m), np.diff(J.indptr))
+    with np.errstate(invalid="ignore"):
+        mag = np.abs(J.data)
+    finite = np.isfinite(mag)
+    out = np.zeros(m, dtype=np.float64)
+    np.maximum.at(out, rows, np.where(finite, mag, 0.0))
+    out[np.unique(rows[~finite])] = np.inf
+    return out
+
+
+def _sparse_improving_gradient_norms(J, x, lb, ub, d, integer_mask, plain) -> np.ndarray:
+    """:func:`improving_gradient_norms` over the stored entries of a sparse ``J``.
+
+    Entry-for-entry the dense formula, with ``(i, j)`` running over the stored
+    entries instead of the full ``(m, n)`` grid; see that function for every
+    constant. ``plain`` is the row sup-norm already computed by the caller.
+    """
+    J = sparse.csr_matrix(J, dtype=np.float64)
+    m, n = J.shape
+    rows = np.repeat(np.arange(m), np.diff(J.indptr))
+    cols = J.indices
+    v = J.data
+    with np.errstate(invalid="ignore"):
+        step = -d[rows] * np.sign(v)
+        slack = 16.0 * _EPS
+        allow = slack * FEASIBLE_DISTANCE_TOL
+        up = np.maximum(ub - x, 0.0) + np.minimum(slack * (np.abs(ub) + np.abs(x)), allow)
+        down = np.maximum(x - lb, 0.0) + np.minimum(slack * (np.abs(lb) + np.abs(x)), allow)
+        room = np.where(step > 0, up[cols], np.where(step < 0, down[cols], 0.0))
+        if integer_mask is not None:
+            mask = np.asarray(integer_mask, dtype=bool).ravel()
+            if mask.size != n:
+                raise ValueError(f"integer_mask has {mask.size} entries for {n} columns")
+            r = np.clip(np.round(x), np.ceil(lb), np.floor(ub))
+            gap = r - x
+            to_int = np.abs(gap) + np.minimum(slack * (np.abs(r) + np.abs(x)), allow)
+            int_room = np.where(step * np.sign(gap)[cols] > 0, to_int[cols], 0.0)
+            int_room = np.where((gap == 0.0)[cols] & (step != 0), to_int[cols], int_room)
+            room = np.where(mask[cols], int_room, room)
+        frac = np.minimum(1.0, room / FEASIBLE_DISTANCE_TOL)
+        contrib = np.abs(v) * frac
+    finite = np.isfinite(contrib)
+    sums = np.bincount(rows, weights=np.where(finite, contrib, 0.0), minlength=m)
+    out = np.minimum(sums, plain)
     out = np.where(d == 0.0, plain, out)
     out[~np.isfinite(plain)] = np.inf
     return np.asarray(out, dtype=np.float64)
@@ -651,6 +722,28 @@ def _sparse_row_scales_checked(J, xw: np.ndarray) -> tuple[np.ndarray, bool]:
     return scales, False
 
 
+def screen_jacobian(evaluator, x_flat: np.ndarray):
+    """The constraint Jacobian at ``x_flat``: scipy CSR when the evaluator has one.
+
+    #1619 B-12a: the dense ``evaluate_jacobian`` is an ``(m, n)`` scatter of a
+    natively sparse tape, so on a collocation model the post-solve screen was
+    quadratic in the mesh (cProfile at nfe=2400: 4.8 s in this screen against 3.3 s
+    for the solve itself). Every consumer below is sparse-aware, and the CSR form is
+    the same matrix (see ``TapeNLPEvaluator.evaluate_sparse_jacobian``: its
+    structure is the tape's exact COO, so it is *exactly* the dense matrix).
+
+    Only the tape evaluator is asked. The legacy JAX evaluator's sparse form can
+    take its pattern from a nonzero mask traced at one interior point, which is
+    not guaranteed to cover an entry that vanishes there; the screen keeps that
+    evaluator on its dense Jacobian rather than inherit the assumption.
+    """
+    from discopt._tape_nlp_evaluator import TapeNLPEvaluator
+
+    if isinstance(evaluator, TapeNLPEvaluator):
+        return evaluator.evaluate_sparse_jacobian(x_flat)
+    return np.asarray(evaluator.evaluate_jacobian(x_flat), dtype=np.float64)
+
+
 def _row_scales_and_gradients(evaluator, x_flat: np.ndarray, rows: np.ndarray, box=None):
     """``(max_j |J_ij| * |x_j|, max_j |J_ij|)`` for the given rows, or ``(None, None)``.
 
@@ -674,7 +767,7 @@ def _row_scales_and_gradients(evaluator, x_flat: np.ndarray, rows: np.ndarray, b
     full form would reject.
     """
     try:
-        J = np.asarray(evaluator.evaluate_jacobian(x_flat), dtype=np.float64)
+        J = screen_jacobian(evaluator, x_flat)
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         logger.debug("feasibility: Jacobian unavailable, using the stricter bound: %s", exc)
         return None, None

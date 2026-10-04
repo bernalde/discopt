@@ -73,6 +73,11 @@ Soundness gates (all refuse rather than approximate)
   is the refusal mechanism (the same choice :func:`implicit` documents).
 * A degenerate active set (an active inequality or bound whose multiplier is ~0)
   -- ``dx*/dp`` is only one-sided there.  Warned once per block, not silenced.
+  This includes a *weakly active* bound or inequality that an interior-point
+  solve leaves a barrier's width off its bound with an equally tiny multiplier
+  (neither the slack nor the multiplier is clearly nonzero, so the active set
+  is ambiguous).  Every solve records ``degenerate`` and the offending
+  ``weakly_active_bounds`` / ``weakly_active_rows`` in ``last_solve_info()``.
 
 The derivative is exact under the standard sIPOPT assumptions: LICQ at the inner
 solution, strict complementarity, and an active set that is locally constant in the
@@ -123,6 +128,15 @@ KKT_RESIDUAL_TOL = 1e-4
 #: An active row whose multiplier is below this is degenerate (strict
 #: complementarity fails) -> warn: the sensitivity is one-sided there.
 COMPLEMENTARITY_TOL = 1e-8
+
+#: A bound (or inequality row) whose primal slack is below
+#: ``WEAKLY_ACTIVE_TOL * (1 + |bound|)`` AND whose multiplier is below
+#: ``WEAKLY_ACTIVE_TOL * (1 + max|grad f|)`` is *weakly active*: the IPM cannot
+#: tell whether it binds, so the active set -- and with it dx*/dp -- is
+#: ambiguous there (#1618 B-10: a generator at Pmin=20 sat 3.3e-5 off its bound
+#: with a 2.2e-6 multiplier; the primal-dual classifier called it free and the
+#: sensitivity was returned with no warning).
+WEAKLY_ACTIVE_TOL = 1e-4
 
 #: Smallest eigenvalue of the reduced Hessian allowed by ``verify_minimizer``.
 CURVATURE_TOL = -1e-6
@@ -466,6 +480,21 @@ def _build_layer(
         if lam.size != m:
             return _failed()
         g = ev.evaluate_constraints(x) if m else np.zeros(0)
+        jac = ev.evaluate_jacobian(x) if m else np.zeros((0, n))
+        # Row scale (#1617 B-07a). A row ``g_i`` and the same row multiplied by
+        # ``s`` describe the same feasible set, but its slack scales by ``s`` and
+        # its multiplier by ``1/s``. Every per-row test below therefore measures
+        # slack as ``|g_i - t_i| / r_i`` (a distance in x-space) and the
+        # multiplier as ``|λ_i| * r_i`` (its pull on the stationarity row), with
+        # ``r_i = max(||∇g_i||, 1)``. Both are invariant to the row's scaling, and
+        # both are unchanged for a row whose gradient norm is at most 1. Measured
+        # on ``6*P*L <= sig*b*h**2`` (gradient norm ~1e13): the deflection row sat
+        # 403 units (4e-11 in x-space) from its bound with λ = 9.9e-12 (a pull of
+        # ~80 on stationarity); the absolute test called it inactive, the
+        # stationarity residual was then 79.5, and ``sensitivity`` refused a
+        # point the divided formulation differentiates without complaint.
+        row_scale = np.maximum(np.linalg.norm(jac, axis=1), 1.0) if m else np.zeros(0)
+        lam_scaled = np.abs(lam) * row_scale
 
         # Active-set identification is primal-DUAL, not a distance threshold.
         # POUNCE is an interior-point method: a constraint it drives to its bound
@@ -483,7 +512,11 @@ def _build_layer(
         slack_hi = np.where(np.isfinite(cu), np.abs(g - cu), np.inf)
         row_slack = np.minimum(slack_lo, slack_hi) if m else np.zeros(0)
         active = np.where(
-            cl == cu, 1.0, (row_slack <= np.maximum(ACTIVE_TOL, np.abs(lam))).astype(float)
+            cl == cu,
+            1.0,
+            (row_slack / row_scale <= np.maximum(ACTIVE_TOL, lam_scaled)).astype(float)
+            if m
+            else np.zeros(0),
         )
 
         zl = (
@@ -508,16 +541,16 @@ def _build_layer(
         # sign convention would leave the forward value right and every
         # derivative silently wrong.
         grad = ev.evaluate_gradient(x)
-        jac = ev.evaluate_jacobian(x) if m else np.zeros((0, n))
         stat = grad + (jac.T @ (lam * active) if m else 0.0)
         free = at_bound < 0.5
         resid = float(np.max(np.abs(stat[free]))) if free.any() else 0.0
         if m:
             act = active > 0.5
             if act.any():
-                resid = max(resid, float(np.max(np.abs(g[act] - row_target[act]))))
+                primal = np.abs(g[act] - row_target[act]) / row_scale[act]
+                resid = max(resid, float(np.max(primal)))
             if (~act).any():
-                resid = max(resid, float(np.max(np.abs(lam[~act]))))
+                resid = max(resid, float(np.max(lam_scaled[~act])))
         scale = 1.0 + float(np.max(np.abs(grad))) if grad.size else 1.0
         if not np.isfinite(resid) or resid > KKT_RESIDUAL_TOL * scale:
             _warn_once(
@@ -532,10 +565,47 @@ def _build_layer(
         # means dx*/dp is one-sided there; that is a real limitation of the
         # sensitivity, so it is warned rather than hidden.
         degenerate = bool(
-            m and np.any((active > 0.5) & (cl != cu) & (np.abs(lam) < COMPLEMENTARITY_TOL))
+            m and np.any((active > 0.5) & (cl != cu) & (lam_scaled < COMPLEMENTARITY_TOL))
         )
         if not degenerate:
             degenerate = bool(np.any((at_bound > 0.5) & (zl + zu < COMPLEMENTARITY_TOL)))
+        # Weakly active: slack AND multiplier both tiny, so the classifier above
+        # could have gone either way.  Checked independently of the at_bound /
+        # active masks -- a weakly active bound is usually classified *free*.
+        mult_tol = WEAKLY_ACTIVE_TOL * scale
+        weak_lo = (
+            np.isfinite(lb)
+            & (
+                np.abs(x - lb)
+                <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(np.where(np.isfinite(lb), lb, 0.0)))
+            )
+            & (zl <= mult_tol)
+        )
+        weak_hi = (
+            np.isfinite(ub)
+            & (
+                np.abs(ub - x)
+                <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(np.where(np.isfinite(ub), ub, 0.0)))
+            )
+            & (zu <= mult_tol)
+        )
+        weak_bounds = np.flatnonzero(weak_lo | weak_hi)
+        if m:
+            row_bnd = np.where(slack_lo <= slack_hi, cl, cu)
+            row_bnd = np.where(np.isfinite(row_bnd), row_bnd, 0.0)
+            weak_rows = np.flatnonzero(
+                (cl != cu)
+                & (row_slack <= WEAKLY_ACTIVE_TOL * (1.0 + np.abs(row_bnd)))
+                & (np.abs(lam) <= mult_tol)
+            )
+        else:
+            weak_rows = np.zeros(0, dtype=int)
+        if weak_bounds.size or weak_rows.size:
+            degenerate = True
+        if state["last"] is not None:
+            state["last"]["degenerate"] = degenerate
+            state["last"]["weakly_active_bounds"] = [int(i) for i in weak_bounds]
+            state["last"]["weakly_active_rows"] = [int(i) for i in weak_rows]
         if degenerate:
             _warn_once(
                 "argmin(): the inner solution has a degenerate active set (an "

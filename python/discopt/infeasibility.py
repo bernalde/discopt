@@ -56,7 +56,14 @@ class IISResult:
     constraints : list[Constraint]
         Constraints belonging to the IIS.
     variable_bounds : list[tuple[Variable, str]]
-        Variable bounds in the IIS, each as ``(variable, "lower"|"upper")``.
+        Variables with at least one bound in the IIS, each as
+        ``(variable, "lower"|"upper")`` (one entry per variable and side).
+    bound_elements : list[tuple[Variable, str, tuple]]
+        The same bounds at **element** granularity, ``(variable, side, index)``
+        with ``index`` the element's multi-index (``()`` for a scalar). For a
+        vector variable only the elements whose bound is essential are listed,
+        so ``z[0] <= 1`` and ``z[1] <= 1`` rather than the whole ``z <= 1``
+        (#1618 C-17).
     n_solves : int
         Number of feasibility solves performed (deletion-filter cost).
     proven_irreducible : bool
@@ -67,11 +74,14 @@ class IISResult:
 
     constraints: list[Constraint] = field(default_factory=list)
     variable_bounds: list[tuple["Variable", str]] = field(default_factory=list)
+    bound_elements: list[tuple["Variable", str, tuple]] = field(default_factory=list)
     n_solves: int = 0
     proven_irreducible: bool = True
 
     def __len__(self) -> int:
-        return len(self.constraints) + len(self.variable_bounds)
+        # Members are counted at element granularity when it is known.
+        n_bounds = len(self.bound_elements) if self.bound_elements else len(self.variable_bounds)
+        return len(self.constraints) + n_bounds
 
     def __bool__(self) -> bool:
         return len(self) > 0
@@ -88,13 +98,15 @@ class IISResult:
             for c in self.constraints:
                 label = c.name if c.name else repr(c)
                 lines.append(f"    - {label}:  {c.body} {c.sense} {c.rhs:g}")
-        if self.variable_bounds:
+        elems = self.bound_elements or [(v, s, ()) for v, s in self.variable_bounds]
+        if elems:
             lines.append("  Variable bounds:")
-            for var, which in self.variable_bounds:
-                bound = var.lb if which == "lower" else var.ub
+            for var, which, idx in elems:
+                bound = np.asarray(var.lb if which == "lower" else var.ub, dtype=np.float64)
                 op = ">=" if which == "lower" else "<="
-                val = float(np.min(bound)) if which == "lower" else float(np.max(bound))
-                lines.append(f"    - {var.name} {op} {val:g}")
+                val = float(np.broadcast_to(bound, var.shape)[idx]) if idx else float(bound.flat[0])
+                label = var.name + (f"[{', '.join(str(i) for i in idx)}]" if idx else "")
+                lines.append(f"    - {label} {op} {val:g}")
         if not self:
             lines.append("  (empty)")
         return "\n".join(lines)
@@ -123,7 +135,7 @@ def _bound_candidates(model: "Model") -> list[tuple[int, str]]:
 def _solve_is_infeasible(
     model: "Model",
     active_constraints: list[Constraint],
-    relaxed_bounds: set[tuple[int, str]],
+    relaxed_bounds: set[tuple],
     saved_bounds: list[tuple[np.ndarray, np.ndarray]],
     time_limit: float,
 ) -> tuple[bool, bool]:
@@ -138,12 +150,20 @@ def _solve_is_infeasible(
     saved_obj = model._objective
     model._constraints = active_constraints
     model._objective = Objective(Constant(0.0), ObjectiveSense.MINIMIZE)
-    for vi, side in relaxed_bounds:
+    for item in relaxed_bounds:
+        # ``(vi, side)`` relaxes the whole variable; ``(vi, side, flat_j)`` one element.
+        vi, side = item[0], item[1]
         v = model._variables[vi]
-        if side == "lower":
-            v.lb = np.full_like(np.asarray(v.lb, dtype=np.float64), -_INF)
+        cur = np.array(v.lb if side == "lower" else v.ub, dtype=np.float64)
+        if len(item) == 2:
+            cur = np.full_like(cur, -_INF if side == "lower" else _INF)
         else:
-            v.ub = np.full_like(np.asarray(v.ub, dtype=np.float64), _INF)
+            cur = np.array(np.broadcast_to(cur, v.shape), dtype=np.float64)
+            cur.reshape(-1)[item[2]] = -_INF if side == "lower" else _INF
+        if side == "lower":
+            v.lb = cur
+        else:
+            v.ub = cur
     try:
         # ``solve`` is typed ``SolveResult | Iterator`` (streaming overload); the
         # non-streaming call returns a SolveResult with ``.status``.
@@ -197,14 +217,14 @@ def compute_iis(
         infeasibility to explain.
     """
     all_constraints = list(model._constraints)
-    bound_items = _bound_candidates(model) if include_bounds else []
+    bound_items: list[tuple] = _bound_candidates(model) if include_bounds else []
 
     # Snapshot every variable's bounds once; each probe restores from this.
     saved_bounds = [(np.asarray(v.lb).copy(), np.asarray(v.ub).copy()) for v in model._variables]
 
     # Active set: indices into all_constraints, plus active bound items.
     active_con_idx = set(range(len(all_constraints)))
-    active_bounds = set(bound_items)
+    active_bounds: set[tuple] = set(bound_items)
     n_solves = 0
     proven = True
 
@@ -248,9 +268,51 @@ def compute_iis(
         if not conclusive:
             proven = False
 
+    # Element refinement (#1618 C-17): a surviving *vector* bound is split into
+    # its elements and filtered again, so the IIS names ``z[0] <= 1`` rather than
+    # the whole ``z <= 1``. Only surviving variables are refined, so an IIS that
+    # involves no vector bound costs no extra probes.
+    for vi, side in sorted(i for i in active_bounds if len(i) == 2):
+        v = model._variables[vi]
+        if v.size <= 1:
+            continue
+        bnd = np.broadcast_to(
+            np.asarray(saved_bounds[vi][0 if side == "lower" else 1], dtype=np.float64), v.shape
+        ).reshape(-1)
+        finite = [
+            j for j in range(v.size) if (bnd[j] > -_FINITE if side == "lower" else bnd[j] < _FINITE)
+        ]
+        # Swap the whole-variable member for its finite elements, then filter them.
+        active_bounds.discard((vi, side))
+        bound_items.remove((vi, side))
+        elems = [(vi, side, j) for j in finite]
+        bound_items.extend(elems)
+        active_bounds.update(elems)
+        for e in elems:
+            active_bounds.discard(e)
+            infeasible, conclusive = probe()
+            if infeasible:
+                continue
+            active_bounds.add(e)
+            if not conclusive:
+                proven = False
+
+    elements: list[tuple["Variable", str, tuple]] = []
+    for item in sorted(active_bounds, key=lambda t: (t[0], t[1], t[2] if len(t) > 2 else -1)):
+        v = model._variables[item[0]]
+        idx: tuple = ()
+        if len(item) == 3:
+            idx = tuple(int(i) for i in np.unravel_index(item[2], v.shape))
+        elements.append((v, item[1], idx))
+    per_var: list[tuple["Variable", str]] = []
+    for v, side, _ in elements:
+        if not any(pv is v and ps == side for pv, ps in per_var):
+            per_var.append((v, side))
+
     return IISResult(
         constraints=[all_constraints[i] for i in sorted(active_con_idx)],
-        variable_bounds=[(model._variables[vi], side) for (vi, side) in sorted(active_bounds)],
+        variable_bounds=per_var,
+        bound_elements=elements,
         n_solves=n_solves,
         proven_irreducible=proven,
     )

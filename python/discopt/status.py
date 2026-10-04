@@ -103,6 +103,10 @@ TERMINATION_TIME_LIMIT = "time_limit"
 TERMINATION_ITERATION_LIMIT = "iteration_limit"
 #: The user stopped the search (the interactive debugger's ``quit``).
 TERMINATION_INTERRUPTED = "interrupted"
+#: Presolve (FBBT / OBBT / nonlinear bound tightening) proved the model
+#: infeasible before any search ran; ``status`` is ``infeasible``, ``node_count``
+#: is 0 and ``algorithm_route`` names the proving pass (#1618 C-17).
+TERMINATION_PRESOLVE = "presolve"
 
 #: Every value ``SolveResult.termination`` may take besides ``None``.
 TERMINATION_REASONS = frozenset(
@@ -113,6 +117,7 @@ TERMINATION_REASONS = frozenset(
         TERMINATION_TIME_LIMIT,
         TERMINATION_ITERATION_LIMIT,
         TERMINATION_INTERRUPTED,
+        TERMINATION_PRESOLVE,
     }
 )
 

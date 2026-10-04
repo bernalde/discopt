@@ -391,6 +391,12 @@ INVENTORY: tuple[tuple[str, str, str, str], ...] = (
     ("discopt._relax.problem_classifier", "extract_qp_data", "trivial", "memory-budgeted, #863"),
     ("discopt._relax.uniform_relax", "clear_analysis_cache", "trivial", "cache clear"),
     ("discopt._rust", "model_to_repr", "trivial", "marshal, linear"),
+    (
+        "discopt.modeling.external",
+        "external_reset",
+        "trivial",
+        "clears <=3 memos of <=8 entries per dm.external block (#1619 B-13)",
+    ),
     ("discopt.decomposition.learning", "record_outcome", "trivial", "record append"),
     ("discopt.decomposition.learning.store", "RecordStore", "trivial", "constructor"),
     ("discopt.mpec", "require_all_relations_lowered", "trivial", "predicate over rows"),

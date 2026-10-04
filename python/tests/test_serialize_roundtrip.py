@@ -813,3 +813,15 @@ def test_a_future_minor_schema_is_readable_but_a_future_major_is_not():
     doc["schema"] = "discopt.model/2.0"
     with pytest.raises(SerializationError, match="major version 2"):
         loads(json.dumps(doc))
+
+
+def test_free_by_construction_survives_a_round_trip():
+    """#1618 X-29b: discopt-made free variables (CVaR's eta) stay exempt from the
+    large-bounds warning after a reload instead of being reset to the empty set."""
+    m = dm.Model("fbc")
+    eta = m.continuous("eta")
+    m.continuous("y", lb=0, ub=1)
+    m._free_by_construction.add(eta.name)
+    m.minimize(eta)
+    m2 = loads(dumps(m))
+    assert m2._free_by_construction == {"eta"}

@@ -352,3 +352,72 @@ def test_ignored_option_table_tracks_the_signature():
     params = set(inspect.signature(solve_model).parameters)
     assert _POUNCE_ROUTE_HONOURED <= params
     assert len(params - _POUNCE_ROUTE_HONOURED) >= 40
+
+
+def _relabel_inaccurate(monkeypatch, perturb=0.0):
+    """Make every qp-ipm solve report ``optimal_inaccurate`` (POUNCE gh#984).
+
+    pounce ``main`` re-judges an ``optimal`` IPM iterate on its normalized KKT
+    measure and reports ``optimal_inaccurate`` when it is above ``tol``; the 0.12.0
+    wheel did not. Relabelling pins the route's handling on either build. Returns
+    the list of statuses handed to the route, so a test can prove the relabel fired.
+    """
+    import dataclasses
+
+    real = pounce.qp.solve_qp
+    seen: list[str] = []
+
+    def relabel(**kw):
+        res = real(**kw)
+        if res.status in ("optimal", "optimal_inaccurate"):
+            res = dataclasses.replace(
+                res, status="optimal_inaccurate", x=np.asarray(res.x) + perturb
+            )
+        seen.append(res.status)
+        return res
+
+    monkeypatch.setattr(pounce.qp, "solve_qp", relabel)
+    return seen
+
+
+def _scaled_row_qp(scale):
+    m = dm.Model("scaled")
+    x = m.continuous("x", lb=-10, ub=10)
+    y = m.continuous("y", lb=-10, ub=10)
+    m.subject_to(scale * (x + y) >= scale * 2.0)
+    m.minimize(x**2 + 2 * y**2)
+    return m, x, y
+
+
+@pytest.mark.parametrize("scale", [1e-6, 1.0])
+def test_optimal_inaccurate_qp_is_a_candidate_not_an_iteration_limit(monkeypatch, scale):
+    """An ``optimal_inaccurate`` qp-ipm point goes through the #1596 certificate.
+
+    It was mapped to ``iteration_limit`` and dropped -- after 17 iterations, with no
+    cap hit -- which is what CI's Linux runner (pounce ``main``) reported for the
+    1e-6 row of #1617 while macOS (the 0.12.0 wheel) returned the same iterate as
+    ``optimal``. Whether it is ``optimal`` or ``feasible`` is now the certificate's
+    call, as it is for an ``optimal`` label.
+    """
+    seen = _relabel_inaccurate(monkeypatch)
+    m, x, y = _scaled_row_qp(scale)
+    r = m.solve(solver="pounce")
+    assert seen == ["optimal_inaccurate"]
+    assert r.algorithm_route == "pounce:qp-ipm"
+    assert r.status in ("optimal", "feasible"), (r.status, r.error)
+    np.testing.assert_allclose([r.x["x"], r.x["y"]], [4 / 3, 2 / 3], rtol=1e-6)
+    assert r.objective == pytest.approx(8 / 3, rel=1e-7)
+    if r.status == "optimal":
+        assert r.bound is not None and r.bound <= r.objective + 1e-9
+    else:
+        assert r.bound is None and r.gap_certified is False
+
+
+def test_optimal_inaccurate_qp_still_faces_the_feasibility_guard(monkeypatch):
+    """The candidate is not trusted: an infeasible ``optimal_inaccurate`` is refused."""
+    seen = _relabel_inaccurate(monkeypatch, perturb=-0.1)  # x + y = 1.8 < 2
+    m, _, _ = _scaled_row_qp(1.0)
+    r = m.solve(solver="pounce")
+    assert seen == ["optimal_inaccurate"]
+    assert r.status == "error"
+    assert "infeasible point" in (r.error or "")
