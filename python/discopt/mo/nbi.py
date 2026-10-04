@@ -10,6 +10,7 @@ evenly-spaced points on it, and map each back to a Pareto point.
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Iterable, Optional
 
 import numpy as np
@@ -69,6 +70,39 @@ def _payoff_matrix(
     for i in range(k):
         raw[i, :] = evaluator.vector_at(anchors[i])
     return raw
+
+
+def _discrete_variable_names(model) -> list[str]:
+    """Names of the model's binary/integer variables (#1618 D-34)."""
+    from discopt.modeling.core import VarType
+
+    return [v.name for v in model._variables if v.var_type in (VarType.BINARY, VarType.INTEGER)]
+
+
+def _warn_nbi_discrete(n_infeasible: int, n_solved: int, discrete: list[str]) -> None:
+    """Warn that an NBI sweep over a discrete model is not a front sampler (#1618 D-34).
+
+    NBI's subproblem pins ``g(x)`` to a *line* through the CHIM. On a model with
+    integer variables the image of ``g`` is a finite point set, which a line meets
+    only by coincidence, so most subproblems are *proved* infeasible. Those cells
+    are not inconclusive, so they do not set ``incomplete`` (#1442 is about holes
+    the solver could not decide), but the returned front is still a handful of
+    coincidental points, not a sample of the Pareto set. Measured on a 4-integer
+    model: 21 subproblems, 18 infeasible, 3 points, and no signal at all.
+    """
+    if not discrete:
+        return
+    shown = ", ".join(discrete[:5]) + (", ..." if len(discrete) > 5 else "")
+    warnings.warn(
+        f"normal_boundary_intersection: the model has integer/binary variables ({shown}). "
+        f"NBI's equality g(x) = CHIM point + t*n meets a discrete objective image only by "
+        f"coincidence: {n_infeasible} of {n_infeasible + n_solved} subproblem(s) were "
+        f"infeasible and the front holds {n_solved} point(s), which is not a sample of the "
+        f"Pareto set. Use discopt.mo.epsilon_constraint (or normalized_normal_constraint, "
+        f"whose inequality form is well-posed on discrete images) for a mixed-integer model.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -189,6 +223,7 @@ def normal_boundary_intersection(
 
         points: list[ParetoPoint] = []
         last_x: Optional[dict[str, np.ndarray]] = None
+        n_infeasible = 0
 
         for w in weights:
             if budget.expired():
@@ -211,6 +246,8 @@ def normal_boundary_intersection(
                 # anything else leaves a hole the caller must be able to see.
                 if result.status != "infeasible":
                     health.record({"w_chim": w_normed.tolist()}, result.status)
+                else:
+                    n_infeasible += 1
                 continue
             obj_vec = _collect_objectives_at_x(objectives, model, result.x, evaluator)
             points.append(
@@ -228,6 +265,7 @@ def normal_boundary_intersection(
         _remove_tracked(model, tracked_cons)
 
     health.warn("nbi")
+    _warn_nbi_discrete(n_infeasible, len(points), _discrete_variable_names(model))
     front = ParetoFront(
         points=points,
         method=_tag("nbi", budget, health),
