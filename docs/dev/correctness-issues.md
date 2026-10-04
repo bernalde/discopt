@@ -2494,6 +2494,21 @@ unchanged; standing gates pass.
   **Gates:** smoke 197 passed / 1 skipped; adversarial 10 passed; OA/LOA/gdpopt/
   nogood/benders 165 passed / 2 skipped; ruff clean; mypy clean on changed files;
   no Rust touched. PR: #451.
+- 2026-10-04 — **second guard narrowed (#1537).** Of the two C-35 downgrades, the
+  first (withhold the no-good cut) is the fix; the second (withhold the bound and
+  `optimal` whenever any configuration is unresolved) proved nothing extra. An
+  unresolved configuration is cut only by OA/feasibility linearizations of convex
+  rows, which are valid everywhere, and `certified_LB` is promoted only from
+  globally valid sources — so a certified bound meeting the incumbent already
+  excludes every unresolved configuration, and the C-35 witnesses still refuse
+  (the master's bound at the failed configuration stays below the incumbent).
+  Cost of the second guard, measured: `tls2` closes `LB = UB = 5.3` in 0.34 s on
+  the OA route but 5 of 6 fixed NLPs end in `error`, so the route fell back and
+  the spatial path spent ~25 s re-proving it (past the budget with rows scaled
+  10^[-3,3]). Now the bound is published whenever it is valid
+  (`_unresolved_configs_block_certificate`, opt-out
+  `DISCOPT_OA_UNRESOLVED_BLOCKS_CERT=1`); the no-incumbent exit still never
+  reports a certified `infeasible` over an unresolved configuration.
 
 ---
 

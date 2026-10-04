@@ -1452,7 +1452,8 @@ class TestOADeadlineAndNoIncumbentContract:
             "downstream consumer truth-tests as an existing incumbent"
         )
 
-    def test_no_incumbent_result_never_contradicts_its_own_trace_bound(self, monkeypatch):
+    @pytest.mark.parametrize("legacy", [False, True], ids=["default", "c35_opt_out"])
+    def test_no_incumbent_result_never_contradicts_its_own_trace_bound(self, monkeypatch, legacy):
         """``bound`` must not carry a number the trace calls uncertified.
 
         The reporter saw ``bound=0.0`` beside ``master_bound_valid=false`` and
@@ -1503,6 +1504,7 @@ class TestOADeadlineAndNoIncumbentContract:
             lambda *args, **kwargs: False,
         )
 
+        monkeypatch.setenv("DISCOPT_OA_UNRESOLVED_BLOCKS_CERT", "1" if legacy else "0")
         result = oa_module.solve_oa(
             m,
             time_limit=30.0,
@@ -1514,13 +1516,22 @@ class TestOADeadlineAndNoIncumbentContract:
         trace = result.mip_nlp_trace
         assert trace is not None
         assert trace["summary"]["unresolved_integer_config_count"] >= 1
-        assert trace["master_bound_valid"] is False
-        assert trace["bound_validity"] == "uncertified"
-        # The master number is still there as a diagnostic...
         assert trace["final_lb"] == pytest.approx(0.0)
-        # ...but the general ``bound`` field, which callers read as a dual
-        # certificate, no longer contradicts the validity signal beside it.
-        assert result.bound is None
+        if legacy:
+            # C-35 downgrade (opt-out): the trace calls the bound uncertified...
+            assert trace["master_bound_valid"] is False
+            assert trace["bound_validity"] == "uncertified"
+            # ...so the general ``bound`` field, which callers read as a dual
+            # certificate, must not contradict it.
+            assert result.bound is None
+        else:
+            # #1537: the unresolved configuration was excluded by nothing but valid
+            # linearizations, so the master number IS a valid bound (the true
+            # optimum is 1.0) -- and ``bound`` and the trace still agree on that.
+            assert trace["master_bound_valid"] is True
+            assert trace["bound_validity"] == "global"
+            assert result.bound == pytest.approx(0.0)
+        assert result.status != "infeasible"
         assert result.gap is None
         assert result.gap_certified is False
         assert result.x is None

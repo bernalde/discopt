@@ -2367,6 +2367,42 @@ def _elastic_restoration_enabled() -> bool:
     )
 
 
+def _unresolved_configs_block_certificate() -> bool:
+    """Does an NLP-unresolved integer configuration withhold OA's certified bound?
+
+    No, by default. C-35 stopped treating a non-rigorous fixed-NLP failure as an
+    infeasibility proof: such a configuration gets **no** no-good cut, only OA and
+    feasibility linearizations of convex rows, which are valid everywhere. The
+    master is therefore still a relaxation over that configuration, and
+    ``certified_LB`` is promoted only from sources that are (a valid master with no
+    local cut, the continuous NLP, convex bounding, a global-valid external bound).
+    A certified bound that meets the incumbent thus already proves that no
+    unresolved configuration can beat it. C-35 additionally withheld the bound and
+    the ``optimal`` status whenever any configuration was unresolved; that second
+    guard proves nothing the bound does not, and it cost every certificate on a
+    class where the fixed NLP fails on the infeasible assignments.
+
+    Measured on ``tls2`` (#1537): OA closes ``LB = UB = 5.3`` in 0.34 s, but 5 of its
+    6 fixed NLPs end in ``error`` on infeasible assignments, so the route returned
+    ``feasible`` and handed the instance to the spatial fallback, which spent
+    ~25 s re-proving it -- at every row-scale span, and past the budget at span 3
+    and 6. The C-35 witnesses (``test_c35_oa_nogood_nlp_failure.py``) still refuse
+    to certify, because there the master's bound at the failed configuration stays
+    below the incumbent.
+
+    Not the default only as an opt-out: ``DISCOPT_OA_UNRESOLVED_BLOCKS_CERT=1``
+    restores the C-35 downgrade for A/B. The no-incumbent exit is unchanged either
+    way -- it still never reports a certified ``infeasible`` over an unresolved
+    configuration.
+    """
+    return os.environ.get("DISCOPT_OA_UNRESOLVED_BLOCKS_CERT", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
 class _ElasticFeasibilityEvaluator:
     """The OA feasibility subproblem as a *constrained* elastic NLP (#1141).
 
@@ -7040,6 +7076,8 @@ def solve_oa(
     # assignments so final certification is downgraded instead of adding an
     # unsound no-good cut.
     unresolved_int_configs: set[tuple[int, ...]] = set()
+    # See ``_unresolved_configs_block_certificate``: default False since #1537.
+    unresolved_blocks_cert = _unresolved_configs_block_certificate()
     incumbent_progress: list[float] = []
     # ``_OA_NO_PROGRESS_ITERATIONS`` bookkeeping: the (LB, UB) pair as of the end
     # of the previous iteration, and how many consecutive iterations have left it
@@ -7456,7 +7494,7 @@ def solve_oa(
         final_lb = _trace_value(certified_LB)
         final_heuristic_lb = _trace_value(heuristic_LB)
         final_ub = _trace_value(UB)
-        has_unresolved = bool(unresolved_int_configs)
+        has_unresolved = bool(unresolved_int_configs) and unresolved_blocks_cert
         bound_valid = bool(
             final_lb is not None and not has_unresolved and not _certified_bound_inverted()
         )
@@ -9502,12 +9540,14 @@ def solve_oa(
             final_reason = "iteration_limit"
 
     # C-35: if any integer configuration was left unresolved by a non-rigorous
-    # NLP failure, the search is incomplete - we deliberately did NOT exclude
-    # those configurations, so neither optimality nor infeasibility is proved.
-    # Downgrade certification; never report a *certified* "infeasible" in this
-    # state (an unresolved configuration might be the feasible/optimal one).
+    # NLP failure, we deliberately did NOT exclude those configurations, so
+    # infeasibility is not proved: never report a *certified* "infeasible" in
+    # this state (an unresolved configuration might be the feasible/optimal one).
     has_unresolved = len(unresolved_int_configs) > 0
-    if has_unresolved:
+    # Whether that also withholds the bound and ``optimal``: by default it does
+    # not, see ``_unresolved_configs_block_certificate``. The no-incumbent exit
+    # below keeps vetoing a certified "infeasible" on ``has_unresolved`` itself.
+    if has_unresolved and unresolved_blocks_cert:
         reported_gap = None
         # #1105: ``bound`` and the trace must not contradict each other. The
         # trace publishes ``master_bound_valid``/``bound_validity`` computed as
@@ -9557,7 +9597,11 @@ def solve_oa(
             certified_gap = _certified_gap_value()
             reported_gap = certified_gap if bound is not None and UB < 1e19 else None
 
-        status = "optimal" if _certified_gap_converged() and not has_unresolved else "feasible"
+        status = (
+            "optimal"
+            if _certified_gap_converged() and not (has_unresolved and unresolved_blocks_cert)
+            else "feasible"
+        )
         if termination_reason in {"cycling", "stalling"}:
             status = "feasible"
         _unverified_incumbent = False
