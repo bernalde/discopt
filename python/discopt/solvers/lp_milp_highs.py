@@ -1919,6 +1919,16 @@ def _weaker_bound(
 #: -1.5e-8 at 1e-8, while ``mip_abs_gap = mip_rel_gap = 0`` leaves it unchanged.
 CROSS_TIGHT_FEAS_TOL = 1e-8
 
+#: ``mip_feasibility_tolerance`` of the first cross-solve (HiGHS's default, which
+#: :func:`_solve_milp_std` keeps).
+CROSS_FEAS_TOL = 1e-6
+
+#: How far above the cross bound the tight bound may land and still count as the
+#: same answer with less tolerance error: ``factor * CROSS_FEAS_TOL * max|c| * max|A|``
+#: (each floored at 1). Measured on the #1640 case: shift 1.5e-6 against a slack of
+#: 1e-4 x the coefficient scale.
+CROSS_TIGHT_SHIFT_FACTOR = 100.0
+
 
 def _tight_cross_bound(
     sf: StdForm, out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any], claim: float
@@ -1933,8 +1943,11 @@ def _tight_cross_bound(
     tighter solve must earn the confirmation the same way the first one had to: a
     certified ``optimal`` of its own, no verified point refuting the claim (the
     #1509/#1621 falsifier), and ``min(primary bound, tight bound)`` closing the gap
-    under the route's stop rule. The published bound is that minimum, so it is still
-    valid whenever either configuration is right (the #1634 argument). Anything else --
+    under the route's stop rule. The published bound is that minimum, so it is
+    valid whenever the primary or the tight solve is right; because the cross bound
+    is dropped, the tight bound must also land within a tolerance-scaled slack of it
+    (:data:`CROSS_TIGHT_SHIFT_FACTOR`) -- a larger jump is two certified solves
+    disagreeing, not tolerance error. Anything else --
     no budget, no verdict, a refutation, a gap that stays open -- leaves the
     certificate declined, as before. ``claim`` is the primary's own certified bound. On
     success ``out.bound`` is replaced and True is returned.
@@ -1944,7 +1957,9 @@ def _tight_cross_bound(
         return False
     kw = dict(kw)
     if kw["time_limit"] is not None:
-        kw["time_limit"] = float(kw["time_limit"]) - float(out.wall_time) - float(cross.wall_time)
+        # ``kw`` already had the primary's wall time taken off by the caller
+        # (:func:`_cross_check_presolve`); only the cross-solve's is left to charge.
+        kw["time_limit"] = float(kw["time_limit"]) - float(cross.wall_time)
         if kw["time_limit"] <= 0.0:
             out.stats["milp/presolve_cross_tight_skipped"] = 1.0
             return False
@@ -1959,6 +1974,23 @@ def _tight_cross_bound(
     if pt is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
         out.labels["milp/presolve_cross_tight_refuted"] = (
             f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
+        )
+        return False
+    # The confirmation drops the cross bound, so the tight solve must explain it as a
+    # tolerance artefact rather than overrule it: a cross bound below the tight one by
+    # more than the tolerance-scaled slack is a disagreement between two certified
+    # solves, and the decline stands (review of #1649).
+    if cross.bound is None:  # _weaker_bound only calls with a cross bound
+        return False
+    shift = float(tight.bound) - float(cross.bound)
+    c_max = float(np.max(np.abs(sf.c))) if sf.c.size else 0.0
+    a_max = float(np.max(np.abs(sf.A.data))) if sf.A.nnz else 0.0
+    slack = CROSS_TIGHT_SHIFT_FACTOR * CROSS_FEAS_TOL * max(1.0, c_max) * max(1.0, a_max)
+    out.stats["milp/presolve_cross_tight_shift"] = shift
+    if shift > slack:
+        out.labels["milp/presolve_cross_tight_disagrees"] = (
+            f"tight bound {float(tight.bound):.12g} is {shift:.3g} above the cross bound "
+            f"{float(cross.bound):.12g}, more than the tolerance slack {slack:.3g}"
         )
         return False
     bound = min(claim, float(tight.bound), obj)

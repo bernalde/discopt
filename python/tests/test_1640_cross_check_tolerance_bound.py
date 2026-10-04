@@ -55,7 +55,7 @@ def test_tight_cross_solve_restores_the_certificate(monkeypatch):
     assert r.status == "optimal" and r.gap_certified
     assert r.objective == pytest.approx(truth, abs=1e-6)
     # Maximize: the published bound is an upper bound, never below the optimum.
-    assert r.bound >= truth - 1e-6
+    assert r.bound >= truth - 1e-9
 
 
 def test_untightened_cross_solve_still_declines(monkeypatch):
@@ -119,12 +119,53 @@ def test_tight_cross_point_refutes_the_claim(monkeypatch):
     assert not r.gap_certified
 
 
+def test_tight_bound_far_above_the_cross_bound_keeps_the_decline(monkeypatch):
+    """Confirming drops the cross bound, so the tight solve may only explain it as
+    tolerance error: a tight bound above it by more than the tolerance-scaled slack is
+    two certified solves disagreeing, and the decline stands (review of #1649)."""
+    real = L._solve_milp_scaled
+
+    def jumped(sf, *, presolve=True, **kw):
+        out = real(sf, presolve=presolve, **kw)
+        if kw.get("feasibility_tolerance", 1e-6) < 1e-6 and out.bound is not None:
+            out.bound = float(out.bound) + 1e3
+        return out
+
+    monkeypatch.setattr(L, "_solve_milp_scaled", jumped)
+    seen = _spy(monkeypatch)
+    m, _ = _log_max()
+    r = m.solve(time_limit=30)
+    assert seen[0].get("milp/presolve_cross_tight_ran") == 1.0
+    assert seen[0]["milp/presolve_cross_tight_shift"] > 1e2
+    assert "milp/presolve_cross_tight_confirmed" not in seen[0]
+    assert not r.gap_certified and r.status == "feasible"
+
+
+def test_tight_solve_budget_charges_only_the_cross_solve(monkeypatch):
+    """The caller already took the primary's wall time off ``kw``; charging it again
+    starved the tight solve of budget it had (review of #1649)."""
+    got: list = []
+
+    def capture(sf, *, presolve=True, **kw):
+        got.append(kw["time_limit"])
+        return L.HighsOutcome("time_limit")
+
+    monkeypatch.setattr(L, "_solve_milp_scaled", capture)
+    out = L.HighsOutcome("optimal", objective=0.0, bound=-1.5e-6, gap_certified=True)
+    out.wall_time = 5.0
+    cross = L.HighsOutcome("optimal", objective=0.0, bound=-1.5e-6, gap_certified=True)
+    cross.wall_time = 4.0
+    kw = dict(time_limit=6.0, gap_tolerance=1e-4, abs_gap_tolerance=None)
+    assert L._tight_cross_bound(None, out, cross, kw, 0.0) is False
+    assert got == [pytest.approx(2.0)]
+
+
 def test_no_budget_for_the_tight_solve_keeps_the_decline():
     out = L.HighsOutcome("optimal", objective=0.0, bound=-1.5e-6, gap_certified=True)
     out.wall_time = 5.0
     cross = L.HighsOutcome("optimal", objective=0.0, bound=-1.5e-6, gap_certified=True)
     cross.wall_time = 5.0
-    kw = dict(time_limit=10.0, gap_tolerance=1e-4, abs_gap_tolerance=None)
+    kw = dict(time_limit=5.0, gap_tolerance=1e-4, abs_gap_tolerance=None)
     assert L._tight_cross_bound(None, out, cross, kw, 0.0) is False
     assert out.stats.get("milp/presolve_cross_tight_skipped") == 1.0
     assert out.bound == -1.5e-6
