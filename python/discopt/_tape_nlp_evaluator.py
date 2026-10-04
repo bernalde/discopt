@@ -386,7 +386,7 @@ class TapeNLPEvaluator:
 
         if model._objective is None:
             raise ValueError("Model has no objective set.")
-        obj = compile_to_nl_expr(model._objective.expression, model)
+        obj = compile_to_nl_expr(model._objective_expression(), model)
         # A body may be ARRAY-valued -- `x <= 1` on a 3-vector is ONE Constraint
         # and THREE rows -- so fan each one out. `reshape(-1)` is C order, which is
         # exactly what the JAX evaluator concatenates
@@ -425,9 +425,8 @@ class TapeNLPEvaluator:
 
         from discopt._relax.least_squares import extract_residuals
 
-        objective = self._model._objective
-        assert objective is not None  # refused in __init__
-        residuals = extract_residuals(objective.expression)
+        # refused in __init__ when there is no objective
+        residuals = extract_residuals(self._model._objective_expression())
         if not residuals:
             self._warn_gn_declined(
                 "gauss_newton requested but the objective is not a recognized "

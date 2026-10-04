@@ -392,14 +392,14 @@ class TestWideBoxSolverIntegration:
         # what gates the fast path here (certificate abstains — see
         # TestWideBoxCertificateAbstainsAsDocumented).
         #
-        # Recentring pinned OFF (#1537, default ON): x in [-1e6, 1e6] meets the
-        # one-sided rule and becomes z - 1e6, so the numerator is the
-        # NON-homogeneous (z - 1e6)**2 and ``classify_division_pattern`` (which
-        # accepts only a homogeneous PSD numerator) no longer proves it. The
-        # recentred solve still certifies 0.01 by B&B; see the ON test below.
-        # Extending the recogniser to affine squares was tried and withheld: it
-        # put this model on the convex fast path, whose bound := incumbent
-        # certificate is false on offset quadratics (#1596).
+        # Recentring pinned OFF (#1537). Until #1609, recentring moved
+        # x in [-1e6, 1e6] to z - 1e6, so the numerator became the
+        # NON-homogeneous (z - 1e6)**2 that ``classify_division_pattern``
+        # (homogeneous PSD numerators only) cannot prove. Extending the
+        # recogniser to affine squares was tried and withheld: it put this model
+        # on the convex fast path, whose bound := incumbent certificate is false
+        # on offset quadratics (#1596). Since #1609 a box containing 0 is never
+        # moved, so the ON arm below now takes the same route.
         monkeypatch.setenv("DISCOPT_RECENTRE", "0")
         m = Model("qol_solver_wide")
         x = m.continuous("x", lb=-1.0e6, ub=1.0e6)
@@ -410,15 +410,18 @@ class TestWideBoxSolverIntegration:
         assert result.convex_fast_path is True
 
     def test_quadratic_over_linear_recentred_still_certifies(self, monkeypatch):
-        # The ON arm of the test above: recentring moves x, the fast path is
-        # not taken, and the solve must still certify the true optimum 0.01.
+        # The ON arm of the test above. #1609: x's box contains 0 and y's lower
+        # bound is below the anchor ratio, so recentring moves nothing and the
+        # homogeneous numerator keeps its convexity proof; the solve must
+        # certify the true optimum 0.01.
         monkeypatch.setenv("DISCOPT_RECENTRE", "1")
         m = Model("qol_solver_wide_recentred")
         x = m.continuous("x", lb=-1.0e6, ub=1.0e6)
         y = m.continuous("y", lb=1.0e-2, ub=1.0e6)
         m.minimize((x * x) / y + y)
         result = m.solve(time_limit=60.0)
-        assert (result.solver_stats or {}).get("recentre/variables_moved", 0) > 0
+        assert not (result.solver_stats or {}).get("recentre/variables_moved")
+        assert result.convex_fast_path is True
         assert result.status == "optimal" and result.gap_certified
         assert abs(result.objective - 0.01) <= 1.0e-6
         assert result.bound <= 0.01 + 1.0e-6

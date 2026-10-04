@@ -672,7 +672,7 @@ class NLPEvaluator:
         from discopt._relax.least_squares import extract_residuals
 
         assert model._objective is not None  # guaranteed by __init__
-        residual_exprs = extract_residuals(model._objective.expression)
+        residual_exprs = extract_residuals(model._objective_expression())
         if not residual_exprs:
             logger.warning(
                 "gauss_newton requested but the objective is not a recognized "

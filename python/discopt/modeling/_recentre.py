@@ -126,9 +126,10 @@ def plan_shifts(model: Model, ratio: float) -> dict[int, np.ndarray]:
 
     * **narrow offset** -- both bounds finite and ``|lb| >= ratio * max(1, ub-lb)``
       (anchor ``lb``); or
-    * **one-sided offset** -- a finite ``lb`` with ``|lb| >= ratio`` on a box at
-      least as wide as that offset (an open ``ub`` counts as infinitely wide):
-      anchor ``lb``; or an open ``lb`` with ``|ub| >= ratio``: anchor ``ub``.
+    * **one-sided offset** -- a finite ``lb >= ratio`` on a box at least as wide
+      as that offset (an open ``ub`` counts as infinitely wide): anchor ``lb``;
+      or an open ``lb`` with ``ub <= -ratio``: anchor ``ub``. A box that contains
+      0 is never moved (#1609).
       Without this, ``x in [1e6, 1e15]`` keeps a user's ``x - 1e6`` unfolded and
       st_miqp4 / alan still certify infeasible / crash under a shift (#1543).
 
@@ -160,8 +161,18 @@ def plan_shifts(model: Model, ratio: float) -> dict[int, np.ndarray]:
         # width = inf). A fixed "open" cutoff alone missed x in [-1.3e6, 9.9987e9]
         # (a 1e10 bound after a shift) and left its (y - c)**2 unfolded -- the #1543
         # trigger, certified 262 vs the true 2 on shifted st_miqp2.
-        from_lb = lb_fin & ~narrow & (np.abs(lb) >= ratio) & (width >= np.abs(lb))
-        from_ub = ub_fin & ~lb_fin & (np.abs(ub) >= ratio)
+        #
+        # A box that already contains 0 is never moved (#1609). Its user origin is
+        # a point of the box, so there is no offset to remove -- only one to add:
+        # j in [-1e3, 1e3] anchored at -1e3 put the optimum j* = 2.5e-4 at
+        # z* = 1000.00025, where the QP route's relative tolerance reported j off
+        # by 19 % as `optimal`. ``narrow`` already excludes 0 (|lb| >= width), so
+        # this bites only the one-sided rules: a finite lb anchors only when
+        # lb > 0, an open lb anchors at ub only when ub < 0. The #1543 trigger
+        # (shifted st_miqp2, x1 in [-1.3e6, 9.9987e9]) is such a box; it is left
+        # alone now and certifies the base optimum 2 unmoved (measured).
+        from_lb = lb_fin & ~narrow & (lb >= ratio) & (width >= lb)
+        from_ub = ub_fin & ~lb_fin & (ub <= -ratio)
         if np.any(narrow | from_lb | from_ub):
             plan[id(v)] = np.where(
                 narrow | from_lb, np.round(lb), np.where(from_ub, np.round(ub), 0.0)
@@ -186,7 +197,16 @@ def _scalar_index_key(node: IndexExpression) -> Optional[tuple]:
         return None
     if len(idx) != len(base.shape):
         return None
-    return (id(base), int(np.ravel_multi_index(tuple(int(i) for i in idx), base.shape)))
+    # Normalise negative indices the way numpy does (``T[-1]`` is ``T[2]`` on a
+    # length-3 T): ``ravel_multi_index`` rejects them, which crashed the pass
+    # (#1609). An index out of range either way is not ours to reinterpret.
+    norm = []
+    for i, n in zip(idx, base.shape):
+        i = int(i)
+        if not -n <= i < n:
+            return None
+        norm.append(i + n if i < 0 else i)
+    return (id(base), int(np.ravel_multi_index(tuple(norm), base.shape)))
 
 
 def _const_value(node) -> Optional[float]:
