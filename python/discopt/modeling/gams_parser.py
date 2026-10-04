@@ -1379,6 +1379,8 @@ class _ModelBuilder:
         self._build_equations(m, solve)
         # 7. Apply bounds (lo, up, fx) and initial values (l)
         self._apply_bounds(m)
+        # 7b. Semicontinuous / semi-integer: needs the final bounds.
+        self._lower_semi_variables(m)
         # 8. Store initial values on the model
         if self._initial_values:
             m._gams_initial_values = self._initial_values  # type: ignore[attr-defined]
@@ -1888,6 +1890,7 @@ class _ModelBuilder:
         return self._eval_const_expr_with_env(expr, env)
 
     def _create_variables(self, m):
+        self._semi_vars: list = []
         for name, gv in self.p.variables.items():
             shape = self._domain_shape(gv.domain)
             vtype = gv.var_type.lower()
@@ -1900,22 +1903,80 @@ class _ModelBuilder:
             elif vtype == "negative":
                 var = m.continuous(name, shape=shape, ub=0.0)
             elif vtype == "semicont":
-                warnings.warn(
-                    f"Semicontinuous variable '{name}' approximated as positive "
-                    f"continuous. Set .lo/.up bounds to constrain the nonzero range.",
-                    stacklevel=2,
-                )
+                # `x = 0 or lo <= x <= up` (#1613 C-03c). Created with GAMS's
+                # default box; `_lower_semi_variables` imposes the disjunction
+                # once the `.lo`/`.up` assignments are known. Reading it as a
+                # plain `continuous(lb=0)` silently changed the feasible set.
                 var = m.continuous(name, shape=shape, lb=0.0)
+                self._semi_vars.append((name, var))
             elif vtype == "semiint":
-                warnings.warn(
-                    f"Semi-integer variable '{name}' approximated as integer. "
-                    f"Set .lo/.up bounds to constrain the nonzero range.",
-                    stacklevel=2,
-                )
                 var = m.integer(name, shape=shape, lb=0, ub=1e6)
+                self._semi_vars.append((name, var))
+            elif vtype in ("sos1", "sos2"):
+                # Read as `free` this silently dropped the SOS restriction --
+                # the same widened-model class as semicont (#1613). GAMS
+                # derives the set membership from the variable's index
+                # structure; that is not implemented, so refuse loudly.
+                raise GamsParseError(
+                    f"{vtype.upper()} variable '{name}' is not supported by the GAMS "
+                    "reader; reading it as a free variable would drop the SOS "
+                    "restriction. Model it with Model.sos1/sos2 instead."
+                )
             else:  # free
                 var = m.continuous(name, shape=shape)
             self.dvar_map[name] = var
+
+    def _lower_semi_variables(self, m):
+        """Impose GAMS ``semicont``/``semiint`` semantics exactly (#1613 C-03c).
+
+        A semicontinuous ``x`` with bounds ``[lo, up]`` means ``x = 0`` **or**
+        ``lo <= x <= up``. Where ``0`` already lies in ``[lo, up]`` that union is
+        just the box, so the element needs nothing. Otherwise it is lowered with
+        an on/off binary ``z``: ``lo*z <= x <= up*z`` on the hull box
+        ``[min(0, lo), max(0, up)]`` -- ``z = 0`` pins ``x = 0`` and ``z = 1``
+        restores ``[lo, up]``, which is the set exactly (integrality, for
+        ``semiint``, stays on ``x``). That needs both bounds finite; an element
+        whose disjunction would need an invented big-M is refused, not
+        approximated.
+        """
+        for name, var in self._semi_vars:
+            lb = np.array(var.lb, dtype=np.float64).reshape(-1)
+            ub = np.array(var.ub, dtype=np.float64).reshape(-1)
+            need = [k for k in range(lb.size) if not (lb[k] <= 0.0 <= ub[k])]
+            if not need:
+                continue
+            # discopt's "infinite" bound is the 1e20-scale sentinel, not inf.
+            bad = [k for k in need if not (abs(lb[k]) < 1e19 and abs(ub[k]) < 1e19)]
+            if bad:
+                raise GamsParseError(
+                    f"Semicontinuous/semi-integer variable '{name}' has an element "
+                    f"(flat index {bad[0]}) with bounds [{lb[bad[0]]}, {ub[bad[0]]}] "
+                    "excluding 0 and an infinite bound; `x = 0 or lo <= x <= up` has no "
+                    "exact bounded lowering then. Give it a finite .lo and .up."
+                )
+            if lb.size == 1 and var.shape in ((), (1,)):
+                z = m.binary(f"{name}__semi_on")
+                m.subject_to(var >= float(lb[0]) * z, name=f"{name}__semi_lo")
+                m.subject_to(var <= float(ub[0]) * z, name=f"{name}__semi_up")
+            else:
+                z = m.binary(f"{name}__semi_on", shape=var.shape)
+                # Elements whose box already contains 0 need no switch; pin
+                # theirs to 0 so no unconstrained binary is left to branch on.
+                z_ub = np.zeros(var.shape)
+                z_ub.reshape(-1)[need] = 1.0
+                z.ub = z_ub
+                for k in need:
+                    idx = np.unravel_index(k, var.shape)
+                    m.subject_to(var[idx] >= float(lb[k]) * z[idx], name=f"{name}__semi_lo_{k}")
+                    m.subject_to(var[idx] <= float(ub[k]) * z[idx], name=f"{name}__semi_up_{k}")
+            new_lb = lb.copy()
+            new_ub = ub.copy()
+            for k in need:
+                new_lb[k] = min(0.0, lb[k])
+                new_ub[k] = max(0.0, ub[k])
+            shape = var.shape
+            var.lb = new_lb.reshape(shape) if shape else np.asarray(new_lb[0])
+            var.ub = new_ub.reshape(shape) if shape else np.asarray(new_ub[0])
 
     def _domain_shape(self, domain: list[str]) -> tuple:
         if not domain:
@@ -2672,9 +2733,6 @@ class _ModelBuilder:
             # .m (marginal/dual), .prior, .scale are informational — skip
             if b.suffix in ("m", "prior", "scale"):
                 continue
-            val = self._eval_const_expr(b.expr)
-            if val is None:
-                continue
             if b.domain:
                 # indexed bound: apply to specific elements
                 import itertools
@@ -2699,14 +2757,25 @@ class _ModelBuilder:
                             # heterogeneous array blocks round-trip (X-2, #413).
                             index_sets.append([sn])
                 for combo in itertools.product(*index_sets):
+                    env = {}
+                    for dn, elem in zip(b.domain, combo):
+                        env[dn] = elem
                     # Evaluate dollar condition on bound assignment
                     if b.dollar_cond is not None:
-                        env = {}
-                        for dn, elem in zip(b.domain, combo):
-                            env[dn] = elem
                         cond_val = self._eval_dollar_cond(b.dollar_cond, env)
                         if cond_val is not None and cond_val == 0.0:
                             continue
+                    # Evaluate the right-hand side PER ELEMENT, with the domain
+                    # index bound: `x.lo(i) = lo(i)` depends on `i`. Evaluating it
+                    # once with no index made it unevaluable, and the bound was
+                    # then silently dropped (#1613: a semicont `x.lo(i)` lost).
+                    val = self._eval_const_expr_with_env(b.expr, env)
+                    if val is None:
+                        raise GamsParseError(
+                            f"Cannot evaluate bound {b.var_name}.{b.suffix}"
+                            f"({', '.join(map(str, combo))}) to a constant; refusing to "
+                            "drop it silently."
+                        )
                     idx = []
                     for dim, elem in enumerate(combo):
                         idx.append(self._element_index(b.var_name, elem, dim))
@@ -2731,6 +2800,12 @@ class _ModelBuilder:
                         var.ub = new_ub
             else:
                 # scalar bound
+                val = self._eval_const_expr(b.expr)
+                if val is None:
+                    raise GamsParseError(
+                        f"Cannot evaluate bound {b.var_name}.{b.suffix} to a constant; "
+                        "refusing to drop it silently."
+                    )
                 if b.suffix == "lo":
                     var.lb = np.full(var.shape, val) if var.shape else np.asarray(val)
                 elif b.suffix == "up":
