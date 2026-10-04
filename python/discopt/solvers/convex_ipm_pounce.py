@@ -445,27 +445,44 @@ def _verdict_status(
     lb: np.ndarray,
     ub: np.ndarray,
     Q: Optional[np.ndarray],
-) -> SolveStatus:
-    """Map a non-optimal engine status, verifying any certificate it implies."""
+) -> Tuple[SolveStatus, str]:
+    """Map a non-optimal engine status, verifying any certificate it implies.
+
+    Returns ``(status, reason)``; ``reason`` names the engine's own status and,
+    when a verdict is withheld, the check that withheld it (#1618 A-09).
+    """
     lbs, ubs = _sentinel(lb), _sentinel(ub)
     if raw == "primal_infeasible":
         if _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_INFEASIBLE:
-            return SolveStatus.INFEASIBLE
-        return SolveStatus.ERROR
+            return SolveStatus.INFEASIBLE, ""
+        return SolveStatus.ERROR, (
+            "the engine reported 'primal_infeasible', but the exact simplex did not "
+            "prove the constraint system empty, so 'infeasible' is not certified"
+        )
     if raw == "dual_infeasible":
         from discopt.solvers import pounce_option_defaults
 
         ray = _certify_unbounded_ray(c, A, cl, cu, lbs, ubs, pounce_option_defaults(), Q=Q)
-        if ray and _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_FEASIBLE:
-            return SolveStatus.UNBOUNDED
-        return SolveStatus.ERROR
+        if not ray:
+            return SolveStatus.ERROR, (
+                "the engine reported 'dual_infeasible' (objective unbounded), but no "
+                "improving recession ray passed the exact-arithmetic check, so "
+                "'unbounded' is not certified"
+            )
+        if _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_FEASIBLE:
+            return SolveStatus.UNBOUNDED, ""
+        return SolveStatus.ERROR, (
+            "the engine reported 'dual_infeasible' and an improving recession ray was "
+            "verified, but the exact simplex did not exhibit a feasible point, so "
+            "'unbounded' is not certified"
+        )
     if raw == "time_limit":
-        return SolveStatus.TIME_LIMIT
+        return SolveStatus.TIME_LIMIT, ""
     if raw in ("iteration_limit", "optimal_inaccurate"):
         # ``optimal_inaccurate`` met only the engine's relaxed tolerance; it is not
         # reported as ``optimal`` (the matrix route would certify it).
-        return SolveStatus.ITERATION_LIMIT
-    return SolveStatus.ERROR
+        return SolveStatus.ITERATION_LIMIT, f"the engine reported {raw!r}"
+    return SolveStatus.ERROR, f"the engine reported {raw!r}"
 
 
 def _kkt_parts(res: Any, n_ub: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -515,13 +532,14 @@ def solve_lp(
     )
     iters = int(res.iters)
     if raw != "optimal":
-        status = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, None)
+        status, why = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, None)
         return LPResult(
             status=status,
             iterations=iters,
             wall_time=wall,
             ray_verified=True if status == SolveStatus.UNBOUNDED else None,
             solve_report=report,
+            message=why,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)
@@ -584,11 +602,13 @@ def solve_qp(
     )
     iters = int(res.iters)
     if raw != "optimal":
+        status, why = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr)
         return QPResult(
-            status=_verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr),
+            status=status,
             iterations=iters,
             wall_time=wall,
             solve_report=report,
+            message=why,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)

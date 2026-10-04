@@ -249,6 +249,23 @@ def solve_lp(
         "numerical": SolveStatus.ERROR,
     }
     st = status_map.get(status, SolveStatus.ERROR)
+    if status == "numerical" and m > 0:
+        # #1618 A-15: the Rust simplex exits ``numerical`` on some plainly infeasible
+        # LPs (``x0 + x1 <= 1``, ``x0 + x1 >= 3`` over ``x >= 0`` -- one pivot, then
+        # the phase-1 bookkeeping gives up). ``numerical`` is not evidence of
+        # infeasibility, so it is never relabelled on its own: the infeasible label is
+        # attached only when a phase-1 dual bound proves the polyhedron empty
+        # (``phase1_infeasibility_proof`` -- an NS-safe / exact-rational bound, the same
+        # certificate the LP/MILP route accepts). Otherwise the exit stays ``ERROR``.
+        from discopt.solvers.lp_milp_highs import StdForm, phase1_infeasibility_proof
+
+        proved, _why = phase1_infeasibility_proof(
+            StdForm.from_arrays(c_std, a_std, b_vec, lb_std, ub_std),
+            time_limit=time_limit,
+        )
+        if proved:
+            return LPResult(status=SolveStatus.INFEASIBLE)
+        return LPResult(status=st)
     if st == SolveStatus.UNBOUNDED:
         # The simplex's ray is a candidate (see ``LpSolution::ray``); decide it
         # exactly over the same standard form the simplex solved (#1286).
