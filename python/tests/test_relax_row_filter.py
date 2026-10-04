@@ -274,8 +274,8 @@ def test_failure_triggered_never_fires_on_solving_instances(name, monkeypatch):
     #       filter rows for. `alan` is this case -- it emits NO solver_stats at
     #       all, so before this assertion it was passing vacuously.
     #
-    # `algorithm_route is None` means the DEFAULT path, which is case (a); only a
-    # named non-default route can excuse a missing counter.
+    # Since #1614 every route is named, the default B&B path included (case (a));
+    # only the `mip-nlp/oa` route can excuse a missing counter.
     route = r.algorithm_route
     if "row_filter/invocations" in stats:
         assert stats["row_filter/invocations"] == 0, (

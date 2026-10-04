@@ -358,7 +358,11 @@ def estimate_parameters(
     # solve() returns SolveResult (not streaming iterator) by default
     result: dm.SolveResult = solve_out  # type: ignore[assignment]
 
-    if result.status not in ("optimal", "feasible"):
+    # ``local_optimal`` is what a local solver (``solver="pounce"``/``"ipopt"``)
+    # reports at a verified KKT point -- the same kind of answer as this function's
+    # own default local solve, so refusing it made every local-solver call raise
+    # (#1617). Any other status has no point to estimate from.
+    if result.status not in ("optimal", "feasible", "local_optimal"):
         raise ValueError(f"Estimation solve failed with status: {result.status}")
 
     # Extract estimated parameters

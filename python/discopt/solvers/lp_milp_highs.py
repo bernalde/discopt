@@ -29,9 +29,12 @@ lazily so a default MINLP solve never loads it.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import logging
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Optional
@@ -1084,7 +1087,72 @@ def _relax_huge_box(sf: StdForm, huge_lo: np.ndarray, huge_hi: np.ndarray) -> St
     )
 
 
-def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> tuple[Any, str]:
+def _absorb_tiny_entries(sf: StdForm) -> tuple[StdForm, np.ndarray, np.ndarray, int]:
+    """Remove every ``|a_ij| <= SMALL_MATRIX_VALUE`` entry HiGHS would drop, soundly (#1617).
+
+    HiGHS drops such an entry on ``passModel`` and answers ``kWarning``; the model it
+    then solves is a *perturbation* of ``sf``, so neither its infeasible label nor its
+    tree bound would be valid for ``sf``. Instead each dropped term ``a_ij x_j`` is
+    replaced by its interval over the declared column box ``[xl_j, xu_j]``: row ``i``
+    becomes the ranged row ``b_i - hi_i <= sum_{kept} a_ik x_k <= b_i - lo_i``. Every
+    feasible point of ``sf`` satisfies the ranged rows, so the passed model is a
+    *relaxation* of ``sf``: an infeasible label and a dual bound for it hold for ``sf``,
+    and every incumbent is still verified against ``sf`` itself by the caller. A term on
+    a column whose side is open (the ``1e20`` sentinel -- tested on the bound, never on
+    the product, CLAUDE.md) opens that side of the row.
+
+    Returns ``(sf without those entries, row_lower, row_upper, n_dropped)``.
+    """
+    A = sf.A.tocsc()
+    data = A.data
+    tiny = np.abs(data) <= SMALL_MATRIX_VALUE
+    n_drop = int(tiny.sum())
+    b = np.asarray(sf.b, dtype=np.float64)
+    if n_drop == 0:
+        return sf, b.copy(), b.copy(), 0
+    col_of = np.repeat(np.arange(A.shape[1]), np.diff(A.indptr))
+    cols = col_of[tiny]
+    rows = A.indices[tiny]
+    a = data[tiny]
+    xl = np.asarray(sf.xl, dtype=np.float64)[cols]
+    xu = np.asarray(sf.xu, dtype=np.float64)[cols]
+    lo_open = np.where(a > 0, xl <= -INF, xu >= INF)
+    hi_open = np.where(a > 0, xu >= INF, xl <= -INF)
+    with np.errstate(invalid="ignore", over="ignore"):
+        t_lo = np.where(a > 0, a * xl, a * xu)
+        t_hi = np.where(a > 0, a * xu, a * xl)
+    t_lo = np.where(lo_open | (a == 0.0), 0.0, t_lo)
+    t_hi = np.where(hi_open | (a == 0.0), 0.0, t_hi)
+    m = sf.m
+    lo_sum = np.bincount(rows, weights=t_lo, minlength=m)
+    hi_sum = np.bincount(rows, weights=t_hi, minlength=m)
+    lo_inf = np.bincount(rows, weights=(lo_open & (a != 0.0)).astype(np.float64), minlength=m)
+    hi_inf = np.bincount(rows, weights=(hi_open & (a != 0.0)).astype(np.float64), minlength=m)
+    # Outward: the sums' own rounding error is bounded by n*eps*sum|terms|, and the
+    # subtraction from ``b`` adds one more ulp; widen by both, then one ulp more.
+    k = np.bincount(rows, minlength=m).astype(np.float64)
+    mag = np.bincount(rows, weights=np.abs(t_lo) + np.abs(t_hi), minlength=m)
+    err = (k + 4.0) * np.finfo(np.float64).eps * (mag + np.abs(b))
+    row_lower = np.nextafter(b - hi_sum - err, -np.inf)
+    row_upper = np.nextafter(b - lo_sum + err, np.inf)
+    touched = np.bincount(rows, minlength=m) > 0
+    row_lower = np.where(touched, row_lower, b)
+    row_upper = np.where(touched, row_upper, b)
+    row_lower = np.where(hi_inf > 0, -np.inf, row_lower)
+    row_upper = np.where(lo_inf > 0, np.inf, row_upper)
+    keep = ~tiny
+    A2 = sp.csc_matrix((data[keep], (A.indices[keep], col_of[keep])), shape=A.shape)
+    return dataclasses.replace(sf, A=A2), row_lower, row_upper, n_drop
+
+
+def _pass_model(
+    h,
+    highspy,
+    sf: StdForm,
+    integer: bool,
+    offset: float = 0.0,
+    row_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
+) -> tuple[Any, str]:
     """Hand ``sf`` to HiGHS; returns ``(passModel status, reason)``, ``reason`` empty on kOk.
 
     kWarning means HiGHS changed the model on the way in -- it drops every matrix entry
@@ -1111,8 +1179,13 @@ def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> 
     lp.col_cost_ = sf.c
     lp.col_lower_ = _to_highs_inf(sf.xl, highspy)
     lp.col_upper_ = _to_highs_inf(sf.xu, highspy)
-    lp.row_lower_ = sf.b
-    lp.row_upper_ = sf.b
+    if row_bounds is None:
+        lp.row_lower_ = sf.b
+        lp.row_upper_ = sf.b
+    else:
+        # ``_absorb_tiny_entries``'s ranged rows; ``±inf`` is HiGHS's own infinity.
+        lp.row_lower_ = np.where(np.isinf(row_bounds[0]), -highspy.kHighsInf, row_bounds[0])
+        lp.row_upper_ = np.where(np.isinf(row_bounds[1]), highspy.kHighsInf, row_bounds[1])
     lp.offset_ = float(offset)
     lp.sense_ = highspy.ObjSense.kMinimize
     lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
@@ -1157,6 +1230,107 @@ def _ray(getter) -> Optional[np.ndarray]:
     return np.asarray(vals, dtype=np.float64) if has else None
 
 
+#: HiGHS options ``Model.solve(highs_options=...)`` may set (#1620). An allowlist,
+#: not a denylist: HiGHS has hundreds of options, and one this route does not know
+#: about (``solver="pdlp"``, ``solve_relaxation``, ``user_objective_scale``,
+#: ``write_*_to_file``, a new release's additions) must be refused here rather than
+#: trusted to be caught by a downstream certificate check. Every entry changes only
+#: logging or the *search* -- never a tolerance, a limit, a gap, the problem HiGHS
+#: solves, or the process-wide thread scheduler (see :func:`_new_highs`) -- so the
+#: route's certificate means the same thing whatever value is passed. Extending it
+#: is a review decision: add the option with that argument.
+ALLOWED_USER_OPTIONS: frozenset[str] = frozenset(
+    {
+        # logging
+        "output_flag",
+        "log_to_console",
+        "log_file",
+        "log_dev_level",
+        "mip_report_level",
+        # search strategy
+        "presolve",
+        "mip_detect_symmetry",
+        "mip_allow_restart",
+        "mip_heuristic_effort",
+        "mip_heuristic_run_rins",
+        "mip_heuristic_run_rens",
+        "mip_heuristic_run_root_reduced_cost",
+        "mip_heuristic_run_zi_round",
+        "mip_heuristic_run_shifting",
+        "mip_lp_age_limit",
+        "mip_pool_age_limit",
+        "mip_pool_soft_limit",
+        "mip_pscost_minreliable",
+        "simplex_scale_strategy",
+        "simplex_dual_edge_weight_strategy",
+        "simplex_primal_edge_weight_strategy",
+        "simplex_price_strategy",
+    }
+)
+
+#: Why the options a user is most likely to reach for are refused; anything else
+#: outside :data:`ALLOWED_USER_OPTIONS` gets the generic message.
+RESERVED_USER_OPTIONS: dict[str, str] = {
+    "mip_rel_gap": "use Model.solve(gap_tolerance=...)",
+    "mip_abs_gap": "use Model.solve(abs_gap_tolerance=...)",
+    "mip_max_nodes": "use Model.solve(max_nodes=...)",
+    "time_limit": "use Model.solve(time_limit=...)",
+    "presolve_rule_off": "the route pins it (#1634: an unsound presolve rule is disabled)",
+    "run_crossover": "the route's dual certificates need a crossover basis",
+    "small_matrix_value": "the route sets it to pass its standard form exactly",
+    "threads": "HiGHS's scheduler is process-wide; a nonzero value breaks later solves",
+    "random_seed": "the route pins it for reproducible certificates",
+}
+
+_USER_OPTIONS: contextvars.ContextVar[tuple[tuple[str, Any], ...]] = contextvars.ContextVar(
+    "discopt_highs_user_options", default=()
+)
+
+
+def validate_user_options(options: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Check ``Model.solve(highs_options=...)`` and return it as ``(key, value)`` pairs.
+
+    Raises ``TypeError`` for a non-mapping or a non-string key and ``ValueError``
+    for any option not in :data:`ALLOWED_USER_OPTIONS` (with the reason from
+    :data:`RESERVED_USER_OPTIONS` when there is a specific one). A bad *value* for
+    an allowed option raises later, from :func:`_set_options`, when the route
+    builds its HiGHS instance.
+    """
+    if not isinstance(options, Mapping):
+        raise TypeError(
+            "highs_options must be a dict of HiGHS option name -> value, got "
+            f"{type(options).__name__}"
+        )
+    pairs = []
+    for key, val in options.items():
+        if not isinstance(key, str):
+            raise TypeError(f"highs_options keys must be HiGHS option names, got {key!r}")
+        if key not in ALLOWED_USER_OPTIONS:
+            why = RESERVED_USER_OPTIONS.get(
+                key,
+                "only logging and search-strategy options are passed through "
+                f"(allowed: {', '.join(sorted(ALLOWED_USER_OPTIONS))})",
+            )
+            raise ValueError(f"highs_options[{key!r}] cannot be set: {why} (#1620)")
+        pairs.append((key, val))
+    return tuple(pairs)
+
+
+@contextlib.contextmanager
+def user_options(pairs: tuple[tuple[str, Any], ...]) -> Iterator[None]:
+    """Apply validated user HiGHS options to every HiGHS instance built in the scope.
+
+    They are set after the route's base options (so ``output_flag=True`` turns the
+    HiGHS log on) and before each solve's own options, so a route option -- e.g. the
+    #1634 cross-check's ``presolve="off"`` -- always wins over a user one.
+    """
+    token = _USER_OPTIONS.set(tuple(pairs))
+    try:
+        yield
+    finally:
+        _USER_OPTIONS.reset(token)
+
+
 def _new_highs(highspy, opts: list[tuple[str, Any]]):
     h = highspy.Highs()
     # ``threads`` stays at HiGHS's default (0). HiGHS keeps one process-wide scheduler,
@@ -1165,6 +1339,8 @@ def _new_highs(highspy, opts: list[tuple[str, Any]]):
     # code run highspy with default options, so pinning a value here made every later
     # LP/MILP solve in the same process return ``error``.
     _set_options(h, highspy, [("output_flag", False), ("random_seed", 0)])
+    # #1620: ``Model.solve(highs_options=...)``, checked by validate_user_options.
+    _set_options(h, highspy, list(_USER_OPTIONS.get()))
     _set_options(h, highspy, opts)
     return h
 
@@ -1796,7 +1972,7 @@ def _cross_check_presolve(sf: StdForm, out: HighsOutcome, kw: dict[str, Any]) ->
             if claim is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
                 refuted = f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
     if refuted is None or pt is None:
-        return _weaker_bound(out, cross, kw)
+        return _weaker_bound(sf, out, cross, kw)
     logger.warning(
         "HiGHS MILP route: the %s certificate is refuted by a presolve-free HiGHS solve "
         "(%s); reporting the verified point uncertified (#1634)",
@@ -1839,7 +2015,18 @@ def _cross_check_presolve(sf: StdForm, out: HighsOutcome, kw: dict[str, Any]) ->
     )
 
 
-def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) -> HighsOutcome:
+def _gap_closed(obj: float, bound: float, kw: dict[str, Any]) -> bool:
+    """The route's stop rule (HiGHS's ``mip_abs_gap`` OR ``mip_rel_gap``)."""
+    gap = max(0.0, obj - bound)
+    abs_tol = kw.get("abs_gap_tolerance")
+    return gap <= (1e-6 if abs_tol is None else abs_tol) or (
+        gap / max(abs(obj), abs(bound), 1e-10) <= kw["gap_tolerance"]
+    )
+
+
+def _weaker_bound(
+    sf: StdForm, out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]
+) -> HighsOutcome:
     """#1634: a certificate stands only if the presolve-free solve AGREES with it.
 
     Agreement means the cross-solve reached the same certified verdict (``infeasible``
@@ -1861,7 +2048,11 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
     instances, so ``min`` of the two bounds is valid whenever either one is -- the
     certificate then rests on the claim of whichever configuration is right. The gap is
     re-tested against the route's own stop rule; a gap the weaker bound reopens is
-    declined, not certified.
+    declined, not certified -- unless the presolve-free solve re-run at a 100x tighter
+    feasibility tolerance confirms the claim (#1640, :func:`_tight_cross_bound`): the
+    cross bound sits below the optimum by about ``mip_feasibility_tolerance`` times a
+    row coefficient, the same order as the 1e-6 absolute gap, so at 1e-6 it can reopen
+    a gap on a correct certificate.
     """
     if not (cross.gap_certified and cross.status == out.status):
         out.stats["milp/presolve_cross_check_no_verdict"] = 1.0
@@ -1876,16 +2067,15 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
     out.stats["milp/presolve_cross_bound"] = float(cross.bound)
     if cross.bound >= out.bound:
         return out
+    claim = float(out.bound)
     out.bound = min(cross.bound, out.objective) if out.objective is not None else cross.bound
     out.labels["milp/bound_provenance"] = "min(presolved, presolve-free)"
     out.stats["milp/presolve_cross_bound_lowered"] = 1.0
     if out.objective is None:
         return out
-    gap = max(0.0, out.objective - out.bound)
-    abs_tol = kw.get("abs_gap_tolerance")
-    closed = gap <= (1e-6 if abs_tol is None else abs_tol) or (
-        gap / max(abs(out.objective), abs(out.bound), 1e-10) <= kw["gap_tolerance"]
-    )
+    closed = _gap_closed(out.objective, out.bound, kw)
+    if not closed:
+        closed = _tight_cross_bound(sf, out, cross, kw, claim)
     if not closed:
         out.gap_certified = False
         out.status = "feasible"
@@ -1895,6 +2085,97 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
             "result is not certified (#1634)"
         )
     return out
+
+
+#: #1640: ``mip_feasibility_tolerance`` of the re-run presolve-free cross-solve. Its
+#: bound is HiGHS's tree bound over node LPs solved to ``mip_feasibility_tolerance``,
+#: so it sits below the true optimum by about that tolerance times the row scale --
+#: the same order as the route's 1e-6 absolute gap. Measured on the #1494 piecewise
+#: ``log``/max case (offset 1e4, h = 1): the cross bound is -1.5e-6 at 1e-6 and
+#: -1.5e-8 at 1e-8, while ``mip_abs_gap = mip_rel_gap = 0`` leaves it unchanged.
+CROSS_TIGHT_FEAS_TOL = 1e-8
+
+#: ``mip_feasibility_tolerance`` of the first cross-solve (HiGHS's default, which
+#: :func:`_solve_milp_std` keeps).
+CROSS_FEAS_TOL = 1e-6
+
+#: How far above the cross bound the tight bound may land and still count as the
+#: same answer with less tolerance error: ``factor * CROSS_FEAS_TOL * max|c| * max|A|``
+#: (each floored at 1). Measured on the #1640 case: shift 1.5e-6 against a slack of
+#: 1e-4 x the coefficient scale.
+CROSS_TIGHT_SHIFT_FACTOR = 100.0
+
+
+def _tight_cross_bound(
+    sf: StdForm, out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any], claim: float
+) -> bool:
+    """#1640: re-run the presolve-free cross-solve at a tighter feasibility tolerance
+    when its bound -- and only its bound -- reopened the route's gap.
+
+    The cross bound being weaker than the primary's by about ``mip_feasibility_tolerance``
+    times a row coefficient is what that tolerance does to a tree bound, not evidence of
+    a false primary certificate; but which of the two it is cannot be told from the
+    numbers. So the question is asked again with the tolerance 100x tighter, and the
+    tighter solve must earn the confirmation the same way the first one had to: a
+    certified ``optimal`` of its own, no verified point refuting the claim (the
+    #1509/#1621 falsifier), and ``min(primary bound, tight bound)`` closing the gap
+    under the route's stop rule. The published bound is that minimum, so it is
+    valid whenever the primary or the tight solve is right; because the cross bound
+    is dropped, the tight bound must also land within a tolerance-scaled slack of it
+    (:data:`CROSS_TIGHT_SHIFT_FACTOR`) -- a larger jump is two certified solves
+    disagreeing, not tolerance error. Anything else --
+    no budget, no verdict, a refutation, a gap that stays open -- leaves the
+    certificate declined, as before. ``claim`` is the primary's own certified bound. On
+    success ``out.bound`` is replaced and True is returned.
+    """
+    obj = out.objective
+    if obj is None:
+        return False
+    kw = dict(kw)
+    if kw["time_limit"] is not None:
+        # ``kw`` already had the primary's wall time taken off by the caller
+        # (:func:`_cross_check_presolve`); only the cross-solve's is left to charge.
+        kw["time_limit"] = float(kw["time_limit"]) - float(cross.wall_time)
+        if kw["time_limit"] <= 0.0:
+            out.stats["milp/presolve_cross_tight_skipped"] = 1.0
+            return False
+    tight = _solve_milp_scaled(sf, presolve=False, feasibility_tolerance=CROSS_TIGHT_FEAS_TOL, **kw)
+    out.stats["milp/presolve_cross_tight_ran"] = 1.0
+    out.stats["milp/presolve_cross_tight_time"] = float(tight.wall_time)
+    if not (tight.gap_certified and tight.status == "optimal" and tight.bound is not None):
+        out.labels["milp/presolve_cross_tight_status"] = tight.status
+        return False
+    out.stats["milp/presolve_cross_tight_bound"] = float(tight.bound)
+    pt = _verified_mip_point(sf, tight.x)
+    if pt is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
+        out.labels["milp/presolve_cross_tight_refuted"] = (
+            f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
+        )
+        return False
+    # The confirmation drops the cross bound, so the tight solve must explain it as a
+    # tolerance artefact rather than overrule it: a cross bound below the tight one by
+    # more than the tolerance-scaled slack is a disagreement between two certified
+    # solves, and the decline stands (review of #1649).
+    if cross.bound is None:  # _weaker_bound only calls with a cross bound
+        return False
+    shift = float(tight.bound) - float(cross.bound)
+    c_max = float(np.max(np.abs(sf.c))) if sf.c.size else 0.0
+    a_max = float(np.max(np.abs(sf.A.data))) if sf.A.nnz else 0.0
+    slack = CROSS_TIGHT_SHIFT_FACTOR * CROSS_FEAS_TOL * max(1.0, c_max) * max(1.0, a_max)
+    out.stats["milp/presolve_cross_tight_shift"] = shift
+    if shift > slack:
+        out.labels["milp/presolve_cross_tight_disagrees"] = (
+            f"tight bound {float(tight.bound):.12g} is {shift:.3g} above the cross bound "
+            f"{float(cross.bound):.12g}, more than the tolerance slack {slack:.3g}"
+        )
+        return False
+    bound = min(claim, float(tight.bound), obj)
+    if not _gap_closed(obj, bound, kw):
+        return False
+    out.bound = bound
+    out.labels["milp/bound_provenance"] = "min(presolved, presolve-free tight)"
+    out.stats["milp/presolve_cross_tight_confirmed"] = 1.0
+    return True
 
 
 def _solve_milp_std(
@@ -1908,11 +2189,14 @@ def _solve_milp_std(
     n_struct: Optional[int] = None,
     root_check: bool = True,
     presolve: bool = True,
+    feasibility_tolerance: float = 1e-6,
 ) -> HighsOutcome:
     """Solve the MILP ``sf`` under the §3.2 contract.
 
     ``presolve=False`` switches HiGHS's presolve off; it is the second solve of the
     #1634 cross-check (:func:`_cross_check_presolve`), not a user option.
+    ``feasibility_tolerance`` is HiGHS's ``mip_feasibility_tolerance``; only the #1640
+    tightened cross-solve (:func:`_weaker_bound`) changes it.
 
     ``abs_gap_tolerance`` is ``Model.solve``'s absolute convergence tolerance
     (#1243), mapped onto HiGHS's ``mip_abs_gap``. The mapping is faithful:
@@ -1984,7 +2268,7 @@ def _solve_milp_std(
         ("mip_rel_gap", float(gap_tolerance)),
         ("mip_abs_gap", 1e-6 if abs_gap_tolerance is None else float(abs_gap_tolerance)),
         ("mip_max_nodes", int(min(max(int(max_nodes), 0), _MAX_NODES_CAP))),
-        ("mip_feasibility_tolerance", 1e-6),
+        ("mip_feasibility_tolerance", float(feasibility_tolerance)),
         ("primal_feasibility_tolerance", 1e-7),
         # #1634: HiGHS's parallel-column presolve fixes integers on an absolute
         # cost-tie test that bad coefficient ratios defeat; see the constant.
@@ -2008,8 +2292,19 @@ def _solve_milp_std(
         stats["milp/huge_box_relaxed"] = 1.0
     # HiGHS gets ``obj_const`` so ``mip_rel_gap`` is measured on the objective this
     # route publishes (#1536); both values read back below therefore include it.
+    # #1617: an entry HiGHS would drop on the way in is absorbed into its row's range
+    # instead -- a relaxation of ``sf``, so HiGHS's infeasible label and tree bound stay
+    # valid for ``sf`` (see :func:`_absorb_tiny_entries`).
+    sf_pass, row_lo, row_hi, n_tiny = _absorb_tiny_entries(_relax_huge_box(sf, huge_lo, huge_hi))
+    if n_tiny:
+        stats["milp/tiny_entries_absorbed"] = float(n_tiny)
     pass_st, pass_why = _pass_model(
-        h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True, offset=sf.obj_const
+        h,
+        highspy,
+        sf_pass,
+        integer=True,
+        offset=sf.obj_const,
+        row_bounds=(row_lo, row_hi) if n_tiny else None,
     )
     if pass_why:
         # No MILP certificate is re-derivable from ``sf`` (HiGHS's infeasible label and

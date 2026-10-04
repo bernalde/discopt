@@ -177,6 +177,7 @@ def _refine_sign(
 # curvature. This preserves the soundness invariant exactly.
 
 _STRUCT_CACHE_KEY = "__struct_cache__"
+_ENTROPY_KEEPALIVE_KEY = "__entropy_keepalive__"
 _STRUCT_HASH_KEY = "__struct_hash_cache__"
 # Set in the classification ``cache`` while walking the children of a maximal
 # polynomial subtree, so descendant polynomial nodes skip the (redundant) whole-
@@ -907,6 +908,32 @@ def _classify_product(
         if special == Curvature.CONVEX:
             return ExprInfo(Curvature.CONVEX, prod_sign)
 
+        # Entropy-family products (#1616 A-01): ``c*x*log(x)`` IS ``c*entropy(x)``
+        # and ``c*x*log(x/y)`` IS ``c*centropy(x, y)``. The solver rewrites these
+        # before it classifies (``canonicalize_entropy``); recognising them here,
+        # with the same strict matchers and domain guards, makes every caller of
+        # the classifier -- ``classify_model`` included -- reach the verdict the
+        # solve uses. The intrinsic is classified by its own atom rules, so no
+        # new curvature claim is introduced.
+        from discopt._relax.factorable_reform import (
+            _match_centropy_product,
+            _match_entropy_affine_product,
+            _match_entropy_product,
+        )
+
+        matched = _match_entropy_product(expr, model)
+        if matched is None:
+            matched = _match_centropy_product(expr, model)
+        if matched is None:
+            matched = _match_entropy_affine_product(expr, model)
+        if matched is not None:
+            # Keep the rewritten nodes alive for the cache's lifetime: the cache
+            # is keyed by ``id()``, and a freed temporary's id can be reused.
+            cache.setdefault(_ENTROPY_KEEPALIVE_KEY, []).append(matched)
+            info = classify_expr_info(matched, model, cache)
+            if info.curvature != Curvature.UNKNOWN:
+                return ExprInfo(info.curvature, prod_sign)
+
     # Bilinear / general product: curvature is UNKNOWN even when both
     # factors share a sign (consider x*y on the positive orthant, whose
     # Hessian has eigenvalues ±1). Sign can still be tightened.
@@ -1010,6 +1037,20 @@ def _classify_power(
     if np.isclose(n, 1.0):
         return base
 
+    # ``base ** 0.5`` IS ``sqrt(base)`` (#1616 B-20b): give the power spelling the
+    # same structural recognisers as the atom -- ``(x**2 + y**2)**0.5`` is the
+    # Euclidean norm, CONVEX, which the generic fractional-power rule below (an
+    # affine base only) cannot see. Exact ``== 0.5`` only: a nearby exponent is a
+    # different function and gets no borrowed verdict.
+    if n == 0.5 and model is not None:
+        from .patterns import classify_sqrt_pattern
+
+        special = classify_sqrt_pattern(expr.left, model, classify_expr, cache)
+        if special == Curvature.CONVEX:
+            return ExprInfo(Curvature.CONVEX, Sign.NONNEG)
+        if special == Curvature.CONCAVE:
+            return ExprInfo(Curvature.CONCAVE, Sign.POS if is_pos(base.sign) else Sign.NONNEG)
+
     # x^2 is convex on all of R for an affine base; sign is NONNEG.
     if np.isclose(n, 2.0):
         if base.curvature == Curvature.AFFINE:
@@ -1052,15 +1093,22 @@ def _classify_power(
         return ExprInfo(Curvature.UNKNOWN, Sign.UNKNOWN)
 
     # Fractional 0 < n < 1 on nonneg domain: concave; result ≥ 0.
+    # DCP composition (#1616): t**n is nondecreasing on t >= 0, so a concave
+    # nonneg base stays concave, the same rule ``sqrt`` already applies.
     if 0 < n < 1:
-        if base.curvature == Curvature.AFFINE and is_nonneg(base.sign):
-            return ExprInfo(Curvature.CONCAVE, Sign.NONNEG)
+        if is_nonneg(base.sign):
+            curv = compose(Curvature.CONCAVE, Monotonicity.NONDEC, base.curvature)
+            if curv == Curvature.CONCAVE:
+                return ExprInfo(Curvature.CONCAVE, Sign.NONNEG)
         return ExprInfo(Curvature.UNKNOWN, Sign.UNKNOWN)
 
-    # n > 1, non-integer, on nonneg domain: convex; result ≥ 0.
+    # n > 1, non-integer, on nonneg domain: convex; result ≥ 0. t**n is convex
+    # and nondecreasing on t >= 0, so a convex nonneg base stays convex (DCP).
     if n > 1:
-        if base.curvature == Curvature.AFFINE and is_nonneg(base.sign):
-            return ExprInfo(Curvature.CONVEX, Sign.NONNEG)
+        if is_nonneg(base.sign):
+            curv = compose(Curvature.CONVEX, Monotonicity.NONDEC, base.curvature)
+            if curv == Curvature.CONVEX:
+                return ExprInfo(Curvature.CONVEX, Sign.NONNEG)
         return ExprInfo(Curvature.UNKNOWN, Sign.UNKNOWN)
 
     # n < 0 non-integer on strictly positive domain: convex.

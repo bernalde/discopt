@@ -111,44 +111,102 @@ class IndefiniteQPError(ValueError):
     """
 
 
-#: Largest number of quadratically-active variables decided by the exact
-#: rational test in :func:`certify_psd`. Rational entries grow during elimination,
-#: so the cost is steep: measured on dense random ``A'A``, 0.16 s at n=30, 3.3 s at
-#: 60, 228 s at 150. Above it the eigenvalue test with a roundoff margin decides,
-#: which may decline a singular PSD matrix (sound: the QP then gets a local answer,
-#: never a false ``optimal``).
+#: Up to this many quadratically-active variables :func:`certify_psd` decides PSD
+#: by the exact rational test with no budget. Rational entries grow during
+#: elimination of a dense full-rank matrix, so the cost is steep: measured on dense
+#: random ``A'A``, 0.16 s at n=30, 3.3 s at 60, 228 s at 150.
 _EXACT_PSD_MAX_N = 30
 
+#: Above :data:`_EXACT_PSD_MAX_N`, a Hessian with at most this many nonzeros per
+#: active row (on average) is still decided exactly, by the sparse elimination
+#: under :data:`_EXACT_PSD_UPDATE_BUDGET` (#1616). These are the matrices the
+#: eigenvalue margin cannot prove: a singular PSD Hessian such as a graph Laplacian
+#: (``sum (x[i+1]-x[i])**2``, ``lambda_min = 0`` exactly) fails any margin
+#: ``lambda_min >= K*eps*||Q||``, and such Hessians are typically sparse with little
+#: fill. Denser matrices go straight to the eigenvalue test, as before.
+_EXACT_PSD_SPARSE_ROW_NNZ = 8
+
+#: Deterministic work budget (exact rational multiply-subtract updates) for the
+#: sparse exact elimination above :data:`_EXACT_PSD_MAX_N`. An operation count,
+#: never a wall-clock limit, so the route a model takes does not depend on machine
+#: load. Exhausting it means "not decided exactly", never "PSD".
+_EXACT_PSD_UPDATE_BUDGET = 500_000
+
+#: Bit-length cap on a rational entry in the budgeted elimination; past it the
+#: elimination stops as undecided (entry growth is what makes elimination slow).
+_EXACT_PSD_MAX_BITS = 2048
+
 #: Above this many quadratically-active variables the dense eigenvalue test is not
-#: run at all and the Hessian counts as unproved (the QP goes to the NLP arm).
+#: run at all; only the sparse exact elimination can prove such a Hessian PSD.
 _EIG_PSD_MAX_N = 4000
 
 
-def _exact_psd(Q: np.ndarray) -> bool:
-    """Decide ``Q`` PSD exactly, by symmetric elimination over the rationals.
+def _exact_psd(Q: np.ndarray, budget: Optional[int] = None) -> Optional[bool]:
+    """Decide ``Q`` PSD exactly, by sparse symmetric elimination over the rationals.
 
     Every float is a dyadic rational, so ``Fraction`` represents ``Q`` exactly and
     the verdict carries no tolerance. A symmetric matrix is PSD iff elimination on a
     positive pivot leaves a PSD Schur complement; a negative diagonal, or a zero
-    diagonal whose row is not zero, refutes it.
+    diagonal whose row is not zero, refutes it. Any positive diagonal is a valid
+    pivot (a symmetric permutation preserves PSD-ness), so the pivot is the row with
+    the fewest nonzeros (minimum degree, ties by index -- deterministic), which
+    keeps sparse elimination sparse.
+
+    Returns ``True``/``False`` when decided. With a ``budget`` (exact updates), also
+    returns ``None`` -- undecided -- once the budget or the
+    :data:`_EXACT_PSD_MAX_BITS` entry size is exhausted. ``budget=None`` is the
+    unbounded exact test.
     """
+    import heapq
     from fractions import Fraction
 
-    A = [[Fraction(float(v)) for v in row] for row in Q]
-    while A:
-        n = len(A)
-        if any(A[i][i] < 0 for i in range(n)):
-            return False
-        for i in range(n):
-            if A[i][i] == 0 and any(A[i][j] != 0 for j in range(n)):
+    n = Q.shape[0]
+    rows: dict[int, dict[int, Fraction]] = {i: {} for i in range(n)}
+    ii, jj = np.nonzero(Q)
+    for i, j in zip(ii.tolist(), jj.tolist()):
+        rows[i][j] = Fraction(float(Q[i, j]))
+
+    def refuted(i: int) -> bool:
+        r = rows[i]
+        d = r.get(i, 0)
+        return d < 0 or (d == 0 and bool(r))
+
+    if any(refuted(i) for i in rows):
+        return False
+    heap = [(len(r), i) for i, r in rows.items() if r]
+    heapq.heapify(heap)
+    ops = 0
+    while heap:
+        deg, p = heapq.heappop(heap)
+        if p not in rows or len(rows[p]) != deg:
+            continue  # stale entry
+        prow = rows.pop(p)
+        piv = prow.pop(p)
+        nbrs = list(prow.items())
+        for i, a_ip in nbrs:
+            ri = rows[i]
+            del ri[p]
+            f = a_ip / piv
+            for j, a_pj in nbrs:
+                v = ri.get(j, 0) - f * a_pj
+                if v == 0:
+                    ri.pop(j, None)
+                    continue
+                if budget is not None and (
+                    v.numerator.bit_length() + v.denominator.bit_length() > _EXACT_PSD_MAX_BITS
+                ):
+                    return None
+                ri[j] = v
+            ops += len(nbrs)
+            if budget is not None and ops > budget:
+                return None
+        for i, _ in nbrs:
+            if refuted(i):
                 return False
-        keep = [i for i in range(n) if A[i][i] != 0]
-        if not keep:
-            return True
-        A = [[A[i][j] for j in keep] for i in keep]
-        p = A[0][0]
-        row = A[0]
-        A = [[A[i][j] - row[i] * row[j] / p for j in range(1, len(A))] for i in range(1, len(A))]
+            if rows[i]:
+                heapq.heappush(heap, (len(rows[i]), i))
+            else:
+                del rows[i]
     return True
 
 
@@ -163,7 +221,11 @@ def certify_psd(Q: np.ndarray) -> bool:
 
     Rows and columns that are identically zero (variables appearing only linearly)
     are dropped first. Up to :data:`_EXACT_PSD_MAX_N` remaining variables the test
-    is exact (:func:`_exact_psd`). Beyond that, the computed minimum eigenvalue must
+    is exact (:func:`_exact_psd`). Beyond that, a sparse Hessian (at most
+    :data:`_EXACT_PSD_SPARSE_ROW_NNZ` nonzeros per row on average) is still decided
+    exactly under a deterministic work budget, at any size (#1616) -- this proves
+    singular PSD Hessians (graph Laplacians) that no floating-point margin can.
+    Otherwise, or when that budget runs out, the computed minimum eigenvalue must
     clear the scale-carrying roundoff margin ``K * eps * ||Q||_2`` the repo already
     uses for this purpose (``solver._CONVEX_OBJ_PSD_EIG_ROUNDOFF_K``, #1397); a
     matrix that does not is treated as unproved, never as PSD.
@@ -176,9 +238,14 @@ def certify_psd(Q: np.ndarray) -> bool:
     S = S[np.ix_(active, active)]
     if S.size == 0:
         return True
-    if S.shape[0] <= _EXACT_PSD_MAX_N:
-        return _exact_psd(S)
-    if S.shape[0] > _EIG_PSD_MAX_N:
+    n = S.shape[0]
+    if n <= _EXACT_PSD_MAX_N:
+        return bool(_exact_psd(S))
+    if np.count_nonzero(S) <= _EXACT_PSD_SPARSE_ROW_NNZ * n:
+        exact = _exact_psd(S, budget=_EXACT_PSD_UPDATE_BUDGET)
+        if exact is not None:
+            return exact
+    if n > _EIG_PSD_MAX_N:
         return False
     from discopt.solver import _CONVEX_OBJ_PSD_EIG_ROUNDOFF_K
 
@@ -466,27 +533,44 @@ def _verdict_status(
     lb: np.ndarray,
     ub: np.ndarray,
     Q: Optional[np.ndarray],
-) -> SolveStatus:
-    """Map a non-optimal engine status, verifying any certificate it implies."""
+) -> Tuple[SolveStatus, str]:
+    """Map a non-optimal engine status, verifying any certificate it implies.
+
+    Returns ``(status, reason)``; ``reason`` names the engine's own status and,
+    when a verdict is withheld, the check that withheld it (#1618 A-09).
+    """
     lbs, ubs = _sentinel(lb), _sentinel(ub)
     if raw == "primal_infeasible":
         if _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_INFEASIBLE:
-            return SolveStatus.INFEASIBLE
-        return SolveStatus.ERROR
+            return SolveStatus.INFEASIBLE, ""
+        return SolveStatus.ERROR, (
+            "the engine reported 'primal_infeasible', but the exact simplex did not "
+            "prove the constraint system empty, so 'infeasible' is not certified"
+        )
     if raw == "dual_infeasible":
         from discopt.solvers import pounce_option_defaults
 
         ray = _certify_unbounded_ray(c, A, cl, cu, lbs, ubs, pounce_option_defaults(), Q=Q)
-        if ray and _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_FEASIBLE:
-            return SolveStatus.UNBOUNDED
-        return SolveStatus.ERROR
+        if not ray:
+            return SolveStatus.ERROR, (
+                "the engine reported 'dual_infeasible' (objective unbounded), but no "
+                "improving recession ray passed the exact-arithmetic check, so "
+                "'unbounded' is not certified"
+            )
+        if _simplex_feasibility_verdict(A, cl, cu, lbs, ubs) == PHASE1_FEASIBLE:
+            return SolveStatus.UNBOUNDED, ""
+        return SolveStatus.ERROR, (
+            "the engine reported 'dual_infeasible' and an improving recession ray was "
+            "verified, but the exact simplex did not exhibit a feasible point, so "
+            "'unbounded' is not certified"
+        )
     if raw == "time_limit":
-        return SolveStatus.TIME_LIMIT
+        return SolveStatus.TIME_LIMIT, ""
     if raw in ("iteration_limit", "optimal_inaccurate"):
         # ``optimal_inaccurate`` met only the engine's relaxed tolerance; it is not
         # reported as ``optimal`` (the matrix route would certify it).
-        return SolveStatus.ITERATION_LIMIT
-    return SolveStatus.ERROR
+        return SolveStatus.ITERATION_LIMIT, f"the engine reported {raw!r}"
+    return SolveStatus.ERROR, f"the engine reported {raw!r}"
 
 
 def _kkt_parts(res: Any, n_ub: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -537,13 +621,14 @@ def solve_lp(
     iters = int(res.iters)
     if raw != "optimal":
         assert A is not None and cl is not None and cu is not None
-        status = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, None)
+        status, why = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, None)
         return LPResult(
             status=status,
             iterations=iters,
             wall_time=wall,
             ray_verified=True if status == SolveStatus.UNBOUNDED else None,
             solve_report=report,
+            message=why,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)
@@ -607,11 +692,13 @@ def solve_qp(
     iters = int(res.iters)
     if raw != "optimal":
         assert A is not None and cl is not None and cu is not None
+        status, why = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr)
         return QPResult(
-            status=_verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr),
+            status=status,
             iterations=iters,
             wall_time=wall,
             solve_report=report,
+            message=why,
         )
     n_ub = 0 if A_ub is None else int(A_ub.shape[0])
     dual, rc = _kkt_parts(res, n_ub)

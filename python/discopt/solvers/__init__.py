@@ -87,6 +87,10 @@ class LPResult:
     #: (#1534), or ``None`` when it was not requested or the backend is not
     #: POUNCE. See :mod:`discopt.solvers._pounce_report` for its contents.
     solve_report: Optional[dict] = None
+    #: Why a non-optimal exit is what it is, in words (#1618 A-09): which status
+    #: the engine itself reported and which verification withheld the verdict it
+    #: implied. ``""`` when the backend records none.
+    message: str = ""
 
 
 @dataclass
@@ -149,6 +153,10 @@ class QPResult:
     #: (#1534), or ``None`` when it was not requested or the backend is not
     #: POUNCE. See :mod:`discopt.solvers._pounce_report` for its contents.
     solve_report: Optional[dict] = None
+    #: Why a non-optimal exit is what it is, in words (#1618 A-09): which status
+    #: the engine itself reported and which verification withheld the verdict it
+    #: implied. ``""`` when the backend records none.
+    message: str = ""
 
 
 @dataclass

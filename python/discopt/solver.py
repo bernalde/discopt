@@ -9,6 +9,7 @@ Connects:
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -1064,6 +1065,7 @@ def _native_kernel_feature_safe(
     incumbent_callback,
     node_callback,
     kwargs,
+    search_levers=(),
 ) -> bool:
     """Whether the native spatial kernel may take over this solve (#789).
 
@@ -1101,9 +1103,49 @@ def _native_kernel_feature_safe(
     # An explicit per-solve tuning object may enable/disable levers whose
     # solver_stats a caller inspects (e.g. cut-inherit pool stats); the kernel
     # emits none of those, so route explicit-tuning solves to the Python engine.
-    if kwargs.get("tuning") is not None:
+    # #1615 D-03: ``_scoped_tuning`` pops ``tuning`` out of ``kwargs`` before the
+    # solve body runs, so the ``kwargs`` test alone was dead; read the scope flag.
+    if kwargs.get("tuning") is not None or _EXPLICIT_TUNING.get():
+        return False
+    # #1615 D-01/D-02/D-08/D-13: search levers the kernel does not read. The kernel
+    # runs its own fixed best-first search over its own McCormick relaxation with
+    # its own root presolve, so a caller who sets any of these away from its
+    # default would otherwise get the kernel's search with the option silently
+    # ignored. Route to the Python engine, which honours them.
+    if search_levers:
         return False
     return True
+
+
+def _native_kernel_ignored_levers(
+    *,
+    strategy,
+    rlt,
+    partitions,
+    presolve,
+    in_tree_presolve_stride,
+    kwargs,
+) -> list[str]:
+    """Names of explicitly-set search options the native kernel would ignore (#1615).
+
+    Each is compared against its ``solve_model`` default: the default *is* what the
+    kernel does (or is the "let the solver decide" value), so only a departure from
+    it is a request the kernel cannot honour.
+    """
+    levers = []
+    if strategy != "best_first":
+        levers.append("strategy")
+    if not (isinstance(rlt, str) and rlt == "auto"):
+        levers.append("rlt")
+    if partitions:
+        levers.append("partitions")
+    if not presolve:
+        levers.append("presolve")
+    if in_tree_presolve_stride != 1:
+        levers.append("in_tree_presolve_stride")
+    if kwargs.get("obbt_at_root", True) is False:
+        levers.append("obbt_at_root")
+    return levers
 
 
 def _root_lp_probe_tight_enabled() -> bool:
@@ -6811,6 +6853,39 @@ def _warn_abs_gap_not_loosened(abs_gap_tolerance: Optional[float], gap_tolerance
     )
 
 
+#: ``solve_model``'s ``gap_tolerance`` default; a larger value is an explicit request
+#: to stop earlier on the relative gap.
+_DEFAULT_REL_GAP_TOL = 1e-4
+
+
+def _warn_kernel_gap_tolerance_absolute(gap_tolerance: float) -> None:
+    """Say so when the native kernel did not honour a LOOSER relative gap (#1615 D-12).
+
+    The kernel fathoms only when ``bound >= incumbent - gap_tolerance`` (absolute)
+    AND the abs-or-relative test holds, so a relative ``gap_tolerance`` above the
+    default never stops it early the way the documented relative criterion -- and
+    the Python engine -- would (Haverly 3: 13 nodes at 0.2 against a root gap of
+    6.7%). Giving the kernel a relative arm is a certificate-semantics change for
+    every kernel solve and needs its own panel, so this declares the drop rather
+    than changing it. Tightening below the default is honoured (the absolute arm
+    is then the stricter one) and is not reported.
+    """
+    if float(gap_tolerance) <= _DEFAULT_REL_GAP_TOL:
+        return
+    import warnings
+
+    warnings.warn(
+        f"The native spatial kernel applied gap_tolerance={gap_tolerance!r} as an "
+        "ABSOLUTE tolerance (it stops only when bound and incumbent are within "
+        f"{gap_tolerance!r} in objective units), not as the relative gap it is "
+        "documented as, so the looser relative tolerance did not stop the search "
+        "early. Set DISCOPT_NATIVE_SPATIAL_KERNEL=0 to run the Python engine, which "
+        "applies gap_tolerance relatively.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
     """The absolute gap tolerance a solve runs at, validated.
 
@@ -8079,6 +8154,93 @@ def _convex_minlp_auto_route(model: Model) -> tuple[Optional[str], str, dict[str
     )
 
 
+def _convex_kernel_defers_to_route_enabled() -> bool:
+    """``DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE`` opt-out (default-ON, #1624).
+
+    ``Model.solve`` runs the native convex kernel *before* ``solve_model``, with
+    ``min(time_limit, DISCOPT_CONVEX_KERNEL_BUDGET)`` -- the whole budget for any
+    ``time_limit <= 120``. On a model the #1059 convex-MINLP router would divert,
+    a kernel that cannot certify therefore leaves ``solve_model`` ~0 s; the
+    router's convexity proof then hits an expired deadline and the route never
+    fires. On MINLPLib ``syn``/``rsyn`` that left 30 of 51 instances with no
+    incumbent at all, where the route finds one on every instance.
+
+    With this on, the kernel stands aside for any model the router would divert
+    (see :func:`_convex_route_preempts_kernel`); models the router declines keep
+    the kernel attempt exactly as before. ``=0`` restores the old order.
+    Graduated on introduction on the #1624 panel (see the PR), which measured the
+    routed, kernel-eligible models flag-ON vs flag-OFF.
+    """
+    return os.environ.get("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "1") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def _convex_route_preempts_kernel(
+    model: Model, option_values: Mapping[str, Any], time_limit: Optional[float] = None
+) -> Optional[str]:
+    """The route reason when ``solve_model`` would divert ``model`` (#1624), else None.
+
+    ``option_values`` are the caller's options as ``Model.solve`` received them;
+    any option the MIP-NLP family would drop makes ``solve_model`` refuse the
+    route, so it refuses the deferral too and the kernel runs as before.
+
+    The router is the same function ``solve_model`` consults. It runs here on the
+    declared model, before ``solve_model``'s declared-bound tightening; a verdict
+    that differs there costs the kernel attempt, never soundness, because the
+    kernel's result is only ever used when certified.
+
+    A raise inside the router is a defect, not a verdict: it is logged loudly and
+    the kernel runs (the pre-#1624 order), rather than skipping the kernel on the
+    strength of a check that did not complete.
+
+    ``time_limit`` is the caller's. The router's convexity classification is held
+    to the budget ``solve_model`` would give it (``min(max(0.2*T, 0.5), 20)`` s and
+    the ``T`` deadline), so the probe cannot overrun ``time_limit`` on its default
+    15 s cap nor prove a verdict ``solve_model``'s own, shorter classification
+    could not reach (review of #1650). The model's budget, deadline and
+    classification memo are restored, so the probe leaves no trace on what follows.
+    """
+    if not _convex_kernel_defers_to_route_enabled():
+        return None
+    if _mip_nlp_ignored_options(option_values):
+        return None
+    saved = {
+        a: getattr(model, a, _PROBE_UNSET)
+        for a in (
+            "_convexity_time_budget",
+            "_solve_deadline",
+            # A classification abandoned under the probe's clamp is memoized as
+            # convexity-unknown; it must not outlive the probe.
+            "_convexity_classification_cache",
+        )
+    }
+    if time_limit is not None:
+        model._convexity_time_budget = min(max(0.2 * float(time_limit), 0.5), 20.0)
+        model._solve_deadline = time.perf_counter() + float(time_limit)
+    try:
+        method, reason, _opts = _convex_minlp_auto_route(model)
+    except Exception as exc:  # noqa: BLE001 - logged; falls back to the old order
+        _warn_fallback_once(
+            "convex kernel: route pre-check", exc, "running the convex kernel first"
+        )
+        return None
+    finally:
+        for a, v in saved.items():
+            if v is _PROBE_UNSET:
+                if hasattr(model, a):
+                    delattr(model, a)
+            else:
+                setattr(model, a, v)
+    return reason if method is not None else None
+
+
+_PROBE_UNSET = object()
+
+
 #: Fraction of the caller's time limit at which the #1059 auto-route is judged.
 #: Under the #1066 guard (:class:`_RouteProgressGuard`) this is the *checkpoint*
 #: -- the route is untouched before it and must show progress after it. With
@@ -8657,12 +8819,32 @@ def _merge_route_and_fallback(route, fallback, is_maximize: bool):
     # better answer, and trading a proof for it would be exactly the kind of
     # silent certificate loss the fallback exists to prevent.
     if route_wins and _gap_is_closed(fallback) and not _gap_is_closed(route):
-        logger.warning(
-            "#1059 route objective %.10g appears to beat the fallback's CERTIFIED "
-            "%.10g; keeping the certified result. This should be impossible and "
-            "indicates a bound or feasibility inconsistency worth investigating.",
+        # The decision is unconditional; only the alarm is gated. A closed gap
+        # certifies the fallback's objective to within the gap tolerance, not
+        # exactly, so a route objective a hair better (5822.93629 vs 5822.93629,
+        # equal at 10 significant figures -- #1618 D-37) is consistent with the
+        # certificate. What is impossible is a feasible point beyond the
+        # fallback's certified *dual bound*; that is the only case worth a WARNING.
+        fb_bound = getattr(fallback, "bound", None)
+        impossible = (
+            fb_bound is None
+            or not np.isfinite(fb_bound)
+            or _bound_crosses_objective(float(fb_bound), route.objective, is_maximize)
+        )
+        logger.log(
+            logging.WARNING if impossible else logging.DEBUG,
+            "#1059 route objective %.10g %s the fallback's CERTIFIED %.10g (dual bound "
+            "%s); keeping the certified result.%s",
             route.objective,
+            "appears to beat" if impossible else "is within the certified gap of",
             fallback.objective,
+            fb_bound,
+            (
+                " This should be impossible and indicates a bound or feasibility "
+                "inconsistency worth investigating."
+                if impossible
+                else ""
+            ),
         )
         route_wins = False
 
@@ -9775,6 +9957,74 @@ def _scoped_determinism(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+#: ``(validated highs_options pairs, {"used": bool})`` for the innermost
+#: ``solve_model`` call, or ``None`` when that call passed no ``highs_options``.
+#: Set by :func:`_scoped_highs_options`; read at the HiGHS LP/MILP route sites.
+_HIGHS_OPTIONS_REQUEST: contextvars.ContextVar[
+    Optional[tuple[tuple[tuple[str, Any], ...], dict]]
+] = contextvars.ContextVar("discopt_highs_options_request", default=None)
+
+
+def _scoped_highs_options(fn: _F) -> _F:
+    """Validate ``highs_options`` up front and warn when no HiGHS route used it (#1620).
+
+    The options are honoured by the verified HiGHS LP/MILP route only
+    (:func:`_highs_route_options`). Validation happens before any work, so a
+    reserved option is refused on every model, not only on the ones that reach
+    HiGHS. A solve that never took that route warns instead of returning as if
+    the options had been applied (CLAUDE.md §3). Nested solves get their own
+    scope: a solve that passed no ``highs_options`` sets the request to ``None``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        opts = kwargs.get("highs_options")
+        if opts is None:
+            if _HIGHS_OPTIONS_REQUEST.get() is None:
+                return fn(*args, **kwargs)
+            token = _HIGHS_OPTIONS_REQUEST.set(None)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _HIGHS_OPTIONS_REQUEST.reset(token)
+        from discopt.solvers.lp_milp_highs import validate_user_options
+
+        state = {"used": False}
+        token = _HIGHS_OPTIONS_REQUEST.set((validate_user_options(opts), state))
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _HIGHS_OPTIONS_REQUEST.reset(token)
+        if not state["used"] and opts:
+            import warnings
+
+            warnings.warn(
+                "highs_options was not used: it applies only to a pure LP or MILP "
+                "solved on the HiGHS route (milp_backend='highs', the default), and "
+                "this solve did not take that route.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return result
+
+    return cast(_F, wrapper)
+
+
+@contextlib.contextmanager
+def _highs_route_options():
+    """Apply the active ``highs_options`` to the HiGHS LP/MILP route and mark it used."""
+    req = _HIGHS_OPTIONS_REQUEST.get()
+    if req is None:
+        yield
+        return
+    from discopt.solvers.lp_milp_highs import user_options
+
+    pairs, state = req
+    state["used"] = True
+    with user_options(pairs):
+        yield
+
+
 def _scoped_role1_deadline(fn: _F) -> _F:
     """Scope :data:`_ROLE1_DEADLINE` to one ``solve_model`` call (#1371).
 
@@ -9802,6 +10052,12 @@ def _scoped_role1_deadline(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+# #1615 D-03: whether the active solve scope was given an explicit ``tuning=``.
+_EXPLICIT_TUNING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "discopt_explicit_tuning", default=False
+)
+
+
 def _scoped_tuning(fn: _F) -> _F:
     """Publish the ``tuning`` kwarg as the active :class:`SolverTuning` for the
     call, then restore the previous context. Relaxer read sites consult
@@ -9823,10 +10079,16 @@ def _scoped_tuning(fn: _F) -> _F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        token = _enter_tuning_scope(kwargs.pop("tuning", None))
+        _explicit = kwargs.pop("tuning", None)
+        token = _enter_tuning_scope(_explicit)
+        # #1615 D-03: the pop above hides ``tuning`` from ``fn``'s ``kwargs``, so
+        # ``_native_kernel_feature_safe`` could never see it. Record "an explicit
+        # tuning was requested" (inherited by nested solves) where it can.
+        explicit_token = _EXPLICIT_TUNING.set(_explicit is not None or _EXPLICIT_TUNING.get())
         try:
             return fn(*args, **kwargs)
         finally:
+            _EXPLICIT_TUNING.reset(explicit_token)
             _reset_tuning(token)
 
     return cast(_F, wrapper)
@@ -9869,7 +10131,34 @@ def _scoped_deep_recursion(fn: _F) -> _F:
         # (factorable walk, then the compiler's node walk); cushion generously and
         # cap so a pathological size can't request an unsatisfiable limit.
         depth_need = min(4000 + 8 * depth, 1_000_000)
-        return _run_with_deep_recursion(lambda: fn(model, *args, **kwargs), depth_need=depth_need)
+        # #1617: the worker thread has its OWN ``threading.local`` records, so the
+        # callback bookkeeping the outermost wrapper reads on THIS thread -- the
+        # enforcement mark (#1500) and the failure record (#1436) -- must be carried
+        # back. Without this a deep model's B&B marked enforcement on the worker and
+        # the caller refused a correctly screened result (lazy TSP, n=24), and a
+        # callback failure on the worker was invisible to the #1436 refusal.
+        worker_state: dict[str, Any] = {}
+        caller_thread = threading.get_ident()
+
+        def _run_and_capture():
+            if threading.get_ident() == caller_thread:  # ran inline: nothing to carry
+                return fn(model, *args, **kwargs)
+            worker_state["ran_on_worker"] = True
+            _CALLBACK_ENFORCEMENT.enforced = False
+            _CALLBACK_FAILURES.failures = []
+            try:
+                return fn(model, *args, **kwargs)
+            finally:
+                worker_state["enforced"] = _CALLBACK_ENFORCEMENT.enforced
+                worker_state["failures"] = list(_CALLBACK_FAILURES.failures)
+
+        try:
+            return _run_with_deep_recursion(_run_and_capture, depth_need=depth_need)
+        finally:
+            if worker_state.get("ran_on_worker"):
+                if worker_state.get("enforced"):
+                    _CALLBACK_ENFORCEMENT.enforced = True
+                _CALLBACK_FAILURES.failures.extend(worker_state.get("failures", ()))
 
     return cast(_F, wrapper)
 
@@ -10159,6 +10448,21 @@ _ROUTE_FALLBACK_NOTE: list[str] = []
 # carry forward, and ``_merge_route_and_fallback`` returns the fallback for it.
 _ROUTE_FALLBACK_STATE: list[tuple[Optional["SolveResult"], bool]] = []
 
+#: #1614 D-14/B-02b: the engine the dispatcher handed the solve to, for the
+#: decorator below to stamp onto ``SolveResult.algorithm_route`` when the engine
+#: itself left it ``None``. Same rail as :data:`_ROUTE_FALLBACK_NOTE` and for the
+#: same reason: the spatial path alone has dozens of return sites. Each dispatch
+#: arm calls :func:`_declare_route` just before it hands over; the LAST
+#: declaration at this depth is the most specific and wins. A route string an
+#: engine wrote itself (HiGHS, OA, pounce, native-milp) is never overwritten, and
+#: a #1059 fallback note still takes precedence over both.
+_ROUTE_NAME: list[str] = []
+
+
+def _declare_route(name: str) -> None:
+    """Name the engine the current ``solve_model`` call is about to hand over to."""
+    _ROUTE_NAME.append(name)
+
 
 def _stamp_layer_timing(fn: _F) -> _F:
     """Stamp the layer profile onto whatever ``SolveResult`` the solve produced.
@@ -10185,6 +10489,7 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # `set` lands in the outer solve's slot -- which is the one that reports.
         _probe_nodes_tok = _IPX_PROBE_NODES.set(0)
         _route_depth = len(_ROUTE_FALLBACK_NOTE)
+        _name_depth = len(_ROUTE_NAME)
         _state_depth = len(_ROUTE_FALLBACK_STATE)
         _gap_depth = len(_GAP_TOLERANCES)
         try:
@@ -10196,6 +10501,8 @@ def _stamp_layer_timing(fn: _F) -> _F:
                 else None
             )
             del _ROUTE_FALLBACK_NOTE[_route_depth:]
+            _route_name = _ROUTE_NAME[-1] if len(_ROUTE_NAME) > _name_depth else None
+            del _ROUTE_NAME[_name_depth:]
             _route_state = (
                 _ROUTE_FALLBACK_STATE[_state_depth]
                 if len(_ROUTE_FALLBACK_STATE) > _state_depth
@@ -10212,6 +10519,14 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # invisibility the issue was filed about.
         if _route_note is not None and isinstance(result, SolveResult):
             result.algorithm_route = _route_note
+        # #1614: every route names itself. Only fills a gap -- an engine's own
+        # route string is more specific than the dispatcher's.
+        if (
+            _route_name is not None
+            and isinstance(result, SolveResult)
+            and result.algorithm_route is None
+        ):
+            result.algorithm_route = _route_name
         # #1059: the fallback must never be worse than the route it replaced.
         # Done here rather than at the fallback site for the same reason as the
         # note: the fallback falls through to the default path's return sites.
@@ -10425,6 +10740,7 @@ def _refusing_on_callback_failure(fn: _F) -> _F:
 @_scoped_tuning
 @_scoped_determinism
 @_scoped_role1_deadline
+@_scoped_highs_options
 @_debug_outermost_solve
 def solve_model(
     model: Model,
@@ -10488,6 +10804,8 @@ def solve_model(
     milp_backend: Optional[str] = None,
     milp_cuts: Optional[bool] = None,
     branching_rule: Optional[str] = None,
+    # #1620: HiGHS options for the HiGHS LP/MILP route; see ``_scoped_highs_options``.
+    highs_options: Optional[dict[str, Any]] = None,
     # #917: extra wall-clock seconds this solve may take *only if* it holds an
     # incumbent when ``time_limit`` expires. Set by ``Model.solve`` to the #844
     # fallback reserve it withheld, so a primary that found a primal reclaims the
@@ -10605,6 +10923,23 @@ def solve_model(
         probe LPs are counted in ``solver_stats["branching/strong_probe_lps"]``,
         not in ``node_count``). Changes only the order of the search, never a
         bound.
+    highs_options : dict, optional
+        HiGHS options (name -> value, HiGHS's own option names) for a pure LP or
+        MILP solved on the HiGHS route (#1620). ``{"output_flag": True}`` prints
+        the HiGHS log (off by default). Only logging and search-strategy
+        options are accepted -- the allowlist is
+        ``discopt.solvers.lp_milp_highs.ALLOWED_USER_OPTIONS`` (``presolve``,
+        ``mip_detect_symmetry``, ``mip_heuristic_*``, ``mip_pool_*``, ...);
+        any other option, including tolerances, gaps, limits, ``solver``,
+        ``threads`` and ``random_seed``, raises ``ValueError`` (use
+        ``gap_tolerance`` / ``abs_gap_tolerance`` / ``time_limit`` /
+        ``max_nodes`` instead). They apply to every HiGHS solve the route
+        makes, including its certificate cross-checks, but a route option
+        always wins (the #1634 cross-check still runs with presolve off). Every
+        certificate is still verified by discopt, so an option can change speed
+        and node count, never a reported bound's validity. On any other route
+        (a nonlinear model, ``milp_backend="native"``, a callback) the options
+        are not used and a ``UserWarning`` says so.
     ipopt_options : dict, optional
         Options passed to the NLP engine: POUNCE (the default ``nlp_solver``)
         or cyipopt (``nlp_solver="ipopt"``).
@@ -10662,10 +10997,13 @@ def solve_model(
         Falls back to standard McCormick for unsupported operations.
     mccormick_bounds : str, default "auto"
         McCormick relaxation lower-bounding strategy:
-        ``"auto"`` resolves to ``"none"`` — the McCormick ``"nlp"`` bound is
-        only valid for convex models (see below), and convex models already
-        get valid bounds from the NLP relaxation, so ``"auto"`` relies on the
-        NLP/alphaBB path in both cases,
+        ``"auto"`` resolves to ``"lp"`` for a **nonconvex** model with an
+        objective (the LP-form McCormick relaxation is a valid global dual
+        bound; when the model has nothing the LP relaxer can tighten or the
+        relaxer cannot be built, the setup falls back, ultimately to
+        ``"none"`` since the nonconvex-``"nlp"`` downgrade below applies), and
+        to ``"none"`` for a convex model or one with no objective,
+        since convex models already get valid bounds from the NLP relaxation,
         ``"nlp"`` solves an NLP over the McCormick objective relaxation.
         This is a valid lower bound **only for convex models**: the bound
         solver evaluates the relaxation at ``x_cv == x_cc`` where every
@@ -11345,7 +11683,22 @@ def solve_model(
         from discopt._relax.problem_classifier import ProblemClass as _PC
         from discopt._relax.problem_classifier import classify_problem
 
-        _lpm_class = classify_problem(model)
+        # #1617: classify the model the engine will SEE. A disjunction, indicator,
+        # SOS or logical constraint lowers to rows over new binaries
+        # (``reformulate_gdp``, run further down this function), so the user model
+        # of ``either_or([[x <= 2], [x >= 6]])`` is an LP to ``classify_problem`` --
+        # which reads only the plain rows -- but a MILP to the engine. Classifying
+        # before the lowering refused every tree option on such a model as "does not
+        # run for an LP". The lowering returns a new model (the input is untouched)
+        # and returns ``model`` itself when there is nothing to lower.
+        from discopt.transformations import get as _lpm_get_transformation
+
+        _lpm_class = classify_problem(
+            _lpm_get_transformation("gdp").apply(
+                model,
+                method=gdp_method if gdp_method in ("big-m", "hull", "mbigm", "auto") else "big-m",
+            )
+        )
         if _lpm_class not in (_PC.LP, _PC.MILP):
             raise ValueError(
                 f"milp_backend={milp_backend!r} selects the engine for an LP or MILP "
@@ -11719,6 +12072,17 @@ def solve_model(
                 "Convex MINLP auto-route raised %s: %s; falling back to the default path",
                 type(_route_exc).__name__,
                 _route_exc,
+            )
+            # #1614 E-01(c): an engine *failure* is not the designed "did not
+            # certify" hand-over. The fallback is still the sound answer, but the
+            # caller must hear that the routed engine broke, not only find it in
+            # ``algorithm_route`` after the fact.
+            warnings.warn(
+                f"{_auto_route_reason}: the routed solve raised "
+                f"{type(_route_exc).__name__}: {_route_exc}; falling back to the "
+                "default path (see SolveResult.algorithm_route)",
+                RuntimeWarning,
+                stacklevel=2,
             )
         _route_elapsed = time.perf_counter() - _route_t0
         # #1059: record WHY this algorithm ran. Only set on the auto-route, so an
@@ -12339,6 +12703,7 @@ def solve_model(
         if decomposition == "benders":
             from discopt.decomposition.benders import solve_benders
 
+            _declare_route("benders: discopt Benders decomposition (decomposition='benders')")
             return solve_benders(
                 model,
                 structure=decomposition_structure,
@@ -12350,6 +12715,9 @@ def solve_model(
         if decomposition == "lagrangian":
             from discopt.decomposition.lagrangian import solve_lagrangian
 
+            _declare_route(
+                "lagrangian: discopt Lagrangian decomposition (decomposition='lagrangian')"
+            )
             return solve_lagrangian(
                 model,
                 structure=decomposition_structure,
@@ -13143,6 +13511,7 @@ def solve_model(
                     max_nodes=max_nodes,
                     ipopt_options=ipopt_options,
                     pounce_options=pounce_options,
+                    highs_options=highs_options,
                     nlp_solver=nlp_solver,
                     sparse=sparse,
                     cutting_planes=cutting_planes,
@@ -13685,6 +14054,7 @@ def solve_model(
                 "Use nlp_bb=False (spatial branch-and-bound) for these callbacks, "
                 "or omit nlp_bb to auto-select a path that honors them."
             )
+        _declare_route("nlp-bb: discopt nonlinear branch and bound (nlp_bb=True)")
         return _solve_nlp_bb(
             model,
             time_limit,
@@ -13856,7 +14226,8 @@ def solve_model(
                     stacklevel=2,
                 )
             if _lpm_backend == "highs":
-                return _solve_lp_highs(model, t_start, time_limit)
+                with _highs_route_options():
+                    return _solve_lp_highs(model, t_start, time_limit)
             _lp_res = _solve_lp(model, t_start, time_limit)
             if _lpm_backend == "native" and _lp_res.algorithm_route is None:
                 _lp_stats = _lp_res.solver_stats or {}
@@ -13874,9 +14245,11 @@ def solve_model(
         elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
                 if _pure_continuous_convexity_known and _pure_continuous_is_convex:
+                    _declare_route("convex-qp: discopt convex QP solve")
                     return _solve_qp(model, t_start, prefer_pounce=nlp_solver == "pounce")
                 _pure_continuous_force_spatial = True
             else:
+                _declare_route("convex-qp: discopt convex QP solve")
                 return _solve_qp(model, t_start, prefer_pounce=nlp_solver == "pounce")
         elif problem_class == ProblemClass.MILP:
             # #748: the specialized MILP engines (``_solve_milp_simplex`` /
@@ -13909,15 +14282,16 @@ def solve_model(
                     and not lagrangian_bound
                     and not _observe_tree
                 ):
-                    _highs_res = _solve_milp_highs(
-                        model,
-                        time_limit,
-                        gap_tolerance,
-                        max_nodes,
-                        t_start,
-                        initial_point=initial_point,
-                        abs_gap_tolerance=abs_gap_tolerance,
-                    )
+                    with _highs_route_options():
+                        _highs_res = _solve_milp_highs(
+                            model,
+                            time_limit,
+                            gap_tolerance,
+                            max_nodes,
+                            t_start,
+                            initial_point=initial_point,
+                            abs_gap_tolerance=abs_gap_tolerance,
+                        )
                     if _highs_res is not None:
                         return _highs_res
                 # Warm-started-simplex engine: the whole MILP B&B runs in Rust
@@ -13994,6 +14368,12 @@ def solve_model(
                         # this engine is no absolute criterion at all (#1315).
                         abs_gap_tolerance=abs_gap_tolerance,
                     )
+                    if _simplex_res is not None and _simplex_res.algorithm_route is None:
+                        # #1614 C1: the in-house engine answering a MILP must say so.
+                        _simplex_res.algorithm_route = (
+                            "native-milp: discopt monolithic Rust MILP engine "
+                            f"({'nlp_solver=simplex' if nlp_solver == 'simplex' else 'default'})"
+                        )
                     if _simplex_res is not None:
                         return _simplex_res
                     _engine_bound = _deferred.get("bound")
@@ -14042,6 +14422,18 @@ def solve_model(
                         "milp-tree: discopt MILP branch and bound (node_callback set; "
                         "the HiGHS route has no tree to observe)"
                     )
+                elif _bb_res.algorithm_route is None:
+                    # #1614: never leave the HiGHS route for the in-house tree silently.
+                    _why = (
+                        "lagrangian_bound=True"
+                        if lagrangian_bound
+                        else "nlp_solver='simplex'"
+                        if nlp_solver == "simplex"
+                        else "the HiGHS route declined"
+                        if _lpm_backend == "highs"
+                        else f"milp_backend={_lpm_backend!r}"
+                    )
+                    _bb_res.algorithm_route = f"milp-tree: discopt MILP branch and bound ({_why})"
                 return _merge_engine_stats(
                     _merge_engine_bound(_bb_res, _engine_bound, model),
                     _deferred.get("stats"),
@@ -14093,6 +14485,7 @@ def solve_model(
                     # relaxations) — HiGHS-free by design (issue #359 / pure-Rust
                     # goal). The convex node QP is solved to global optimality, so the
                     # B&B bound is valid.
+                    _declare_route("miqp-bb: discopt convex MIQP branch and bound")
                     return _solve_miqp_bb(
                         model,
                         time_limit,
@@ -14362,6 +14755,9 @@ def solve_model(
             )
         if _root_convexity_known and _root_is_convex:
             logger.info("Convex MINLP detected, using NLP-BB (nonlinear Branch and Bound)")
+            _declare_route(
+                "nlp-bb: discopt nonlinear branch and bound (convex MINLP, auto-selected)"
+            )
             return _solve_nlp_bb(
                 model,
                 time_limit,
@@ -14626,6 +15022,14 @@ def solve_model(
         incumbent_callback=incumbent_callback,
         node_callback=node_callback,
         kwargs=kwargs,
+        search_levers=_native_kernel_ignored_levers(
+            strategy=strategy,
+            rlt=rlt,
+            partitions=partitions,
+            presolve=presolve,
+            in_tree_presolve_stride=in_tree_presolve_stride,
+            kwargs=kwargs,
+        ),
     ):
         _native_result = _try_native_spatial_kernel(
             model,
@@ -14649,7 +15053,19 @@ def solve_model(
             source=((_prereform_model, _prereform_nvars) if _prereform_model is not None else None),
         )
     if _native_result is not None:
+        if _native_result.algorithm_route is None:
+            _native_result.algorithm_route = (
+                "native-spatial: discopt Rust spatial branch-and-bound kernel"
+            )
+        _warn_kernel_gap_tolerance_absolute(gap_tolerance)
         return _native_result
+    # #1614: everything past this point is the Python spatial tree.
+    _declare_route(
+        "spatial-bb: discopt spatial branch and bound (Python tree"
+        + (", lazy_constraints" if lazy_constraints is not None else "")
+        + (", incumbent_callback" if incumbent_callback is not None else "")
+        + ")"
+    )
 
     # --- #654: deadline-exhausted short-circuit before the spatial search build ---
     # Everything below (the per-node NLP evaluator's one-time XLA compile, the
@@ -22240,6 +22656,8 @@ POUNCE_ROUTE_NLP = "pounce:nlp"
 #: Ipopt's ``Infeasible_Problem_Detected``: the NLP converged to a point of
 #: locally minimal infeasibility.
 _IPOPT_INFEASIBLE_PROBLEM = 2
+#: Ipopt/POUNCE ``Solved_To_Acceptable_Level`` (#1618 B-05b).
+_IPOPT_SOLVED_TO_ACCEPTABLE = 1
 
 #: ``solve_model`` parameters ``solver="pounce"`` honours (#1533). Every other
 #: parameter left at a non-default value is reported as ignored, so the list of
@@ -22415,6 +22833,17 @@ def _solve_pounce_route(
         from discopt.solvers import convex_ipm_pounce as _cvx
 
         is_lp = pclass == ProblemClass.LP
+        # #1615 B-01b: the convex lp-ipm/qp-ipm arm is a cold matrix solve; it does
+        # not thread a starting point through, so an ``initial_solution`` /
+        # ``warm_start`` the caller passed would be dropped without a word. The NLP
+        # arm below does use them, so this warning is specific to the convex arm.
+        # ``Model.solve`` turns a warm start's primal half into ``initial_point``
+        # too, so name the option the caller actually passed.
+        _dropped_starts = (
+            ["warm_start"]
+            if warm_start is not None
+            else (["initial_solution"] if initial_point is not None else [])
+        )
         # Options are validated against the engine that actually runs (#1585). An
         # LP is always the convex engine, so refuse before solving. A QP is routed
         # to qp-ipm only once ``solve_qp`` has proved its Hessian PSD; an indefinite
@@ -22430,6 +22859,7 @@ def _solve_pounce_route(
                 out = fn(options=engine_opts, **kw)
                 raw["iterations"] = out.iterations
                 raw["status"] = out.status
+                raw["message"] = getattr(out, "message", "")
                 return out
 
             return call
@@ -22466,6 +22896,15 @@ def _solve_pounce_route(
             outcome = None
             pclass = ProblemClass.NLP  # fall to the NLP arm below
         if pclass != ProblemClass.NLP:
+            if _dropped_starts:
+                warnings.warn(
+                    f"solver='pounce' ignores {_dropped_starts[0]} on this "
+                    f"{'LP' if is_lp else 'convex QP'}: POUNCE's "
+                    f"{'lp-ipm' if is_lp else 'qp-ipm'} route starts cold (the starting "
+                    "point only takes effect on the NLP interior-point arm).",
+                    UserWarning,
+                    stacklevel=3,
+                )
             wall = time.perf_counter() - t_start
             if isinstance(outcome, _DeferredUnbounded):
                 result = SolveResult(
@@ -22491,6 +22930,7 @@ def _solve_pounce_route(
                         error=(
                             f"POUNCE {route.split(':')[1]} returned no verified answer "
                             f"(engine status {getattr(st, 'value', st)!r})."
+                            + (f" {raw['message']}." if raw.get("message") else "")
                             + (" " + " ".join(reject_reason) if reject_reason else "")
                         ),
                     )
@@ -22522,7 +22962,15 @@ def _solve_pounce_route(
         raw_status_out=raw_status,
     )
     result.wall_time = time.perf_counter() - t_start
-    if result.status == "optimal":
+    if result.status == "optimal" and raw_status and raw_status[0] == _IPOPT_SOLVED_TO_ACCEPTABLE:
+        # #1618 B-05b: Ipopt/POUNCE code 1 (``Solved_To_Acceptable_Level``) met only
+        # the *acceptable* tolerances, whose dual-infeasibility default is 1e10 -- a
+        # point with an unscaled dual infeasibility of 1.6e4 passed. That is not an
+        # established stationary point, so it is not ``local_optimal`` (which the
+        # status vocabulary defines as one); it is a point from a local search that
+        # stopped short of its convergence test: ``local_limit``.
+        result.status = "local_limit"
+    elif result.status == "optimal":
         result.status = "local_optimal"
     elif result.status == "infeasible" or (
         result.status == "error" and raw_status and raw_status[0] == _IPOPT_INFEASIBLE_PROBLEM
@@ -25391,8 +25839,12 @@ def _lp_qp_unpack_duals(
     ``A_ub`` rows first (multipliers ≥ 0), then ``A_eq`` rows (free).
     ``_decompose_eq_slack_form`` emits inequalities to ``A_ub`` in declared
     order, flipping the row sign for ``">="`` so HiGHS sees ``-body ≤ 0``;
-    we flip the multiplier back so the returned dual reflects the original
-    ``">="`` body (giving ``μ ≤ 0`` in the examiner convention).
+    composing that flip with HiGHS's ``∂obj/∂b`` sign leaves ``μ ≥ 0`` for a
+    binding ``">="`` row, exactly as for ``"<="`` -- the
+    ``SolveResult.constraint_duals`` convention (#1620): ``∇F + Σ_{≤} μ ∇body
+    − Σ_{≥} μ ∇body + Σ_{=} λ ∇(lhs − rhs) = 0`` with ``μ ≥ 0`` for both
+    inequality senses. (This docstring used to claim ``μ ≤ 0`` for ``">="``;
+    the code never did that -- ``min 2a + 3b`` s.t. ``a + b >= 4`` reports +2.)
 
     Reduced costs are split into lower- and upper-bound multipliers using the
     examiner's convention ``λ_lb = max(rc, 0)``, ``λ_ub = max(-rc, 0)``.
@@ -25411,9 +25863,9 @@ def _lp_qp_unpack_duals(
 
     constraint_duals: Optional[dict[str, np.ndarray]] = None
     if row_dual is not None and row_dual.size == n_ub + n_eq:
-        # HiGHS reports row duals as ∂obj/∂b. The examiner uses the Lagrangian
-        # convention μ s.t. ∇f + ∇body·μ = 0, with μ ≥ 0 for "<=" and μ ≤ 0
-        # for ">=", so we negate for "<=" and "==" rows. For ">=" the
+        # HiGHS reports row duals as ∂obj/∂b. The reported convention (see
+        # SolveResult.constraint_duals) is μ ≥ 0 for both "<=" and ">=" rows, so
+        # we negate for "<=" and "==" rows. For ">=" the
         # extractor already flipped the row to "-body ≤ const", which (after
         # composing the two negations) leaves the HiGHS row_dual unflipped.
         out: dict[str, np.ndarray] = {}
@@ -27767,7 +28219,16 @@ def _solve_qp_matrix(
 
             logger.warning(msg)
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
-            return SolveResult(status="error", wall_time=wall_time, node_count=result.node_count)
+            # #1618 A-20: the cause goes on the result too, not only in the warning
+            # stream -- a bare ``error`` read "ended ... without recording a cause".
+            return SolveResult(
+                status="error",
+                wall_time=wall_time,
+                node_count=result.node_count,
+                error=msg + " A variable declared without bounds gets the default box "
+                "[-9.999e19, 9.999e19], which is inside that window; declare it with "
+                "lb=-numpy.inf / ub=numpy.inf if it is genuinely free.",
+            )
         return SolveResult(status="unbounded", wall_time=wall_time, node_count=result.node_count)
     elif result.status == SolveStatus.TIME_LIMIT:
         # NOTE (#1262): this exit and the ITERATION_LIMIT one below leave
@@ -30618,6 +31079,8 @@ def _solve_lp_highs(model: Model, t_start: float, time_limit: float | None = Non
         status=out.status,
         wall_time=wall,
         gap_certified=False,
+        # #1617: the route knows why it failed; say so on the result.
+        error=(f"HiGHS LP route: {out.message}" if out.status == "error" and out.message else None),
         solver_stats=stats,
         algorithm_route=route,
     )
@@ -30771,6 +31234,10 @@ def _solve_milp_highs(
     _budget_bound = bound if out.status in ("time_limit", "node_limit") else None
     return SolveResult(
         status=out.status,
+        # #1617: the route knows why it failed; say so on the result.
+        error=(
+            f"HiGHS MILP route: {out.message}" if out.status == "error" and out.message else None
+        ),
         bound=_budget_bound,
         wall_time=wall,
         node_count=out.node_count,

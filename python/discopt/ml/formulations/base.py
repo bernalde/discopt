@@ -119,7 +119,12 @@ class TreeFormulation:
     scaling : OffsetScaling or None
         Optional input/output scaling.
     split_eps : float
-        Epsilon for encoding strict inequality splits.
+        Half-width of the separation band around each split threshold
+        (default 1e-5). It must exceed the solver's absolute feasibility
+        tolerance (1e-6): a tree is discontinuous at its thresholds, so
+        tolerance-sized slack becomes an O(1) prediction error. The default
+        matches :class:`~discopt.ml.formulations.tree_ensemble.TreeEnsembleFormulation`
+        (#1447, #1620); see that class for the measured rationale.
 
     Example
     -------
@@ -134,7 +139,7 @@ class TreeFormulation:
         ensemble: TreeEnsembleDefinition,
         prefix: str = "tree",
         scaling: OffsetScaling | None = None,
-        split_eps: float = 1e-6,
+        split_eps: float = 1e-5,
     ) -> None:
         self._model = model
         self._ensemble = ensemble

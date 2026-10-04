@@ -44,6 +44,7 @@ from discopt.decomposition.structure import (
 )
 from discopt.modeling.core import Model, SolveResult, VarType
 from discopt.solvers import SolveStatus
+from discopt.solvers.lp_backend import names_decomposition_route
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class LagrangianConfig:
     lambda_max0: float = 1e4  # initial multiplier box; grows x10 when hit
 
 
+@names_decomposition_route("lagrangian: discopt Lagrangian decomposition")
 def solve_lagrangian(
     model: Model,
     *,
@@ -329,6 +331,7 @@ def solve_lagrangian(
     cuts: list[tuple[float, np.ndarray, np.ndarray]] = []
     lam_center = np.zeros(m_coup)
     lam_max = cfg.lambda_max0
+    prev_hit_box = False  # did the iterate being evaluated sit on the box?
     status = "iteration_limit"
 
     for it in range(cfg.max_iterations):
@@ -343,6 +346,15 @@ def solve_lagrangian(
             best_L = L
             lam_center = lam.copy()  # serious step: move the stability centre
             stall = 0
+            # #1611 D-24: the multiplier box is a trust region. Grow it only when
+            # a step that sat on the box was *serious* -- the dual still rises
+            # toward the boundary, so its maximizer may lie outside. Growing it
+            # whenever the cutting-plane maximizer merely touched the box (as the
+            # model does while it has too few cuts to be bounded) inflated the
+            # box x10 every iteration: the level target scaled with the box,
+            # every iterate was a null step at ~1e10, and the bound stayed 0.0.
+            if cfg.method == "bundle" and prev_hit_box and lam_max < 1e12:
+                lam_max *= 10.0
         else:
             stall += 1
 
@@ -385,11 +397,15 @@ def solve_lagrangian(
             lam, L_hat, hit_box = _level_bundle_step(
                 lp, qp, cuts, m_coup, free_mask, best_L, lam_center, lam_max, cfg.level_gamma
             )
-            if hit_box and lam_max < 1e12:
-                lam_max *= 10.0  # adaptive box growth
+            prev_hit_box = bool(np.any(np.abs(lam) > 0.99 * lam_max))
             # Reliable dual stopping test: the cutting-plane upper model L̂* is
-            # within tolerance of the best dual value, so the dual is maximized.
-            if np.isfinite(L_hat) and L_hat - best_L <= cfg.gap_tolerance * max(1.0, abs(best_L)):
+            # within tolerance of the best dual value, so the dual is maximized
+            # over the box -- and, when the maximizer is interior, globally.
+            if (
+                not hit_box
+                and np.isfinite(L_hat)
+                and L_hat - best_L <= cfg.gap_tolerance * max(1.0, abs(best_L))
+            ):
                 break
 
     # Promote to optimal if bounds already met.

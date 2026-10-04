@@ -897,7 +897,11 @@ def _tighten_univariate_quadratic_interval(
     error of the discriminant itself rather than a constraint violation.
     """
     if abs(a) <= 1e-12:
-        if abs(b) <= 1e-12:
+        # Dropping a tiny ``a >= 0`` is a relaxation (``a*x^2 >= 0``). Dropping a tiny
+        # nonzero ``b`` is NOT: ``5 - 1e-13*y <= 0`` over ``y <= 1e14`` was read as
+        # ``5 <= 0`` and a feasible model was proved infeasible (#1617). Only an exact
+        # zero makes the row a constant; any other ``b`` is divided through.
+        if b == 0.0:
             return (lb, ub) if rhs >= -_EMPTY_INTERVAL_FEAS_TOL else None
         bound = rhs / b
         if b > 0.0:
@@ -3421,12 +3425,19 @@ class DefinedVariableForwardRule(NonlinearBoundTighteningRule):
         for var in model._variables:
             off = metadata.base_offsets[id(var)]
             sz = var.size
-            box[var] = Interval(
-                float(np.min(out_lb[off : off + sz])),
-                float(np.max(out_ub[off : off + sz])),
-            )
-            if sz == 1:
+            # #1617: an array variable's enclosure is an ARRAY interval, as
+            # ``interval_eval`` reads it (``box[x].lo[i]`` for ``x[i]``). The scalar
+            # min/max this used to store crashed every indexed lookup
+            # (``IndexError`` on a 0-d array), and an empty variable (``shape=(0,)``)
+            # crashed the ``np.min`` itself.
+            if var.shape == ():
+                box[var] = Interval(float(out_lb[off]), float(out_ub[off]))
                 idx_to_var[off] = var
+            else:
+                box[var] = Interval(
+                    np.array(out_lb[off : off + sz], dtype=np.float64).reshape(var.shape),
+                    np.array(out_ub[off : off + sz], dtype=np.float64).reshape(var.shape),
+                )
 
         for con in _rows_until(model, deadline):
             if getattr(con, "sense", None) != "==":

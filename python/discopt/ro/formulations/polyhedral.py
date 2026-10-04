@@ -117,6 +117,18 @@ class PolyhedralRobustFormulation:
                             Constant(other_unc.parameter.value),
                         )
 
+                # A row that does not contain this parameter has no uncertain
+                # data: it gets no counterpart. Testing the *coefficients* for
+                # variables instead is wrong — coeff_j is built as the
+                # syntactic difference ``unit_j - base``, which mentions every
+                # variable of the row even when they cancel, so a parameter-free
+                # row was given a spurious dual penalty -b^T lam. On an equality
+                # row that penalty is a free slack (``sum(w) - 1 + e^T lam = 0``
+                # admits w = 0), producing a "robust" optimum below the nominal
+                # one (#1611 X-30a).
+                if not _contains_uncertain_param(expr_isolated, {pname}):
+                    continue
+
                 # Extract per-component coefficients of p in the expression.
                 # coeff_j = (expr at p_j = p_bar_j + 1) - (expr at p_j = p_bar_j)
                 base = substitute_param(expr_isolated, pname, Constant(nominal))
@@ -134,10 +146,6 @@ class PolyhedralRobustFormulation:
 
                 has_var_coeff = any(_contains_variable(c) for c in coeff_exprs)
 
-                if not has_var_coeff and not _contains_uncertain_param(expr_isolated, {pname}):
-                    # Parameter doesn't appear in this expression.
-                    continue
-
                 if not has_var_coeff:
                     # All coefficients are constants: compute the worst-case
                     # value numerically via LP (the old approach, but correct
@@ -149,13 +157,19 @@ class PolyhedralRobustFormulation:
                 else:
                     # Coefficients involve decision variables: use LP duality.
                     # Introduce lam >= 0 of size n_rows.
+                    # The duals are left unbounded above. A dual of the
+                    # polytope equals (a combination of) the row's coefficients
+                    # coeff_j(x) -- decision-variable expressions in the
+                    # model's units -- so no constant cap is valid: the former
+                    # ``sum|b| + 100`` cap cut off the true counterpart and made
+                    # the same model infeasible once rescaled (#1611 X-30b).
+                    # lam enters only linearly, so an unbounded dual is no
+                    # obstacle to the solve.
                     lam_vars = []
-                    lam_ub = float(np.sum(np.abs(b_poly))) + 100.0
                     for i in range(n_rows):
                         lv = m.continuous(
                             f"{self._prefix}_lam{dual_idx}_{i}",
                             lb=0,
-                            ub=lam_ub,
                         )
                         lam_vars.append(lv)
 

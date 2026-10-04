@@ -17,6 +17,7 @@ from discopt.export._common import (
     binary_box_is_default,
     builder_objective,
     iter_builder_linear_rows,
+    legal_unique_names,
     refuse_non_algebraic_relations,
 )
 from discopt.export._extract import (
@@ -65,7 +66,9 @@ def to_lp(model: Model, path: str | Path | None = None) -> str | None:
     # by name rather than die on ``con.body`` in the row loop below (#1218).
     refuse_non_algebraic_relations(model, "LP")
     flat_vars = flatten_variables(model)
-    var_names = [name for name, _, _, _, _ in flat_vars]
+    # Whitespace-tokenised format: names are made legal AND distinct, or a
+    # reader sees a different model (#1613 C-03a). See `legal_unique_names`.
+    var_names = legal_unique_names([name for name, _, _, _, _ in flat_vars], "lp")
     mvars = model._variables
 
     lines: list[str] = []
@@ -131,7 +134,7 @@ def to_lp(model: Model, path: str | Path | None = None) -> str | None:
     lines.append("Subject To")
     rows: list[tuple[str, dict[int, float], str, float]] = []
     for i, con in enumerate(model._constraints):
-        base = (con.name if con.name else f"c{i}").replace(" ", "_").replace("-", "_")
+        base = con.name if con.name else f"c{i}"
         # An array-valued body is many LP rows. Without this expansion the
         # extractor walked straight into an unindexed shaped variable and
         # refused the whole model -- which locked the vectorised form of a
@@ -142,9 +145,12 @@ def to_lp(model: Model, path: str | Path | None = None) -> str | None:
             lin, const = extract_linear_terms(body, flat_vars, model_vars=mvars)
             rows.append((con_name, lin, con.sense, -const))
     for j, brow in enumerate(iter_builder_linear_rows(model)):
-        con_name = (brow.name if brow.name else f"b{j}").replace(" ", "_").replace("-", "_")
+        con_name = brow.name if brow.name else f"b{j}"
         rows.append((con_name, dict(brow.coeffs), brow.sense, brow.rhs))
 
+    # `obj` (the objective's label) is reserved so a row cannot share it.
+    row_names = legal_unique_names([r[0] for r in rows], "lp", ("obj",))
+    rows = [(nm, *r[1:]) for nm, r in zip(row_names, rows)]
     for con_name, lin, sense_str, rhs in rows:
         expr_str = _format_linear_expr(lin, var_names, 0.0)
         if not expr_str:
@@ -163,7 +169,7 @@ def to_lp(model: Model, path: str | Path | None = None) -> str | None:
 
     # Bounds section
     lines.append("Bounds")
-    for vname, vtype, _shape, lb, ub in flat_vars:
+    for vname, (_raw_name, vtype, _shape, lb, ub) in zip(var_names, flat_vars):
         if vtype == VarType.BINARY and binary_box_is_default(lb, ub):
             # Binary bounds are implicit (0 <= x <= 1) only while the box is
             # the declared one. A pinned binary falls through and gets an
@@ -182,14 +188,14 @@ def to_lp(model: Model, path: str | Path | None = None) -> str | None:
     lines.append("")
 
     # Generals (integer variables)
-    int_vars = [name for name, vt, _, _, _ in flat_vars if vt == VarType.INTEGER]
+    int_vars = [nm for nm, (_, vt, _, _, _) in zip(var_names, flat_vars) if vt == VarType.INTEGER]
     if int_vars:
         lines.append("Generals")
         lines.append("  " + " ".join(int_vars))
         lines.append("")
 
     # Binaries
-    bin_vars = [name for name, vt, _, _, _ in flat_vars if vt == VarType.BINARY]
+    bin_vars = [nm for nm, (_, vt, _, _, _) in zip(var_names, flat_vars) if vt == VarType.BINARY]
     if bin_vars:
         lines.append("Binaries")
         lines.append("  " + " ".join(bin_vars))

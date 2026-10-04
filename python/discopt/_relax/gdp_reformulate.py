@@ -16,6 +16,7 @@ original model is returned unchanged (zero overhead).
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import numpy as np
@@ -208,6 +209,24 @@ def reformulate_gdp(
         new_model._variables.append(var)
         return var
 
+    # #1615 C-10a: indicator constraints -- ``Model.if_then`` and the blocks
+    # ``Model.add_disjunction`` lowers to ``if_then`` + ``exactly(1)`` -- are always
+    # lowered by big-M (or multiple big-M); the hull / simplex reformulations
+    # apply only to ``either_or`` disjunctions. Say so rather than let a caller
+    # believe ``gdp_method="hull"`` reached them.
+    if method in ("hull", "simplex"):
+        _n_ind = sum(1 for c in model._constraints if isinstance(c, _IndicatorConstraint))
+        if _n_ind:
+            warnings.warn(
+                f"gdp_method={method!r} does not apply to the {_n_ind} indicator "
+                "constraint(s) in this model (Model.if_then, and the Disjunct blocks "
+                "of Model.add_disjunction, which lower to if_then): they are "
+                "reformulated by big-M. Only Model.either_or disjunctions take the "
+                f"{method!r} reformulation.",
+                UserWarning,
+                stacklevel=2,
+            )
+
     # In auto mode, ask the F1 advisor for a per-disjunction
     # recommendation up front; if any disjunction (or indicator) is
     # routed to mbigm we still need the LP relaxation precomputed.
@@ -366,8 +385,9 @@ def _unbounded_big_m_error(constraint: Constraint, direction: str) -> ValueError
         f"no valid finite big-M exists. A too-small big-M would cut feasible "
         f"points of the active disjunct and yield a false certificate. Add a "
         f"finite bound to the variable(s) in this disjunct/indicator (e.g. "
-        f"m.continuous(..., lb=..., ub=...)), or use the 'hull' reformulation "
-        f"(method='hull'), which does not require a finite big-M."
+        f"m.continuous(..., lb=..., ub=...)). The 'hull' reformulation "
+        f"(method='hull') needs no big-M, but it too needs a finite bound on every "
+        f"variable of the disjunction, within each disjunct (#1617)."
     )
 
 
@@ -1496,6 +1516,29 @@ def _reformulate_disjunction_hull(
             if vname not in db:
                 db[vname] = (float(np.min(var.lb)), float(np.max(var.ub)))
         disjunct_bounds.append(db)
+
+    # #1617: every bound-linking row ``dlb*y_k <= v_{j,k} <= dub*y_k`` needs a FINITE
+    # bound. At the unbounded sentinel (9.999e19) the row is ``v <= 1e20*y``: exact
+    # only in exact arithmetic -- the integrality tolerance lets ``y = 1e-5`` buy
+    # ``v <= 1e15`` -- and every LP/MILP engine refuses or mangles the coefficient
+    # (HiGHS: ``|a_ij| >= 1e15`` -> kError, surfaced as a causeless ``error``).
+    # Dropping the row instead is not exact either: an unselected disjunct's copy
+    # then ranges over that disjunct's recession cone. Refuse, naming the variable,
+    # exactly as big-M refuses a sentinel-sized M.
+    for k, db in enumerate(disjunct_bounds):
+        for vname, (dlb, dub) in db.items():
+            if not (np.isfinite(dlb) and np.isfinite(dub)) or max(abs(dlb), abs(dub)) >= (
+                _BIGM_SENTINEL
+            ):
+                side = "upper" if not np.isfinite(dub) or abs(dub) >= _BIGM_SENTINEL else "lower"
+                raise ValueError(
+                    f"GDP hull reformulation of disjunction {prefix!r}: variable {vname!r} "
+                    f"has no finite {side} bound within disjunct {k} (bounds "
+                    f"[{dlb:g}, {dub:g}]). The hull links each disaggregated copy to its "
+                    "selector by that bound (v <= ub*y), so an unbounded variable "
+                    "admits no exact hull. Give the variable a finite bound (e.g. "
+                    "m.continuous(..., ub=...)) or bound it inside every disjunct."
+                )
 
     # disagg[k][var_name] = disaggregated Variable v_{j,k}
     disagg: list[dict[str, Variable]] = []

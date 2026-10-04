@@ -662,7 +662,16 @@ class DAEBuilder:
         -------
         Expression
             A single expression suitable for use in ``m.minimize()``.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`discretize` -- the quadrature is built over
+            the discretized state variables, which do not exist yet (#1620;
+            this used to surface as a bare ``KeyError`` on the state name).
         """
+        if not self._discretized:
+            raise RuntimeError("Call discretize() before integral()")
         cs = self._cs
         tp = self._element_points()
 

@@ -58,7 +58,8 @@ CASES = [
     ("log2", lambda x: dm.log2(x), [(0.2, 6.0)], True, "CONCAVE"),
     ("log10", lambda x: dm.log10(x), [(0.2, 6.0)], True, "CONCAVE"),
     ("log1p", lambda x: dm.log1p(x), [(0.0, 6.0)], True, "CONCAVE"),
-    ("entropy", lambda x: x * dm.log(x), [(0.2, 4.0)], False, "UNKNOWN"),
+    # x*log(x) is convex for x > 0 (f'' = 1/x); #1616 made the detector prove it.
+    ("entropy", lambda x: x * dm.log(x), [(0.2, 4.0)], False, "CONVEX"),
     # ---- sqrt / abs ----
     ("sqrt", lambda x: dm.sqrt(x), [(0.1, 9.0)], True, "CONCAVE"),
     ("abs", lambda x: abs(x), [(-3.0, 2.0)], True, "CONVEX"),
