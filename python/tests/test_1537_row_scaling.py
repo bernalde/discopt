@@ -238,3 +238,26 @@ def test_row_scaled_m3_certifies_on_the_highs_master(monkeypatch):
     # minlplib.solu: m3 =opt= 37.8 (minimize). Certified, never above it.
     assert res.bound <= 37.8 + 1e-6, res.bound
     assert res.objective == pytest.approx(37.8, rel=1e-4)
+
+
+def test_row_scaled_flay03m_admits_no_infeasible_incumbent(monkeypatch):
+    """flay03m with rows scaled in 10^[-6,6]. OA's fixed-NLP subproblem returned
+    iteration-limited points at objectives 39.10 and 27.16 (optimum 48.99) that
+    violate a row scaled by ~5e-6 by ~3e-5 -- inside the old absolute ``1e-4``
+    screen, about 6.5 in the row's own units. Admitted as the incumbent, the 27.16
+    point ended OA with the master bound above it; the route withdrew both, fell
+    back, and the spatial path published no bound in its remaining 25 s.
+
+    Candidates are now judged by the exit gate's verifier (``verify_point``, keyed
+    on each row's scale). Anti-vacuity (CLAUDE.md §6): the trace must show that
+    gate refusing candidates, or this instance no longer reaches it."""
+    monkeypatch.delenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", raising=False)
+    res = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30)
+    trace = res.mip_nlp_trace or {}
+    assert trace.get("summary", {}).get("rejected_incumbent_count", 0) > 0, trace.get("summary")
+    route = res.algorithm_route or ""
+    assert "fell back" not in route, route
+    assert res.gap_certified, (res.status, res.bound, route)
+    # minlplib.solu: flay03m =opt= 48.98979486 (minimize). Never above it.
+    assert res.bound <= 48.98979486 + 1e-6, res.bound
+    assert res.objective == pytest.approx(48.98979486, rel=1e-4)

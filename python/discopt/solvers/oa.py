@@ -6898,6 +6898,9 @@ def solve_oa(
     heuristic_bound_source: Optional[str] = None
     incumbent = None
     incumbent_obj = None
+    # Candidates ``verified_candidate`` refused, and the best of them (see there).
+    rejected_incumbents = 0
+    best_refused: Optional[tuple[np.ndarray, float]] = None
     integer_assignments_seen: set[tuple[float, ...]] = set()
     # Local NLP failures do not prove fixed-integer infeasibility. Track those
     # assignments so final certification is downgraded instead of adding an
@@ -7371,6 +7374,7 @@ def solve_oa(
             for status, count in sorted(fixed_nlp_call_status_counts.items())
         }
         summary["fixed_nlp_scheduler"] = fixed_nlp_manager.scheduler_trace()
+        summary["rejected_incumbent_count"] = int(rejected_incumbents)
         if interior_point_store is not None:
             interior_counts = Counter(record.source for record in interior_point_store.records)
             summary["interior_point_count"] = int(len(interior_point_store.records))
@@ -7952,12 +7956,50 @@ def solve_oa(
             mip_nlp_trace=_build_mip_nlp_trace("continuous_nlp_infeasible"),
         )
 
+    def verified_candidate(x: np.ndarray, obj: float) -> Optional[tuple[np.ndarray, float]]:
+        """The point and objective to adopt as OA's incumbent, or ``None``.
+
+        ``UB`` ends the loop (``LB >= UB - tol``) and is what the published gap is
+        measured against, so it may only come from a point the exit gate would
+        publish. The fixed-NLP path screened candidates at an *absolute* ``1e-4``
+        on each row as written (``_is_primal_feasible``), and the ECP path at an
+        absolute ``1e-6``; neither is invariant under row scaling. Measured
+        (#1537): ``flay03m`` with each row multiplied by ``10**U(-6, 6)`` admitted
+        two iteration-limited fixed-NLP points at objectives 39.10 and 27.16
+        against an optimum of 48.99, each violating a row scaled by ``5e-6`` by
+        ``3e-5`` -- about 6.5 in the row's own units. The second ended OA with
+        ``LB > UB``, which then withdrew the (valid) master bound. Using the exit
+        gate's own arbiter here means a candidate is refused exactly when it could
+        not have been published, so no publishable incumbent is lost.
+
+        The best refused candidate is kept in ``best_refused`` and returned,
+        UNVERIFIED, only if the loop ends with no verified incumbent -- which is
+        what the exit gate already did with it before this screen existed. It is a
+        warm start for the caller (the #1059 route hands it to the fallback), never
+        a bound. Measured on ``portfol_roundlot`` (unscaled): the fixed NLP's point
+        misses row 5 by 2.6e-6 (allowed 1e-6); dropping it outright left the
+        fallback cold, and the solve lost the certificate it earns from that start.
+        """
+        nonlocal rejected_incumbents, best_refused
+        x_out, obj_out, refusal = _exit_verified_incumbent(model, x, obj, _obj_sign)
+        if refusal is not None:
+            rejected_incumbents += 1
+            logger.debug("OA: candidate incumbent %.12g refused: %s", obj, refusal)
+            if best_refused is None or obj < best_refused[1]:
+                best_refused = (np.asarray(x, dtype=np.float64).copy(), float(obj))
+            return None
+        return x_out, float(obj_out)
+
     def accept_incumbent(
         x: np.ndarray,
         obj: float,
         multipliers: Optional[np.ndarray],
-    ) -> None:
+    ) -> bool:
         nonlocal UB, incumbent, incumbent_obj, incumbent_derivative_data
+        candidate = verified_candidate(x, obj)
+        if candidate is None:
+            return False
+        x, obj = candidate
         UB = float(obj)
         incumbent = np.asarray(x, dtype=np.float64).copy()
         incumbent_obj = float(obj)
@@ -7970,6 +8012,7 @@ def solve_oa(
                 multipliers,
             )
         _record_interior_point(incumbent, "incumbent", {"objective": float(obj)})
+        return True
 
     if init_strategy == "rNLP":
         relax_attempt = None
@@ -8992,12 +9035,13 @@ def solve_oa(
                     )
                 # In ECP, use master objective as heuristic UB
                 master_obj = float(evaluator.evaluate_objective(x_master))
-                cons_vals = evaluator.evaluate_constraints(x_master)
-                is_feasible = all(cons_vals[k] <= 1e-6 for k in range(n_cons))
-                if is_feasible and master_obj < UB:
-                    UB = master_obj
-                    incumbent = x_master.copy()
-                    incumbent_obj = master_obj
+                ecp_candidate = None
+                if master_obj < UB:
+                    ecp_candidate = verified_candidate(x_master, master_obj)
+                if ecp_candidate is not None and ecp_candidate[1] < UB:
+                    incumbent = np.asarray(ecp_candidate[0], dtype=np.float64).copy()
+                    incumbent_obj = ecp_candidate[1]
+                    UB = incumbent_obj
                     _record_interior_point(
                         incumbent,
                         "ecp_candidate",
@@ -9048,8 +9092,10 @@ def solve_oa(
             if x_nlp is not None:
                 if obj_nlp is not None and obj_nlp < UB:
                     multipliers = nlp_attempt.multipliers
-                    accept_incumbent(x_nlp, obj_nlp, multipliers)
-                    incumbent_update = "improved"
+                    if accept_incumbent(x_nlp, obj_nlp, multipliers):
+                        incumbent_update = "improved"
+                    else:
+                        incumbent_update = "not_verified"
                 else:
                     incumbent_update = "not_improved"
 
@@ -9343,6 +9389,12 @@ def solve_oa(
         # reports *less*, so it cannot manufacture a certificate.
         bound = None
 
+    if incumbent is None and best_refused is not None:
+        # Every candidate failed the screen in ``verified_candidate``. Return the
+        # best one exactly as the exit gate returned it before that screen existed:
+        # it is refused again just below and leaves as an unverified point. ``UB``
+        # stays infinite, so no gap is computed against it.
+        incumbent, incumbent_obj = best_refused
     if incumbent is not None and incumbent_obj is not None:
         # --- exit gate: verify the point that actually LEAVES ---
         # Placed here, after every acceptance gate and every terminal
