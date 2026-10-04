@@ -7812,6 +7812,69 @@ def _convex_minlp_route_enabled() -> bool:
     return raw.strip() != "0"
 
 
+#: Values of ``DISCOPT_CONVEX_ROUTE_OA_MASTER`` -> the ``milp_solver`` the route
+#: names (``None`` = name none, i.e. the MIP-NLP layer's in-house ``"auto"``).
+_CONVEX_ROUTE_OA_MASTERS: dict[str, Optional[str]] = {"highs": "highs", "auto": None}
+
+
+def _convex_route_oa_master() -> Optional[str]:
+    """``DISCOPT_CONVEX_ROUTE_OA_MASTER``: the MILP engine for the routed OA master.
+
+    **Default ``highs``** (#1537 follow-up, 2026-10-04); ``auto`` is the opt-out
+    to the in-house simplex master the route used from #1141 to here. Any other
+    value raises rather than guessing.
+
+    #1141 took HiGHS off this route on *policy* -- "HiGHS is an opt-in optional
+    dependency and the default route must never depend on one" -- while its own
+    panel had the HiGHS route ahead (26/26 certified in 35.6 s vs 24/26 in
+    118.7 s). That premise expired with #1229, which made ``highspy>=1.10`` a
+    core dependency for the pure LP/MILP route. A missing ``highspy`` is now a
+    broken install, and the route treats it the way that route does: it raises
+    (:func:`discopt.solvers.lp_milp_highs.require_highspy`) instead of silently
+    choosing a different engine.
+
+    Measured with the shipping route, guard and fallback in place (plain
+    ``solve(time_limit=30)``, arms interleaved per instance; script
+    ``discopt_benchmarks/scripts/convex_route_oa_master_panel.py``,
+    ``docs/dev/performance-plan.md`` §25.13). Certified count / total wall:
+
+    ======================================  ===============  ===============
+    panel                                   ``auto``         ``highs``
+    ======================================  ===============  ===============
+    in-repo routed, unscaled (26)           26 / 58.9 s      26 / 66.0 s
+    ...rows scaled 10^U(-3,3)               24 / 84.1 s      25 / 62.0 s
+    ...rows scaled 10^U(-6,6)               20 / 248.8 s     22 / 142.1 s
+    syn/rsyn (51), DISCOPT_CONVEX_KERNEL=0  22 / 893.6 s     31 / 632.0 s
+    syn/rsyn (51), default kernel ON        20 / 1040.0 s    20 / 1040.3 s
+    ======================================  ===============  ===============
+
+    No certificate lost anywhere; 941 executed bound checks, 0 violations. With
+    the kernel ON the route fires on only 4 of 51 ``syn``/``rsyn`` rows -- the
+    kernel takes the whole budget on the rest (#1624) -- so there the arms tie.
+    One wall regression: ``portfol_roundlot`` 0.90 s -> 13.11 s, still
+    certified. Its master is flat (bound ~0.0282902 from the first iteration)
+    and has many assignments tied at the optimum; HiGHS breaks the tie towards
+    ones whose NLPs are poor, OA misses the guard checkpoint and the spatial
+    fallback certifies.
+
+    The master's bound is HiGHS's ``mip_dual_bound``, never its incumbent
+    (``milp_highs``), and OA reads only ``master_result.bound``, so the
+    certificate does not depend on which engine closed the master.
+    """
+    raw = os.environ.get("DISCOPT_CONVEX_ROUTE_OA_MASTER", "highs").strip().lower()
+    if raw not in _CONVEX_ROUTE_OA_MASTERS:
+        raise ValueError(
+            f"DISCOPT_CONVEX_ROUTE_OA_MASTER={raw!r}; choose from "
+            f"{sorted(_CONVEX_ROUTE_OA_MASTERS)}"
+        )
+    master = _CONVEX_ROUTE_OA_MASTERS[raw]
+    if master == "highs":
+        from discopt.solvers.lp_milp_highs import require_highspy
+
+        require_highspy()
+    return master
+
+
 def _convex_route_requires_syntactic_objective() -> bool:
     """``DISCOPT_CONVEX_ROUTE_SYNTACTIC_OBJECTIVE``: route to OA only when the
     objective is convex by the syntactic rules (default ON, ``=0`` opts out).
@@ -7942,6 +8005,11 @@ def _convex_minlp_auto_route(model: Model) -> tuple[Optional[str], str, dict[str
     five (20 certificates), because the spatial fallback rescues rows rather than
     stealing from them.
 
+    **The master engine moved to HiGHS (2026-10-04)** -- the target is still
+    ``"oa"``; only ``milp_solver`` changed. #1141's policy reason expired when
+    #1229 made ``highspy`` a core dependency; see :func:`_convex_route_oa_master`
+    for the panel and the ``auto`` opt-out.
+
     Every gate below is a *refusal* to route: an unknown convexity verdict, a
     nonconvex model, a missing MILP backend, or an opaque ``dm.custom`` body all
     leave the model on the sound default path. The route never fires on a model
@@ -8012,19 +8080,17 @@ def _convex_minlp_auto_route(model: Model) -> tuple[Optional[str], str, dict[str
     except ImportError:
         return None, "not routed: no MILP backend available for the OA master", {}
 
-    # No highspy gate here any more (#1141). It used to fall back to ``"oa"``
-    # when highspy was missing, which made the default algorithm for this whole
-    # problem class depend on an OPTIONAL dependency being installed. Every
-    # install now takes the same path, and the panel picked which one.
+    # The master engine is a selector, not a capability probe: a missing
+    # highspy raises there (a broken install, since #1229), and it never
+    # silently changes the algorithm -- the #1141 defect.
+    master = _convex_route_oa_master()
     return (
         "oa",
         (
             f"mip-nlp/oa: {problem_class.value} certified convex at the root "
-            "(DISCOPT_CONVEX_MINLP_ROUTE)"
+            f"(DISCOPT_CONVEX_MINLP_ROUTE; master={master or 'in-house'})"
         ),
-        # Deliberately empty. Naming a backend here is what coupled the default
-        # path to an opt-in package, and `"oa"` needs no backend key at all.
-        {},
+        {} if master is None else {"milp_solver": master},
     )
 
 

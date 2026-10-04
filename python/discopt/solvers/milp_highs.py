@@ -149,16 +149,27 @@ def _prepare_cut_row(
     # under ``small_matrix_value`` and dropped -- so the row was scaled by
     # 7.04e13 to rescue a term it discarded, and what reached the master was a
     # redundant ``s_k >= 0`` carrying a 7.04e13 coefficient.
-    liftable = a_abs[a_abs * scale_cap > small_tol]
-    # ``a_max`` itself always qualifies (``a_max * scale_cap`` is ``large_tol/10``,
-    # far above ``small_tol``), so this is never empty.
-    a_min = float(np.min(liftable))
-    room = min(10.0 * small_tol / a_min, scale_cap)
-    headroom = math.floor(math.log2(room))
-    if headroom > 0:
-        scale = 2.0**headroom
+    if a_max >= large_tol:
+        # The big end is one HiGHS REFUSES (kError), not drops: scale the row DOWN,
+        # by a power of two so it stays the same inequality bit-for-bit. Measured on
+        # ``clay0303hfsg`` with rows scaled by up to 1e6: OA cut coefficients reached
+        # 1.6e22 and the whole master was rejected. Whatever this pushes under
+        # ``small_tol`` is handled below like any other tiny term -- dropped on its
+        # valid side, or refused.
+        scale = 2.0 ** math.floor(math.log2(scale_cap))
         coeffs = coeffs * scale
         rhs *= scale
+    else:
+        liftable = a_abs[a_abs * scale_cap > small_tol]
+        # ``a_max`` itself always qualifies (``a_max * scale_cap`` is
+        # ``large_tol/10``, far above ``small_tol``), so this is never empty.
+        a_min = float(np.min(liftable))
+        room = min(10.0 * small_tol / a_min, scale_cap)
+        headroom = math.floor(math.log2(room))
+        if headroom > 0:
+            scale = 2.0**headroom
+            coeffs = coeffs * scale
+            rhs *= scale
 
     tiny = (coeffs != 0.0) & (np.abs(coeffs) <= small_tol)
     if not tiny.any():
@@ -199,6 +210,54 @@ def _prepare_cut_row(
     return nz, kept[nz], rhs
 
 
+def _fit_rows_to_window(
+    a: sp.csr_matrix,
+    rhs: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    small_tol: float,
+    large_tol: float,
+    equality: bool,
+) -> tuple[sp.csr_matrix, np.ndarray]:
+    """Apply :func:`_prepare_cut_row` to every row with an entry HiGHS would not take.
+
+    ``passModel`` drops ``|a_ij| <= small_matrix_value`` and answers ``kWarning``,
+    and refuses the model (``kError``) on ``|a_ij| >= large_matrix_value``, exactly
+    as ``addRow`` does, so a whole master built from OA cuts needs the same
+    fitting the lazy path already gets. Rows with no such entry are returned
+    bit-for-bit, so every master that HiGHS accepted before is unchanged.
+
+    An equality row may only be *scaled* (power of two: exact); it has no valid
+    side to drop a term on, so one that still holds a tiny entry after scaling is
+    refused rather than silently perturbed.
+    """
+    if a.nnz == 0:
+        return a, rhs
+    misfit_row = np.zeros(a.shape[0], dtype=bool)
+    rows_of_nz = np.repeat(np.arange(a.shape[0]), np.diff(a.indptr))
+    a_abs = np.abs(a.data)
+    misfit_row[rows_of_nz[(a_abs <= small_tol) | (a_abs >= large_tol)]] = True
+    if not misfit_row.any():
+        return a, rhs
+    a = a.tolil(copy=True)
+    rhs = rhs.copy()
+    for i in np.flatnonzero(misfit_row):
+        dense = a.getrow(i).toarray().ravel()
+        nnz_before = int(np.count_nonzero(dense))
+        idx, vals, new_rhs = _prepare_cut_row(dense, float(rhs[i]), lb, ub, small_tol, large_tol)
+        if equality and idx.size != nnz_before:
+            raise ValueError(
+                f"equality row {i} of the HiGHS master has coefficients at or below "
+                f"HiGHS's small_matrix_value ({small_tol:g}) that no exact rescaling "
+                "lifts clear of it; HiGHS would drop them and the row would change."
+            )
+        row = np.zeros(a.shape[1])
+        row[idx] = vals
+        a[i, :] = row
+        rhs[i] = new_rhs
+    return a.tocsr(), rhs
+
+
 def _stack_rows(
     A_ub: Optional[Union[np.ndarray, sp.spmatrix]],
     b_ub: Optional[np.ndarray],
@@ -206,14 +265,21 @@ def _stack_rows(
     b_eq: Optional[np.ndarray],
     n: int,
     highs_inf: float,
+    window: Optional[tuple[np.ndarray, np.ndarray, float, float]] = None,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
-    """Stack ``A_ub x <= b_ub`` and ``A_eq x == b_eq`` into HiGHS's row-range form."""
+    """Stack ``A_ub x <= b_ub`` and ``A_eq x == b_eq`` into HiGHS's row-range form.
+
+    ``window=(lb, ub, small_tol, large_tol)`` fits every row to HiGHS's coefficient
+    window first (:func:`_fit_rows_to_window`); without it rows pass as given.
+    """
     blocks, lowers, uppers = [], [], []
     if A_ub is not None and b_ub is not None:
         a = sp.csr_matrix(A_ub, dtype=np.float64)
         rhs = np.asarray(b_ub, dtype=np.float64).ravel()
         if a.shape[1] != n or a.shape[0] != rhs.shape[0]:
             raise ValueError(f"A_ub {a.shape} inconsistent with c ({n},) / b_ub {rhs.shape}")
+        if window is not None:
+            a, rhs = _fit_rows_to_window(a, rhs, *window, equality=False)
         blocks.append(a)
         lowers.append(np.full(a.shape[0], -highs_inf))
         uppers.append(rhs)
@@ -222,6 +288,8 @@ def _stack_rows(
         rhs = np.asarray(b_eq, dtype=np.float64).ravel()
         if a.shape[1] != n or a.shape[0] != rhs.shape[0]:
             raise ValueError(f"A_eq {a.shape} inconsistent with c ({n},) / b_eq {rhs.shape}")
+        if window is not None:
+            a, rhs = _fit_rows_to_window(a, rhs, *window, equality=True)
         blocks.append(a)
         lowers.append(rhs)
         uppers.append(rhs)
@@ -276,7 +344,11 @@ def solve_milp(
     c_arr = np.asarray(c, dtype=np.float64).ravel()
     n = c_arr.shape[0]
     lb, ub = _marshal_col_bounds(bounds, n)
-    a_csc, row_lower, row_upper = _stack_rows(A_ub, b_ub, A_eq, b_eq, n, highspy.kHighsInf)
+    h = highspy.Highs()
+    small_tol, large_tol = _highs_matrix_window(h, highspy)
+    a_csc, row_lower, row_upper = _stack_rows(
+        A_ub, b_ub, A_eq, b_eq, n, highspy.kHighsInf, window=(lb, ub, small_tol, large_tol)
+    )
 
     lp = highspy.HighsLp()
     lp.num_col_ = n
@@ -302,7 +374,6 @@ def solve_milp(
             for f in int_mask
         ]
 
-    h = highspy.Highs()
     # Every option write is checked: a rejected option would silently leave the
     # solve on a different configuration than the one reported (CLAUDE.md §6/§7).
     opts: list[tuple[str, object]] = [
@@ -469,7 +540,11 @@ def solve_milp_with_lazy_cuts(
     c_arr = np.asarray(c, dtype=np.float64).ravel()
     n = c_arr.shape[0]
     lb, ub = _marshal_col_bounds(bounds, n)
-    a_csc, row_lower, row_upper = _stack_rows(A_ub, b_ub, A_eq, b_eq, n, highspy.kHighsInf)
+    h = highspy.Highs()
+    small_tol, large_tol = _highs_matrix_window(h, highspy)
+    a_csc, row_lower, row_upper = _stack_rows(
+        A_ub, b_ub, A_eq, b_eq, n, highspy.kHighsInf, window=(lb, ub, small_tol, large_tol)
+    )
 
     lp = highspy.HighsLp()
     lp.num_col_ = n
@@ -495,7 +570,6 @@ def solve_milp_with_lazy_cuts(
             for f in int_mask
         ]
 
-    h = highspy.Highs()
     for key, val in [("output_flag", False), ("mip_rel_gap", float(gap_tolerance))]:
         if h.setOptionValue(key, val) != highspy.HighsStatus.kOk:
             raise RuntimeError(f"HiGHS rejected option {key}={val!r}")
@@ -512,7 +586,6 @@ def solve_milp_with_lazy_cuts(
         sol.col_value = seed
         h.setSolution(sol)
 
-    small_tol, large_tol = _highs_matrix_window(h, highspy)
     counts = {
         "mipsol_calls": 0,
         "mipnode_calls": 0,

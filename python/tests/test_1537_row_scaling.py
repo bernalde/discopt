@@ -206,9 +206,15 @@ def test_row_scaled_m3_loses_its_certificate_soundly(monkeypatch):
     (see ``docs/dev/flag-retirement-audit.md``). This pins what main keeps: the
     certificate is lost, never replaced by a bound above the optimum. A future
     row-scale-invariant fix flips the ``gap_certified`` assertion and must pass the
-    panel to do so."""
+    panel to do so.
+
+    Pinned to the in-house master (``DISCOPT_CONVEX_ROUTE_OA_MASTER=auto``), which
+    is where the #1296 guard lives and which remains a shipped route. The default
+    HiGHS master is that row-scale-tolerant fix for this instance (performance-plan
+    §25.13): see ``test_row_scaled_m3_certifies_on_the_highs_master``."""
     from discopt._rust import profile_counters_py, profile_reset_py
 
+    monkeypatch.setenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", "auto")
     monkeypatch.setenv("DISCOPT_PROFILE", "1")
     profile_reset_py()
     res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
@@ -217,3 +223,18 @@ def test_row_scaled_m3_loses_its_certificate_soundly(monkeypatch):
     assert not res.gap_certified, (res.status, res.bound)
     # minlplib.solu: m3 =opt= 37.8 (minimize). No false bound.
     assert res.bound is None or res.bound <= 37.8 + 1e-6, res.bound
+
+
+def test_row_scaled_m3_certifies_on_the_highs_master(monkeypatch):
+    """The same m3 at 10^[-6,6] on the default convex-route master. HiGHS fits each
+    master row to its own coefficient window (``milp_highs._fit_rows_to_window``),
+    so the 1e-11 column ratio that trips the in-house guard never reaches a
+    certificate decision; the route certifies, with no bound above the optimum.
+    Measured on the route panel: +m3 at span 6, 22/26 vs 20/26 (§25.13)."""
+    monkeypatch.delenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", raising=False)
+    res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
+    assert "master=highs" in (res.algorithm_route or ""), res.algorithm_route
+    assert res.gap_certified, (res.status, res.bound, res.algorithm_route)
+    # minlplib.solu: m3 =opt= 37.8 (minimize). Certified, never above it.
+    assert res.bound <= 37.8 + 1e-6, res.bound
+    assert res.objective == pytest.approx(37.8, rel=1e-4)

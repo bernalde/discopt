@@ -158,10 +158,17 @@ async function installDiscopt() {
   // The consequence is worth stating plainly rather than hiding: the LP and
   // MILP numbers this page prints come from the Rust simplex, so they are not a
   // measurement of the HiGHS route a desktop install takes by default.
+  //
+  // `DISCOPT_CONVEX_ROUTE_OA_MASTER=auto` is the same move for the convex-MINLP
+  // route (performance-plan §25.13): its OA master defaults to HiGHS and, like
+  // the LP/MILP route, raises `HighsUnavailable` rather than probing for
+  // highspy. `auto` is its documented opt-out to the in-house simplex master.
+  // The MINLP example died on exactly that raise before this line existed.
   await pyodide.runPythonAsync(`
 import os
 
 os.environ["DISCOPT_LP_MILP_BACKEND"] = "rust"
+os.environ["DISCOPT_CONVEX_ROUTE_OA_MASTER"] = "auto"
 `);
 
   // Fail loudly and immediately if the deps-false gamble was wrong, rather than

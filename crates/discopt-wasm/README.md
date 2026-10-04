@@ -103,10 +103,12 @@ So `worker.js` also sets
 
 ```js
 os.environ["DISCOPT_LP_MILP_BACKEND"] = "rust"
+os.environ["DISCOPT_CONVEX_ROUTE_OA_MASTER"] = "auto"
 ```
 
-which is discopt's own documented opt-out from the #1229 HiGHS route, selecting the
-certified in-house Rust simplex. The consequence worth knowing: **the LP and MILP numbers
+which are discopt's own documented opt-outs from the #1229 HiGHS route and from the
+HiGHS master of the convex-MINLP OA route (performance-plan §25.13), selecting the
+certified in-house Rust simplex for both. The consequence worth knowing: **the LP and MILP numbers
 this page prints come from the Rust simplex, not from HiGHS.** Both are certified, and
 `python/tests/test_wasm_examples.py` runs the examples with that variable set and with
 the three modules made unimportable, so the page's environment is the tested one.
