@@ -195,7 +195,7 @@ class RobustCounterpart:
         names = {u.parameter.name for u in self._uncertainty_sets}
         m = self._model
         oriented = []
-        for con in m._constraints:
+        for con in _split_vector_uncertain_rows(m._constraints, names):
             if (
                 not isinstance(con, Constraint)
                 or con.sense == "<="
@@ -246,3 +246,53 @@ class RobustCounterpart:
                 self._prefix,
             )
         raise ValueError(f"Unsupported uncertainty set kind: {self.kind!r}")
+
+
+def _split_vector_uncertain_rows(constraints, names: set[str]) -> list:
+    """Expand every vector-valued uncertain row into one scalar row per element.
+
+    A vector constraint ``body(x, xi) <= 0`` of shape ``s`` is the conjunction
+    of its ``prod(s)`` scalar rows, and each one must hold for every ``xi``
+    *independently*: the adversary picks a different worst case per row. The
+    formulations robustify one constraint body at a time, so a vector body was
+    treated as a single row -- the polyhedral (budget) counterpart then gave
+    the whole vector ONE set of dual multipliers, forcing ``A^T lam`` to equal
+    every element's coefficient vector at once. That is exact only when all
+    elements share a coefficient vector, and otherwise over-conservative: the
+    bound rows ``y0 + Y xi <= ub`` that :class:`AffineDecisionRule` adds for a
+    1-D recourse variable pinned every policy column ``Y_j`` to a common
+    value, so the affine rule could not adapt and returned the static value
+    for every budget (#1611 X-30c). Splitting is exact for every set kind.
+
+    Rows whose body has no statically known shape (reductions, matmul) or is
+    scalar, and rows with no uncertain parameter, pass through unchanged.
+    """
+    from discopt.modeling.core import Constraint, IndexExpression
+    from discopt.ro.formulations._common import _contains_uncertain_param
+
+    out = []
+    for con in constraints:
+        if not isinstance(con, Constraint) or not _contains_uncertain_param(con.body, names):
+            out.append(con)
+            continue
+        try:
+            shape = tuple(con.body.shape)
+        except AttributeError:
+            shape = ()
+        if int(np.prod(shape)) <= 1:
+            out.append(con)
+            continue
+        rhs = np.asarray(con.rhs, dtype=np.float64)
+        for idx in np.ndindex(*shape):
+            index = idx[0] if len(idx) == 1 else idx
+            elem_rhs = float(rhs[idx]) if rhs.ndim > 0 else float(rhs)
+            name = f"{con.name}[{','.join(map(str, idx))}]" if con.name is not None else None
+            out.append(
+                Constraint(
+                    body=IndexExpression(con.body, index),
+                    sense=con.sense,
+                    rhs=elem_rhs,
+                    name=name,
+                )
+            )
+    return out
