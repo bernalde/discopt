@@ -54,6 +54,20 @@ objective coefficient to at most 1 (:func:`objective_scale`), and maps the
 answer back: ``x`` is unchanged, objective and every dual divide by ``sigma``.
 A power of two makes both directions exact, and ``sigma = 1`` (no change at all)
 for every objective whose coefficients are already at most 1.
+
+The engine's ``tol`` is an **absolute** bound on its KKT residual (POUNCE
+``QpOptions::tol``, default ``1e-8``; a scale-relative arm opens only below the
+finite-precision floor). Dual infeasibility and complementarity are linear in
+the objective, so a solve of ``sigma*objective`` stopped at ``tol`` is stopped at
+``tol/sigma`` in the caller's units -- 8192x looser on ``3200*j**2``, where the
+mapped-back complementarity of 6.6e-6 failed the #1384 stationarity guard and
+the solve came back ``error``. The engine is therefore handed ``tol*sigma``
+(:func:`engine_tol`): the caller-unit stopping test is the one asked for, and the
+primal residual, which ``sigma`` does not touch, is held at least as tight --
+down to a floor of ``16*eps`` (:data:`_ENGINE_TOL_FLOOR`), below which the scaled
+problem (coefficients at most 1) cannot resolve its residual and the engine runs
+to ``iteration_limit``. The floor only ever loosens the request; the #1384
+stationarity guard downstream still judges every point the engine returns.
 """
 
 from __future__ import annotations
@@ -250,6 +264,33 @@ def objective_scale(P, c: np.ndarray) -> float:
     return math.ldexp(1.0, -math.ceil(math.log2(m)))
 
 
+#: POUNCE ``QpOptions::default().tol`` (``pounce-convex/src/ipm.rs``), which the
+#: Python surface does not expose. ``test_engine_default_tol_is_mirrored`` pins it:
+#: ``tol=None`` and ``tol=_ENGINE_DEFAULT_TOL`` must give the identical solve.
+_ENGINE_DEFAULT_TOL = 1e-8
+
+
+#: The smallest engine ``tol`` :func:`engine_tol` asks for. Measured 2026-10-04 on
+#: ten solves (``test_1537_pounce_objective_scale.py``: the production LP with
+#: costs x1e-2..x1e8, ``1e8*x + x**2/2`` bounded and free, ``k/2*j**2`` with
+#: ``k`` = 6400, 1e6, 1e8): ``1*eps`` sends the x1e6 and x1e8 LPs to
+#: ``iteration_limit``; ``4*eps`` to ``20*eps`` pass all ten; ``64*eps`` loses
+#: ``k = 1e8`` to the stationarity guard. ``16*eps`` sits ~4x inside both edges.
+_ENGINE_TOL_FLOOR = 16.0 * float(np.finfo(np.float64).eps)
+
+
+def engine_tol(tol: Optional[float], sigma: float) -> Optional[float]:
+    """The engine tolerance that keeps ``tol`` in the caller's units under ``sigma``.
+
+    ``None`` (the engine default) passes through when ``sigma == 1``, so an
+    unscaled solve is bit-for-bit what it was. See the module docstring.
+    """
+    if sigma == 1.0:
+        return tol
+    want = (_ENGINE_DEFAULT_TOL if tol is None else float(tol)) * sigma
+    return max(want, _ENGINE_TOL_FLOOR)
+
+
 def _unscale_result(res: Any, sigma: float) -> Any:
     """``res`` of the engine solve of ``sigma * objective``, in the caller's units.
 
@@ -361,7 +402,7 @@ def _solve(
             h=h,
             lb=lb,
             ub=ub,
-            tol=opts.get("tol"),
+            tol=engine_tol(opts.get("tol"), sigma),
             max_iter=opts.get("max_iter"),
             time_limit=limit,
             collect_iterates=print_level > 0 or solve_report,
