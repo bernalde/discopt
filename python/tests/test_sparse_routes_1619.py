@@ -116,6 +116,16 @@ def test_screen_jacobian_is_sparse_and_exact_for_tape_evaluator():
 
 def test_dae_post_solve_screen_peak_memory_is_linear():
     pytest.importorskip("pounce")
+    m = _batch_dae(400)
+    res, peak = _peak_mb(lambda: m.solve(solver="pounce"))
+    assert res.status in ("optimal", "local_optimal")
+    assert peak < PEAK_LIMIT_MB, f"DAE solve peaked at {peak:.1f} MB (nfe=400)"
+
+    # The solve's own screen reaches the Jacobian only when some row is near a
+    # line, which depends on the IPM's last iterate (it did not fire in a CI
+    # run). So drive the screen directly from a point that is: the solution
+    # shifted off its rows.
+    x = np.concatenate([np.ravel(np.asarray(res.x[v.name], dtype=float)) for v in m._variables])
     fired = {"n": 0, "sparse": 0}
     orig = F.improving_gradient_norms
 
@@ -127,13 +137,12 @@ def test_dae_post_solve_screen_peak_memory_is_linear():
     mp = pytest.MonkeyPatch()
     mp.setattr(F, "improving_gradient_norms", counting)
     try:
-        res, peak = _peak_mb(lambda: _batch_dae(400).solve(solver="pounce"))
+        _verdict, screen_peak = _peak_mb(lambda: F.check_constraints(m, x + 1e-5))
     finally:
         mp.undo()
-    assert res.status in ("optimal", "local_optimal")
-    assert fired["n"] > 0, "the post-solve screen never ran"
+    assert fired["n"] > 0, "the post-solve screen never reached the Jacobian"
     assert fired["sparse"] == fired["n"]
-    assert peak < PEAK_LIMIT_MB, f"DAE solve peaked at {peak:.1f} MB (nfe=400)"
+    assert screen_peak < PEAK_LIMIT_MB, f"screen peaked at {screen_peak:.1f} MB (nfe=400)"
 
 
 # ------------------------------------------------------------ sparse/dense parity
