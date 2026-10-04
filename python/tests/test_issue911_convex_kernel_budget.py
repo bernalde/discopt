@@ -206,3 +206,14 @@ def test_real_instance_does_not_pay_a_second_full_budget(monkeypatch):
         f"kernel attempt -- the default path was handed a second full budget "
         f"instead of the {budget - attempt:.2f}s that remained"
     )
+
+
+@pytest.fixture(autouse=True)
+def _kernel_runs_first(monkeypatch):
+    """#1624: this file exercises the kernel's OWN attempt on ``Model.solve``.
+
+    ``clay0303hfsg`` is also a model the convex-MINLP route takes, and by default
+    the kernel now defers to the route there, so no attempt would run. The
+    ``=0`` opt-out keeps these tests on the kernel-first order they are about.
+    """
+    monkeypatch.setenv("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "0")

@@ -124,6 +124,17 @@ The release procedure that produces these entries is documented in
 
 ### Fixed
 
+- **The convex kernel no longer starves the convex-MINLP route** (`fix`, #1624).
+  `Model.solve` ran the native convex kernel first with the whole of any
+  `time_limit <= 120`; on a kernel-eligible model the #1059 router would divert,
+  a kernel that could not certify left `solve_model` ~0 s and the route never
+  fired. The kernel now defers to the route on exactly those models
+  (`DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE`, default ON, `=0` restores
+  kernel-first). Panel at 30 s, 77 instances (the 67 routed kernel-eligible
+  models plus 10 non-routed eligible controls): certified 31 -> 44, incumbents
+  32 -> 67, 0 certificates or incumbents lost, 220 oracle bound checks with 0
+  violations; on the 48 routed, kernel-eligible `syn`/`rsyn` rows incumbents
+  18 -> 48 and certified 17 -> 28.
 - **Row-scaled MILP certificates: regression fixtures; row pre-pass retired** (`test`, contributes to #1537).
   - Scaling a model's rows by powers of ten (10^[-6,6]) makes the #1296 tiny-entry guard withdraw the certificate on m3/flay03m. That is sound (a lost certificate, never a false bound) and is now pinned by regression tests, so a future row-scale-invariant fix flips them visibly.
   - A pow2 row pre-pass in `scaling::equilibrate` that restored these certificates was tried and retired under §5: it lost clay0303hfsg's certificate at 20 s, with 15x the Numerical LP verdicts of the legacy factors, and a legacy-factor retry at every `Scaling` entry point did not reach the failing (unscaled, warm) solves. Measurements in `docs/dev/flag-retirement-audit.md`. No solver code changes.

@@ -89,7 +89,7 @@ import math
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from discopt.modeling.core import SolveResult
@@ -1096,9 +1096,21 @@ class _AttemptClock(threading.local):
         # ``(objective, x_dict)``, or None (#1440). Published only after the #779
         # guard passes on the pristine model. See :func:`last_declined_incumbent`.
         self.declined_incumbent: Optional[tuple] = None
+        # Why the last attempt stood aside for the convex-MINLP route before its
+        # tree ran (#1624), or None. See :func:`last_deferred_reason`.
+        self.deferred_reason: Optional[str] = None
 
 
 _ATTEMPT = _AttemptClock()
+
+
+def last_deferred_reason() -> Optional[str]:
+    """The route verdict the last attempt on this thread deferred to, or None (#1624).
+
+    Set only when :func:`try_convex_solve` was handed a ``defer_to`` probe and the
+    probe named a route; the kernel's tree then never ran.
+    """
+    return _ATTEMPT.deferred_reason
 
 
 def last_attempt_seconds() -> float:
@@ -1197,7 +1209,11 @@ def last_attempt_rust_seconds() -> float:
 
 
 def try_convex_solve(
-    model, *, time_limit: float = 3600.0, gap_tolerance: float = 1e-4
+    model,
+    *,
+    time_limit: float = 3600.0,
+    gap_tolerance: float = 1e-4,
+    defer_to: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Optional[SolveResult]:
     """Route `model` to the native convex kernel, or return ``None`` to fall back.
 
@@ -1242,6 +1258,13 @@ def try_convex_solve(
     certifies in ~8 s and turns a 10 s OFF-arm ``time_limit`` (no incumbent) into a
     certified optimum; any fractional cap below ~0.8 of the budget gives that back.
     The fraction was dropped rather than shipped as a dead knob.
+
+    **Deferring to the convex-MINLP route (#1624).** ``defer_to`` is consulted once
+    the model is known to be kernel-eligible (its spec built) and before the tree
+    runs. When it returns a reason, the attempt declines without running the tree, so
+    the budget goes to ``solve_model`` and the route it would take. Asked only after
+    the spec, so the router's classification is paid only on kernel-eligible models,
+    and inside the clock, so that cost is billed like the rest of the attempt.
     """
     _ATTEMPT.seconds = 0.0
     _ATTEMPT.rust_seconds = 0.0
@@ -1249,6 +1272,7 @@ def try_convex_solve(
     # on this thread) can never read a bound left behind by an earlier attempt.
     _ATTEMPT.declined_bound = None
     _ATTEMPT.declined_incumbent = None
+    _ATTEMPT.deferred_reason = None
     if not convex_kernel_enabled():
         return None
     # Clock starts HERE, after the flag check, so a flag-off solve reads exactly 0.0
@@ -1257,13 +1281,19 @@ def try_convex_solve(
     # wall the caller has to pay for.
     _attempt_t0 = time.perf_counter()
     try:
-        return _attempt_convex_solve(model, time_limit=time_limit, gap_tolerance=gap_tolerance)
+        return _attempt_convex_solve(
+            model, time_limit=time_limit, gap_tolerance=gap_tolerance, defer_to=defer_to
+        )
     finally:
         _ATTEMPT.seconds = time.perf_counter() - _attempt_t0
 
 
 def _attempt_convex_solve(
-    model, *, time_limit: float, gap_tolerance: float
+    model,
+    *,
+    time_limit: float,
+    gap_tolerance: float,
+    defer_to: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Optional[SolveResult]:
     """The attempt itself; :func:`try_convex_solve` wraps it to clock every exit."""
     import os
@@ -1275,6 +1305,13 @@ def _attempt_convex_solve(
     spec = build_convex_spec(model)
     if spec is None:
         return None
+
+    if defer_to is not None:
+        reason = defer_to(model)
+        if reason is not None:
+            _ATTEMPT.deferred_reason = reason
+            logger.info("convex kernel: deferring to the convex-MINLP route (%s)", reason)
+            return None
 
     budget = min(time_limit, float(os.environ.get("DISCOPT_CONVEX_KERNEL_BUDGET", "120")))
     t0 = time.perf_counter()

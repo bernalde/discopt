@@ -155,3 +155,14 @@ def test_a_real_declining_attempt_is_billed():
         f"reported wall {res.wall_time}s against a true wall of {true_wall}s with a "
         f"{attempt}s convex-kernel attempt -- the #1422 under-report is back"
     )
+
+
+@pytest.fixture(autouse=True)
+def _kernel_runs_first(monkeypatch):
+    """#1624: this file exercises the kernel's OWN attempt on ``Model.solve``.
+
+    ``clay0303hfsg`` is also a model the convex-MINLP route takes, and by default
+    the kernel now defers to the route there, so no attempt would run. The
+    ``=0`` opt-out keeps these tests on the kernel-first order they are about.
+    """
+    monkeypatch.setenv("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "0")

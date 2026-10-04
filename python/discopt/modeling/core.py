@@ -8906,6 +8906,35 @@ class Model:
             and kwargs.get("gdp_method", "big-m") == "big-m"
         ):
             _ck_res = None
+
+            # #1624: a model the convex-MINLP router would divert goes to the
+            # route, not to the kernel. The kernel's attempt takes the whole of any
+            # ``time_limit <= 120``, so when it cannot certify, ``solve_model`` gets
+            # ~0 s, the router's convexity proof hits the expired deadline, and the
+            # route never fires: on MINLPLib ``syn``/``rsyn`` 30 of 51 instances
+            # returned no incumbent, against 51/51 with the kernel off. The option
+            # snapshot mirrors what ``solve_model`` consults before routing, so the
+            # kernel defers exactly when the route would be taken.
+            def _route_preempts_convex_kernel(model: "Model") -> Optional[str]:
+                from discopt.solver import _convex_route_preempts_kernel
+
+                return _convex_route_preempts_kernel(
+                    model,
+                    {
+                        **kwargs,
+                        "threads": threads,
+                        "deterministic": deterministic,
+                        "partitions": partitions,
+                        "skip_convex_check": skip_convex_check,
+                        "nlp_bb": nlp_bb,
+                        "lazy_constraints": lazy_constraints,
+                        "incumbent_callback": incumbent_callback,
+                        "node_callback": node_callback,
+                        "abs_gap_tolerance": abs_gap_tolerance,
+                    },
+                    time_limit=time_limit,
+                )
+
             try:
                 from discopt.solvers._convex_kernel import (
                     convex_kernel_reserve_seconds,
@@ -8932,6 +8961,7 @@ class Model:
                         self,
                         time_limit=max(0.0, float(time_limit) - _ck_reserve),
                         gap_tolerance=gap_tolerance,
+                        defer_to=_route_preempts_convex_kernel,
                     )
                 finally:
                     # In the ``finally`` so an attempt that raised part-way through
