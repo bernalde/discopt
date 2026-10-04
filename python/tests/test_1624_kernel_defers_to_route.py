@@ -101,3 +101,37 @@ def test_router_raise_falls_back_to_kernel_loudly(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         assert S._convex_route_preempts_kernel(from_nl(_NL), {}) is None
     assert "router defect 1624" in caplog.text
+
+
+def test_probe_classification_is_held_to_the_callers_time_limit(monkeypatch):
+    """Review of #1650: the probe ran the router's classification on its default 15 s
+    cap, outside ``solve_model``'s clamp, so it could overrun ``time_limit`` and prove
+    a verdict ``solve_model``'s shorter classification could not. It now sees the
+    budget ``solve_model`` would set, and leaves the model's attributes as it found
+    them."""
+    import discopt.solver as S
+
+    seen: list = []
+
+    def router(model):
+        seen.append(
+            (
+                getattr(model, "_convexity_time_budget", None),
+                getattr(model, "_solve_deadline", None),
+            )
+        )
+        model._convexity_classification_cache = (False, False, None)
+        return None, None, None
+
+    monkeypatch.setattr(S, "_convex_minlp_auto_route", router)
+    m = from_nl(_NL)
+    import time
+
+    t0 = time.perf_counter()
+    assert S._convex_route_preempts_kernel(m, {}, time_limit=2.0) is None
+    assert len(seen) == 1
+    budget, deadline = seen[0]
+    assert budget == pytest.approx(0.5)  # min(max(0.2 * 2, 0.5), 20)
+    assert deadline is not None and t0 < deadline <= time.perf_counter() + 2.0
+    for attr in ("_convexity_time_budget", "_solve_deadline", "_convexity_classification_cache"):
+        assert not hasattr(m, attr), attr

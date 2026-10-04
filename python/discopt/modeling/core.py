@@ -8858,6 +8858,7 @@ class Model:
                         "node_callback": node_callback,
                         "abs_gap_tolerance": abs_gap_tolerance,
                     },
+                    time_limit=time_limit,
                 )
 
             try:
