@@ -1141,11 +1141,31 @@ class Expression:
             return f"${self}$"
 
 
+def _non_numeric_constant_message(value) -> str:
+    """The refusal for a ``None``/string operand (#1628), naming what was passed."""
+    if value is None:
+        return (
+            "cannot use None as a numeric constant in an expression. A helper that "
+            "builds an expression most likely forgot its `return`."
+        )
+    if isinstance(value, np.ndarray):
+        return (
+            f"cannot use a numpy array of dtype {value.dtype} (text) as a numeric "
+            f"constant in an expression; convert it to numbers first."
+        )
+    return (
+        f"cannot use {type(value).__name__} {value!r} as a numeric constant in an "
+        f"expression; pass a number (float/int/numpy array), not text."
+    )
+
+
 class Constant(Expression):
     """A numeric constant in the expression DAG."""
 
     def __init__(self, value: Union[float, int, np.ndarray]):
         if isinstance(value, np.ndarray):
+            if value.dtype.kind in "US":
+                raise TypeError(_non_numeric_constant_message(value))
             self.value = value.astype(np.float64)
         elif type(value) is float:
             # A Python float is already float64, so the `dtype=` kwarg only makes
@@ -1154,6 +1174,14 @@ class Constant(Expression):
             # else can slip through with the wrong dtype.
             self.value = np.asarray(value)
         else:
+            # ``np.asarray(None, dtype=float64)`` is ``nan`` and
+            # ``np.asarray("1.5", dtype=float64)`` is ``1.5``: neither raises, so a
+            # ``None`` (a helper that forgot its ``return``) or a string used as an
+            # operand became a silent NaN / parsed number in the DAG, and a
+            # ``minimize(None)`` solve reported ``feasible`` with ``objective=nan``
+            # (#1628). Refuse both here, where every operand is wrapped.
+            if value is None or isinstance(value, (str, bytes)):
+                raise TypeError(_non_numeric_constant_message(value))
             self.value = np.asarray(value, dtype=np.float64)
 
     def __repr__(self):
@@ -5954,6 +5982,46 @@ class Model:
             f"rather than a single point."
         )
 
+    @classmethod
+    def _checked_objective(cls, expr, sense: str) -> Expression:
+        """Validate and wrap a ``minimize``/``maximize`` argument (#1628, #1445).
+
+        ``None`` is refused rather than read as "no objective": discopt's
+        feasibility spelling is ``minimize(0)`` (what the GAMS reader emits for
+        an objectiveless CNS solve), and a model with no objective at all is
+        refused by :meth:`validate`. Accepting ``None`` used to wrap it as a NaN
+        constant, and the solve reported ``status="feasible"`` with
+        ``objective=nan`` -- the usual cause being a builder helper that forgot
+        its ``return``. A non-finite *constant* objective is refused for the same
+        reason: it can only produce a NaN/inf objective, never an optimum.
+        """
+        if expr is None:
+            raise TypeError(
+                f"{sense}() got None, not an expression. A helper that builds the "
+                f"objective most likely forgot its `return`. For a pure "
+                f"feasibility problem, use m.minimize(0)."
+            )
+        if isinstance(expr, (str, bytes)):
+            raise TypeError(
+                f"{sense}() needs a numeric expression, got {type(expr).__name__} {expr!r}."
+            )
+        if isinstance(expr, (list, tuple)) and any(isinstance(e, Expression) for e in expr):
+            # numpy's own message here is "setting an array element with a
+            # sequence", which names neither the objective nor the fix.
+            raise TypeError(
+                f"{sense}() got a {type(expr).__name__} of expressions, not one "
+                f"scalar expression. Combine them first, e.g. dm.sum(...) for a "
+                f"total; for several objectives at once see discopt.mo."
+            )
+        wrapped = cls._scalar_objective(_wrap(expr), sense)
+        if isinstance(wrapped, Constant) and not np.all(np.isfinite(wrapped.value)):
+            raise ValueError(
+                f"{sense}() got a non-finite constant objective "
+                f"({wrapped.value.tolist()!r}); an objective must be finite. For a "
+                f"pure feasibility problem, use m.minimize(0)."
+            )
+        return wrapped
+
     def minimize(self, expr: Expression):
         """
         Set the objective to minimize.
@@ -5967,8 +6035,11 @@ class Model:
 
         Raises
         ------
+        TypeError
+            If ``expr`` is ``None``, a string, or a list of expressions (#1628).
+            For a pure feasibility problem, use ``minimize(0)``.
         ValueError
-            If ``expr`` has more than one element.
+            If ``expr`` has more than one element, or is a non-finite constant.
 
         Examples
         --------
@@ -5976,7 +6047,7 @@ class Model:
         >>> m.minimize(dm.sum(lambda i: c[i] * x[i], over=range(n)))
         """
         self._objective = Objective(
-            self._scalar_objective(_wrap(expr), "minimize"), ObjectiveSense.MINIMIZE
+            self._checked_objective(expr, "minimize"), ObjectiveSense.MINIMIZE
         )
 
     def maximize(self, expr: Expression):
@@ -5992,15 +6063,18 @@ class Model:
 
         Raises
         ------
+        TypeError
+            If ``expr`` is ``None``, a string, or a list of expressions (#1628).
+            For a pure feasibility problem, use ``minimize(0)``.
         ValueError
-            If ``expr`` has more than one element.
+            If ``expr`` has more than one element, or is a non-finite constant.
 
         Examples
         --------
         >>> m.maximize(profit @ x - dm.sum(penalty * y))
         """
         self._objective = Objective(
-            self._scalar_objective(_wrap(expr), "maximize"), ObjectiveSense.MAXIMIZE
+            self._checked_objective(expr, "maximize"), ObjectiveSense.MAXIMIZE
         )
 
     # ── Bound scoping: the shared primitive behind every fix ──────────
