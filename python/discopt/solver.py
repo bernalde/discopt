@@ -13499,6 +13499,7 @@ def solve_model(
                     max_nodes=max_nodes,
                     ipopt_options=ipopt_options,
                     pounce_options=pounce_options,
+                    highs_options=highs_options,
                     nlp_solver=nlp_solver,
                     sparse=sparse,
                     cutting_planes=cutting_planes,

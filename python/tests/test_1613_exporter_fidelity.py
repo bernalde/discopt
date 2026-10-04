@@ -293,7 +293,12 @@ def test_deep_sum_round_trips_through_nl_reader(tmp_path):
         res = subprocess.run(
             [pounce, str(p)], capture_output=True, text=True, timeout=300, cwd=tmp_path
         )
-        assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-2000:]
+        out = res.stdout[-2000:] + res.stderr[-2000:]
+        if res.returncode != 0 and "bundled CLI binary not found" in out:
+            # The `pounce` entry-point shim is installed but its wheel ships no
+            # CLI binary (CI's Linux wheel): there is no reader to test against.
+            pytest.skip("pounce CLI shim present but its binary is not installed")
+        assert res.returncode == 0, out
 
 
 def test_semiint_without_upper_bound_refuses():

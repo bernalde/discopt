@@ -430,7 +430,12 @@ def _has_positive_lower_bound(expr: Expression, model: Model) -> bool:
         return True
     from .interval_eval import evaluate_interval
 
-    enc = evaluate_interval(expr, model)
+    try:
+        enc = evaluate_interval(expr, model)
+    except (IndexError, TypeError, ValueError):
+        # A malformed node (an index outside its base, as `_is_nonneg_domain`
+        # also guards) has no enclosure to prove anything from: not proven.
+        return False
     lo = np.asarray(enc.lo, dtype=np.float64)
     return bool(lo.size > 0 and np.all(np.isfinite(lo)) and np.all(lo > 0.0))
 
