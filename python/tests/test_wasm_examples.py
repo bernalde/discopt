@@ -91,10 +91,10 @@ def browser_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     certified in-house simplex -- not a relaxation of anything.
     """
     monkeypatch.setenv("DISCOPT_LP_MILP_BACKEND", "rust")
-    # And the convex-MINLP route's OA master (performance-plan §25.13), whose
-    # HiGHS default raises the same ``HighsUnavailable`` -- the MINLP example
-    # did, before worker.js set its opt-out too.
-    monkeypatch.setenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", "auto")
+    # And the convex-MINLP route, whose OA master is always HiGHS (the in-house
+    # master was retired) and raises the same ``HighsUnavailable``: worker.js
+    # turns the route off, so a convex MINLP takes the default spatial path.
+    monkeypatch.setenv("DISCOPT_CONVEX_MINLP_ROUTE", "0")
     _block_imports(monkeypatch)
 
 

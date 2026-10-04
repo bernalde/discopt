@@ -171,7 +171,7 @@ def test_row_scaled_ex14_1_9_keeps_its_certificate():
 
 
 # --------------------------------------------------------------------------- #
-# Rust MILP equilibration under per-row scaling (#1537; row pre-pass retired).
+# The routed OA master under per-row scaling (#1537).
 # --------------------------------------------------------------------------- #
 
 
@@ -194,43 +194,13 @@ def _per_row_scaled(name: str, span: float):
     return new
 
 
-def test_row_scaled_m3_loses_its_certificate_soundly(monkeypatch):
-    """m3 with rows scaled in 10^[-6,6]. An OA-master column for a variable that
-    appears in a row scaled by ~1e5 and one scaled by ~1e-6 holds a 1e-11 ratio,
-    which the column-first equilibration reads as noise, so the #1296 guard
-    withdraws the master certificates and the solve ends uncertified.
-
-    A pow2 row pre-pass (``DISCOPT_LP_ROW_PRESCALE``) restored this certificate but
-    was retired after its §5 panel: clay0303hfsg (rows scaled in 10^[-3,3]) lost its
-    certificate at 20 s, with 15x the Numerical LP verdicts of the legacy factors
-    (see ``docs/dev/flag-retirement-audit.md``). This pins what main keeps: the
-    certificate is lost, never replaced by a bound above the optimum. A future
-    row-scale-invariant fix flips the ``gap_certified`` assertion and must pass the
-    panel to do so.
-
-    Pinned to the in-house master (``DISCOPT_CONVEX_ROUTE_OA_MASTER=auto``), which
-    is where the #1296 guard lives and which remains a shipped route. The default
-    HiGHS master is that row-scale-tolerant fix for this instance (performance-plan
-    §25.13): see ``test_row_scaled_m3_certifies_on_the_highs_master``."""
-    from discopt._rust import profile_counters_py, profile_reset_py
-
-    monkeypatch.setenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", "auto")
-    monkeypatch.setenv("DISCOPT_PROFILE", "1")
-    profile_reset_py()
-    res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
-    # Anti-vacuity (CLAUDE.md §6): the shape still reaches the guard.
-    assert dict(profile_counters_py()).get("MilpTinyEntryDecert", 0) > 0
-    assert not res.gap_certified, (res.status, res.bound)
-    # minlplib.solu: m3 =opt= 37.8 (minimize). No false bound.
-    assert res.bound is None or res.bound <= 37.8 + 1e-6, res.bound
-
-
 def test_row_scaled_m3_certifies_on_the_highs_master(monkeypatch):
-    """The same m3 at 10^[-6,6] on the default convex-route master. HiGHS fits each
-    master row to its own coefficient window (``milp_highs._fit_rows_to_window``),
-    so the 1e-11 column ratio that trips the in-house guard never reaches a
-    certificate decision; the route certifies, with no bound above the optimum.
-    Measured on the route panel: +m3 at span 6, 22/26 vs 20/26 (§25.13)."""
+    """m3 with rows scaled in 10^[-6,6]. An OA-master column for a variable in a row
+    scaled by ~1e5 and one scaled by ~1e-6 holds a 1e-11 ratio. HiGHS (the routed
+    master) fits each master row to its own coefficient window
+    (``milp_highs._fit_rows_to_window``), so the route certifies, with no bound
+    above the optimum. The retired in-house master lost this certificate
+    (performance-plan §25.13)."""
     monkeypatch.delenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", raising=False)
     res = _per_row_scaled("m3.nl", 6.0).solve(time_limit=5)
     assert "master=highs" in (res.algorithm_route or ""), res.algorithm_route
