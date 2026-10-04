@@ -10677,15 +10677,16 @@ def solve_model(
     highs_options : dict, optional
         HiGHS options (name -> value, HiGHS's own option names) for a pure LP or
         MILP solved on the HiGHS route (#1620). ``{"output_flag": True}`` prints
-        the HiGHS log (off by default); search options such as ``presolve``,
-        ``mip_detect_symmetry``, ``mip_heuristic_effort`` or ``mip_pool_*`` pass
-        straight through. They apply to every HiGHS solve the route makes,
-        including its certificate cross-checks, but a route option always wins
-        (the #1634 cross-check still runs with presolve off). Options the
-        certificate depends on are refused with ``ValueError``: tolerances,
-        gaps, limits, infinity/objective cut-offs, ``threads``, ``random_seed``
-        and ``presolve_rule_off`` -- use ``gap_tolerance`` /
-        ``abs_gap_tolerance`` / ``time_limit`` / ``max_nodes`` instead. Every
+        the HiGHS log (off by default). Only logging and search-strategy
+        options are accepted -- the allowlist is
+        ``discopt.solvers.lp_milp_highs.ALLOWED_USER_OPTIONS`` (``presolve``,
+        ``mip_detect_symmetry``, ``mip_heuristic_*``, ``mip_pool_*``, ...);
+        any other option, including tolerances, gaps, limits, ``solver``,
+        ``threads`` and ``random_seed``, raises ``ValueError`` (use
+        ``gap_tolerance`` / ``abs_gap_tolerance`` / ``time_limit`` /
+        ``max_nodes`` instead). They apply to every HiGHS solve the route
+        makes, including its certificate cross-checks, but a route option
+        always wins (the #1634 cross-check still runs with presolve off). Every
         certificate is still verified by discopt, so an option can change speed
         and node count, never a reported bound's validity. On any other route
         (a nonlinear model, ``milp_backend="native"``, a callback) the options

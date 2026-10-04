@@ -1160,12 +1160,46 @@ def _ray(getter) -> Optional[np.ndarray]:
     return np.asarray(vals, dtype=np.float64) if has else None
 
 
-#: HiGHS options ``Model.solve(highs_options=...)`` may NOT set (#1620), with the
-#: reason. The route's certificates are built on these values (tolerances, gaps, the
-#: #1634 presolve rule), or they have a ``solve`` keyword of their own that the route
-#: already maps onto HiGHS, or setting them breaks later solves in the process
-#: (``threads``, see :func:`_new_highs`). Refused loudly rather than silently
-#: overridden. Name patterns are refused as a class in :func:`validate_user_options`.
+#: HiGHS options ``Model.solve(highs_options=...)`` may set (#1620). An allowlist,
+#: not a denylist: HiGHS has hundreds of options, and one this route does not know
+#: about (``solver="pdlp"``, ``solve_relaxation``, ``user_objective_scale``,
+#: ``write_*_to_file``, a new release's additions) must be refused here rather than
+#: trusted to be caught by a downstream certificate check. Every entry changes only
+#: logging or the *search* -- never a tolerance, a limit, a gap, the problem HiGHS
+#: solves, or the process-wide thread scheduler (see :func:`_new_highs`) -- so the
+#: route's certificate means the same thing whatever value is passed. Extending it
+#: is a review decision: add the option with that argument.
+ALLOWED_USER_OPTIONS: frozenset[str] = frozenset(
+    {
+        # logging
+        "output_flag",
+        "log_to_console",
+        "log_file",
+        "log_dev_level",
+        "mip_report_level",
+        # search strategy
+        "presolve",
+        "mip_detect_symmetry",
+        "mip_allow_restart",
+        "mip_heuristic_effort",
+        "mip_heuristic_run_rins",
+        "mip_heuristic_run_rens",
+        "mip_heuristic_run_root_reduced_cost",
+        "mip_heuristic_run_zi_round",
+        "mip_heuristic_run_shifting",
+        "mip_lp_age_limit",
+        "mip_pool_age_limit",
+        "mip_pool_soft_limit",
+        "mip_pscost_minreliable",
+        "simplex_scale_strategy",
+        "simplex_dual_edge_weight_strategy",
+        "simplex_primal_edge_weight_strategy",
+        "simplex_price_strategy",
+    }
+)
+
+#: Why the options a user is most likely to reach for are refused; anything else
+#: outside :data:`ALLOWED_USER_OPTIONS` gets the generic message.
 RESERVED_USER_OPTIONS: dict[str, str] = {
     "mip_rel_gap": "use Model.solve(gap_tolerance=...)",
     "mip_abs_gap": "use Model.solve(abs_gap_tolerance=...)",
@@ -1178,20 +1212,6 @@ RESERVED_USER_OPTIONS: dict[str, str] = {
     "random_seed": "the route pins it for reproducible certificates",
 }
 
-#: Substrings of option names refused as a class: tolerances, infinity/bound
-#: conventions and objective cut-offs change what the route certifies, and limits
-#: change which status HiGHS stops with.
-_RESERVED_USER_OPTION_PATTERNS = (
-    "tolerance",
-    "epsilon",
-    "infinite",
-    "objective_bound",
-    "objective_target",
-    "_limit",
-    "mip_max_",
-    "matrix_value",
-)
-
 _USER_OPTIONS: contextvars.ContextVar[tuple[tuple[str, Any], ...]] = contextvars.ContextVar(
     "discopt_highs_user_options", default=()
 )
@@ -1201,9 +1221,10 @@ def validate_user_options(options: Mapping[str, Any]) -> tuple[tuple[str, Any], 
     """Check ``Model.solve(highs_options=...)`` and return it as ``(key, value)`` pairs.
 
     Raises ``TypeError`` for a non-mapping or a non-string key and ``ValueError``
-    for a reserved option (:data:`RESERVED_USER_OPTIONS`, or a name matching a
-    reserved class). An option HiGHS itself does not know raises later, from
-    :func:`_set_options`, when the route builds its HiGHS instance.
+    for any option not in :data:`ALLOWED_USER_OPTIONS` (with the reason from
+    :data:`RESERVED_USER_OPTIONS` when there is a specific one). A bad *value* for
+    an allowed option raises later, from :func:`_set_options`, when the route
+    builds its HiGHS instance.
     """
     if not isinstance(options, Mapping):
         raise TypeError(
@@ -1214,10 +1235,12 @@ def validate_user_options(options: Mapping[str, Any]) -> tuple[tuple[str, Any], 
     for key, val in options.items():
         if not isinstance(key, str):
             raise TypeError(f"highs_options keys must be HiGHS option names, got {key!r}")
-        why = RESERVED_USER_OPTIONS.get(key)
-        if why is None and any(pat in key for pat in _RESERVED_USER_OPTION_PATTERNS):
-            why = "it changes what the route's certificate means"
-        if why is not None:
+        if key not in ALLOWED_USER_OPTIONS:
+            why = RESERVED_USER_OPTIONS.get(
+                key,
+                "only logging and search-strategy options are passed through "
+                f"(allowed: {', '.join(sorted(ALLOWED_USER_OPTIONS))})",
+            )
             raise ValueError(f"highs_options[{key!r}] cannot be set: {why} (#1620)")
         pairs.append((key, val))
     return tuple(pairs)

@@ -79,9 +79,40 @@ def test_highs_options_reserved_key_is_refused(key):
         _small_milp().solve(highs_options={key: 1})
 
 
-def test_highs_options_unknown_option_is_refused_by_highs():
+@pytest.mark.parametrize(
+    "key",
+    [
+        "no_such_highs_option",
+        # Real HiGHS options a denylist let through (review of #1648): they change
+        # the problem solved, the algorithm's exactness, or write files.
+        "solver",
+        "solve_relaxation",
+        "user_objective_scale",
+        "user_bound_scale",
+        "allow_unbounded_or_infeasible",
+        "parallel",
+        "mip_root_presolve_only",
+        "write_solution_to_file",
+    ],
+)
+def test_highs_options_outside_the_allowlist_is_refused(key):
+    with pytest.raises(ValueError, match="only logging and search-strategy options"):
+        _small_milp().solve(highs_options={key: 1})
+
+
+def test_highs_options_bad_value_for_an_allowed_option_is_refused_by_highs():
     with pytest.raises(RuntimeError, match="HiGHS rejected option"):
-        _small_milp().solve(highs_options={"no_such_highs_option": 1})
+        _small_milp().solve(highs_options={"presolve": "no_such_value"})
+
+
+def test_highs_options_allowlist_names_are_real_highs_options():
+    import highspy
+    from discopt.solvers.lp_milp_highs import ALLOWED_USER_OPTIONS
+
+    h = highspy.Highs()
+    for name in sorted(ALLOWED_USER_OPTIONS):
+        status, _ = h.getOptionValue(name)
+        assert status == highspy.HighsStatus.kOk, name
 
 
 def test_highs_options_on_a_non_highs_route_warns():
