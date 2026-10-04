@@ -54,7 +54,11 @@ class CallbackContext:
         omits rows so no dual bound exists. Never over-reports: this value never
         exceeds what the final ``SolveResult.bound`` would certify (A1).
     gap : float or None
-        Relative optimality gap, or None if no incumbent exists — and also None
+        Optimality gap of the B&B tree, computed by the Rust ``TreeManager::gap``
+        as ``(incumbent - lower_bound) / max(1, |incumbent|)`` (clamped at 0) --
+        i.e. a *relative* gap only when ``|incumbent| >= 1``; for incumbents
+        smaller than 1 in magnitude it is the *absolute* gap. ``None`` if no
+        incumbent exists — and also None
         whenever ``best_bound`` is None, since a gap against a non-bound (a
         tainted tree or the failure sentinel) is meaningless (A2).
     elapsed_time : float

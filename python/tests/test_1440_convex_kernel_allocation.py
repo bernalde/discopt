@@ -501,3 +501,14 @@ class TestTheReserveReachesTheAttempt:
             f"the attempt spent only {spent:.3f}s -- the reserve has taken far more "
             f"than it was asked for, which would disable the kernel by stealth"
         )
+
+
+@pytest.fixture(autouse=True)
+def _kernel_runs_first(monkeypatch):
+    """#1624: this file exercises the kernel's OWN attempt on ``Model.solve``.
+
+    ``clay0303hfsg`` is also a model the convex-MINLP route takes, and by default
+    the kernel now defers to the route there, so no attempt would run. The
+    ``=0`` opt-out keeps these tests on the kernel-first order they are about.
+    """
+    monkeypatch.setenv("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "0")

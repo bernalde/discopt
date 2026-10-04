@@ -48,7 +48,9 @@ class SensitivityResult:
     lambda_star : ndarray, shape (m,)
         Optimal constraint multipliers.
     objective : float
-        Optimal objective value.
+        Optimal objective value in the solver's internal minimization form
+        (``-f*`` for a maximize model; :func:`discopt.sensitivity.sensitivity`
+        converts to the model's sense).
     status : str
         NLP termination status (e.g. ``"optimal"``).
     dx_dp : ndarray, shape (n, n_params)
@@ -68,6 +70,11 @@ class SensitivityResult:
         Which variables sat on one of their own bounds (sensitivity 0).
     method : str
         ``"exact"`` or ``"fd"`` -- how the right-hand side was formed.
+    dobjective_dp : ndarray, shape (n_params,), or None
+        Total derivative of :attr:`objective` along the solution path,
+        ``∇ₓf(x*) · dx*/dp + ∂f/∂p`` -- what :meth:`predict_objective` uses. Same
+        convention as ``objective``: the internal minimization form, so for a
+        maximize model both are those of ``-f``.
     """
 
     x_star: np.ndarray
@@ -81,6 +88,7 @@ class SensitivityResult:
     active: Optional[np.ndarray] = None
     at_bound: Optional[np.ndarray] = None
     method: str = "exact"
+    dobjective_dp: Optional[np.ndarray] = None
 
     def predict(self, new_values: list[float]) -> np.ndarray:
         """First-order prediction of x* at new parameter values.
@@ -114,15 +122,36 @@ class SensitivityResult:
     def predict_objective(self, new_values: list[float]) -> float:
         """First-order prediction of the optimal objective at new parameter values.
 
-        Uses the envelope theorem: df*/dp = ∂f/∂p|x* (only direct dependence,
-        since KKT stationarity eliminates the indirect x* effect).
+        .. code-block:: text
 
-        For a quick estimate, delegates to `predict` and re-evaluates
-        the objective if the model is available; otherwise returns a
-        linear approximation using the multiplier signs.
+            f*(p + Δp) ≈ f*(p) + (df*/dp) · Δp
+
+        with ``df*/dp`` = :attr:`dobjective_dp`, the total derivative of the
+        objective along the solution path, ``∇ₓf · dx*/dp + ∂f/∂p`` (at a KKT point
+        with a locally constant active set this equals the envelope-theorem value
+        ``∂L/∂p``). Approximation error O(‖Δp‖²).
+
+        Before #1618 (B-07b) this returned the base objective for any argument.
+
+        Raises:
+            ValueError: if ``new_values`` has the wrong length, or the result was
+                built without ``dobjective_dp`` (a hand-constructed instance).
         """
-        self.predict(new_values)
-        return float(self.objective)
+        if len(new_values) != len(self.parameters):
+            raise ValueError(f"Expected {len(self.parameters)} values, got {len(new_values)}")
+        if self.dobjective_dp is None:
+            raise ValueError(
+                "predict_objective needs dobjective_dp, which pounce_sensitivity fills; "
+                "this SensitivityResult was constructed without it."
+            )
+        dp = np.array(
+            [
+                float(new_values[k]) - float(self.parameters[k].value)
+                for k in range(len(self.parameters))
+            ],
+            dtype=np.float64,
+        )
+        return float(self.objective + np.asarray(self.dobjective_dp, dtype=np.float64) @ dp)
 
     def sensitivity_summary(
         self, var_names: Optional[list[str]] = None, param_names: Optional[list[str]] = None
@@ -279,6 +308,15 @@ def pounce_sensitivity(
         )
         d2x_dp2 = None
 
+    # #1618 B-07b: the objective's total derivative along the solution path, in the
+    # same convention as ``objective`` -- POUNCE's internal minimization form (``-f``
+    # for a maximize model), which ``discopt.sensitivity`` relies on and converts.
+    x_j = jnp.asarray(x_star, dtype=jnp.float64)
+    p_j = jnp.asarray(p0)
+    grad_x = np.asarray(jax.grad(lambda xx: phi.objective_fn(xx, phi.params_tuple(p_j)))(x_j))
+    grad_p = np.asarray(jax.grad(lambda pp: phi.objective_fn(x_j, phi.params_tuple(pp)))(p_j))
+    dobjective_dp = grad_x @ np.asarray(dx_dp) + grad_p
+
     return SensitivityResult(
         x_star=np.asarray(x_star),
         lambda_star=np.asarray(lambda_star),
@@ -291,6 +329,7 @@ def pounce_sensitivity(
         active=np.asarray(active, dtype=bool),
         at_bound=np.asarray(at_bound, dtype=bool),
         method=method,
+        dobjective_dp=np.asarray(dobjective_dp, dtype=np.float64).reshape(len(params)),
     )
 
 

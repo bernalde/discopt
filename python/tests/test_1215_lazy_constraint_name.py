@@ -141,5 +141,12 @@ def test_names_survive_export():
     m.constraint(s, lambda i: x[i] <= 1.0, name="cap", fast=False)
     m.minimize(sum(x[i] for i in s))
     text = m.to_lp()
-    missing = [i for i in range(3) if f"cap[{i}]" not in text]
+    # `[`/`]` are outside the CPLEX LP name alphabet, so the exporter maps each
+    # name through `legal_unique_names` (#1613). What must survive is the
+    # *family's* names, in that deterministic legal spelling, one per row.
+    from discopt.export._common import legal_unique_names
+
+    expected = legal_unique_names([f"cap[{i}]" for i in range(3)], "lp")
+    assert len(set(expected)) == 3
+    missing = [n for n in expected if f"{n}:" not in text]
     assert not missing, (missing, text[:2000])

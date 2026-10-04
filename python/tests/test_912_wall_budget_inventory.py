@@ -467,6 +467,14 @@ _SLICE_CATEGORY = {(p, s): c for p, s, c in KNOWN_SLICES}
 
 # (module-relative path, source line, category). See the module docstring.
 KNOWN: tuple[tuple[str, str, str], ...] = (
+    # #1624: the convex-route probe classifies under the caller's own deadline,
+    # so classification stops when the caller's time_limit is spent -- the
+    # ``contract`` role. The probe's work is bounded by its own budget, not this.
+    (
+        "solver.py",
+        "model._solve_deadline = time.perf_counter() + float(time_limit)",
+        "contract",
+    ),
     (
         "_daemon_core.py",
         "if self.max_lifetime > 0 and time.monotonic() - started >= self.max_lifetime:",

@@ -324,3 +324,86 @@ def binary_box_is_default(lb, ub) -> bool:
     lo = np.asarray(lb, dtype=np.float64)
     hi = np.asarray(ub, dtype=np.float64)
     return bool(np.all(lo <= 0.0) and np.all(hi >= 1.0))
+
+
+# ── File-format-legal, collision-free names (#1613 C-03a) ──
+#
+# MPS and LP are whitespace-tokenised formats: a name with a space in it is two
+# tokens, so a reader sees a *different model* rather than an error. Measured on
+# the issue witness: free MPS with column ``x[LSR naphtha,regular]`` read by
+# HiGHS optimised to 8.0 where the model's optimum is 24.0. Sanitising alone is
+# not enough either: two distinct names can sanitise to the same token (``"a b"``
+# and ``"a_b"``), and the flattening of an array ``x`` (``x_0``, ``x_1``) can
+# already collide with a scalar named ``x_0``. A shared token is a *merged*
+# column or row, i.e. another silently different model. So every exporter that
+# writes names goes through :func:`legal_unique_names`, which both maps each
+# name into the format's legal alphabet and de-duplicates the results.
+
+# CPLEX LP name alphabet: letters, digits and these punctuation characters --
+# minus ``/``, which HiGHS's LP reader rejects inside a name (measured).
+_LP_NAME_PUNCT = frozenset("!\"#$%&(),.;?@_`'{}|~")
+# Words an LP reader treats as section/bound keywords (case-insensitive). A
+# column or row spelled like one is mis-parsed, so it gets a suffix.
+_LP_KEYWORDS = frozenset(
+    {
+        "minimize", "minimise", "minimum", "min", "maximize", "maximise", "maximum",
+        "max", "subject", "to", "st", "s.t.", "such", "that", "bounds", "bound",
+        "free", "inf", "infinity", "general", "generals", "gen", "integer",
+        "integers", "binary", "binaries", "bin", "semi", "semis",
+        "semi-continuous", "sos", "end",
+    }
+)  # fmt: skip
+
+
+def _legal_mps_name(name: str) -> str:
+    # Free MPS separates fields by whitespace; anything that is not a printable,
+    # non-space ASCII character is replaced. ``-`` is also replaced, matching the
+    # row-name sanitiser this replaces.
+    out = "".join(ch if (33 <= ord(ch) <= 126 and ch != "-") else "_" for ch in name)
+    return out or "_"
+
+
+def _legal_lp_name(name: str) -> str:
+    out = "".join(
+        ch if (ch.isascii() and ch.isalnum()) or ch in _LP_NAME_PUNCT else "_" for ch in name
+    )
+    if not out:
+        return "_"
+    # A name may not start with a digit or a period (it would read as a number),
+    # nor with ``inf``/``nan`` in any case: HiGHS reads ``inf_``/``info``/
+    # ``nanx`` as a number and rejects the file (measured).
+    if out[0].isdigit() or out[0] == "." or out[:3].lower() in ("inf", "nan"):
+        out = "_" + out
+    if out.lower() in _LP_KEYWORDS:
+        out = out + "_"
+    return out
+
+
+def legal_unique_names(names: list[str], fmt: str, reserved: tuple[str, ...] = ()) -> list[str]:
+    """Map *names* to tokens legal in *fmt* (``"mps"`` or ``"lp"``), all distinct.
+
+    A name that is already legal and unused is returned unchanged, so a model
+    with clean names exports byte-identically. A name that is illegal is mapped
+    into the format's alphabet; a result that collides with an earlier one (or
+    with a *reserved* token such as the objective row's name) gets the first
+    free ``_<k>`` suffix. Distinct inputs therefore always give distinct
+    outputs — a merge of two columns or rows is impossible by construction.
+    """
+    if fmt == "mps":
+        legal = _legal_mps_name
+    elif fmt == "lp":
+        legal = _legal_lp_name
+    else:
+        raise ValueError(f"unknown name format {fmt!r}")
+    used: set[str] = set(reserved)
+    out: list[str] = []
+    for raw in names:
+        cand = legal(raw)
+        if cand in used:
+            k = 1
+            while f"{cand}_{k}" in used:
+                k += 1
+            cand = f"{cand}_{k}"
+        used.add(cand)
+        out.append(cand)
+    return out

@@ -4178,6 +4178,24 @@ class SolveResult:
         a certificate stated in problem units must be built from.
         ``barrier_parameter`` is the terminal interior-point ``mu``, forwarded by
         :meth:`solve`'s ``warm_start`` to seed the next solve.
+    constraint_duals : dict of str to numpy.ndarray, or None
+        KKT multipliers at the returned point, keyed by ``Constraint.name``
+        (one entry per row for a vector body), when the route exposes them.
+        Sign convention (#1620), for the objective ``F`` the solver
+        *minimized* -- ``F = f`` for MINIMIZE, ``F = -f`` for MAXIMIZE::
+
+            grad F + sum_{<=} mu_i grad(body_i) - sum_{>=} mu_i grad(body_i)
+                   + sum_{==} lam_k grad(lhs_k - rhs_k) = 0
+
+        so **both** inequality senses carry ``mu >= 0`` (positive when
+        binding), and an equality's ``lam`` is free, signed against
+        ``lhs - rhs``. Example: ``min 2a + 3b`` s.t. ``a + b >= 4`` reports
+        ``+2`` for that row; ``min x**2 + y**2`` s.t. ``x + y == 5`` reports
+        ``-5``. Dict order is **not** declaration order: inequality rows come
+        first, then equality rows.
+    bound_duals_lower, bound_duals_upper : dict of str to numpy.ndarray, or None
+        Multipliers of active variable bounds, keyed by ``Variable.name``,
+        ``>= 0`` in the same internal-minimization convention.
     solve_report : dict or None
         POUNCE's structured solve report for the one POUNCE call that produced
         this result -- the ``pounce.solve-report/v1`` document, the same data as
@@ -7082,10 +7100,41 @@ class Model:
         name : str, optional
             Base name for the constraint group.
 
+        Notes
+        -----
+        The indicator is lowered to a big-M row. ``M`` is the tightest valid
+        value discopt can derive for the body over the variable box (an LP bound
+        for a linear body, interval arithmetic otherwise) **times a 1.01 safety
+        factor** (``_relax/gdp_reformulate.py``); a body with no finite bound is
+        refused. So ``m.if_then(z, [x >= 500])`` with ``x`` in ``[0, 1000]``
+        becomes ``x - 500 >= -505 (1 - z)``, i.e. ``505 z - x <= 5``, not the
+        exact ``x >= 500 z``. Both are valid and agree at integral ``z``; the
+        1% margin only loosens the LP relaxation (here ``z <= 5/505`` rather
+        than ``z = 0`` at ``x = 0``), which can cost root bound and nodes on
+        models dominated by such rows. When that matters, write the exact
+        big-M row by hand (#1620).
+
         Examples
         --------
         >>> m.if_then(y[0], [x[0] >= 10, x[1] <= 50], name="unit0_active")
         """
+        # #1617: a ``BooleanVar`` (from :meth:`boolean`) is backed by a binary
+        # Variable; use it. Any other logical expression has no single 0/1 column to
+        # act as the indicator -- refuse here, at the call, rather than with a
+        # ``float()`` TypeError deep inside ``solve()``.
+        if isinstance(indicator, BooleanVar):
+            indicator = indicator.variable
+        elif isinstance(indicator, LogicalExpression):
+            raise TypeError(
+                "if_then: the indicator must be a binary variable or a BooleanVar, not "
+                f"the logical expression {indicator!r}; state it with "
+                "m.logical(expr.implies(...)) or introduce a BooleanVar for it."
+            )
+        elif not isinstance(indicator, Expression):
+            raise TypeError(
+                "if_then: the indicator must be a binary variable or a BooleanVar, got "
+                f"{type(indicator).__name__}."
+            )
         for k, c in enumerate(then_constraints):
             c.name = f"{name}_then_{k}" if name else None
             # Store as indicator constraint; Rust presolve will handle
@@ -8007,10 +8056,14 @@ class Model:
             convexity-gated routes (the convex MINLP and GP auto-routes) and the
             "nonconvex model under NLP-BB" warning.
         nlp_bb : bool or None, default None
-            Nonlinear Branch & Bound mode. When ``None`` (default),
-            auto-selects NLP-BB for convex MINLPs and spatial B&B
-            otherwise. When ``True``, forces NLP-BB (heuristic mode if
-            nonconvex). When ``False``, forces spatial B&B.
+            Nonlinear Branch & Bound mode. When ``None`` (default), a MINLP
+            certified convex at the root is auto-routed to outer approximation
+            (``solver="mip-nlp"``, ``mip_nlp_method="oa"``; opt out with
+            ``DISCOPT_CONVEX_MINLP_ROUTE=0``); a convex MINLP the route refuses
+            (e.g. the caller set an option OA ignores) falls back to NLP-BB, and
+            everything else runs spatial B&B. When ``True``, forces NLP-BB
+            (heuristic mode if nonconvex) and suppresses the OA auto-route.
+            When ``False``, forces spatial B&B.
         lazy_constraints : callable, optional
             Lazy constraint callback. Called at integer-feasible nodes.
             Should accept ``(ctx, model)`` and return a list of
@@ -8104,6 +8157,13 @@ class Model:
             ``max_wall_time``, ``print_level`` (any positive value prints its
             iteration trace), ``tau`` and ``tau_max``; an NLP-engine option such
             as ``mu_strategy`` on an LP raises rather than being ignored.
+            The NLP engine does **not** run at Ipopt's defaults: discopt seeds
+            ``constr_viol_tol=1e-8`` and ``bound_relax_factor=0`` (iterates
+            and the returned point stay inside the declared box;
+            ``pounce_option_defaults`` / ``pounce_incumbent_options`` in
+            ``discopt.solvers``), and a ``pounce_options`` entry overrides
+            either (#1620). The same baseline applies wherever discopt returns
+            a POUNCE point as the solution.
 
             Use ``solver="amp"`` to select
             Adaptive Multivariate Partitioning. AMP-specific keyword
@@ -8846,6 +8906,35 @@ class Model:
             and kwargs.get("gdp_method", "big-m") == "big-m"
         ):
             _ck_res = None
+
+            # #1624: a model the convex-MINLP router would divert goes to the
+            # route, not to the kernel. The kernel's attempt takes the whole of any
+            # ``time_limit <= 120``, so when it cannot certify, ``solve_model`` gets
+            # ~0 s, the router's convexity proof hits the expired deadline, and the
+            # route never fires: on MINLPLib ``syn``/``rsyn`` 30 of 51 instances
+            # returned no incumbent, against 51/51 with the kernel off. The option
+            # snapshot mirrors what ``solve_model`` consults before routing, so the
+            # kernel defers exactly when the route would be taken.
+            def _route_preempts_convex_kernel(model: "Model") -> Optional[str]:
+                from discopt.solver import _convex_route_preempts_kernel
+
+                return _convex_route_preempts_kernel(
+                    model,
+                    {
+                        **kwargs,
+                        "threads": threads,
+                        "deterministic": deterministic,
+                        "partitions": partitions,
+                        "skip_convex_check": skip_convex_check,
+                        "nlp_bb": nlp_bb,
+                        "lazy_constraints": lazy_constraints,
+                        "incumbent_callback": incumbent_callback,
+                        "node_callback": node_callback,
+                        "abs_gap_tolerance": abs_gap_tolerance,
+                    },
+                    time_limit=time_limit,
+                )
+
             try:
                 from discopt.solvers._convex_kernel import (
                     convex_kernel_reserve_seconds,
@@ -8872,6 +8961,7 @@ class Model:
                         self,
                         time_limit=max(0.0, float(time_limit) - _ck_reserve),
                         gap_tolerance=gap_tolerance,
+                        defer_to=_route_preempts_convex_kernel,
                     )
                 finally:
                     # In the ``finally`` so an attempt that raised part-way through
@@ -9019,6 +9109,12 @@ class Model:
             # silently shrinking a limit the user stated outright — and an external
             # MILP/QP backend has no use for this fallback anyway.
             and solver is None
+            # #1611 D-25: an explicitly requested decomposition (Lagrangian, Benders,
+            # ...) is the caller's chosen algorithm. When it returned no incumbent the
+            # fallback used to re-solve with the LP-per-node B&B and report THAT as
+            # ``optimal`` -- ignoring ``max_nodes`` and hiding that the requested
+            # method never produced the answer. The decomposition's own result stands.
+            and not kwargs.get("decomposition")
             # The engine branches on integer PRODUCTS in constraint rows; a box-only
             # model gives it nothing to work with, and the primary solves such a
             # model directly.

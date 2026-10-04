@@ -53,6 +53,29 @@ from discopt.modeling.core import (
 )
 
 
+def _is_add(*nodes: Expression) -> bool:
+    """True if any of *nodes* is a binary ``+`` (so its parent heads a 3+ chain)."""
+    return any(isinstance(n, BinaryOp) and n.op == "+" for n in nodes)
+
+
+def _add_chain(root: Expression) -> list[Expression]:
+    """Operands of the maximal ``+`` chain rooted at *root*, left to right.
+
+    Walks only through ``BinaryOp("+")`` nodes, with an explicit stack (the
+    chain can be as deep as the sum is long); any other node is an operand.
+    """
+    leaves: list[Expression] = []
+    stack: list[Expression] = [root]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, BinaryOp) and n.op == "+":
+            stack.append(n.right)
+            stack.append(n.left)
+        else:
+            leaves.append(n)
+    return leaves
+
+
 def to_nl(
     model: Model,
     path: Union[str, Path, None] = None,
@@ -225,6 +248,42 @@ def nl_row_order(model: Model) -> np.ndarray:
     writer = _NLWriter(model)
     writer.write()
     return np.asarray(writer._row_order, dtype=np.intp)
+
+
+def nl_column_order(model: Model) -> np.ndarray:
+    """The model flat column behind each column of ``model.to_nl()``'s output (#1620).
+
+    ``.nl`` orders variables by nonlinearity class and integrality
+    (:meth:`_NLWriter._reorder_vars_canonical`), so its columns are generally a
+    permutation of the model's. ``order[j]`` is the model's flat column index
+    (variables in declaration order, each expanded row-major -- the layout of
+    ``SolveResult.x`` flattened) written as ``.nl`` column ``j``. A reader's
+    per-column output -- a ``.sol`` primal vector, a tape evaluated in ``.nl``
+    order -- maps back with ``model_vals[order] = nl_vals``; the row analogue is
+    :func:`nl_row_order`.
+
+    The permutation is read off the Python writer, which is the one that exposes
+    it. Because :func:`to_nl` normally runs the Rust writer, the Python writer's
+    text is compared with what :func:`to_nl` writes for this model, and a
+    mismatch raises ``RuntimeError`` rather than return a map for a different
+    file (the #1578 lesson recorded in :func:`nl_row_order`).
+    """
+    refuse_non_algebraic_relations(model, ".nl")
+    model.validate(for_solve=False)
+    writer = _NLWriter(model)
+    text = writer.write()
+    rust = _rust_nl_text(model, None)
+    if rust is not None and rust != text:
+        raise RuntimeError(
+            "nl_column_order: the Rust and Python .nl writers disagree on this model, so "
+            "the Python writer's column permutation would not describe the file to_nl "
+            "writes. Set DISCOPT_RUST_NL=0 to export with the Python writer, whose order "
+            "this function then returns."
+        )
+    offsets = variable_flat_offsets(model)
+    return np.asarray(
+        [offsets[id(var)] + int(elem) for var, elem in writer._flat_vars], dtype=np.intp
+    )
 
 
 _RUST_NL_ENV = "DISCOPT_RUST_NL"
@@ -1501,6 +1560,16 @@ class _NLWriter:
                         continue
                     raise ValueError(f"Cannot resolve indexed expression: {node}")
                 buf.write(f"v{vi}\n")
+            elif isinstance(node, BinaryOp) and node.op == "+" and _is_add(node.left, node.right):
+                # A chain of three or more `+` is ONE n-ary sum (`o54`), not
+                # `n - 1` nested `o0`: the chain's depth is linear in its length
+                # (a `sum()` body, `_split_expr`'s refolded nonlinear terms, a
+                # matmul row) and overflowed downstream recursive `.nl` readers
+                # (#1613 B-15b). The Rust writer (`nl_writer.rs`) does the same;
+                # the two are diffed byte for byte.
+                leaves = _add_chain(node)
+                buf.write(f"o{_OP_SUMLIST}\n{len(leaves)}\n")
+                stack.extend(reversed(leaves))
             elif isinstance(node, BinaryOp):
                 op_map = {
                     "+": _OP_ADD,
