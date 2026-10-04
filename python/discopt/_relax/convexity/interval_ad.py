@@ -1005,6 +1005,18 @@ def _function_call(expr: FunctionCall, model: Model, box: dict, cache: dict, n: 
         return _apply_cos(arg, n)
     if name == "tan":
         return _apply_tan(arg, n)
+    if name == "entropy":
+        # f = g log g (#1616 A-02): f' = (log g + 1) g',
+        # f'' = (log g + 1) H_g + (1/g) (∇g ∇gᵀ). Requires g > 0 strictly on the
+        # box (1/g is unbounded at 0), else abstain.
+        if np.any(arg.value.lo <= 0):
+            return _unbounded(n)
+        g = arg.value
+        d1 = iv.log(g) + _ONE
+        inv_g = _ONE / g
+        grad = _dscale(d1, arg.grad)
+        hess = _dadd(_dscale(d1, arg.hess), _dscale(inv_g, _self_outer(arg.grad)))
+        return _SparseAD(value=iv.entropy(g), grad=grad, hess=hess, n=n)
     if name == "sqrt":
         # sqrt = x^0.5 on the positive domain.
         if np.any(arg.value.lo < 0):

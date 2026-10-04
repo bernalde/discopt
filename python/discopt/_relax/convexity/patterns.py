@@ -419,9 +419,27 @@ def _split_const_mul(expr: Expression) -> tuple[float, Optional[Expression]]:
 def _has_positive_lower_bound(expr: Expression, model: Model) -> bool:
     """True when ``expr`` is provably strictly positive on the declared box.
 
+    First the syntactic proof (:func:`_has_positive_lower_bound_terms`: every
+    term strictly positive); failing that, a sound outward-rounded interval
+    enclosure of ``expr`` over the box whose lower end is ``> 0`` (#1616 D-23:
+    ``(1 - eps)*z + eps`` with ``z in [0, 1]`` is ``>= eps`` although its ``z`` term
+    is not strictly positive). Conservative: returns False on anything it cannot
+    prove.
+    """
+    if _has_positive_lower_bound_terms(expr, model):
+        return True
+    from .interval_eval import evaluate_interval
+
+    enc = evaluate_interval(expr, model)
+    lo = np.asarray(enc.lo, dtype=np.float64)
+    return bool(lo.size > 0 and np.all(np.isfinite(lo)) and np.all(lo > 0.0))
+
+
+def _has_positive_lower_bound_terms(expr: Expression, model: Model) -> bool:
+    """True when every term of ``expr`` is syntactically strictly positive.
+
     Handles variables, indexed variables, positive constants, and affine
-    combinations where every term is strictly positive. Conservative:
-    returns False on anything it cannot prove.
+    combinations where every term is strictly positive.
     """
     if isinstance(expr, Constant):
         val = np.asarray(expr.value)
@@ -437,20 +455,22 @@ def _has_positive_lower_bound(expr: Expression, model: Model) -> bool:
                 return False
             return lb > 0.0
     if isinstance(expr, BinaryOp) and expr.op == "+":
-        return _has_positive_lower_bound(expr.left, model) and _has_positive_lower_bound(
-            expr.right, model
-        )
+        return _has_positive_lower_bound_terms(
+            expr.left, model
+        ) and _has_positive_lower_bound_terms(expr.right, model)
     if isinstance(expr, SumOverExpression):
-        return bool(expr.terms) and all(_has_positive_lower_bound(t, model) for t in expr.terms)
+        return bool(expr.terms) and all(
+            _has_positive_lower_bound_terms(t, model) for t in expr.terms
+        )
     if isinstance(expr, BinaryOp) and expr.op == "*":
         if isinstance(expr.left, (Constant, Parameter)):
             v = np.asarray(expr.left.value)
             if v.ndim == 0 and float(v) > 0.0:
-                return _has_positive_lower_bound(expr.right, model)
+                return _has_positive_lower_bound_terms(expr.right, model)
         if isinstance(expr.right, (Constant, Parameter)):
             v = np.asarray(expr.right.value)
             if v.ndim == 0 and float(v) > 0.0:
-                return _has_positive_lower_bound(expr.left, model)
+                return _has_positive_lower_bound_terms(expr.left, model)
     return False
 
 
