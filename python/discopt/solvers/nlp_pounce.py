@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence, cast
 
 import numpy as np
 
@@ -460,6 +460,17 @@ def solve_nlp(
             # block-structured KKT path is pounce#955 and unreleased. Degrade to
             # the full-space solve rather than raising (#394's pattern).
             _logger.debug("pounce has no set_block_structure; ignoring passthrough")
+
+    # #1615 B-08: pounce derives ``mu_init`` from the warm start's captured barrier
+    # parameter and that derived value overrides ``options["mu_init"]``, so an
+    # explicit ``mu_init`` was silently discarded whenever a warm start was given.
+    # ``WarmStart.mu_init`` is pounce's own explicit-override field; route the
+    # caller's value through it. (Under pounce's default
+    # ``warm_start_recentering="residual"`` it is a floor the solver may raise.)
+    if warm_start is not None and "mu_init" in opts:
+        import dataclasses
+
+        warm_start = dataclasses.replace(cast(Any, warm_start), mu_init=float(opts["mu_init"]))
 
     t0 = time.perf_counter()
     try:
