@@ -4583,7 +4583,7 @@ Outcome, up front:
 | `DISCOPT_OA_INFEASIBLE_NOGOOD` | **stays OFF** | §25.7 |
 | `DISCOPT_ROOT_CUT_DEADLINE` (§24's) | **default ON** | §25.9 |
 | convex route target: HiGHS → `"oa"` | **retargeted** | §25.10–25.11 |
-| routed OA master: in-house → HiGHS (`DISCOPT_CONVEX_ROUTE_OA_MASTER`) | **default `highs`**, `auto` opt-out | §25.13 |
+| routed OA master: in-house → HiGHS (`DISCOPT_CONVEX_ROUTE_OA_MASTER`) | **in-house `auto` retired 2026-10-04**; always HiGHS | §25.13 |
 
 ### 25.1 The capability
 
@@ -5250,7 +5250,8 @@ valid lower bound on the same terms as the in-house one.
 
 #### The panels
 
-`discopt_benchmarks/scripts/convex_route_oa_master_panel.py`: plain
+`discopt_benchmarks/scripts/convex_route_oa_master_panel.py` (removed with the
+`auto` retirement below; recover it from git history): plain
 `Model.solve(time_limit=30)` with no kwargs, so the #1066 guard, the decision
 point (CC-1143) and the spatial fallback all participate; arms set by the real
 environment variable, interleaved per instance; the route counted as having
@@ -5353,15 +5354,14 @@ the guard's check-in, and the spatial fallback certifies. The same instance at
 span 3 goes the other way (in-house `feasible` at 10.3 s, HiGHS `optimal` in
 0.20 s): tie-breaking on a flat master is engine-sensitive, not engine-biased.
 
-**Status: default `highs`**, `DISCOPT_CONVEX_ROUTE_OA_MASTER=auto` the opt-out
-and the in-house path intact. The browser build (`crates/discopt-wasm`) has no
-`highspy` wheel and sets `auto` explicitly in `web/worker.js`, beside its existing
-`DISCOPT_LP_MILP_BACKEND=rust` — the smoke suite's browser-environment test caught
-the MINLP example raising `HighsUnavailable` before that line existed. This is an opt-out for a shipped default (CLAUDE.md
-§5, "out of scope"), so it adds no row to the flag-retirement audit. What would
-change it: the in-house master closing the gap §25.11 measured — at which point
-`auto` would also bring fractional-node separation (§25.4), which HiGHS cannot
-host.
+**Status (2026-10-04): `auto` retired.** The routed OA master is always HiGHS;
+`DISCOPT_CONVEX_ROUTE_OA_MASTER` set to anything but `highs` raises. Owner
+decision: HiGHS is discopt's MILP solver, and the in-house master lost or tied
+HiGHS on every panel above. The panel script went with it. The browser build
+(`crates/discopt-wasm`, no `highspy` wheel) used to set `auto`; it now sets
+`DISCOPT_CONVEX_MINLP_ROUTE=0`, so a convex MINLP there takes the default
+spatial path. The fractional-node separation `auto` would have hosted (§25.4) is
+not pursued on the in-house MILP.
 
 ## CC-1143 The convex-MINLP route's abstain cost: three hypotheses falsified, one survived
 
