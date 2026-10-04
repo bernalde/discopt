@@ -385,8 +385,9 @@ def _unbounded_big_m_error(constraint: Constraint, direction: str) -> ValueError
         f"no valid finite big-M exists. A too-small big-M would cut feasible "
         f"points of the active disjunct and yield a false certificate. Add a "
         f"finite bound to the variable(s) in this disjunct/indicator (e.g. "
-        f"m.continuous(..., lb=..., ub=...)), or use the 'hull' reformulation "
-        f"(method='hull'), which does not require a finite big-M."
+        f"m.continuous(..., lb=..., ub=...)). The 'hull' reformulation "
+        f"(method='hull') needs no big-M, but it too needs a finite bound on every "
+        f"variable of the disjunction, within each disjunct (#1617)."
     )
 
 
@@ -1515,6 +1516,29 @@ def _reformulate_disjunction_hull(
             if vname not in db:
                 db[vname] = (float(np.min(var.lb)), float(np.max(var.ub)))
         disjunct_bounds.append(db)
+
+    # #1617: every bound-linking row ``dlb*y_k <= v_{j,k} <= dub*y_k`` needs a FINITE
+    # bound. At the unbounded sentinel (9.999e19) the row is ``v <= 1e20*y``: exact
+    # only in exact arithmetic -- the integrality tolerance lets ``y = 1e-5`` buy
+    # ``v <= 1e15`` -- and every LP/MILP engine refuses or mangles the coefficient
+    # (HiGHS: ``|a_ij| >= 1e15`` -> kError, surfaced as a causeless ``error``).
+    # Dropping the row instead is not exact either: an unselected disjunct's copy
+    # then ranges over that disjunct's recession cone. Refuse, naming the variable,
+    # exactly as big-M refuses a sentinel-sized M.
+    for k, db in enumerate(disjunct_bounds):
+        for vname, (dlb, dub) in db.items():
+            if not (np.isfinite(dlb) and np.isfinite(dub)) or max(abs(dlb), abs(dub)) >= (
+                _BIGM_SENTINEL
+            ):
+                side = "upper" if not np.isfinite(dub) or abs(dub) >= _BIGM_SENTINEL else "lower"
+                raise ValueError(
+                    f"GDP hull reformulation of disjunction {prefix!r}: variable {vname!r} "
+                    f"has no finite {side} bound within disjunct {k} (bounds "
+                    f"[{dlb:g}, {dub:g}]). The hull links each disaggregated copy to its "
+                    "selector by that bound (v <= ub*y), so an unbounded variable "
+                    "admits no exact hull. Give the variable a finite bound (e.g. "
+                    "m.continuous(..., ub=...)) or bound it inside every disjunct."
+                )
 
     # disagg[k][var_name] = disaggregated Variable v_{j,k}
     disagg: list[dict[str, Variable]] = []

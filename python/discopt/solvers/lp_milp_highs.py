@@ -1084,7 +1084,72 @@ def _relax_huge_box(sf: StdForm, huge_lo: np.ndarray, huge_hi: np.ndarray) -> St
     )
 
 
-def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> tuple[Any, str]:
+def _absorb_tiny_entries(sf: StdForm) -> tuple[StdForm, np.ndarray, np.ndarray, int]:
+    """Remove every ``|a_ij| <= SMALL_MATRIX_VALUE`` entry HiGHS would drop, soundly (#1617).
+
+    HiGHS drops such an entry on ``passModel`` and answers ``kWarning``; the model it
+    then solves is a *perturbation* of ``sf``, so neither its infeasible label nor its
+    tree bound would be valid for ``sf``. Instead each dropped term ``a_ij x_j`` is
+    replaced by its interval over the declared column box ``[xl_j, xu_j]``: row ``i``
+    becomes the ranged row ``b_i - hi_i <= sum_{kept} a_ik x_k <= b_i - lo_i``. Every
+    feasible point of ``sf`` satisfies the ranged rows, so the passed model is a
+    *relaxation* of ``sf``: an infeasible label and a dual bound for it hold for ``sf``,
+    and every incumbent is still verified against ``sf`` itself by the caller. A term on
+    a column whose side is open (the ``1e20`` sentinel -- tested on the bound, never on
+    the product, CLAUDE.md) opens that side of the row.
+
+    Returns ``(sf without those entries, row_lower, row_upper, n_dropped)``.
+    """
+    A = sf.A.tocsc()
+    data = A.data
+    tiny = np.abs(data) <= SMALL_MATRIX_VALUE
+    n_drop = int(tiny.sum())
+    b = np.asarray(sf.b, dtype=np.float64)
+    if n_drop == 0:
+        return sf, b.copy(), b.copy(), 0
+    col_of = np.repeat(np.arange(A.shape[1]), np.diff(A.indptr))
+    cols = col_of[tiny]
+    rows = A.indices[tiny]
+    a = data[tiny]
+    xl = np.asarray(sf.xl, dtype=np.float64)[cols]
+    xu = np.asarray(sf.xu, dtype=np.float64)[cols]
+    lo_open = np.where(a > 0, xl <= -INF, xu >= INF)
+    hi_open = np.where(a > 0, xu >= INF, xl <= -INF)
+    with np.errstate(invalid="ignore", over="ignore"):
+        t_lo = np.where(a > 0, a * xl, a * xu)
+        t_hi = np.where(a > 0, a * xu, a * xl)
+    t_lo = np.where(lo_open | (a == 0.0), 0.0, t_lo)
+    t_hi = np.where(hi_open | (a == 0.0), 0.0, t_hi)
+    m = sf.m
+    lo_sum = np.bincount(rows, weights=t_lo, minlength=m)
+    hi_sum = np.bincount(rows, weights=t_hi, minlength=m)
+    lo_inf = np.bincount(rows, weights=(lo_open & (a != 0.0)).astype(np.float64), minlength=m)
+    hi_inf = np.bincount(rows, weights=(hi_open & (a != 0.0)).astype(np.float64), minlength=m)
+    # Outward: the sums' own rounding error is bounded by n*eps*sum|terms|, and the
+    # subtraction from ``b`` adds one more ulp; widen by both, then one ulp more.
+    k = np.bincount(rows, minlength=m).astype(np.float64)
+    mag = np.bincount(rows, weights=np.abs(t_lo) + np.abs(t_hi), minlength=m)
+    err = (k + 4.0) * np.finfo(np.float64).eps * (mag + np.abs(b))
+    row_lower = np.nextafter(b - hi_sum - err, -np.inf)
+    row_upper = np.nextafter(b - lo_sum + err, np.inf)
+    touched = np.bincount(rows, minlength=m) > 0
+    row_lower = np.where(touched, row_lower, b)
+    row_upper = np.where(touched, row_upper, b)
+    row_lower = np.where(hi_inf > 0, -np.inf, row_lower)
+    row_upper = np.where(lo_inf > 0, np.inf, row_upper)
+    keep = ~tiny
+    A2 = sp.csc_matrix((data[keep], (A.indices[keep], col_of[keep])), shape=A.shape)
+    return dataclasses.replace(sf, A=A2), row_lower, row_upper, n_drop
+
+
+def _pass_model(
+    h,
+    highspy,
+    sf: StdForm,
+    integer: bool,
+    offset: float = 0.0,
+    row_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
+) -> tuple[Any, str]:
     """Hand ``sf`` to HiGHS; returns ``(passModel status, reason)``, ``reason`` empty on kOk.
 
     kWarning means HiGHS changed the model on the way in -- it drops every matrix entry
@@ -1111,8 +1176,13 @@ def _pass_model(h, highspy, sf: StdForm, integer: bool, offset: float = 0.0) -> 
     lp.col_cost_ = sf.c
     lp.col_lower_ = _to_highs_inf(sf.xl, highspy)
     lp.col_upper_ = _to_highs_inf(sf.xu, highspy)
-    lp.row_lower_ = sf.b
-    lp.row_upper_ = sf.b
+    if row_bounds is None:
+        lp.row_lower_ = sf.b
+        lp.row_upper_ = sf.b
+    else:
+        # ``_absorb_tiny_entries``'s ranged rows; ``±inf`` is HiGHS's own infinity.
+        lp.row_lower_ = np.where(np.isinf(row_bounds[0]), -highspy.kHighsInf, row_bounds[0])
+        lp.row_upper_ = np.where(np.isinf(row_bounds[1]), highspy.kHighsInf, row_bounds[1])
     lp.offset_ = float(offset)
     lp.sense_ = highspy.ObjSense.kMinimize
     lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
@@ -2008,8 +2078,19 @@ def _solve_milp_std(
         stats["milp/huge_box_relaxed"] = 1.0
     # HiGHS gets ``obj_const`` so ``mip_rel_gap`` is measured on the objective this
     # route publishes (#1536); both values read back below therefore include it.
+    # #1617: an entry HiGHS would drop on the way in is absorbed into its row's range
+    # instead -- a relaxation of ``sf``, so HiGHS's infeasible label and tree bound stay
+    # valid for ``sf`` (see :func:`_absorb_tiny_entries`).
+    sf_pass, row_lo, row_hi, n_tiny = _absorb_tiny_entries(_relax_huge_box(sf, huge_lo, huge_hi))
+    if n_tiny:
+        stats["milp/tiny_entries_absorbed"] = float(n_tiny)
     pass_st, pass_why = _pass_model(
-        h, highspy, _relax_huge_box(sf, huge_lo, huge_hi), integer=True, offset=sf.obj_const
+        h,
+        highspy,
+        sf_pass,
+        integer=True,
+        offset=sf.obj_const,
+        row_bounds=(row_lo, row_hi) if n_tiny else None,
     )
     if pass_why:
         # No MILP certificate is re-derivable from ``sf`` (HiGHS's infeasible label and

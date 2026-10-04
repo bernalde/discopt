@@ -9972,7 +9972,34 @@ def _scoped_deep_recursion(fn: _F) -> _F:
         # (factorable walk, then the compiler's node walk); cushion generously and
         # cap so a pathological size can't request an unsatisfiable limit.
         depth_need = min(4000 + 8 * depth, 1_000_000)
-        return _run_with_deep_recursion(lambda: fn(model, *args, **kwargs), depth_need=depth_need)
+        # #1617: the worker thread has its OWN ``threading.local`` records, so the
+        # callback bookkeeping the outermost wrapper reads on THIS thread -- the
+        # enforcement mark (#1500) and the failure record (#1436) -- must be carried
+        # back. Without this a deep model's B&B marked enforcement on the worker and
+        # the caller refused a correctly screened result (lazy TSP, n=24), and a
+        # callback failure on the worker was invisible to the #1436 refusal.
+        worker_state: dict[str, Any] = {}
+        caller_thread = threading.get_ident()
+
+        def _run_and_capture():
+            if threading.get_ident() == caller_thread:  # ran inline: nothing to carry
+                return fn(model, *args, **kwargs)
+            worker_state["ran_on_worker"] = True
+            _CALLBACK_ENFORCEMENT.enforced = False
+            _CALLBACK_FAILURES.failures = []
+            try:
+                return fn(model, *args, **kwargs)
+            finally:
+                worker_state["enforced"] = _CALLBACK_ENFORCEMENT.enforced
+                worker_state["failures"] = list(_CALLBACK_FAILURES.failures)
+
+        try:
+            return _run_with_deep_recursion(_run_and_capture, depth_need=depth_need)
+        finally:
+            if worker_state.get("ran_on_worker"):
+                if worker_state.get("enforced"):
+                    _CALLBACK_ENFORCEMENT.enforced = True
+                _CALLBACK_FAILURES.failures.extend(worker_state.get("failures", ()))
 
     return cast(_F, wrapper)
 
@@ -11439,7 +11466,22 @@ def solve_model(
         from discopt._relax.problem_classifier import ProblemClass as _PC
         from discopt._relax.problem_classifier import classify_problem
 
-        _lpm_class = classify_problem(model)
+        # #1617: classify the model the engine will SEE. A disjunction, indicator,
+        # SOS or logical constraint lowers to rows over new binaries
+        # (``reformulate_gdp``, run further down this function), so the user model
+        # of ``either_or([[x <= 2], [x >= 6]])`` is an LP to ``classify_problem`` --
+        # which reads only the plain rows -- but a MILP to the engine. Classifying
+        # before the lowering refused every tree option on such a model as "does not
+        # run for an LP". The lowering returns a new model (the input is untouched)
+        # and returns ``model`` itself when there is nothing to lower.
+        from discopt.transformations import get as _lpm_get_transformation
+
+        _lpm_class = classify_problem(
+            _lpm_get_transformation("gdp").apply(
+                model,
+                method=gdp_method if gdp_method in ("big-m", "hull", "mbigm", "auto") else "big-m",
+            )
+        )
         if _lpm_class not in (_PC.LP, _PC.MILP):
             raise ValueError(
                 f"milp_backend={milp_backend!r} selects the engine for an LP or MILP "
@@ -30726,6 +30768,8 @@ def _solve_lp_highs(model: Model, t_start: float, time_limit: float | None = Non
         status=out.status,
         wall_time=wall,
         gap_certified=False,
+        # #1617: the route knows why it failed; say so on the result.
+        error=(f"HiGHS LP route: {out.message}" if out.status == "error" and out.message else None),
         solver_stats=stats,
         algorithm_route=route,
     )
@@ -30879,6 +30923,10 @@ def _solve_milp_highs(
     _budget_bound = bound if out.status in ("time_limit", "node_limit") else None
     return SolveResult(
         status=out.status,
+        # #1617: the route knows why it failed; say so on the result.
+        error=(
+            f"HiGHS MILP route: {out.message}" if out.status == "error" and out.message else None
+        ),
         bound=_budget_bound,
         wall_time=wall,
         node_count=out.node_count,
