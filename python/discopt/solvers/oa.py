@@ -1615,6 +1615,124 @@ def _nlp_scaled_tol(evaluator, x0) -> Optional[float]:
     return _NLP_DEFAULT_TOL * max(f0, _NLP_TOL_SCALE_FLOOR)
 
 
+#: Ceiling on a row-equilibration factor. A row whose gradient nearly vanishes
+#: at the start point would otherwise be scaled by ``1/tiny``.
+_NLP_ROW_SCALE_CLAMP = 1e8
+
+#: A row bound at or beyond this magnitude is the ``1e20`` infinity sentinel.
+_NLP_INF_BOUND = 1e19
+
+
+def _nlp_row_equilibration_enabled() -> bool:
+    """``DISCOPT_OA_NLP_ROW_EQUILIBRATE``: row-equilibrate the fixed-integer NLP.
+
+    Default-ON; ``=0`` restores the unscaled subsolve. See
+    :class:`_RowEquilibratedEvaluator` for the measurement.
+    """
+    return os.environ.get("DISCOPT_OA_NLP_ROW_EQUILIBRATE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+class _RowEquilibratedEvaluator:
+    """An NLP evaluator whose constraint row ``i`` is ``s_i * g_i(x)``.
+
+    ``s_i = 1 / max_j |dg_i/dx_j(x0)|``, fixed at the start point and clamped to
+    ``[1, C]`` with ``C =`` :data:`_NLP_ROW_SCALE_CLAMP`; a row with a zero or
+    non-finite gradient keeps ``s_i = 1``. Rows are only ever scaled UP. That is
+    the half POUNCE lacks (below), and it only tightens a row's tolerance in its
+    original units: a scaled-down row's ``tol`` would loosen by its norm, and the
+    point would then fail ``verify_point`` in the original units. Measured: the
+    two-sided version (``[1/C, C]``) lost the certificate of ``portfol_roundlot``
+    unscaled on the route panel (``feasible`` at 20 s against ``optimal`` in
+    13.0 s); one-sided, it certifies in 13.0 s again. Only the subsolver sees this
+    evaluator: the objective, ``_is_primal_feasible`` and the exit gate's
+    ``verify_point`` all judge the returned point against the ORIGINAL rows.
+
+    Why (#1537). POUNCE's gradient-based scaling (Ipopt's default) only scales a
+    row DOWN, when its gradient exceeds ``nlp_scaling_max_gradient``; a row whose
+    coefficients are ``1e-6`` is passed through as it is, and the multiplier it
+    needs is ``~1e6`` times larger than its neighbours'. Measured on ``flay03m``
+    with each row multiplied by ``10**U(-6, 6)``, ``solver="mip-nlp"``, T=30: the
+    fixed NLP returned ``OPTIMAL`` 6 times and ``ITERATION_LIMIT`` 133 times, and
+    raising ``max_iter`` from 200 to 3000 still left 12 of 19 at the limit -- a
+    conditioning failure, not a budget one. Equilibrated: 226 of 226 ``OPTIMAL``
+    and no candidate refused by the exit gate. On the default convex route the
+    same instance certifies in 9 MILPs (10/10 NLPs optimal, bound 48.98979484
+    against an optimum of 48.98979486), where it had certified only on macOS
+    after refusing 7 unconverged candidates, and fell back uncertified on Linux.
+
+    Row bounds are ``0``/``+-inf`` for every row OA builds (``body - rhs``), so
+    scaling a row leaves its bounds unchanged; :meth:`wrap` refuses (returns
+    ``None``) when a finite row bound is non-zero rather than scale a row and not
+    its bound. Multipliers come back in scaled units: with ``g' = s * g`` the
+    Lagrangian term ``lam' * g'`` is ``(s * lam') * g``, so
+    :meth:`unscale_multipliers` returns ``s * lam'``.
+    """
+
+    def __init__(self, evaluator, scales: np.ndarray) -> None:
+        self._ev = evaluator
+        self._s = scales
+        self._jac_rows: Optional[np.ndarray] = None
+
+    @classmethod
+    def wrap(cls, evaluator, x0: np.ndarray) -> Optional["_RowEquilibratedEvaluator"]:
+        m = int(getattr(evaluator, "n_constraints", 0) or 0)
+        if m == 0:
+            return None
+        from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
+
+        cl, cu = _infer_constraint_bounds(evaluator)
+        # ``-1e20``/``1e20`` is the infinite-bound sentinel, not a finite bound.
+        for b in (cl, cu):
+            finite = np.isfinite(b) & (np.abs(b) < _NLP_INF_BOUND)
+            if np.any(b[finite] != 0.0):
+                return None
+        J = evaluator.evaluate_jacobian(np.asarray(x0, dtype=np.float64))
+        J = J.toarray() if hasattr(J, "toarray") else np.asarray(J, dtype=np.float64)
+        if J.shape[0] != m:
+            return None
+        norms = np.abs(J).max(axis=1) if J.size else np.zeros(m)
+        ok = np.isfinite(norms) & (norms > 0.0)
+        scales = np.ones(m)
+        scales[ok] = np.clip(1.0 / norms[ok], 1.0, _NLP_ROW_SCALE_CLAMP)
+        if np.all(scales == 1.0):
+            return None
+        return cls(evaluator, scales)
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def unscale_multipliers(self, lam):
+        if lam is None:
+            return None
+        lam = np.asarray(lam, dtype=np.float64)
+        return self._s * lam if lam.shape == self._s.shape else lam
+
+    def evaluate_constraints(self, x):
+        return self._s * np.asarray(self._ev.evaluate_constraints(x), dtype=np.float64)
+
+    def evaluate_jacobian(self, x):
+        J = self._ev.evaluate_jacobian(x)
+        if hasattr(J, "multiply"):
+            return J.multiply(self._s[:, None]).tocsr()
+        return self._s[:, None] * np.asarray(J, dtype=np.float64)
+
+    def evaluate_jacobian_values(self, x):
+        if self._jac_rows is None:
+            self._jac_rows = np.asarray(self._ev.jacobian_structure()[0], dtype=np.int64)
+        return np.asarray(self._ev.evaluate_jacobian_values(x)) * self._s[self._jac_rows]
+
+    def evaluate_lagrangian_hessian(self, x, obj_factor, lagrange):
+        return self._ev.evaluate_lagrangian_hessian(x, obj_factor, self._s * np.asarray(lagrange))
+
+    def evaluate_hessian_values(self, x, obj_factor, lagrange):
+        return self._ev.evaluate_hessian_values(x, obj_factor, self._s * np.asarray(lagrange))
+
+
 def _time_left(t_start: float, time_limit: float) -> float:
     """Unfloored seconds left before ``t_start + time_limit`` (negative once past)."""
     return float(time_limit) - (time.perf_counter() - float(t_start))
@@ -1684,7 +1802,17 @@ def _solve_nlp_attempt(
                 opts["tol"] = tol
         if max_wall_time is not None:
             opts["max_wall_time"] = max(float(max_wall_time), _NLP_WALL_FLOOR_S)
-        result = solve_nlp(evaluator, x0, options=opts)
+        # The incumbent-producing subsolve sees equilibrated rows (#1537); every
+        # judgement of the returned point below stays on the original evaluator.
+        scaled = (
+            _RowEquilibratedEvaluator.wrap(evaluator, x0)
+            if scale_tol and _nlp_row_equilibration_enabled()
+            else None
+        )
+        nlp_ev: Any = scaled if scaled is not None else evaluator
+        result = solve_nlp(nlp_ev, x0, options=opts)
+        if scaled is not None and getattr(result, "multipliers", None) is not None:
+            result.multipliers = scaled.unscale_multipliers(result.multipliers)
 
         from discopt.solvers import SolveStatus
 
@@ -4822,6 +4950,8 @@ def _exit_verified_incumbent(
     x_flat: np.ndarray,
     obj: float,
     obj_sign: float,
+    *,
+    warn: bool = True,
 ) -> tuple[np.ndarray, float, Optional[str]]:
     """Verify the point OA is about to return; repair round-off or refuse to certify.
 
@@ -4877,7 +5007,11 @@ def _exit_verified_incumbent(
     than implied.
 
     Returns ``(x, objective, refusal_reason)``; ``refusal_reason`` is ``None``
-    when the returned point verifies.
+    when the returned point verifies. ``warn=False`` drops the refusal to a debug
+    record: the in-loop candidate screen (``verified_candidate``) asks the same
+    question of every fixed-NLP point and logs its own refusals, and a WARNING per
+    refused candidate is noise (7 per solve on ``flay03m`` rows scaled in 10^[-6,6]), not a
+    statement about what the solve returns.
     """
     from discopt.validation.feasibility import verify_point
 
@@ -4922,7 +5056,7 @@ def _exit_verified_incumbent(
                 repaired_obj = float(obj_sign * second.objective)
             return out, repaired_obj, None
 
-    logger.warning(
+    (logger.warning if warn else logger.debug)(
         "OA: the returned incumbent does not verify (%s) and %d near-bound "
         "repair(s) did not fix it. Reporting the point WITHOUT certification: "
         "its objective is not a proven upper bound. The master's dual bound is "
@@ -6898,6 +7032,9 @@ def solve_oa(
     heuristic_bound_source: Optional[str] = None
     incumbent = None
     incumbent_obj = None
+    # Candidates ``verified_candidate`` refused, and the best of them (see there).
+    rejected_incumbents = 0
+    best_refused: Optional[tuple[np.ndarray, float]] = None
     integer_assignments_seen: set[tuple[float, ...]] = set()
     # Local NLP failures do not prove fixed-integer infeasibility. Track those
     # assignments so final certification is downgraded instead of adding an
@@ -7371,6 +7508,7 @@ def solve_oa(
             for status, count in sorted(fixed_nlp_call_status_counts.items())
         }
         summary["fixed_nlp_scheduler"] = fixed_nlp_manager.scheduler_trace()
+        summary["rejected_incumbent_count"] = int(rejected_incumbents)
         if interior_point_store is not None:
             interior_counts = Counter(record.source for record in interior_point_store.records)
             summary["interior_point_count"] = int(len(interior_point_store.records))
@@ -7952,12 +8090,50 @@ def solve_oa(
             mip_nlp_trace=_build_mip_nlp_trace("continuous_nlp_infeasible"),
         )
 
+    def verified_candidate(x: np.ndarray, obj: float) -> Optional[tuple[np.ndarray, float]]:
+        """The point and objective to adopt as OA's incumbent, or ``None``.
+
+        ``UB`` ends the loop (``LB >= UB - tol``) and is what the published gap is
+        measured against, so it may only come from a point the exit gate would
+        publish. The fixed-NLP path screened candidates at an *absolute* ``1e-4``
+        on each row as written (``_is_primal_feasible``), and the ECP path at an
+        absolute ``1e-6``; neither is invariant under row scaling. Measured
+        (#1537): ``flay03m`` with each row multiplied by ``10**U(-6, 6)`` admitted
+        two iteration-limited fixed-NLP points at objectives 39.10 and 27.16
+        against an optimum of 48.99, each violating a row scaled by ``5e-6`` by
+        ``3e-5`` -- about 6.5 in the row's own units. The second ended OA with
+        ``LB > UB``, which then withdrew the (valid) master bound. Using the exit
+        gate's own arbiter here means a candidate is refused exactly when it could
+        not have been published, so no publishable incumbent is lost.
+
+        The best refused candidate is kept in ``best_refused`` and returned,
+        UNVERIFIED, only if the loop ends with no verified incumbent -- which is
+        what the exit gate already did with it before this screen existed. It is a
+        warm start for the caller (the #1059 route hands it to the fallback), never
+        a bound. Measured on ``portfol_roundlot`` (unscaled): the fixed NLP's point
+        misses row 5 by 2.6e-6 (allowed 1e-6); dropping it outright left the
+        fallback cold, and the solve lost the certificate it earns from that start.
+        """
+        nonlocal rejected_incumbents, best_refused
+        x_out, obj_out, refusal = _exit_verified_incumbent(model, x, obj, _obj_sign, warn=False)
+        if refusal is not None:
+            rejected_incumbents += 1
+            logger.debug("OA: candidate incumbent %.12g refused: %s", obj, refusal)
+            if best_refused is None or obj < best_refused[1]:
+                best_refused = (np.asarray(x, dtype=np.float64).copy(), float(obj))
+            return None
+        return x_out, float(obj_out)
+
     def accept_incumbent(
         x: np.ndarray,
         obj: float,
         multipliers: Optional[np.ndarray],
-    ) -> None:
+    ) -> bool:
         nonlocal UB, incumbent, incumbent_obj, incumbent_derivative_data
+        candidate = verified_candidate(x, obj)
+        if candidate is None:
+            return False
+        x, obj = candidate
         UB = float(obj)
         incumbent = np.asarray(x, dtype=np.float64).copy()
         incumbent_obj = float(obj)
@@ -7970,6 +8146,7 @@ def solve_oa(
                 multipliers,
             )
         _record_interior_point(incumbent, "incumbent", {"objective": float(obj)})
+        return True
 
     if init_strategy == "rNLP":
         relax_attempt = None
@@ -8992,12 +9169,13 @@ def solve_oa(
                     )
                 # In ECP, use master objective as heuristic UB
                 master_obj = float(evaluator.evaluate_objective(x_master))
-                cons_vals = evaluator.evaluate_constraints(x_master)
-                is_feasible = all(cons_vals[k] <= 1e-6 for k in range(n_cons))
-                if is_feasible and master_obj < UB:
-                    UB = master_obj
-                    incumbent = x_master.copy()
-                    incumbent_obj = master_obj
+                ecp_candidate = None
+                if master_obj < UB:
+                    ecp_candidate = verified_candidate(x_master, master_obj)
+                if ecp_candidate is not None and ecp_candidate[1] < UB:
+                    incumbent = np.asarray(ecp_candidate[0], dtype=np.float64).copy()
+                    incumbent_obj = ecp_candidate[1]
+                    UB = incumbent_obj
                     _record_interior_point(
                         incumbent,
                         "ecp_candidate",
@@ -9048,8 +9226,10 @@ def solve_oa(
             if x_nlp is not None:
                 if obj_nlp is not None and obj_nlp < UB:
                     multipliers = nlp_attempt.multipliers
-                    accept_incumbent(x_nlp, obj_nlp, multipliers)
-                    incumbent_update = "improved"
+                    if accept_incumbent(x_nlp, obj_nlp, multipliers):
+                        incumbent_update = "improved"
+                    else:
+                        incumbent_update = "not_verified"
                 else:
                     incumbent_update = "not_improved"
 
@@ -9343,6 +9523,12 @@ def solve_oa(
         # reports *less*, so it cannot manufacture a certificate.
         bound = None
 
+    if incumbent is None and best_refused is not None:
+        # Every candidate failed the screen in ``verified_candidate``. Return the
+        # best one exactly as the exit gate returned it before that screen existed:
+        # it is refused again just below and leaves as an unverified point. ``UB``
+        # stays infinite, so no gap is computed against it.
+        incumbent, incumbent_obj = best_refused
     if incumbent is not None and incumbent_obj is not None:
         # --- exit gate: verify the point that actually LEAVES ---
         # Placed here, after every acceptance gate and every terminal
