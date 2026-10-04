@@ -6363,6 +6363,41 @@ def solve_lp_nlp_bb(
         bound = float(master_result.bound)
         if decomp.obj_is_linear and decomp.obj_coeffs is not None:
             bound += float(decomp.obj_coeffs[1])
+    # #1634: a check-in bound is read off the PRIMARY HiGHS tree mid-search, and
+    # that tree's presolve can prune the master optimum (rule 13 is off, but the
+    # #1634 slack panel still measured 1/1200 false bounds with presolve on). The
+    # HiGHS lazy master holds its final bound against a presolve-free re-solve
+    # (``callback_stats["presolve_cross_check"]``); a check-in bound that solve
+    # does not confirm -- lowered below it, or withdrawn -- must not come back
+    # through the ``max`` below and certify on its own. Such a stop is then not
+    # reported as convergence either: the certificate, if any, rests on the
+    # cross-checked bound through the ordinary gap test.
+    cross_check = (master_result.callback_stats or {}).get("presolve_cross_check")
+    early_exit_unconfirmed = False
+    if converged_at[0] is not None and cross_check is not None:
+        confirmed = _master_bound_internal(master_result.bound)
+        # Confirmed means the cross-checked bound *itself* passes the gap test the
+        # stop was taken on -- not that it equals the check-in reading to the last
+        # bit (a presolve-free re-solve lands a hair lower on ordinary B&B noise;
+        # an exact ``<`` here threw away valid certificates on the Linux runner).
+        # Either way only the cross-checked bound is reported below, never the
+        # higher check-in value.
+        if (
+            confirmed is not None
+            and incumbent_obj is not None
+            and _compute_gap(confirmed, incumbent_obj) <= gap_tolerance
+        ):
+            converged_at[0] = min(converged_at[0], confirmed)
+        else:
+            logger.warning(
+                "lp_nlp_bb: early-exit check-in bound %.12g not confirmed by the "
+                "presolve-free cross-solve (%s); the stop is not reported as "
+                "convergence (#1634)",
+                float(converged_at[0]),
+                "withdrawn" if confirmed is None else f"{confirmed:.12g}",
+            )
+            converged_at[0] = None
+            early_exit_unconfirmed = True
     if converged_at[0] is not None:
         # Report the bound the stop was actually taken on. Both readings are valid
         # bounds in the internal sense, so the tighter one is the honest one -- and
@@ -6427,6 +6462,9 @@ def solve_lp_nlp_bb(
     # detail, not a property of the solve. Assert on this one, not on
     # ``converged_early``, when the question is "did the exit ever see the gap".
     callback_stats["converged_observed"] = bool(converged_observed[0])
+    # #1634: the check-in bound that stopped the master was not confirmed by the
+    # presolve-free cross-solve, so ``converged_early`` was cleared above.
+    callback_stats["early_exit_unconfirmed"] = bool(early_exit_unconfirmed)
     callback_terminated = bool(callback_stats.get("terminated"))
     status, termination_reason = _lp_nlp_bb_exit_status(
         converged_early=converged_at[0] is not None,
@@ -6440,6 +6478,11 @@ def solve_lp_nlp_bb(
             hook is not None and (time.perf_counter() - t_start) < float(time_limit)
         ),
     )
+    if early_exit_unconfirmed:
+        # The master was stopped by the early exit, not by the clock or a hook;
+        # say so, and that the stop's bound did not survive the cross-check.
+        # ``status`` is untouched: it already rests on the cross-checked bound.
+        termination_reason = "early_exit_unconfirmed"
 
     trace_bound_validity = (
         "global"
@@ -8916,8 +8959,20 @@ def solve_oa(
             master_result = repaired_result
 
         if master_result.status == SolveStatus.UNBOUNDED or master_result.x is None:
-            # Master unbounded → need more OA cuts. Generate at midpoint.
-            logger.info("OA: Master MILP unbounded at iteration %d, adding cuts", iteration)
+            # Master unbounded → need more OA cuts. Generate at midpoint. A master
+            # with no point for another reason (e.g. an ``infeasible`` claim the
+            # #1634 presolve-free cross-solve did not confirm comes back ERROR with
+            # ``x=None``) takes the same branch; label it by what it was.
+            no_point_reason = (
+                "master_unbounded"
+                if master_result.status == SolveStatus.UNBOUNDED
+                else f"master_no_point_{master_result.status.value}"
+            )
+            logger.info(
+                "OA: master MILP returned no point (%s) at iteration %d, adding cuts",
+                no_point_reason,
+                iteration,
+            )
             lb_clip = np.clip(decomp.lb, -1e8, 1e8)
             ub_clip = np.clip(decomp.ub, -1e8, 1e8)
             x_mid = 0.5 * (lb_clip + ub_clip)
@@ -8962,7 +9017,7 @@ def solve_oa(
                     "convex_bounding": convex_bounding_record,
                     "master_controls": master_control_trace,
                     "external_hooks": external_hook_events,
-                    "termination_reason": "master_unbounded",
+                    "termination_reason": no_point_reason,
                 }
             )
             continue
