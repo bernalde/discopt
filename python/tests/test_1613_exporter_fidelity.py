@@ -294,3 +294,26 @@ def test_deep_sum_round_trips_through_nl_reader(tmp_path):
             [pounce, str(p)], capture_output=True, text=True, timeout=300, cwd=tmp_path
         )
         assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-2000:]
+
+
+def test_semiint_without_upper_bound_refuses():
+    """GAMS's default ``.up`` for semiint is +inf; reading it as an invented
+    ub=1e6 big-M returned ``optimal -1e6`` for ``min -n`` (review of #1644)."""
+    with pytest.raises(GamsParseError):
+        parse_gams(
+            "Semiint Variable n; Variable obj; n.lo = 3; Equation e; e.. obj =e= -n;"
+            " Model mm /all/; Solve mm using mip minimizing obj;"
+        )
+
+
+def test_semicontinuous_default_lower_bound_is_one():
+    """GAMS's default ``.lo`` for semicont is 1 (measured on GAMS 53.2), so
+    ``x`` in ``{0} U [1, 5]``: with ``x >= 0.3`` the minimum of ``x`` is 1."""
+    m = parse_gams(
+        "Semicont Variable x; Variable obj; x.up = 5; Equation e, c;"
+        " e.. obj =e= x; c.. x =g= 0.3;"
+        " Model mm /all/; Solve mm using mip minimizing obj;"
+    )
+    r = m.solve()
+    assert r.status == "optimal"
+    assert r.objective == pytest.approx(1.0, abs=1e-6)

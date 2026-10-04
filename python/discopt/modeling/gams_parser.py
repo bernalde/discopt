@@ -1907,10 +1907,14 @@ class _ModelBuilder:
                 # default box; `_lower_semi_variables` imposes the disjunction
                 # once the `.lo`/`.up` assignments are known. Reading it as a
                 # plain `continuous(lb=0)` silently changed the feasible set.
-                var = m.continuous(name, shape=shape, lb=0.0)
+                # GAMS's default box for semicont/semiint is [1, +inf]
+                # (measured on GAMS 53.2: `x.lo` = 1, `x.up` = +INF).
+                var = m.continuous(name, shape=shape, lb=1.0)
                 self._semi_vars.append((name, var))
             elif vtype == "semiint":
-                var = m.integer(name, shape=shape, lb=0, ub=1e6)
+                # No invented ub=1e6: an unset `.up` is +inf in GAMS, and
+                # `_lower_semi_variables` refuses it rather than big-M it.
+                var = m.integer(name, shape=shape, lb=1, ub=9.999e19)
                 self._semi_vars.append((name, var))
             elif vtype in ("sos1", "sos2"):
                 # Read as `free` this silently dropped the SOS restriction --
