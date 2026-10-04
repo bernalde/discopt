@@ -466,6 +466,21 @@ def _build_layer(
         if lam.size != m:
             return _failed()
         g = ev.evaluate_constraints(x) if m else np.zeros(0)
+        jac = ev.evaluate_jacobian(x) if m else np.zeros((0, n))
+        # Row scale (#1617 B-07a). A row ``g_i`` and the same row multiplied by
+        # ``s`` describe the same feasible set, but its slack scales by ``s`` and
+        # its multiplier by ``1/s``. Every per-row test below therefore measures
+        # slack as ``|g_i - t_i| / r_i`` (a distance in x-space) and the
+        # multiplier as ``|λ_i| * r_i`` (its pull on the stationarity row), with
+        # ``r_i = max(||∇g_i||, 1)``. Both are invariant to the row's scaling, and
+        # both are unchanged for a row whose gradient norm is at most 1. Measured
+        # on ``6*P*L <= sig*b*h**2`` (gradient norm ~1e13): the deflection row sat
+        # 403 units (4e-11 in x-space) from its bound with λ = 9.9e-12 (a pull of
+        # ~80 on stationarity); the absolute test called it inactive, the
+        # stationarity residual was then 79.5, and ``sensitivity`` refused a
+        # point the divided formulation differentiates without complaint.
+        row_scale = np.maximum(np.linalg.norm(jac, axis=1), 1.0) if m else np.zeros(0)
+        lam_scaled = np.abs(lam) * row_scale
 
         # Active-set identification is primal-DUAL, not a distance threshold.
         # POUNCE is an interior-point method: a constraint it drives to its bound
@@ -483,7 +498,11 @@ def _build_layer(
         slack_hi = np.where(np.isfinite(cu), np.abs(g - cu), np.inf)
         row_slack = np.minimum(slack_lo, slack_hi) if m else np.zeros(0)
         active = np.where(
-            cl == cu, 1.0, (row_slack <= np.maximum(ACTIVE_TOL, np.abs(lam))).astype(float)
+            cl == cu,
+            1.0,
+            (row_slack / row_scale <= np.maximum(ACTIVE_TOL, lam_scaled)).astype(float)
+            if m
+            else np.zeros(0),
         )
 
         zl = (
@@ -508,16 +527,16 @@ def _build_layer(
         # sign convention would leave the forward value right and every
         # derivative silently wrong.
         grad = ev.evaluate_gradient(x)
-        jac = ev.evaluate_jacobian(x) if m else np.zeros((0, n))
         stat = grad + (jac.T @ (lam * active) if m else 0.0)
         free = at_bound < 0.5
         resid = float(np.max(np.abs(stat[free]))) if free.any() else 0.0
         if m:
             act = active > 0.5
             if act.any():
-                resid = max(resid, float(np.max(np.abs(g[act] - row_target[act]))))
+                primal = np.abs(g[act] - row_target[act]) / row_scale[act]
+                resid = max(resid, float(np.max(primal)))
             if (~act).any():
-                resid = max(resid, float(np.max(np.abs(lam[~act]))))
+                resid = max(resid, float(np.max(lam_scaled[~act])))
         scale = 1.0 + float(np.max(np.abs(grad))) if grad.size else 1.0
         if not np.isfinite(resid) or resid > KKT_RESIDUAL_TOL * scale:
             _warn_once(
@@ -532,7 +551,7 @@ def _build_layer(
         # means dx*/dp is one-sided there; that is a real limitation of the
         # sensitivity, so it is warned rather than hidden.
         degenerate = bool(
-            m and np.any((active > 0.5) & (cl != cu) & (np.abs(lam) < COMPLEMENTARITY_TOL))
+            m and np.any((active > 0.5) & (cl != cu) & (lam_scaled < COMPLEMENTARITY_TOL))
         )
         if not degenerate:
             degenerate = bool(np.any((at_bound > 0.5) & (zl + zu < COMPLEMENTARITY_TOL)))

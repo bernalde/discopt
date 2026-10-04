@@ -57,6 +57,7 @@ Ceccon, Siirola, Misener (2020), "SUSPECT," TOP.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -934,10 +935,138 @@ def _classify_product(
             if info.curvature != Curvature.UNKNOWN:
                 return ExprInfo(info.curvature, prod_sign)
 
+        # Perspective composite (#1617 C-12b): ``g(A1/L, ..., Ak/L) * L``.
+        if perspective_composite_enabled():
+            persp = _classify_perspective_composite(expr, model, cache)
+            if persp is not None:
+                return ExprInfo(persp, prod_sign)
+
     # Bilinear / general product: curvature is UNKNOWN even when both
     # factors share a sign (consider x*y on the positive orthant, whose
     # Hessian has eigenvalues ±1). Sign can still be tightened.
     return ExprInfo(Curvature.UNKNOWN, prod_sign)
+
+
+def perspective_composite_enabled() -> bool:
+    """``DISCOPT_PERSPECTIVE_COMPOSITE`` gate for the perspective-composite rule.
+
+    Read at call time so a test can flip it per solve. See
+    :func:`_classify_perspective_composite` and ``docs/dev/flag-retirement-audit.md``.
+
+    **Kept as a documented opt-in (default OFF), CLAUDE.md section 5.** The rule is
+    sound (differential and sampling tests in
+    ``tests/test_issue_1617_c12b_hull_perspective.py``; 5250 GDP/convexity tests
+    pass with it ON) and tightens the root: the #1617 C-12b synthesis witness goes
+    from -1898 to the optimum -482.18 at the root, 7 nodes to 1. But a proof of
+    convexity re-routes the whole model to NLP-BB, and on the class it fires on
+    (48 of MINLPLib's 54 ``*hfsg`` hull instances, ``syn*``/``rsyn*``; 1 in-repo,
+    ``syn05hfsg``) the 30 s panel (2026-10-04, one interleaved rep per arm, load
+    ~170) certified 36 vs 39 OFF -- 3 gains (``syn30m03``, ``syn40m03``,
+    ``rsyn0830m03``) against 6 losses (``rsyn0805m02/m03``, ``rsyn0810m03``,
+    ``rsyn0815m03/m04``, ``rsyn0830m02``), shifted-geomean wall 3.48 -> 3.89 s.
+    Cert-clean (no bound past a ``minlplib.solu`` optimum in 96 rows) but not
+    net-positive. What would change that: consuming the proof for OA cuts on the
+    spatial path *without* the NLP-BB route switch, or an NLP-BB that keeps pace
+    with the spatial tree on the ``rsyn*m03/m04`` instances.
+    """
+    return os.environ.get("DISCOPT_PERSPECTIVE_COMPOSITE", "0").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    )
+
+
+def _perspective_atoms(e_expr: Expression, l_expr: Expression) -> Optional[list[BinaryOp]]:
+    """The ``A / L`` atoms of ``e_expr``, or ``None`` if a variable sits outside one.
+
+    An atom is a ``/`` node whose divisor is structurally ``l_expr``; it is not
+    descended into. Any ``Variable`` (or indexed ``Variable``) reached outside an
+    atom means ``e_expr`` is not a function of the ratios alone, and the
+    perspective identity does not apply. ``Parameter`` leaves are constants.
+    """
+    from .patterns import _expr_struct_eq
+
+    atoms: list[BinaryOp] = []
+    seen: set[int] = set()
+    stack: list[Expression] = [e_expr]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, BinaryOp) and node.op == "/" and _expr_struct_eq(node.right, l_expr):
+            atoms.append(node)
+            continue
+        if isinstance(node, Variable):
+            return None
+        if isinstance(node, IndexExpression) and isinstance(node.base, Variable):
+            return None
+        if isinstance(node, MatMulExpression):
+            # Not walked by the atom collector below; refuse rather than guess.
+            return None
+        stack.extend(_classify_children(node))
+    return atoms or None
+
+
+def _classify_perspective_composite(
+    expr: BinaryOp, model: Model, cache: dict
+) -> Optional[Curvature]:
+    """Curvature of ``E * L`` where ``E = g(A1/L, ..., Ak/L)`` and ``L`` affine > 0.
+
+    The perspective ``L * g(z/L)`` of a function ``g`` convex (concave) in ``z``
+    is jointly convex (concave) in ``(z, L)`` on ``L > 0``; composed with the
+    affine map ``x -> (A(x), L(x))`` it stays convex (concave). This is the
+    shape the GDP hull writes for a nonlinear disjunct body (Furman, Sawaya and
+    Grossmann's eps-perspective: ``yhat * g(v / yhat)`` with
+    ``yhat = (1 - eps) * y + eps``), which the generic product rule calls
+    UNKNOWN because ``v / yhat`` is not convex in ``(v, y)`` -- so a convex
+    disjunct became a nonconvex hull row relaxed by McCormick (#1617 C-12b).
+
+    Proof obligations, each checked:
+
+    * ``L`` is affine and provably strictly positive on the box;
+    * every variable of ``E`` sits inside a ratio ``A_i / L`` whose divisor is
+      structurally ``L`` and whose numerator ``A_i`` is affine;
+    * ``E``'s curvature *in the ratios* is classified by the ordinary rules in a
+      fresh cache that seeds each ratio as an AFFINE leaf. Sign and domain
+      checks inside that pass evaluate the real ratio ``A_i / L`` over the box,
+      i.e. an enclosure of the values ``z_i`` actually takes, so a domain-guarded
+      atom (``log``, ``sqrt``) is only accepted where ``g`` is defined.
+
+    Returns ``None`` when any obligation fails (conservative).
+    """
+    from .patterns import _has_positive_lower_bound
+
+    for e_expr, l_expr in ((expr.left, expr.right), (expr.right, expr.left)):
+        if classify_expr(l_expr, model, cache) != Curvature.AFFINE:
+            continue
+        if not _has_positive_lower_bound(l_expr, model):
+            continue
+        atoms = _perspective_atoms(e_expr, l_expr)
+        if atoms is None:
+            continue
+        seeded: dict = {}
+        for key in (_DEADLINE_KEY, _VISIT_COUNT_KEY):
+            if key in cache:
+                seeded[key] = cache[key]
+        ok = True
+        for atom in atoms:
+            if classify_expr(atom.left, model, cache) != Curvature.AFFINE:
+                ok = False
+                break
+            # sign(A / L) = sign(A) since L > 0.
+            num_sign = classify_expr_info(atom.left, model, cache).sign
+            seeded[id(atom)] = ExprInfo(Curvature.AFFINE, num_sign)
+        if not ok:
+            continue
+        # Keep the seeded atoms alive while their ids key the fresh cache.
+        seeded["__perspective_atoms__"] = atoms
+        curv = classify_expr_info(e_expr, model, seeded).curvature
+        if curv in (Curvature.CONVEX, Curvature.CONCAVE, Curvature.AFFINE):
+            return curv
+    return None
 
 
 def _classify_division(
