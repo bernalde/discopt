@@ -56,6 +56,9 @@ _NON_INTRINSIC = frozenset(
         "atleast",
         "atmost",
         "exactly",
+        "at_least",  # aliases of atleast / atmost (#1617)
+        "at_most",
+        "xor",
         # importers
         "from_pyomo",
         "from_nl",

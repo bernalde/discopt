@@ -1183,7 +1183,14 @@ _STATE_NOT_CARRIED = frozenset(
 _STATE_PLAIN = ("_aux_counter", "_decomp_stages", "_decomp_blocks")
 
 #: Attributes carried in "state" as a sorted list (a set is not JSON).
-_STATE_AS_SORTED_LIST = ("_zero_spanning_factor_auxes", "_implied_integer_auxes")
+#: ``_free_by_construction`` (#1618 X-29b) names the variables discopt itself made
+#: free (CVaR's ``eta``); carried so a reloaded model does not start blaming the
+#: user for bounds they never declared.
+_STATE_AS_SORTED_LIST = (
+    "_zero_spanning_factor_auxes",
+    "_implied_integer_auxes",
+    "_free_by_construction",
+)
 
 #: Attributes carried in "state" by a bespoke encoder.
 _STATE_BESPOKE = (
