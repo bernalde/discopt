@@ -67,12 +67,11 @@ def test_sensitivity_is_invariant_to_row_scaling(scale):
     y = m.continuous("y", lb=-10, ub=10)
     m.subject_to(scale * (x + y) >= scale * p)
     m.minimize(x**2 + 2 * y**2)
-    # Started at the KKT point: from a cold start POUNCE's path on the 1e-6 row is
-    # platform-dependent (it hit iteration_limit on CI's Linux runner, not on macOS),
-    # and what is under test is the sensitivity's row-scale invariance, not the solve.
-    r = m.solve(solver="pounce", initial_solution={x: 4 / 3, y: 2 / 3})
+    r = m.solve(solver="pounce")
     # The 1e-6 row's QP route reports an uncertified "feasible" (#1596); the
-    # sensitivity only needs the KKT point.
+    # sensitivity only needs the KKT point. pounce ``main`` labels that iterate
+    # ``optimal_inaccurate``, which the route once mapped to ``iteration_limit``
+    # and dropped (see test_1533_pounce_route's optimal_inaccurate tests).
     assert r.status in ("optimal", "local_optimal", "feasible")
     sens = m.sensitivity(wrt=[p])
     # min x^2 + 2y^2 s.t. x + y = p  ->  x = 2p/3, y = p/3.
