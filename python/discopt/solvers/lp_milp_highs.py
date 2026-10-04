@@ -1468,6 +1468,16 @@ def logical_column_scales(sf: StdForm, n_struct: Optional[int]) -> Optional[np.n
     route certifies today is handed to HiGHS unchanged. A user's own tiny-coefficient
     column is not touched and still decertifies: that class was measured wrong
     (#1295) and is the user's scaling, not the route's.
+
+    #1621: the same holds for a user's tiny entry that shares the logical's row. In a
+    big-M row ``x - M z + s = 0`` the logical is small only because ``x`` is: ``x``'s
+    own entry sits at ``1/M`` of the row too. Rescaling ``s`` there removes the one
+    entry #1295 measures (an open column) and leaves the user's ``1/M`` entry -- the
+    actual trap -- in a model now handed to HiGHS as trusted. Measured on the #1621
+    blending MILP: certified ``infeasible`` at M = 1e9 and ``optimal`` 0 at M = 1e10
+    (true optimum 473,958.43, x = 0 feasible). So a logical is rescaled only when
+    every OTHER entry of its row is within the cap of the row's largest -- the row is
+    well scaled apart from the route's own column, which is the #1537 premise.
     """
     if n_struct is None or n_struct >= sf.n or sf.A.nnz == 0:
         return None
@@ -1478,11 +1488,19 @@ def logical_column_scales(sf: StdForm, n_struct: Optional[int]) -> Optional[np.n
     scales = np.ones(sf.n)
     cand = _logical_columns(sf)
     cand[:n_struct] = False
+    # Smallest nonzero entry of each row over the columns that are not rescaling
+    # candidates (a logical is the only entry of its column, so this is "every other
+    # entry of the row" for each candidate).
+    keep = ~cand[absA.col] & (absA.data > 0.0)
+    row_min_other = np.full(sf.m, np.inf)
+    np.minimum.at(row_min_other, absA.row[keep], absA.data[keep])
     lo_open, hi_open = sf.xl <= -INF, sf.xu >= INF
     for j in np.flatnonzero(cand):
         i, a = int(A.indices[A.indptr[j]]), abs(float(A.data[A.indptr[j]]))
         if row_max[i] <= 0.0 or a / row_max[i] >= UNSCALABLE_OPEN_RATIO:
             continue
+        if row_min_other[i] / row_max[i] < UNSCALABLE_OPEN_RATIO:
+            continue  # #1621: the user's own entry is below the cap; not ours to excuse
         # floor, not round: the rescaled entry lands in (row_max / 2, row_max], so it
         # never becomes its row's new largest and lowers every other entry's ratio.
         f = float(2.0 ** np.floor(np.log2(row_max[i] / a)))
@@ -1563,7 +1581,75 @@ def solve_milp_std(
             plain.labels["milp/logicals_rescale_refused"] = why
             return plain
     out.stats["milp/logicals_rescaled"] = float(np.count_nonzero(f != 1.0))
+    if out.gap_certified and out.status in ("optimal", "infeasible"):
+        return _cross_check_rescaled(sf, out, kw, t0)
     return out
+
+
+def _cross_check_rescaled(
+    sf: StdForm, out: HighsOutcome, kw: dict[str, Any], t0: float
+) -> HighsOutcome:
+    """#1621: hold a certificate earned on the rescaled form against ``sf`` itself.
+
+    The incumbent re-verification in :func:`solve_milp_std` covers the POINT of an
+    ``optimal`` result; it says nothing about the bound, and an ``infeasible`` has no
+    point at all. Both certificates were measured false through the rescaling (#1621:
+    ``infeasible`` at M = 1e9 and ``optimal`` 0 at M = 1e10 on a MILP whose optimum is
+    473,958.43). So ``sf`` is solved as given and its VERIFIED incumbent, if any, is
+    held against the rescaled claim: any verified point refutes ``infeasible``, and a
+    verified point below the certified bound by more than the route's own equality
+    yardstick (``CERT_ABS + CERT_REL |bound|``, as in the #1509 refutation) refutes
+    ``optimal``. A refuted claim is discarded and the plain solve is published -- the
+    pre-#1537 path, whose #1295 guard then decides what may be certified.
+
+    This is a falsifier, not a proof, in the #1509 sense: a cross-solve that yields no
+    verified point is no evidence either way and the rescaled certificate stands. A
+    cross-check that cannot run for want of budget is a safety net that never ran, so
+    the certificate is withdrawn (the #1309 rule).
+    """
+    kw = dict(kw)
+    if kw["time_limit"] is not None:
+        kw["time_limit"] = max(0.0, float(kw["time_limit"]) - (time.perf_counter() - t0))
+        if kw["time_limit"] <= 0.0:
+            out.stats["milp/rescale_cross_check_skipped"] = 1.0
+            out.labels["milp/certificate"] = "declined"
+            out.gap_certified = False
+            out.message = (
+                "certificate from the rescaled form withdrawn: no time budget left to "
+                "cross-check it against the unscaled model (#1621)"
+            )
+            if out.status == "optimal":
+                out.status = "feasible"
+                out.bound = out.root_bound
+                if out.bound is not None and out.objective is not None:
+                    out.bound = min(out.bound, out.objective)
+            else:
+                out.status, out.bound = "error", None
+            return out
+    plain = _solve_milp_std(sf, **kw)
+    out.stats["milp/rescale_cross_check_ran"] = 1.0
+    pt = _verified_mip_point(sf, plain.x)
+    refuted = None
+    if pt is not None:
+        if out.status == "infeasible":
+            refuted = f"a verified point of objective {pt[1]:.12g} exists"
+        else:
+            # A certified optimum's claim is its bound (``objective`` when HiGHS gave
+            # none: certified means the incumbent is optimal).
+            claim = out.bound if out.bound is not None else out.objective
+            if claim is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
+                refuted = f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
+    if refuted is None:
+        return out
+    logger.warning(
+        "HiGHS MILP route: the rescaled-form %s certificate is refuted on the unscaled "
+        "model (%s); publishing the unscaled solve instead (#1621)",
+        out.status,
+        refuted,
+    )
+    plain.stats["milp/rescale_certificate_refuted"] = 1.0
+    plain.labels["milp/rescale_certificate_refuted"] = f"{out.status}: {refuted}"
+    return plain
 
 
 def _solve_milp_std(

@@ -405,7 +405,12 @@ def test_rescaled_logical_point_is_reverified_on_the_callers_form():
     """#1414's class through the rescaling: ``min -x + 3 z, x <= M z`` with M = 1e8.
     The unit slack is rescaled by ~2**26, so x = 10, z = 0 (a 10-unit violation) is
     1.5e-7 in the scaled slack and passes its ``>= -tol`` bound. The mapped point
-    must be re-verified on the original form and the rescaled answer discarded."""
+    must be re-verified on the original form and the rescaled answer discarded.
+
+    #1621: the row's own ``x`` entry is 1e-8 of its largest, so the logical is no
+    longer rescaled at all (the user's scaling is not the route's to excuse); the
+    re-verification path itself is exercised under forced rescaling in
+    ``test_1621_rescaled_certificate_cross_check.py``."""
     m = dm.Model("bigm")
     x = m.continuous("x", lb=0, ub=10)
     z = m.binary("z")
@@ -414,5 +419,5 @@ def test_rescaled_logical_point_is_reverified_on_the_callers_form():
     r = m.solve(time_limit=30)
     st = r.solver_stats or {}
     assert st.get("route/lp_milp_backend") == 1.0
-    assert st.get("milp/logicals_rescale_refused") == 1.0, st
+    assert "milp/logicals_rescaled" not in st, st
     assert r.objective is None or r.objective >= -7.0 - 1e-6, (r.status, r.objective)
