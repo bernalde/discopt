@@ -990,6 +990,8 @@ def solve_lp_spatial_bb(
             heapq.heappush(heap, kids[0])
 
     status = "infeasible"
+    # Bound of a node popped but left unexplored by the gap-tolerance exit (#1627).
+    exit_open_lb = float("inf")
     while heap or plunge:
         if (time.perf_counter() - t0) >= time_limit or nodes >= max_nodes:
             status = "time_limit"
@@ -1023,6 +1025,13 @@ def solve_lp_spatial_bb(
         if bound >= inc_val - 1e-9 * (1 + abs(inc_val)):
             continue
         if inc_x is not None and abs(inc_val - glb) <= gap_tolerance * (1 + abs(inc_val)):
+            # #1627: the gap closed WITHIN TOLERANCE, not to zero. The popped node was
+            # neither branched nor fathomed, so it is still live and its ``bound``
+            # must reach the published dual bound below. It is in neither ``heap``
+            # nor ``plunge`` any more, and when it was the last live node the final
+            # ``gbound`` collapsed to ``inc_val`` -- a "bound" up to ``gap_tolerance``
+            # ABOVE the true optimum, published with ``gap=0.0`` and certified.
+            exit_open_lb = bound
             status = "optimal"
             break
         # primal: cheap one-shot rounding every node; the continuous completion (one
@@ -1113,7 +1122,7 @@ def solve_lp_spatial_bb(
 
     # Every live node counts, on the frontier OR parked mid-plunge (#862).
     gbound = min([h[0] for h in heap] + [p[0] for p in plunge], default=float("inf"))
-    gbound = min(gbound, unresolved_lb)
+    gbound = min(gbound, unresolved_lb, exit_open_lb)
     if inc_x is not None:
         gbound = min(gbound, inc_val)
     if not np.isfinite(gbound):

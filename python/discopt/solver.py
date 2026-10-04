@@ -52,6 +52,7 @@ from discopt._relax.problem_classifier import dense_Q as _dense_Q
 if TYPE_CHECKING:
     from discopt._evaluator_cache import Fingerprint as _EvaluatorFingerprint
     from discopt._relax.nlp_evaluator import NLPEvaluator
+    from discopt.modeling.core import ObjectiveSense
 from discopt._rust import PyTreeManager
 from discopt.constants import CONSTRAINT_INF as _CONSTRAINT_INF
 from discopt.constants import DEFAULT_VARIABLE_BOUND
@@ -26665,6 +26666,42 @@ def _quadratic_rows_solution_feasible(x, quadratic_constraints, tol=1e-6) -> boo
     return True
 
 
+def _engine_bound_in_model_sense(
+    status: SolveStatus,
+    engine_bound: Optional[float],
+    objective: Optional[float],
+    obj_const: float,
+    sense: ObjectiveSense,
+) -> Optional[float]:
+    """The dual bound to publish from an external engine's matrix-form result (#1627).
+
+    ``engine_bound`` is the engine's dual bound for the internal minimization
+    without ``obj_const``; it is mapped to the model's sense (a lower bound for
+    minimize, an upper bound for maximize). An ``OPTIMAL`` status from a MIP engine
+    means optimal WITHIN its gap tolerance, not gap zero, so the incumbent is never
+    substituted for a bound the engine did report -- that published a bound up to
+    the tolerance past the true optimum (the #1627 class; ``milp_simplex`` #1141).
+    On ``OPTIMAL`` the bound is capped at the incumbent (a bound that crosses the
+    incumbent is not a bound), and the incumbent stands in only when the engine
+    reported no bound at all (a continuous LP/QP solved to optimality).
+    """
+    from discopt.modeling.core import ObjectiveSense
+
+    bound: Optional[float] = None
+    if engine_bound is not None and np.isfinite(engine_bound):
+        bound = float(engine_bound) + float(obj_const)
+        if sense == ObjectiveSense.MAXIMIZE:
+            bound = -bound
+    if status == SolveStatus.OPTIMAL and objective is not None:
+        if bound is None:
+            bound = objective
+        elif sense == ObjectiveSense.MAXIMIZE:
+            bound = max(bound, objective)
+        else:
+            bound = min(bound, objective)
+    return bound
+
+
 def _solve_qcp_gurobi(
     model: Model,
     t_start: float,
@@ -26738,13 +26775,9 @@ def _solve_qcp_gurobi(
         if sense == ObjectiveSense.MAXIMIZE:
             objective = -objective
 
-    bound = None
-    if result.status == SolveStatus.OPTIMAL and objective is not None:
-        bound = objective
-    elif result.bound is not None:
-        bound = float(result.bound) + float(qcp_data.obj_const)
-        if sense == ObjectiveSense.MAXIMIZE:
-            bound = -bound
+    bound = _engine_bound_in_model_sense(
+        result.status, result.bound, objective, float(qcp_data.obj_const), sense
+    )
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and objective is not None
@@ -26763,8 +26796,14 @@ def _solve_qcp_gurobi(
             # feasibility-verified just above -- but it is now a decision on
             # the page rather than a default nobody read.
             gap_certified=True,
-            bound=objective,
-            gap=result.gap if result.gap is not None else _optimal_relative_gap(objective),
+            bound=bound,
+            gap=(
+                _relative_gap_from_objective_bound(objective, bound)
+                if bound != objective
+                else result.gap
+                if result.gap is not None
+                else _optimal_relative_gap(objective)
+            ),
             x=_unpack_solution(model, x_flat),
             wall_time=wall_time,
             node_count=result.node_count,
@@ -27470,14 +27509,10 @@ def _solve_qp_matrix(
         if sense == ObjectiveSense.MAXIMIZE:
             objective = -objective
 
-    bound = None
     result_bound = getattr(result, "bound", None)
-    if result.status == SolveStatus.OPTIMAL and objective is not None:
-        bound = objective
-    elif result_bound is not None:
-        bound = float(result_bound) + float(qp_data.obj_const)
-        if sense == ObjectiveSense.MAXIMIZE:
-            bound = -bound
+    bound = _engine_bound_in_model_sense(
+        result.status, result_bound, objective, float(qp_data.obj_const), sense
+    )
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and result.objective is not None
@@ -27531,6 +27566,13 @@ def _solve_qp_matrix(
         # only if a certificate that charges the complementarity the backend left
         # unconverged supports it. Otherwise the point is an uncertified incumbent.
         qp_bound: Optional[float] = objective
+        if integrality is not None:
+            # #1627: an MIQP engine's OPTIMAL is optimal WITHIN its gap tolerance, so
+            # publish its own dual bound (capped at the incumbent re-evaluated just
+            # above), never the incumbent in its place.
+            qp_bound = _engine_bound_in_model_sense(
+                result.status, result_bound, objective, float(qp_data.obj_const), sense
+            )
         qp_certified = True
         reduced_costs = result.reduced_costs
         if integrality is None:
@@ -27629,7 +27671,9 @@ def _solve_qp_matrix(
             bound_valid=True,
             bound_source="convex_proof" if integrality is None else "bnb_tree",
             gap=(
-                result.gap
+                _relative_gap_from_objective_bound(objective, qp_bound)
+                if integrality is not None and qp_bound != objective
+                else result.gap
                 if integrality is not None and result.gap is not None
                 # #1605: the near-zero contract of the NLP route -- a relative gap
                 # is undefined at a ~0 incumbent (``None``, not ``0.0``).
@@ -27795,13 +27839,9 @@ def _solve_milp_gurobi(
     # ``result.bound`` is a valid lower bound for the internal minimization.
     # Map it back to the original sense: lower bound for minimize, upper bound
     # for maximize (matching discopt's existing SolveResult convention).
-    bound = None
-    if result.status == SolveStatus.OPTIMAL and objective is not None:
-        bound = objective
-    elif result.bound is not None:
-        bound = float(result.bound) + float(lp_data.obj_const)
-        if sense == ObjectiveSense.MAXIMIZE:
-            bound = -bound
+    bound = _engine_bound_in_model_sense(
+        result.status, result.bound, objective, float(lp_data.obj_const), sense
+    )
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and objective is not None
@@ -27822,7 +27862,13 @@ def _solve_milp_gurobi(
             # Explicit, not defaulted -- see ``_solve_qcp_gurobi``'s optimal exit.
             gap_certified=True,
             bound=bound,
-            gap=result.gap if result.gap is not None else 0.0,
+            gap=(
+                _relative_gap_from_objective_bound(objective, bound)
+                if bound != objective
+                else result.gap
+                if result.gap is not None
+                else 0.0
+            ),
             x=_unpack_solution(model, result.x[:n_orig]),
             wall_time=wall_time,
             node_count=result.node_count,

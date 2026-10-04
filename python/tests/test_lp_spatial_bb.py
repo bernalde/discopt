@@ -355,3 +355,81 @@ def test_nvs17_dual_bound_is_valid_and_tight():
     assert r.bound >= -2000.0  # vastly tighter than the -65842 frozen root
     if r.objective is not None:
         assert r.objective >= -1100.4 - 1e-4  # incumbent can't beat the true optimum
+
+
+# #1627: a 3-variable pure-integer indefinite QP on which the engine stops on the
+# relative-gap test. The ``+50`` offset widens ``gap_tolerance * (1 + |obj|)`` enough
+# for the test to fire while the incumbent is the SECOND-best lattice point.
+_Q1627 = np.array(
+    [
+        [0.9187125752349193, 0.6467764992156544, 0.55311840279085],
+        [0.6467764992156544, 0.13998859082388795, 0.9322535749280303],
+        [0.55311840279085, 0.9322535749280303, -2.746006524206777],
+    ]
+)
+_C1627 = np.array([0.10211160994508059, 0.10262073706528213, 0.6566341201517099])
+_A1627 = np.array(
+    [
+        [-0.1981071757858644, 1.9693169325367323, -0.4469940127582583],
+        [-0.4576820833721809, -0.2547121267169519, -2.149236242811033],
+    ]
+)
+_B1627 = np.array([1.0715466980488162, 1.322703918000912])
+
+
+def _miqp_1627(sense):
+    m = dm.Model("miqp_1627")
+    x = m.integer("x", shape=(3,), lb=-3, ub=3)
+    f = 0.01 * (
+        sum(_Q1627[i, j] * x[i] * x[j] for i in range(3) for j in range(3))
+        + sum(_C1627[i] * x[i] for i in range(3))
+    )
+    if sense == "min":
+        m.minimize(f + 50.0)
+    else:
+        m.maximize(-f - 50.0)
+    for k in range(2):
+        m.subject_to(sum(_A1627[k, i] * x[i] for i in range(3)) <= _B1627[k])
+    return m
+
+
+def _oracle_1627():
+    import itertools
+
+    vals = [
+        0.01 * (z @ _Q1627 @ z + _C1627 @ z) + 50.0
+        for z in (np.array(p, float) for p in itertools.product(range(-3, 4), repeat=3))
+        if np.all(_A1627 @ z <= _B1627)
+    ]
+    return min(vals)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("sense", ["min", "max"])
+def test_gap_tolerance_exit_publishes_the_proven_bound_not_the_incumbent(sense):
+    """#1627: on the gap-tolerance exit the node just popped is still live. Its bound
+    must reach the published dual bound; the engine used to drop it and, with the
+    frontier then empty, publish ``bound = incumbent`` with ``gap = 0`` -- a
+    certified bound 4.6e-3 above the brute-force optimum."""
+    opt = _oracle_1627()  # minimize-sense optimum (49.61427314400109)
+    m = _miqp_1627(sense)
+    r = m.solve(time_limit=30, lp_spatial=True)
+    assert r.status == "optimal" and r.gap_certified
+    assert r.bound is not None and r.objective is not None
+    tol = 1e-9 * (1 + abs(opt))
+    if sense == "min":
+        assert r.bound <= opt + tol, f"bound {r.bound} crosses the optimum {opt}"
+        assert r.bound <= r.objective
+        honest = r.objective - r.bound
+    else:
+        assert r.bound >= -opt - tol, f"bound {r.bound} crosses the optimum {-opt}"
+        assert r.bound >= r.objective
+        honest = r.bound - r.objective
+    # The reported gap describes the published pair, never a 0 hiding an open gap.
+    from discopt.solvers._gap import reported_gap
+
+    assert honest > 0.0
+    assert r.gap == pytest.approx(reported_gap(r.objective, r.bound), rel=1e-12)
+    assert r.gap > 0.0
+    # Still a legitimate early stop: optimal WITHIN the requested tolerance.
+    assert honest <= 1e-4 * (1 + abs(r.objective))
