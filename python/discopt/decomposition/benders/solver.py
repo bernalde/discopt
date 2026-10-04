@@ -639,7 +639,12 @@ def solve_benders(
         eta_vec = np.asarray(mres.x[n_master : n_master + n_blocks], dtype=np.float64)
         if x_center is None:
             x_center = x_hat.copy()  # first stabilization centre (T2.2)
-        lb = mres.bound if mres.bound is not None else mres.objective
+        # Only a dual bound is a bound: a limit-hit master's ``objective`` is its
+        # incumbent, an *upper* value, and ``best_lb`` keeps whatever enters it.
+        if mres.status == SolveStatus.OPTIMAL:
+            lb = mres.bound if mres.bound is not None else mres.objective
+        else:
+            lb = mres.bound
         lower_bound = (float(lb) + lin.c_offset) if lb is not None else None
         if lower_bound is not None and not np.any(eta_vec <= cfg.eta_floor + 1.0):
             # Same eta-floor guard as the final bound below (T0.5): while a

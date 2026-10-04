@@ -66,3 +66,41 @@ def test_single_cut_benders_certificate_matches_reported_bound(purge):
     assert r.bound is not None
     # The certificate is the reported pair: it must close the gap.
     assert relative_gap(r.objective, r.bound) <= cfg.gap_tolerance
+
+
+def test_limit_hit_master_incumbent_is_never_kept_as_bound(monkeypatch):
+    """A master that hits its limit with an incumbent and no dual bound returns
+    its *primal* value; ``best_lb`` must not absorb it (review of #1642). Before
+    the fix this certified ``optimal`` with bound 411.14 > the optimum 410.30."""
+    import discopt.solvers.lp_backend as lpb
+    from discopt.solvers import MILPResult, SolveStatus
+
+    real_get = lpb.get_milp_solver
+    calls = {"master": 0, "limited": 0}
+
+    def get_milp_solver(*a, **k):
+        real = real_get(*a, **k)
+
+        def milp(c, **kw):
+            res = real(c, **kw)
+            if len(c) > n_w and res.x is not None:  # with-eta masters only
+                calls["master"] += 1
+                if calls["master"] >= 3:
+                    calls["limited"] += 1
+                    return MILPResult(
+                        status=SolveStatus.TIME_LIMIT,
+                        x=res.x,
+                        objective=float(res.objective) + 5.0,  # incumbent above the LB
+                        bound=None,
+                    )
+            return res
+
+        return milp
+
+    monkeypatch.setattr(lpb, "get_milp_solver", get_milp_solver)
+    m, y, _ = build_monolithic("s")
+    m.first_stage(y)
+    r = solve_benders(m, config=BendersConfig(multicut=False))
+    assert calls["limited"] > 0
+    assert r.bound is None or r.bound <= 410.2988766 + 1e-6
+    assert r.status != "optimal"
