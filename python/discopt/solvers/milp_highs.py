@@ -646,7 +646,12 @@ def _cross_check_presolve(
 
 
 def _cross_check_lazy_master(
-    h, highspy, status: SolveStatus, bound: Optional[float], time_left: Optional[float]
+    h,
+    highspy,
+    status: SolveStatus,
+    bound: Optional[float],
+    time_left: Optional[float],
+    objective: Optional[float] = None,
 ) -> tuple[SolveStatus, Optional[float], dict]:
     """#1634 for the lazy-cut master: re-solve its FINAL model with presolve off.
 
@@ -654,6 +659,10 @@ def _cross_check_lazy_master(
     master's point; only its verdict and bound are used, as in
     :func:`_cross_check_presolve`: ``min`` of the two bounds, ``infeasible`` only if
     both agree, and a claim the cross-solve cannot confirm is withdrawn.
+
+    ``OPTIMAL`` survives a lowered bound when the gap against ``objective`` (the
+    master's returned incumbent) is still closed at the master's ``mip_rel_gap``:
+    two B&B runs stopping at different points inside that gap is not a refutation.
     """
     infeasible = status == SolveStatus.INFEASIBLE
     diag: dict[str, object] = {"ran": False, "primary_status": status.value}
@@ -708,9 +717,17 @@ def _cross_check_lazy_master(
             cbound,
         )
         bound = cbound
-        if status == SolveStatus.OPTIMAL:
+        if status == SolveStatus.OPTIMAL and not _gap_closed(objective, bound, float(rel_gap)):
             status = SolveStatus.ITERATION_LIMIT
     return status, bound, diag
+
+
+def _gap_closed(objective: Optional[float], bound: float, rel_gap: float) -> bool:
+    """Whether ``bound`` still closes the gap to ``objective`` at ``rel_gap`` (#1634)."""
+    if objective is None or not np.isfinite(objective):
+        return False
+    gap = max(0.0, float(objective) - float(bound))
+    return gap <= 1e-9 or gap / max(abs(float(objective)), abs(float(bound)), 1e-10) <= rel_gap
 
 
 def solve_milp_with_lazy_cuts(
@@ -1037,7 +1054,9 @@ def solve_milp_with_lazy_cuts(
     # #1634: the master's bound is the OA lower bound; hold it against a presolve-free
     # solve of the final master before it leaves this function.
     time_left = None if time_limit is None else float(time_limit) - (time.time() - t0)
-    status, bound, cross_diag = _cross_check_lazy_master(h, highspy, status, bound, time_left)
+    status, bound, cross_diag = _cross_check_lazy_master(
+        h, highspy, status, bound, time_left, objective=obj_out
+    )
 
     return MILPResult(
         status=status,

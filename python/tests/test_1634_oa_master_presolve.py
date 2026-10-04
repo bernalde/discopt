@@ -197,3 +197,89 @@ def test_claim_is_withdrawn_without_budget():
     assert r.bound is None
     assert r.status == SolveStatus.ITERATION_LIMIT
     assert "withdrawn" in r.callback_stats["presolve_cross_check"]
+
+
+def _early_exit_model():
+    """Convex MINLP whose LP/NLP-BB separator keeps cutting after the gap closes, so
+    the driver's check-in (``callback_terminate``) stops the HiGHS master early
+    (the #1066 ``_separator_outlives_the_certificate`` fixture)."""
+    m = Model("oa1634_early_exit")
+    xs = [m.continuous(f"x{i}", lb=0.0, ub=3.0) for i in range(8)]
+    ys = [m.binary(f"y{i}") for i in range(8)]
+    for xi, yi in zip(xs, ys):
+        m.subject_to(xi <= 3.0 * yi)
+    m.subject_to(sum(xs) >= 4.0)
+    m.minimize(sum((xi - 0.5) ** 2 for xi in xs) + 0.001 * sum(ys))
+    return m
+
+
+def _lp_nlp_bb(model):
+    """The single-tree driver on the HiGHS lazy master, called directly so a solve
+    that does not certify is not replaced by the route's fallback, with a caller
+    ``termination_hook`` that never stops (and must be seen to run)."""
+    from discopt.solvers.oa import solve_lp_nlp_bb
+
+    seen: list[dict] = []
+    r = solve_lp_nlp_bb(
+        model,
+        time_limit=60.0,
+        milp_solver="highs",
+        termination_hook=lambda ctx: bool(seen.append(dict(ctx))),
+    )
+    assert seen, "the termination hook never ran"
+    return r
+
+
+def test_lp_nlp_bb_early_exit_cannot_restore_an_unconfirmed_bound(monkeypatch):
+    """The driver's early exit records the PRIMARY tree's check-in bound and used to
+    publish ``max(master bound, check-in bound)``: a bound the presolve-free
+    cross-solve lowered came straight back and certified on its own.
+
+    The fault is injected at the cross-check (it reports the final master bound 1.0
+    lower than it is), so the test does not depend on finding a rare instance where
+    HiGHS's presolve-on tree is wrong with rule 13 off. A correct driver publishes
+    the lowered bound and does not certify on it.
+    """
+    real = MH._cross_check_lazy_master
+    fired = []
+
+    def lowered(h, highspy, status, bound, time_left, objective=None):
+        status, bound, diag = real(h, highspy, status, bound, time_left, objective=objective)
+        if bound is not None:
+            fired.append(bound)
+            bound -= 1.0
+            diag["bound_lowered"] = 1.0
+            status = SolveStatus.ITERATION_LIMIT
+        return status, bound, diag
+
+    monkeypatch.setattr(MH, "_cross_check_lazy_master", lowered)
+    r = _lp_nlp_bb(_early_exit_model())
+    stats = r.mip_nlp_trace["summary"]["callback_stats"]
+    assert fired, "the lazy-master cross-check never ran"
+    assert stats["presolve_cross_check"]["ran"]
+    # The early exit must actually have fired, or this tests nothing (CLAUDE.md §6).
+    assert stats["early_exit_unconfirmed"] is True, stats
+    assert stats["converged_early"] is False
+    assert r.bound is not None and r.bound <= fired[-1] - 1.0 + 1e-9, (r.bound, fired)
+    assert not r.gap_certified
+    assert r.mip_nlp_trace["termination_reason"] == "early_exit_unconfirmed"
+
+
+def test_lp_nlp_bb_early_exit_still_certifies_when_confirmed():
+    """Without a fault the cross-check confirms the check-in bound and the early exit
+    certifies as before."""
+    r = _lp_nlp_bb(_early_exit_model())
+    stats = r.mip_nlp_trace["summary"]["callback_stats"]
+    assert stats["presolve_cross_check"]["ran"]
+    assert stats["early_exit_unconfirmed"] is False
+    assert r.gap_certified
+    assert r.objective == pytest.approx(0.008, abs=1e-6)
+
+
+def test_lazy_cross_check_keeps_optimal_inside_the_gap():
+    """A cross-solve bound a hair below the primary's, still inside ``mip_rel_gap`` of
+    the incumbent, is B&B noise, not a refutation: ``OPTIMAL`` must survive. One that
+    opens the gap must not."""
+    assert MH._gap_closed(1.0, 1.0 - 5e-5, 1e-4)
+    assert not MH._gap_closed(1.0, 0.99, 1e-4)
+    assert not MH._gap_closed(None, 0.0, 1e-4)
