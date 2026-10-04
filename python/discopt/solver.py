@@ -10156,6 +10156,21 @@ _ROUTE_FALLBACK_NOTE: list[str] = []
 # carry forward, and ``_merge_route_and_fallback`` returns the fallback for it.
 _ROUTE_FALLBACK_STATE: list[tuple[Optional["SolveResult"], bool]] = []
 
+#: #1614 D-14/B-02b: the engine the dispatcher handed the solve to, for the
+#: decorator below to stamp onto ``SolveResult.algorithm_route`` when the engine
+#: itself left it ``None``. Same rail as :data:`_ROUTE_FALLBACK_NOTE` and for the
+#: same reason: the spatial path alone has dozens of return sites. Each dispatch
+#: arm calls :func:`_declare_route` just before it hands over; the LAST
+#: declaration at this depth is the most specific and wins. A route string an
+#: engine wrote itself (HiGHS, OA, pounce, native-milp) is never overwritten, and
+#: a #1059 fallback note still takes precedence over both.
+_ROUTE_NAME: list[str] = []
+
+
+def _declare_route(name: str) -> None:
+    """Name the engine the current ``solve_model`` call is about to hand over to."""
+    _ROUTE_NAME.append(name)
+
 
 def _stamp_layer_timing(fn: _F) -> _F:
     """Stamp the layer profile onto whatever ``SolveResult`` the solve produced.
@@ -10182,6 +10197,7 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # `set` lands in the outer solve's slot -- which is the one that reports.
         _probe_nodes_tok = _IPX_PROBE_NODES.set(0)
         _route_depth = len(_ROUTE_FALLBACK_NOTE)
+        _name_depth = len(_ROUTE_NAME)
         _state_depth = len(_ROUTE_FALLBACK_STATE)
         _gap_depth = len(_GAP_TOLERANCES)
         try:
@@ -10193,6 +10209,8 @@ def _stamp_layer_timing(fn: _F) -> _F:
                 else None
             )
             del _ROUTE_FALLBACK_NOTE[_route_depth:]
+            _route_name = _ROUTE_NAME[-1] if len(_ROUTE_NAME) > _name_depth else None
+            del _ROUTE_NAME[_name_depth:]
             _route_state = (
                 _ROUTE_FALLBACK_STATE[_state_depth]
                 if len(_ROUTE_FALLBACK_STATE) > _state_depth
@@ -10209,6 +10227,14 @@ def _stamp_layer_timing(fn: _F) -> _F:
         # invisibility the issue was filed about.
         if _route_note is not None and isinstance(result, SolveResult):
             result.algorithm_route = _route_note
+        # #1614: every route names itself. Only fills a gap -- an engine's own
+        # route string is more specific than the dispatcher's.
+        if (
+            _route_name is not None
+            and isinstance(result, SolveResult)
+            and result.algorithm_route is None
+        ):
+            result.algorithm_route = _route_name
         # #1059: the fallback must never be worse than the route it replaced.
         # Done here rather than at the fallback site for the same reason as the
         # note: the fallback falls through to the default path's return sites.
@@ -11708,6 +11734,17 @@ def solve_model(
                 type(_route_exc).__name__,
                 _route_exc,
             )
+            # #1614 E-01(c): an engine *failure* is not the designed "did not
+            # certify" hand-over. The fallback is still the sound answer, but the
+            # caller must hear that the routed engine broke, not only find it in
+            # ``algorithm_route`` after the fact.
+            warnings.warn(
+                f"{_auto_route_reason}: the routed solve raised "
+                f"{type(_route_exc).__name__}: {_route_exc}; falling back to the "
+                "default path (see SolveResult.algorithm_route)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         _route_elapsed = time.perf_counter() - _route_t0
         # #1059: record WHY this algorithm ran. Only set on the auto-route, so an
         # explicit solver="mip-nlp" leaves the field None (the caller already
@@ -12327,6 +12364,7 @@ def solve_model(
         if decomposition == "benders":
             from discopt.decomposition.benders import solve_benders
 
+            _declare_route("benders: discopt Benders decomposition (decomposition='benders')")
             return solve_benders(
                 model,
                 structure=decomposition_structure,
@@ -12338,6 +12376,9 @@ def solve_model(
         if decomposition == "lagrangian":
             from discopt.decomposition.lagrangian import solve_lagrangian
 
+            _declare_route(
+                "lagrangian: discopt Lagrangian decomposition (decomposition='lagrangian')"
+            )
             return solve_lagrangian(
                 model,
                 structure=decomposition_structure,
@@ -13673,6 +13714,7 @@ def solve_model(
                 "Use nlp_bb=False (spatial branch-and-bound) for these callbacks, "
                 "or omit nlp_bb to auto-select a path that honors them."
             )
+        _declare_route("nlp-bb: discopt nonlinear branch and bound (nlp_bb=True)")
         return _solve_nlp_bb(
             model,
             time_limit,
@@ -13862,9 +13904,11 @@ def solve_model(
         elif problem_class == ProblemClass.QP and not _callbacks_force_bb:
             if _pure_continuous:
                 if _pure_continuous_convexity_known and _pure_continuous_is_convex:
+                    _declare_route("convex-qp: discopt convex QP solve")
                     return _solve_qp(model, t_start, prefer_pounce=nlp_solver == "pounce")
                 _pure_continuous_force_spatial = True
             else:
+                _declare_route("convex-qp: discopt convex QP solve")
                 return _solve_qp(model, t_start, prefer_pounce=nlp_solver == "pounce")
         elif problem_class == ProblemClass.MILP:
             # #748: the specialized MILP engines (``_solve_milp_simplex`` /
@@ -13982,6 +14026,12 @@ def solve_model(
                         # this engine is no absolute criterion at all (#1315).
                         abs_gap_tolerance=abs_gap_tolerance,
                     )
+                    if _simplex_res is not None and _simplex_res.algorithm_route is None:
+                        # #1614 C1: the in-house engine answering a MILP must say so.
+                        _simplex_res.algorithm_route = (
+                            "native-milp: discopt monolithic Rust MILP engine "
+                            f"({'nlp_solver=simplex' if nlp_solver == 'simplex' else 'default'})"
+                        )
                     if _simplex_res is not None:
                         return _simplex_res
                     _engine_bound = _deferred.get("bound")
@@ -14030,6 +14080,18 @@ def solve_model(
                         "milp-tree: discopt MILP branch and bound (node_callback set; "
                         "the HiGHS route has no tree to observe)"
                     )
+                elif _bb_res.algorithm_route is None:
+                    # #1614: never leave the HiGHS route for the in-house tree silently.
+                    _why = (
+                        "lagrangian_bound=True"
+                        if lagrangian_bound
+                        else "nlp_solver='simplex'"
+                        if nlp_solver == "simplex"
+                        else "the HiGHS route declined"
+                        if _lpm_backend == "highs"
+                        else f"milp_backend={_lpm_backend!r}"
+                    )
+                    _bb_res.algorithm_route = f"milp-tree: discopt MILP branch and bound ({_why})"
                 return _merge_engine_stats(
                     _merge_engine_bound(_bb_res, _engine_bound, model),
                     _deferred.get("stats"),
@@ -14081,6 +14143,7 @@ def solve_model(
                     # relaxations) — HiGHS-free by design (issue #359 / pure-Rust
                     # goal). The convex node QP is solved to global optimality, so the
                     # B&B bound is valid.
+                    _declare_route("miqp-bb: discopt convex MIQP branch and bound")
                     return _solve_miqp_bb(
                         model,
                         time_limit,
@@ -14350,6 +14413,9 @@ def solve_model(
             )
         if _root_convexity_known and _root_is_convex:
             logger.info("Convex MINLP detected, using NLP-BB (nonlinear Branch and Bound)")
+            _declare_route(
+                "nlp-bb: discopt nonlinear branch and bound (convex MINLP, auto-selected)"
+            )
             return _solve_nlp_bb(
                 model,
                 time_limit,
@@ -14637,7 +14703,18 @@ def solve_model(
             source=((_prereform_model, _prereform_nvars) if _prereform_model is not None else None),
         )
     if _native_result is not None:
+        if _native_result.algorithm_route is None:
+            _native_result.algorithm_route = (
+                "native-spatial: discopt Rust spatial branch-and-bound kernel"
+            )
         return _native_result
+    # #1614: everything past this point is the Python spatial tree.
+    _declare_route(
+        "spatial-bb: discopt spatial branch and bound (Python tree"
+        + (", lazy_constraints" if lazy_constraints is not None else "")
+        + (", incumbent_callback" if incumbent_callback is not None else "")
+        + ")"
+    )
 
     # --- #654: deadline-exhausted short-circuit before the spatial search build ---
     # Everything below (the per-node NLP evaluator's one-time XLA compile, the

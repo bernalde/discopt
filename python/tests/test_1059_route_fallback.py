@@ -329,6 +329,8 @@ class TestFallbackEndToEnd:
         """The default path keeps its own answer and its empty route field."""
         monkeypatch.delenv(ROUTE_ENV, raising=False)
         result = _load("alan").solve(time_limit=60.0)
-        assert result.algorithm_route is None
+        # #1614: the default path names its engine; it must not be the auto-route.
+        assert result.algorithm_route is not None
+        assert "mip-nlp/oa" not in result.algorithm_route, result.algorithm_route
         assert result.gap_certified is True
         assert result.objective == pytest.approx(2.925, abs=1e-3)
