@@ -8654,12 +8654,32 @@ def _merge_route_and_fallback(route, fallback, is_maximize: bool):
     # better answer, and trading a proof for it would be exactly the kind of
     # silent certificate loss the fallback exists to prevent.
     if route_wins and _gap_is_closed(fallback) and not _gap_is_closed(route):
-        logger.warning(
-            "#1059 route objective %.10g appears to beat the fallback's CERTIFIED "
-            "%.10g; keeping the certified result. This should be impossible and "
-            "indicates a bound or feasibility inconsistency worth investigating.",
+        # The decision is unconditional; only the alarm is gated. A closed gap
+        # certifies the fallback's objective to within the gap tolerance, not
+        # exactly, so a route objective a hair better (5822.93629 vs 5822.93629,
+        # equal at 10 significant figures -- #1618 D-37) is consistent with the
+        # certificate. What is impossible is a feasible point beyond the
+        # fallback's certified *dual bound*; that is the only case worth a WARNING.
+        fb_bound = getattr(fallback, "bound", None)
+        impossible = (
+            fb_bound is None
+            or not np.isfinite(fb_bound)
+            or _bound_crosses_objective(float(fb_bound), route.objective, is_maximize)
+        )
+        logger.log(
+            logging.WARNING if impossible else logging.DEBUG,
+            "#1059 route objective %.10g %s the fallback's CERTIFIED %.10g (dual bound "
+            "%s); keeping the certified result.%s",
             route.objective,
+            "appears to beat" if impossible else "is within the certified gap of",
             fallback.objective,
+            fb_bound,
+            (
+                " This should be impossible and indicates a bound or feasibility "
+                "inconsistency worth investigating."
+                if impossible
+                else ""
+            ),
         )
         route_wins = False
 
@@ -22228,6 +22248,8 @@ POUNCE_ROUTE_NLP = "pounce:nlp"
 #: Ipopt's ``Infeasible_Problem_Detected``: the NLP converged to a point of
 #: locally minimal infeasibility.
 _IPOPT_INFEASIBLE_PROBLEM = 2
+#: Ipopt/POUNCE ``Solved_To_Acceptable_Level`` (#1618 B-05b).
+_IPOPT_SOLVED_TO_ACCEPTABLE = 1
 
 #: ``solve_model`` parameters ``solver="pounce"`` honours (#1533). Every other
 #: parameter left at a non-default value is reported as ignored, so the list of
@@ -22418,6 +22440,7 @@ def _solve_pounce_route(
                 out = fn(options=engine_opts, **kw)
                 raw["iterations"] = out.iterations
                 raw["status"] = out.status
+                raw["message"] = getattr(out, "message", "")
                 return out
 
             return call
@@ -22479,6 +22502,7 @@ def _solve_pounce_route(
                         error=(
                             f"POUNCE {route.split(':')[1]} returned no verified answer "
                             f"(engine status {getattr(st, 'value', st)!r})."
+                            + (f" {raw['message']}." if raw.get("message") else "")
                             + (" " + " ".join(reject_reason) if reject_reason else "")
                         ),
                     )
@@ -22510,7 +22534,15 @@ def _solve_pounce_route(
         raw_status_out=raw_status,
     )
     result.wall_time = time.perf_counter() - t_start
-    if result.status == "optimal":
+    if result.status == "optimal" and raw_status and raw_status[0] == _IPOPT_SOLVED_TO_ACCEPTABLE:
+        # #1618 B-05b: Ipopt/POUNCE code 1 (``Solved_To_Acceptable_Level``) met only
+        # the *acceptable* tolerances, whose dual-infeasibility default is 1e10 -- a
+        # point with an unscaled dual infeasibility of 1.6e4 passed. That is not an
+        # established stationary point, so it is not ``local_optimal`` (which the
+        # status vocabulary defines as one); it is a point from a local search that
+        # stopped short of its convergence test: ``local_limit``.
+        result.status = "local_limit"
+    elif result.status == "optimal":
         result.status = "local_optimal"
     elif result.status == "infeasible" or (
         result.status == "error" and raw_status and raw_status[0] == _IPOPT_INFEASIBLE_PROBLEM
@@ -27719,7 +27751,16 @@ def _solve_qp_matrix(
 
             logger.warning(msg)
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
-            return SolveResult(status="error", wall_time=wall_time, node_count=result.node_count)
+            # #1618 A-20: the cause goes on the result too, not only in the warning
+            # stream -- a bare ``error`` read "ended ... without recording a cause".
+            return SolveResult(
+                status="error",
+                wall_time=wall_time,
+                node_count=result.node_count,
+                error=msg + " A variable declared without bounds gets the default box "
+                "[-9.999e19, 9.999e19], which is inside that window; declare it with "
+                "lb=-numpy.inf / ub=numpy.inf if it is genuinely free.",
+            )
         return SolveResult(status="unbounded", wall_time=wall_time, node_count=result.node_count)
     elif result.status == SolveStatus.TIME_LIMIT:
         # NOTE (#1262): this exit and the ITERATION_LIMIT one below leave
