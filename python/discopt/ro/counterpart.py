@@ -53,6 +53,8 @@ from __future__ import annotations
 
 from typing import Union
 
+import numpy as np
+
 from discopt.ro.uncertainty import (
     BoxUncertaintySet,
     EllipsoidalUncertaintySet,
@@ -156,6 +158,7 @@ class RobustCounterpart:
         if self._formulated:
             raise RuntimeError("formulate() has already been called")
 
+        self._orient_uncertain_rows()
         strategy = self._build_strategy()
         strategy.build()
 
@@ -170,6 +173,52 @@ class RobustCounterpart:
             kind=self.kind,
         )
         self._formulated = True
+
+    def _orient_uncertain_rows(self) -> None:
+        """Rewrite every uncertain row as ``body <= rhs`` before robustifying.
+
+        Every formulation robustifies a constraint body by its *worst-case
+        maximum*, which is the counterpart of ``body <= rhs`` only. An
+        uncertain ``body >= rhs`` row must instead hold at the worst-case
+        minimum, and an uncertain equality ``body(x, xi) == rhs`` must hold for
+        *every* ``xi`` -- i.e. both ``max_xi body <= rhs`` and
+        ``min_xi body >= rhs``. Applying the one-sided maximum to such rows
+        produced counterparts that are not robust (#1611 X-30a). So each
+        uncertain ``>=`` row is negated into ``<=`` form, and each uncertain
+        equality is split into the two one-sided rows ``body <= rhs`` and
+        ``-body <= -rhs``; the formulations then see only ``<=`` rows. Rows that
+        contain no uncertain parameter are left untouched.
+        """
+        from discopt.modeling.core import BinaryOp, Constant, Constraint
+        from discopt.ro.formulations._common import _contains_uncertain_param
+
+        names = {u.parameter.name for u in self._uncertainty_sets}
+        m = self._model
+        oriented = []
+        for con in m._constraints:
+            if (
+                not isinstance(con, Constraint)
+                or con.sense == "<="
+                or not _contains_uncertain_param(con.body, names)
+            ):
+                oriented.append(con)
+                continue
+            neg_body = BinaryOp("*", Constant(np.array(-1.0)), con.body)
+            neg_rhs = 0.0 - float(con.rhs)
+            if con.sense == ">=":
+                oriented.append(Constraint(body=neg_body, sense="<=", rhs=neg_rhs, name=con.name))
+            elif con.sense == "==":
+                base = con.name
+                le_name = f"{base}_ro_le" if base is not None else None
+                ge_name = f"{base}_ro_ge" if base is not None else None
+                oriented.append(Constraint(body=con.body, sense="<=", rhs=con.rhs, name=le_name))
+                oriented.append(Constraint(body=neg_body, sense="<=", rhs=neg_rhs, name=ge_name))
+            else:
+                raise ValueError(
+                    f"RobustCounterpart: unsupported constraint sense {con.sense!r} "
+                    f"on uncertain row {con.name!r}"
+                )
+        m._constraints = oriented
 
     def _build_strategy(self):
         if self.kind == "box":
