@@ -1972,7 +1972,7 @@ def _cross_check_presolve(sf: StdForm, out: HighsOutcome, kw: dict[str, Any]) ->
             if claim is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
                 refuted = f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
     if refuted is None or pt is None:
-        return _weaker_bound(out, cross, kw)
+        return _weaker_bound(sf, out, cross, kw)
     logger.warning(
         "HiGHS MILP route: the %s certificate is refuted by a presolve-free HiGHS solve "
         "(%s); reporting the verified point uncertified (#1634)",
@@ -2015,7 +2015,18 @@ def _cross_check_presolve(sf: StdForm, out: HighsOutcome, kw: dict[str, Any]) ->
     )
 
 
-def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) -> HighsOutcome:
+def _gap_closed(obj: float, bound: float, kw: dict[str, Any]) -> bool:
+    """The route's stop rule (HiGHS's ``mip_abs_gap`` OR ``mip_rel_gap``)."""
+    gap = max(0.0, obj - bound)
+    abs_tol = kw.get("abs_gap_tolerance")
+    return gap <= (1e-6 if abs_tol is None else abs_tol) or (
+        gap / max(abs(obj), abs(bound), 1e-10) <= kw["gap_tolerance"]
+    )
+
+
+def _weaker_bound(
+    sf: StdForm, out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]
+) -> HighsOutcome:
     """#1634: a certificate stands only if the presolve-free solve AGREES with it.
 
     Agreement means the cross-solve reached the same certified verdict (``infeasible``
@@ -2037,7 +2048,11 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
     instances, so ``min`` of the two bounds is valid whenever either one is -- the
     certificate then rests on the claim of whichever configuration is right. The gap is
     re-tested against the route's own stop rule; a gap the weaker bound reopens is
-    declined, not certified.
+    declined, not certified -- unless the presolve-free solve re-run at a 100x tighter
+    feasibility tolerance confirms the claim (#1640, :func:`_tight_cross_bound`): the
+    cross bound sits below the optimum by about ``mip_feasibility_tolerance`` times a
+    row coefficient, the same order as the 1e-6 absolute gap, so at 1e-6 it can reopen
+    a gap on a correct certificate.
     """
     if not (cross.gap_certified and cross.status == out.status):
         out.stats["milp/presolve_cross_check_no_verdict"] = 1.0
@@ -2052,16 +2067,15 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
     out.stats["milp/presolve_cross_bound"] = float(cross.bound)
     if cross.bound >= out.bound:
         return out
+    claim = float(out.bound)
     out.bound = min(cross.bound, out.objective) if out.objective is not None else cross.bound
     out.labels["milp/bound_provenance"] = "min(presolved, presolve-free)"
     out.stats["milp/presolve_cross_bound_lowered"] = 1.0
     if out.objective is None:
         return out
-    gap = max(0.0, out.objective - out.bound)
-    abs_tol = kw.get("abs_gap_tolerance")
-    closed = gap <= (1e-6 if abs_tol is None else abs_tol) or (
-        gap / max(abs(out.objective), abs(out.bound), 1e-10) <= kw["gap_tolerance"]
-    )
+    closed = _gap_closed(out.objective, out.bound, kw)
+    if not closed:
+        closed = _tight_cross_bound(sf, out, cross, kw, claim)
     if not closed:
         out.gap_certified = False
         out.status = "feasible"
@@ -2071,6 +2085,97 @@ def _weaker_bound(out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any]) ->
             "result is not certified (#1634)"
         )
     return out
+
+
+#: #1640: ``mip_feasibility_tolerance`` of the re-run presolve-free cross-solve. Its
+#: bound is HiGHS's tree bound over node LPs solved to ``mip_feasibility_tolerance``,
+#: so it sits below the true optimum by about that tolerance times the row scale --
+#: the same order as the route's 1e-6 absolute gap. Measured on the #1494 piecewise
+#: ``log``/max case (offset 1e4, h = 1): the cross bound is -1.5e-6 at 1e-6 and
+#: -1.5e-8 at 1e-8, while ``mip_abs_gap = mip_rel_gap = 0`` leaves it unchanged.
+CROSS_TIGHT_FEAS_TOL = 1e-8
+
+#: ``mip_feasibility_tolerance`` of the first cross-solve (HiGHS's default, which
+#: :func:`_solve_milp_std` keeps).
+CROSS_FEAS_TOL = 1e-6
+
+#: How far above the cross bound the tight bound may land and still count as the
+#: same answer with less tolerance error: ``factor * CROSS_FEAS_TOL * max|c| * max|A|``
+#: (each floored at 1). Measured on the #1640 case: shift 1.5e-6 against a slack of
+#: 1e-4 x the coefficient scale.
+CROSS_TIGHT_SHIFT_FACTOR = 100.0
+
+
+def _tight_cross_bound(
+    sf: StdForm, out: HighsOutcome, cross: HighsOutcome, kw: dict[str, Any], claim: float
+) -> bool:
+    """#1640: re-run the presolve-free cross-solve at a tighter feasibility tolerance
+    when its bound -- and only its bound -- reopened the route's gap.
+
+    The cross bound being weaker than the primary's by about ``mip_feasibility_tolerance``
+    times a row coefficient is what that tolerance does to a tree bound, not evidence of
+    a false primary certificate; but which of the two it is cannot be told from the
+    numbers. So the question is asked again with the tolerance 100x tighter, and the
+    tighter solve must earn the confirmation the same way the first one had to: a
+    certified ``optimal`` of its own, no verified point refuting the claim (the
+    #1509/#1621 falsifier), and ``min(primary bound, tight bound)`` closing the gap
+    under the route's stop rule. The published bound is that minimum, so it is
+    valid whenever the primary or the tight solve is right; because the cross bound
+    is dropped, the tight bound must also land within a tolerance-scaled slack of it
+    (:data:`CROSS_TIGHT_SHIFT_FACTOR`) -- a larger jump is two certified solves
+    disagreeing, not tolerance error. Anything else --
+    no budget, no verdict, a refutation, a gap that stays open -- leaves the
+    certificate declined, as before. ``claim`` is the primary's own certified bound. On
+    success ``out.bound`` is replaced and True is returned.
+    """
+    obj = out.objective
+    if obj is None:
+        return False
+    kw = dict(kw)
+    if kw["time_limit"] is not None:
+        # ``kw`` already had the primary's wall time taken off by the caller
+        # (:func:`_cross_check_presolve`); only the cross-solve's is left to charge.
+        kw["time_limit"] = float(kw["time_limit"]) - float(cross.wall_time)
+        if kw["time_limit"] <= 0.0:
+            out.stats["milp/presolve_cross_tight_skipped"] = 1.0
+            return False
+    tight = _solve_milp_scaled(sf, presolve=False, feasibility_tolerance=CROSS_TIGHT_FEAS_TOL, **kw)
+    out.stats["milp/presolve_cross_tight_ran"] = 1.0
+    out.stats["milp/presolve_cross_tight_time"] = float(tight.wall_time)
+    if not (tight.gap_certified and tight.status == "optimal" and tight.bound is not None):
+        out.labels["milp/presolve_cross_tight_status"] = tight.status
+        return False
+    out.stats["milp/presolve_cross_tight_bound"] = float(tight.bound)
+    pt = _verified_mip_point(sf, tight.x)
+    if pt is not None and claim - pt[1] > CERT_ABS + CERT_REL * abs(claim):
+        out.labels["milp/presolve_cross_tight_refuted"] = (
+            f"bound {claim:.12g} is above a verified point's objective {pt[1]:.12g}"
+        )
+        return False
+    # The confirmation drops the cross bound, so the tight solve must explain it as a
+    # tolerance artefact rather than overrule it: a cross bound below the tight one by
+    # more than the tolerance-scaled slack is a disagreement between two certified
+    # solves, and the decline stands (review of #1649).
+    if cross.bound is None:  # _weaker_bound only calls with a cross bound
+        return False
+    shift = float(tight.bound) - float(cross.bound)
+    c_max = float(np.max(np.abs(sf.c))) if sf.c.size else 0.0
+    a_max = float(np.max(np.abs(sf.A.data))) if sf.A.nnz else 0.0
+    slack = CROSS_TIGHT_SHIFT_FACTOR * CROSS_FEAS_TOL * max(1.0, c_max) * max(1.0, a_max)
+    out.stats["milp/presolve_cross_tight_shift"] = shift
+    if shift > slack:
+        out.labels["milp/presolve_cross_tight_disagrees"] = (
+            f"tight bound {float(tight.bound):.12g} is {shift:.3g} above the cross bound "
+            f"{float(cross.bound):.12g}, more than the tolerance slack {slack:.3g}"
+        )
+        return False
+    bound = min(claim, float(tight.bound), obj)
+    if not _gap_closed(obj, bound, kw):
+        return False
+    out.bound = bound
+    out.labels["milp/bound_provenance"] = "min(presolved, presolve-free tight)"
+    out.stats["milp/presolve_cross_tight_confirmed"] = 1.0
+    return True
 
 
 def _solve_milp_std(
@@ -2084,11 +2189,14 @@ def _solve_milp_std(
     n_struct: Optional[int] = None,
     root_check: bool = True,
     presolve: bool = True,
+    feasibility_tolerance: float = 1e-6,
 ) -> HighsOutcome:
     """Solve the MILP ``sf`` under the §3.2 contract.
 
     ``presolve=False`` switches HiGHS's presolve off; it is the second solve of the
     #1634 cross-check (:func:`_cross_check_presolve`), not a user option.
+    ``feasibility_tolerance`` is HiGHS's ``mip_feasibility_tolerance``; only the #1640
+    tightened cross-solve (:func:`_weaker_bound`) changes it.
 
     ``abs_gap_tolerance`` is ``Model.solve``'s absolute convergence tolerance
     (#1243), mapped onto HiGHS's ``mip_abs_gap``. The mapping is faithful:
@@ -2160,7 +2268,7 @@ def _solve_milp_std(
         ("mip_rel_gap", float(gap_tolerance)),
         ("mip_abs_gap", 1e-6 if abs_gap_tolerance is None else float(abs_gap_tolerance)),
         ("mip_max_nodes", int(min(max(int(max_nodes), 0), _MAX_NODES_CAP))),
-        ("mip_feasibility_tolerance", 1e-6),
+        ("mip_feasibility_tolerance", float(feasibility_tolerance)),
         ("primal_feasibility_tolerance", 1e-7),
         # #1634: HiGHS's parallel-column presolve fixes integers on an absolute
         # cost-tie test that bad coefficient ratios defeat; see the constant.
