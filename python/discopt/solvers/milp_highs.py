@@ -49,27 +49,18 @@ import numpy as np
 import scipy.sparse as sp
 
 from discopt.solvers import MILPResult, SolveStatus
+from discopt.solvers.lp_milp_highs import MILP_PRESOLVE_RULE_OFF
 from discopt.solvers.milp_simplex import _INF, BoundList, _marshal_col_bounds
 
 logger = logging.getLogger(__name__)
 
-#: HiGHS ``presolve_rule_off`` bit for ``kPresolveRuleParallelRowsAndCols`` (rule 13 of
-#: ``PresolveRuleType``; HiGHS logs it as "Rule 13 (bit 8192): Parallel rows and
-#: columns"), switched off on every master solve here (#1634).
-#:
-#: ``HPresolve::detectParallelRowsAndCols`` decides "these two columns cost the same" by
-#: ``|c_col * colScale - c_dup| <= dual_feasibility_tolerance`` -- an ABSOLUTE 1e-7 on a
-#: cost measured per unit of the duplicate column, with ``colScale`` the ratio of the
-#: two columns' coefficients -- and on that tie fixes the integer column at a bound. A
-#: zero-cost continuous column that ends up a singleton in a row with an integer column
-#: (a model's own slack ``a x + s = b``) is "parallel" to it, and a coefficient ratio of
-#: ~1e5 turns a real cost into a "tie". Measured on the #1634 generator written with
-#: explicit slacks (``A x + s = b``, plus a convex quadratic so it takes the convex-MINLP
-#: route, OA on this master): 35 of 1200 instances certified a false optimum (seed 181
-#: at cost scale 1e-3: certified 0.02082, enumerated truth 0.00801). The same MILPs
-#: through this backend directly: 35/1200 false master bounds with HiGHS defaults,
-#: 1/1200 with this bit off. The pure-MILP route switches the same bit off (#1638).
-MASTER_PRESOLVE_RULE_OFF = 1 << 13
+# #1634: every master solve here switches off the same HiGHS presolve rule the
+# pure-MILP route does (:data:`~discopt.solvers.lp_milp_highs.MILP_PRESOLVE_RULE_OFF`,
+# rule 13, ParallelRowsAndCols). Measured on the #1634 generator written with explicit
+# slacks (``A x + s = b``) plus a convex quadratic, so it takes the convex-MINLP route
+# with OA on this master: 35/1200 false certificates on main (seed 181 at cost scale
+# 1e-3 certified 0.02082 against an enumerated 0.00801). The same masters through this
+# backend directly: 35/1200 false bounds with HiGHS defaults, 1/1200 with rule 13 off.
 #: Row/bound slack the #1634 cross-check grants a point before it counts as verified,
 #: relative to ``max(1, |rhs|, |a| @ |x|)``. A verified point is only ever used to
 #: LOWER a bound, so a loose value errs toward a weaker bound, never a false one.
@@ -440,7 +431,7 @@ def _solve_milp_once(
         ("mip_rel_gap", float(gap_tolerance)),
         # #1634: HiGHS's parallel-column presolve fixes integers on an absolute
         # cost-tie test that bad coefficient ratios defeat; see the constant.
-        ("presolve_rule_off", int(MASTER_PRESOLVE_RULE_OFF)),
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),
     ]
     if not presolve:
         opts.append(("presolve", "off"))
@@ -552,7 +543,8 @@ def _cross_check_presolve(
     An OA / GDP master's ``bound`` becomes the global lower bound, so a master solve
     that prunes its own optimum is a FALSE certificate on a convex MINLP. HiGHS's MIP
     presolve and tree decide on ABSOLUTE tolerances that a badly scaled master
-    defeats. Rule 13 is off (:data:`MASTER_PRESOLVE_RULE_OFF`), but measured on the
+    defeats. Rule 13 is off (:data:`~discopt.solvers.lp_milp_highs.MILP_PRESOLVE_RULE_OFF`),
+    but measured on the
     #1634 slack panel through this backend that still leaves 1/1200 false bounds with
     presolve on, and 6/1200 with presolve off entirely; the two configurations never
     failed on the same instance. So:
@@ -681,7 +673,7 @@ def _cross_check_lazy_master(
     opts: list[tuple[str, object]] = [
         ("output_flag", False),
         ("presolve", "off"),
-        ("presolve_rule_off", int(MASTER_PRESOLVE_RULE_OFF)),
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),
         ("mip_rel_gap", float(rel_gap)),
     ]
     if time_left is not None:
@@ -853,7 +845,7 @@ def solve_milp_with_lazy_cuts(
     for key, val in [
         ("output_flag", False),
         ("mip_rel_gap", float(gap_tolerance)),
-        ("presolve_rule_off", int(MASTER_PRESOLVE_RULE_OFF)),  # #1634
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),  # #1634
     ]:
         if h.setOptionValue(key, val) != highspy.HighsStatus.kOk:
             raise RuntimeError(f"HiGHS rejected option {key}={val!r}")
