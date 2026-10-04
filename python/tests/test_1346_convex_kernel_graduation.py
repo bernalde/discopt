@@ -188,12 +188,14 @@ def test_a_milp_returns_the_same_answer_either_way(flag, kernel):
         assert r.bound <= r.objective + 1e-6, "UNSOUND: bound above incumbent (min)"
 
 
+@pytest.mark.parametrize("defer", ["0", "1"])
 @pytest.mark.parametrize("kernel", ["0", "1"])
-def test_a_convex_minlp_returns_the_same_answer_either_way(flag, kernel):
+def test_a_convex_minlp_returns_the_same_answer_either_way(flag, kernel, defer):
     """The kernel is a *route*, not a relaxation: adopted only when it certifies and
     its incumbent verifies against the pristine model (#779), so the flag may not
     move the objective or invert the bound."""
     flag("DISCOPT_CONVEX_KERNEL", kernel)
+    flag("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", defer)  # #1624: kernel-first vs route
     r = _convex_minlp().solve(time_limit=60)
     # x=3 makes (x-3)^2 = 0, so z=0; x+y>=3 is then satisfied at y=0. Optimum 0.
     assert r.objective == pytest.approx(0.0, abs=1e-4)
@@ -292,6 +294,9 @@ def test_the_spec_carries_the_objective_constant():
 def test_the_reported_objective_is_the_objective_at_the_reported_point(flag):
     """The bar that matters: ``result.objective`` must be ``f(result.x)``."""
     flag("DISCOPT_CONVEX_KERNEL", "1")
+    # #1624: this model is also one the convex-MINLP route takes, and the kernel
+    # now defers to it; the opt-out keeps this test on the kernel it is about.
+    flag("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "0")
     checked = 0
     for const in (0.0, OBJ_CONST):
         r = _kernel_minlp_with_constant(const).solve(time_limit=60)
@@ -312,6 +317,7 @@ def test_the_constant_shifts_the_answer_by_exactly_the_constant(flag):
     """Route-independent invariant: adding K to a linear objective adds K to the
     optimum and to the bound, and moves nothing else."""
     flag("DISCOPT_CONVEX_KERNEL", "1")
+    flag("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "0")  # #1624: exercise the kernel
     base = _kernel_minlp_with_constant(0.0).solve(time_limit=60)
     shifted = _kernel_minlp_with_constant(OBJ_CONST).solve(time_limit=60)
     assert base.objective is not None and shifted.objective is not None

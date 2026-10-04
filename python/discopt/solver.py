@@ -8076,6 +8076,61 @@ def _convex_minlp_auto_route(model: Model) -> tuple[Optional[str], str, dict[str
     )
 
 
+def _convex_kernel_defers_to_route_enabled() -> bool:
+    """``DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE`` opt-out (default-ON, #1624).
+
+    ``Model.solve`` runs the native convex kernel *before* ``solve_model``, with
+    ``min(time_limit, DISCOPT_CONVEX_KERNEL_BUDGET)`` -- the whole budget for any
+    ``time_limit <= 120``. On a model the #1059 convex-MINLP router would divert,
+    a kernel that cannot certify therefore leaves ``solve_model`` ~0 s; the
+    router's convexity proof then hits an expired deadline and the route never
+    fires. On MINLPLib ``syn``/``rsyn`` that left 30 of 51 instances with no
+    incumbent at all, where the route finds one on every instance.
+
+    With this on, the kernel stands aside for any model the router would divert
+    (see :func:`_convex_route_preempts_kernel`); models the router declines keep
+    the kernel attempt exactly as before. ``=0`` restores the old order.
+    Graduated on introduction on the #1624 panel (see the PR), which measured the
+    routed, kernel-eligible models flag-ON vs flag-OFF.
+    """
+    return os.environ.get("DISCOPT_CONVEX_KERNEL_DEFER_TO_ROUTE", "1") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def _convex_route_preempts_kernel(model: Model, option_values: Mapping[str, Any]) -> Optional[str]:
+    """The route reason when ``solve_model`` would divert ``model`` (#1624), else None.
+
+    ``option_values`` are the caller's options as ``Model.solve`` received them;
+    any option the MIP-NLP family would drop makes ``solve_model`` refuse the
+    route, so it refuses the deferral too and the kernel runs as before.
+
+    The router is the same function ``solve_model`` consults. It runs here on the
+    declared model, before ``solve_model``'s declared-bound tightening; a verdict
+    that differs there costs the kernel attempt, never soundness, because the
+    kernel's result is only ever used when certified.
+
+    A raise inside the router is a defect, not a verdict: it is logged loudly and
+    the kernel runs (the pre-#1624 order), rather than skipping the kernel on the
+    strength of a check that did not complete.
+    """
+    if not _convex_kernel_defers_to_route_enabled():
+        return None
+    if _mip_nlp_ignored_options(option_values):
+        return None
+    try:
+        method, reason, _opts = _convex_minlp_auto_route(model)
+    except Exception as exc:  # noqa: BLE001 - logged; falls back to the old order
+        _warn_fallback_once(
+            "convex kernel: route pre-check", exc, "running the convex kernel first"
+        )
+        return None
+    return reason if method is not None else None
+
+
 #: Fraction of the caller's time limit at which the #1059 auto-route is judged.
 #: Under the #1066 guard (:class:`_RouteProgressGuard`) this is the *checkpoint*
 #: -- the route is untouched before it and must show progress after it. With
