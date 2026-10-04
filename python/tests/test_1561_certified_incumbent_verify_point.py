@@ -219,8 +219,15 @@ def test_nlpbb_does_not_certify_a_point_whose_integral_realisation_fails():
 
 
 def _extending_route(monkeypatch, result, *, aux_in_x: bool):
-    """A route that appends an aux column + a row on it, as structure cuts do."""
+    """A route that appends an aux column + a row on it, as structure cuts do.
+
+    Returns a list that receives the extended column count on each call, so a
+    test can prove the extension happened -- since #1610 the solve hands the
+    caller's model back unextended, so it cannot be read off the model after.
+    """
     import discopt.solver as solver
+
+    fired: list[int] = []
 
     def _solve_model(model, **kw):
         u = model.continuous("u_cut_0", lb=0.0, ub=1e6)
@@ -228,19 +235,23 @@ def _extending_route(monkeypatch, result, *, aux_in_x: bool):
         model.subject_to(u == 2.0 * xv, name="cut_def_0")
         if aux_in_x:
             result.x = dict(result.x, u_cut_0=np.array(2.0 * float(result.x["x"])))
+        fired.append(len(model._variables))
         return result
 
     monkeypatch.setattr(solver, "solve_model", _solve_model)
+    return fired
 
 
 @pytest.mark.parametrize("aux_in_x", [True, False], ids=["aux-in-x", "aux-not-in-x"])
 def test_a_solve_that_appends_variables_keeps_a_valid_certificate(monkeypatch, no_kernel, aux_in_x):
     m = _model(nonlinear=True)
     n_declared = len(m._variables)
-    _extending_route(monkeypatch, _certified(4.0, 1.0), aux_in_x=aux_in_x)
+    fired = _extending_route(monkeypatch, _certified(4.0, 1.0), aux_in_x=aux_in_x)
     res = m.solve(time_limit=5.0)
 
-    assert len(m._variables) == n_declared + 1, "the stub did not extend the model"
+    assert fired == [n_declared + 1], "the stub did not extend the model"
+    # #1610: the extension is the solve's working state, not the caller's model.
+    assert len(m._variables) == n_declared
     assert res.status == "optimal" and res.gap_certified is True, (
         res.status,
         res.solver_stats,
@@ -288,16 +299,29 @@ def test_declared_bounds_are_frozen_at_the_snapshot():
 
 
 @pytest.mark.slow
-def test_gas_network_structure_cuts_keep_their_certificate():
+def test_gas_network_structure_cuts_keep_their_certificate(monkeypatch):
     """The real instance: structure cuts append 2 aux columns (19 -> 21)."""
     pytest.importorskip("sympy")
+    import discopt._relax.symbolic.cut_recognizer as cut_recognizer
     from discopt.benchmarks.problems.gas_network_minlp import build_gas_network_minlp
 
+    # Since #1610 the solve hands the caller's model back unextended, so the
+    # extension is observed inside the solve, where the recognizer runs.
+    extended: list[int] = []
+    real_inject = cut_recognizer.recognize_and_inject
+
+    def _spy(model, *a, **kw):
+        n = real_inject(model, *a, **kw)
+        extended.append(len(model._variables))
+        return n
+
+    monkeypatch.setattr(cut_recognizer, "recognize_and_inject", _spy)
     m = build_gas_network_minlp()
     n_declared = len(m._variables)
     res = m.solve(time_limit=90, gap_tolerance=1e-4)
 
-    assert len(m._variables) > n_declared, "structure cuts did not extend the model"
+    assert extended and max(extended) > n_declared, "structure cuts did not extend the model"
+    assert len(m._variables) == n_declared  # #1610: the caller's model is unchanged
     assert res.status == "optimal" and res.gap_certified is True, (
         res.status,
         res.solver_stats,

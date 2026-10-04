@@ -129,14 +129,37 @@ def _build_convex_minlp(sense: str) -> Model:
     return m
 
 
+def _spy_root_cuts(monkeypatch) -> list[int]:
+    """Record the number of cuts each root-cut stage call produced.
+
+    Since #1610 a solve restores the caller's constraint list on exit, so the
+    applied cuts are no longer observable on the model afterwards; they are
+    observed here, inside the solve, at the stage that generates them.
+    """
+    import discopt.solvers._root_cuts as rc
+
+    calls: list[int] = []
+    real = rc.generate_root_cuts
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        calls.append(len(out.cuts))
+        return out
+
+    monkeypatch.setattr(rc, "generate_root_cuts", spy)
+    return calls
+
+
 @pytest.mark.parametrize("sense", ["max", "min"])
 def test_flag_off_inert(monkeypatch, sense):
     _flag(monkeypatch, False)
     assert nlpbb_root_cuts_enabled() is False
+    calls = _spy_root_cuts(monkeypatch)
     m = _build_convex_minlp(sense)
     n_before = len(m._constraints)
     m.solve(time_limit=30, nlp_bb=True)
-    assert len(m._constraints) == n_before, "flag OFF must add no constraints"
+    assert calls == [], "flag OFF must not run the root-cut stage"
+    assert len(m._constraints) == n_before, "a solve leaves the model's rows unchanged"
 
 
 @pytest.mark.parametrize("sense", ["max", "min"])
@@ -443,10 +466,12 @@ def test_root_cuts_fire_on_vector_variable_blocks(monkeypatch):
     n_before = len(_build_convex_minlp_vector()._constraints)
 
     _flag(monkeypatch, True)
+    calls = _spy_root_cuts(monkeypatch)
     m = _build_convex_minlp_vector()
     r = m.solve(time_limit=30, nlp_bb=True)
-    added = len(m._constraints) - n_before
-    assert added > 0, "root-cut stage must reach models built from vector blocks"
+    assert calls and sum(calls) > 0, "root-cut stage must reach models built from vector blocks"
+    # #1610: the cuts are solver-owned; the caller's rows come back unchanged.
+    assert len(m._constraints) == n_before
     # ...and the cuts must be sound: same optimum, dual bound below it (min).
     assert r.objective == pytest.approx(base.objective, abs=1e-4, rel=1e-4)
     if r.bound is not None:
