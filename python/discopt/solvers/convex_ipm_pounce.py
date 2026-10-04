@@ -364,11 +364,20 @@ def _solve(
     time_limit: Optional[float],
     options: Optional[dict],
     solve_report: bool = False,
-) -> Tuple[str, Any, float, np.ndarray, np.ndarray, np.ndarray, Optional[dict]]:
+) -> Tuple[
+    str,
+    Any,
+    float,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[dict],
+]:
     """Run :func:`pounce.qp.solve_qp` once; map nothing yet.
 
     Returns ``(raw_status, result, wall, A, cl, cu, report)`` where ``A, cl, cu``
-    is the stacked row system the certificate checks need and ``report`` is the
+    is the stacked row system the certificate checks need (``None`` on an
+    ``optimal`` status, which never reaches those checks -- #1619) and ``report`` is the
     ``pounce.solve-report/v1`` document when ``solve_report`` is set (#1534),
     else ``None``.
     """
@@ -422,7 +431,19 @@ def _solve(
     if print_level > 0:
         _print_trace("lp-ipm" if P is None else "qp-ipm", res)
 
-    A_rows, cl, cu = _stack_constraints(A_ub, b_ub, A_eq, b_eq, n)
+    # The stacked DENSE row system is what the infeasible / unbounded certificate
+    # checks in ``_verdict_status`` consume, and nothing else does. Build it only on
+    # the status that reaches them (#1619): on an ``optimal`` solve it was an
+    # (m, n) float64 copy of sparse input -- 64 MB on the 2000-row chain LP of
+    # #1619 -- that was then thrown away.
+    A_rows: Optional[np.ndarray] = None
+    cl: Optional[np.ndarray] = None
+    cu: Optional[np.ndarray] = None
+    if res.status != "optimal":
+        A_rows, cl, cu = _stack_constraints(A_ub, b_ub, A_eq, b_eq, n)
+    n_rows = (0 if A_ub is None or b_ub is None else int(A_ub.shape[0])) + (
+        0 if A_eq is None or b_eq is None else int(A_eq.shape[0])
+    )
     report = None
     if solve_report:
         from discopt.solvers._pounce_report import convex_report
@@ -430,7 +451,7 @@ def _solve(
         report = convex_report(
             res,
             wall_time=wall,
-            n_constraints=int(A_rows.shape[0]),
+            n_constraints=n_rows,
             started_unix_nanos=started_unix_nanos,
         )
     return res.status, res, wall, A_rows, cl, cu, report
@@ -515,6 +536,7 @@ def solve_lp(
     )
     iters = int(res.iters)
     if raw != "optimal":
+        assert A is not None and cl is not None and cu is not None
         status = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, None)
         return LPResult(
             status=status,
@@ -584,6 +606,7 @@ def solve_qp(
     )
     iters = int(res.iters)
     if raw != "optimal":
+        assert A is not None and cl is not None and cu is not None
         return QPResult(
             status=_verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr),
             iterations=iters,

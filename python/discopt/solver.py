@@ -3621,8 +3621,11 @@ def _check_constraint_feasibility(evaluator, x, cl_list, cu_list, tol=1e-4):
         return True
     try:
         from discopt._relax.primal_heuristics import _scale_from_jacobian
+        from discopt.validation.feasibility import screen_jacobian
 
-        jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64)
+        # #1619 B-12a: CSR from the tape evaluator (the same matrix), so this
+        # screen is O(nnz) rather than O(m*n) on a collocation model.
+        jac = screen_jacobian(evaluator, x)
         grad = _feas_improving_row_norms(evaluator, jac, x, cons, cl, cu, n_check)
         scale = np.asarray(_scale_from_jacobian(jac, x), dtype=np.float64)[:n_check]
     except Exception as exc:  # noqa: BLE001 - reported, never silently accepted
@@ -26246,11 +26249,19 @@ def _solve_lp_matrix(
     finite — #1328) — discarding *its*
     verdict would throw away a certificate about the box actually declared.
     """
-    from discopt._relax.problem_classifier import extract_lp_data
+    import scipy.sparse as _sp
+
+    from discopt._relax.problem_classifier import extract_lp_data, sparse_constraint_matrices
     from discopt.modeling.core import ObjectiveSense
     from discopt.solvers import SolveStatus
 
-    lp_data = extract_lp_data(model)
+    # #1619 (A-12): every consumer below is sparse-aware -- the slack projection,
+    # the feasibility arbiter, and each ``solve_lp`` backend (lp_simplex marshals
+    # CSC, convex_ipm_pounce hands scipy.sparse to POUNCE, gurobi takes CSR) -- so
+    # the matrix is extracted as CSR at every size and never densified here. The
+    # dense form cost 541 MB peak on a 6,000-nonzero chain LP.
+    with sparse_constraint_matrices():
+        lp_data = extract_lp_data(model)
     n_orig = sum(v.size for v in model._variables)
 
     bounds = list(
@@ -26260,7 +26271,14 @@ def _solve_lp_matrix(
         )
     )
 
-    A_eq_full = _dense_A(lp_data.A_eq)
+    # A rung that cannot emit COO (the tape / autodiff fallbacks) still returns a
+    # dense array; ``_dense_A`` validates it and CSR keeps the rest of this
+    # function on one layout.
+    A_eq_full = (
+        lp_data.A_eq.tocsr()
+        if _sp_issparse(lp_data.A_eq)
+        else _sp.csr_matrix(_dense_A(lp_data.A_eq))
+    )
     n_total = A_eq_full.shape[1] if A_eq_full.shape[0] > 0 else n_orig
     n_slack = n_total - n_orig
     b_eq_full = np.asarray(lp_data.b_eq)
@@ -26831,6 +26849,17 @@ def _solve_qcp_gurobi(
     return SolveResult(status="error", wall_time=wall_time, node_count=result.node_count)
 
 
+def _feas_matrix(A):
+    """``A`` as float64 for the feasibility arbiter: CSR when sparse, else ndarray.
+
+    ``np.asarray`` on a scipy sparse matrix returns a 0-d object array rather than
+    raising, so the arbiter must branch on sparsity here instead (#1619).
+    """
+    if _sp_issparse(A):
+        return A.tocsr().astype(np.float64)
+    return np.asarray(A, dtype=np.float64)
+
+
 def _matrix_solution_feasible(x, A_ub, b_ub, A_eq, b_eq, bounds, tol=1e-6, rtol=1e-9) -> bool:
     """Check a matrix-form LP/QP solution against its own constraints.
 
@@ -26883,17 +26912,17 @@ def _matrix_solution_feasible(x, A_ub, b_ub, A_eq, b_eq, bounds, tol=1e-6, rtol=
         return False
     absx = np.abs(x)
     if A_ub is not None and b_ub is not None and len(b_ub):
-        A_ub = np.asarray(A_ub, dtype=np.float64)
+        A_ub = _feas_matrix(A_ub)
         viol = A_ub @ x - np.asarray(b_ub, dtype=np.float64)
-        row_scale = np.abs(A_ub) @ absx
+        row_scale = np.asarray(abs(A_ub) @ absx, dtype=np.float64).ravel()
         thresh = _matrix_row_threshold(A_ub, row_scale, tol, rtol)
         bad = np.nonzero(viol > thresh)[0]
         if bad.size and _any_row_truly_violated(A_ub, x, b_ub, bad, thresh, signed=True):
             return False
     if A_eq is not None and b_eq is not None and len(b_eq):
-        A_eq = np.asarray(A_eq, dtype=np.float64)
+        A_eq = _feas_matrix(A_eq)
         viol = np.abs(A_eq @ x - np.asarray(b_eq, dtype=np.float64))
-        row_scale = np.abs(A_eq) @ absx
+        row_scale = np.asarray(abs(A_eq) @ absx, dtype=np.float64).ravel()
         thresh = _matrix_row_threshold(A_eq, row_scale, tol, rtol)
         bad = np.nonzero(viol > thresh)[0]
         if bad.size and _any_row_truly_violated(A_eq, x, b_eq, bad, thresh, signed=False):
@@ -26982,7 +27011,11 @@ def _matrix_row_threshold(A, row_scale, tol: float, rtol: float) -> np.ndarray:
     no allowance for rounding, while ``tol + rtol·row_scale`` here is exactly such
     an allowance. Passing it would restore the 2e6 this function exists to remove.
     """
-    grad_inf = np.abs(np.asarray(A, dtype=np.float64)).max(axis=1)
+    if _sp_issparse(A):
+        # Implicit zeros take part in the max exactly as the dense zeros do.
+        grad_inf = np.asarray(abs(A).max(axis=1).toarray(), dtype=np.float64).ravel()
+    else:
+        grad_inf = np.abs(np.asarray(A, dtype=np.float64)).max(axis=1)
     capped = np.minimum(tol + rtol * row_scale, _feas_distance_cap(grad_inf))
     return np.asarray(capped, dtype=np.float64)
 
@@ -27003,16 +27036,22 @@ def _any_row_truly_violated(A, x, b, rows, thresh, *, signed: bool) -> bool:
     """
     import math
 
-    A = np.asarray(A, dtype=np.float64)
+    sparse = _sp_issparse(A)
+    if sparse:
+        A = A.tocsr()
+    else:
+        A = np.asarray(A, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     for i in rows:
-        resid = math.fsum(A[i] * x) - b[i]
+        # Only flagged rows are densified, one at a time (#1619): O(n) per row.
+        a_i = np.asarray(A[[i]].toarray(), dtype=np.float64).ravel() if sparse else A[i]
+        resid = math.fsum(a_i * x) - b[i]
         if not signed:
             resid = abs(resid)
         # The representability floor is charged HERE, so it costs nothing on a
         # feasible point and is computed from the row's own columns (#1335).
-        if resid > max(float(thresh[i]), _row_representability_floor(A[i], x)):
+        if resid > max(float(thresh[i]), _row_representability_floor(a_i, x)):
             return True
     return False
 

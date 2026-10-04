@@ -41,6 +41,7 @@ from discopt.validation.feasibility import (
     feasible_distance_cap,
     improving_gradient_norms,
     jacobian_row_gradient_norms,
+    screen_jacobian,
 )
 
 logger = logging.getLogger(__name__)
@@ -809,7 +810,9 @@ def _check_constraint_feasibility(
     # terms (cancellation noise), capped by the first-order distance to the row's
     # surface — before deciding.
     try:
-        jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64)
+        # #1619 B-12a: CSR from the tape evaluator (exactly the same matrix), so
+        # this screen is O(nnz); the dense scatter made it quadratic in the mesh.
+        jac = screen_jacobian(evaluator, x)
         scale = _scale_from_jacobian(jac, x)
         grad = _row_gradient_norms(evaluator, jac, x, cl, cu)
     except Exception:
@@ -904,6 +907,16 @@ def _scale_from_jacobian(jac, x: np.ndarray) -> np.ndarray:
     Dropping the entry keeps the scale finite and only ever *shrinks* this
     loosening term, so the test can never become more permissive through it.
     """
+    import scipy.sparse as _sp
+
+    if _sp.issparse(jac):
+        # #1619: same rule on the stored entries; an unstored entry is exactly 0
+        # and contributes 0 either way. ``np.asarray`` on a sparse matrix would
+        # return a 0-d object array instead of raising.
+        a = _sp.csr_matrix(jac, dtype=np.float64, copy=True)
+        a.data = np.abs(a.data)
+        a.data[~np.isfinite(a.data)] = 0.0
+        return np.asarray(a @ np.abs(np.asarray(x, dtype=np.float64)), dtype=np.float64)
     jac = np.abs(np.asarray(jac, dtype=np.float64))
     jac = np.where(np.isfinite(jac), jac, 0.0)
     return jac @ np.abs(np.asarray(x, dtype=np.float64))
@@ -981,7 +994,7 @@ def scaled_violation_ratio(
     viol = row_violations(evaluator, x, cl, cu)
     if viol.size == 0 or not bool(np.any(viol > 0.0)):
         return 0.0
-    jac = np.asarray(evaluator.evaluate_jacobian(x), dtype=np.float64)
+    jac = screen_jacobian(evaluator, x)
     scale = _scale_from_jacobian(jac, x)
     grad = _row_gradient_norms(evaluator, jac, x, cl, cu)
     n = viol.size
