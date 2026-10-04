@@ -1,4 +1,8 @@
-"""#1619: the LP route and the post-solve feasibility screen stay sparse.
+"""#1619: the LP route and the post-solve screen stay sparse; dm.external memoizes.
+
+B-13: a ``dm.external`` block was called once per *use* of its output, so a
+point used in the objective and a constraint cost two simulator calls (400 calls
+for 199 points). The memo makes it one per distinct point.
 
 A-12: ``solver="pounce"`` on an LP densified ``A`` (and pounce then densified it
 again into ``G``), so a 2000-row chain LP peaked at 542 MB of traced memory.
@@ -216,3 +220,74 @@ def test_matrix_solution_feasible_sparse_matches_dense_and_rejects():
     for A1, A2 in ((A_ub, A_eq), (A_ub.toarray(), A_eq.toarray())):
         assert not _matrix_solution_feasible(x, A1, bad_ub, A2, b_eq, bounds)
         assert not _matrix_solution_feasible(x, A1, b_ub, A2, bad_eq, bounds)
+
+
+# --------------------------------------------------------- B-13 (dm.external memo)
+
+
+def _counted_external():
+    calls = {"fn": 0}
+
+    def f(x):
+        calls["fn"] += 1
+        return np.array([x[0] ** 2 + x[1] ** 2, x[0] - x[1]])
+
+    sim = dm.external(
+        f,
+        jac=lambda x: np.array([[2 * x[0], 2 * x[1]], [1.0, -1.0]]),
+        hess=lambda x: np.stack([2 * np.eye(2), np.zeros((2, 2))]),
+        shape=(2,),
+    )
+    return sim, calls
+
+
+def test_external_called_once_per_distinct_point():
+    sim, calls = _counted_external()
+    m = dm.Model("e")
+    x = m.continuous("x", shape=(2,), lb=-3, ub=3)
+    y = sim(x)
+    m.minimize(y[0] + 0.5 * y[1])
+    m.subject_to(y[1] >= 0.2)
+    r = m.solve(solver="direct", max_evals=200, local_refine=False)
+    evals = int(r.solver_stats["direct/evals"])
+    assert evals > 0 and r.objective is not None
+    # two uses of y per point: main called fn twice per evaluation (400 for 199)
+    assert calls["fn"] <= evals + 1, (calls["fn"], evals)
+
+
+def test_external_memo_returns_fresh_copies_and_distinguishes_points():
+    from discopt.modeling.external import _checked
+
+    seen = []
+
+    def f(x):
+        seen.append(np.array(x))
+        return np.array([x[0] * 2.0])
+
+    call = _checked(f, role="fn", label="t", want=lambda xs: (1,))
+    a = call(np.array([1.0]))
+    a[0] = 99.0  # a consumer mutating its result must not poison the memo
+    assert call(np.array([1.0]))[0] == 2.0
+    assert len(seen) == 1
+    # a different point -- even by one ulp -- is a fresh call
+    nxt = np.nextafter(1.0, 2.0)
+    assert call(np.array([nxt]))[0] == 2.0 * nxt
+    assert len(seen) == 2
+
+
+def test_external_memo_never_caches_a_failure():
+    from discopt.modeling.external import _checked
+
+    n = {"k": 0}
+
+    def flaky(x):
+        n["k"] += 1
+        if n["k"] == 1:
+            raise RuntimeError("transient")
+        return np.array([1.0])
+
+    call = _checked(flaky, role="fn", label="t", want=lambda xs: (1,))
+    with pytest.raises(RuntimeError):
+        call(np.array([0.0]))
+    assert call(np.array([0.0]))[0] == 1.0
+    assert n["k"] == 2

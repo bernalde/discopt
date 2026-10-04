@@ -93,6 +93,7 @@ does, because the callback machinery is JAX's.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -101,6 +102,11 @@ import numpy as np
 from discopt.modeling.core import custom
 
 __all__ = ["ExternalSpec", "external", "external_failure", "external_spec"]
+
+#: Points each external callable remembers (#1619 B-13). A handful covers the
+#: real access pattern -- every use of one point, then its Jacobian and Hessian,
+#: before the solver moves on -- without holding a long history of large outputs.
+_MEMO_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -179,9 +185,34 @@ def _checked(
     continue to a withheld-incumbent ``status="error"`` -- so the error never
     reaches the caller of ``Model.solve()``. The recorded exception is what the
     solver re-raises instead (see ``solver.py``'s ``_external_block_failure``).
+
+    Validated results are memoized on the exact input (#1619 B-13). Every use of
+    a block's output -- ``y[0]`` in the objective and ``y[1]`` in a constraint --
+    is its own trip through the callback, so without a memo one evaluation point
+    cost one simulator call *per use* (measured: 400 calls for 199 points). The
+    key is the input's dtype, shape and raw bytes, so only a bit-identical point
+    is a hit; a hit returns a copy, so a consumer that mutates its array cannot
+    corrupt the cache. The memo is per callable and keeps the most recent
+    :data:`_MEMO_SIZE` points. A raised error is never cached. This assumes the
+    callable is a function of its input -- which every consumer (derivatives,
+    the NLP solver, the screen) already assumes.
     """
+    memo: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
     def call(x_np):
+        x_arr = np.asarray(x_np)
+        key = (x_arr.dtype.str, x_arr.shape, x_arr.tobytes())
+        hit = memo.get(key)
+        if hit is not None:
+            memo.move_to_end(key)
+            return hit.copy()
+        arr = _evaluate(x_np)
+        memo[key] = arr.copy()
+        if len(memo) > _MEMO_SIZE:
+            memo.popitem(last=False)
+        return arr
+
+    def _evaluate(x_np):
         try:
             raw = f(x_np)
             if raw is None:
