@@ -40,11 +40,27 @@ the ``±9.999e19`` box a column declared without bounds receives, which, kept
 finite, costs the IPM several times the iterations. The caller passes
 ``relaxes_huge_bounds=True`` to the matrix route so an ``UNBOUNDED`` verdict over
 such a relaxed box is not certified (#850).
+
+Objective scale
+---------------
+The engine's stopping test is not invariant to the scale of the objective: the
+same 2080-column production LP that stops at a primal residual of 5.5e-9 with its
+costs in dollars stops at 4.9e-6 with the costs in cents (x100) -- 3.5x over the
+per-row test ``_matrix_solution_feasible`` applies -- and the solve came back
+``error`` (#1537). A QP ``1e8*x + x**2/2`` on ``[0, 10]`` ended in
+``numerical_failure``. :func:`_solve` therefore hands the engine
+``sigma*P, sigma*c`` with ``sigma`` the power of two that brings the largest
+objective coefficient to at most 1 (:func:`objective_scale`), and maps the
+answer back: ``x`` is unchanged, objective and every dual divide by ``sigma``.
+A power of two makes both directions exact, and ``sigma = 1`` (no change at all)
+for every objective whose coefficients are already at most 1.
 """
 
 from __future__ import annotations
 
+import math
 import time
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -217,6 +233,84 @@ def _print_trace(selector: str, res: Any) -> None:
     print(f"status: {res.status}   iterations: {int(res.iters)}   objective: {res.obj!r}")
 
 
+def objective_scale(P, c: np.ndarray) -> float:
+    """The power of two ``sigma <= 1`` that brings ``max(|P|, |c|)`` to at most 1.
+
+    ``1.0`` when every objective coefficient is already at most 1 in magnitude,
+    or the objective is zero. See the module docstring ("Objective scale").
+    """
+    mags = [float(np.max(np.abs(c))) if c.size else 0.0]
+    if P is not None:
+        data = P.data if sp.issparse(P) else np.asarray(P)
+        if np.size(data):
+            mags.append(float(np.max(np.abs(data))))
+    m = max(mags)
+    if not math.isfinite(m) or m <= 1.0:
+        return 1.0
+    return math.ldexp(1.0, -math.ceil(math.log2(m)))
+
+
+def _unscale_result(res: Any, sigma: float) -> Any:
+    """``res`` of the engine solve of ``sigma * objective``, in the caller's units.
+
+    ``x`` and the primal residual do not depend on the objective; the objective,
+    every multiplier, the dual residual and complementarity (``z * slack``) are
+    linear in it. ``kkt_error`` is the max of the three residuals, so it is
+    recomputed from the rescaled parts rather than divided as a whole.
+    """
+    if sigma == 1.0:
+        return res
+    inv = 1.0 / sigma  # exact: sigma is a power of two
+    resid = dict(res.residuals or {})
+    for key in ("dual_infeasibility", "complementarity"):
+        if resid.get(key) is not None:
+            resid[key] = float(resid[key]) * inv
+    parts = [
+        float(v)
+        for k in ("primal_infeasibility", "dual_infeasibility", "complementarity")
+        if (v := resid.get(k)) is not None
+    ]
+    if parts:
+        kkt = max(parts)
+    elif res.kkt_error is not None:
+        kkt = float(res.kkt_error) * max(1.0, inv)  # no breakdown: the safe upper bound
+    else:
+        kkt = None
+    if "kkt_error" in resid:
+        resid["kkt_error"] = kkt
+
+    def mult(v):
+        return None if v is None else np.asarray(v, dtype=np.float64) * inv
+
+    iterates = [
+        {
+            **it,
+            **{
+                k: float(it[k]) * inv
+                for k in ("objective", "dual_infeasibility")
+                if it.get(k) is not None
+            },
+        }
+        for it in (res.iterates or [])
+    ]
+    return SimpleNamespace(
+        status=res.status,
+        success=getattr(res, "success", None),
+        iters=res.iters,
+        x=res.x,
+        obj=None if res.obj is None else float(res.obj) * inv,
+        y=mult(res.y),
+        z=mult(res.z),
+        z_lb=mult(res.z_lb),
+        z_ub=mult(res.z_ub),
+        kkt_error=kkt,
+        residuals=resid,
+        iterates=iterates,
+        scaling_warning=getattr(res, "scaling_warning", None),
+        objective_scale=sigma,
+    )
+
+
 def _solve(
     P: Optional[np.ndarray],
     c: np.ndarray,
@@ -251,12 +345,16 @@ def _solve(
     h = None if b_ub is None else np.asarray(b_ub, dtype=np.float64).ravel()
     b = None if b_eq is None else np.asarray(b_eq, dtype=np.float64).ravel()
 
+    sigma = objective_scale(P, c)  # module docstring, "Objective scale" (#1537)
+    P_eng = P if P is None or sigma == 1.0 else P * sigma
+    c_eng = c if sigma == 1.0 else c * sigma
+
     started_unix_nanos = time.time_ns()
     t0 = time.perf_counter()
     try:
         res = _pounce_solve_qp(
-            P=P,
-            c=c,
+            P=P_eng,
+            c=c_eng,
             A=A,
             b=b,
             G=G,
@@ -279,6 +377,7 @@ def _solve(
             raise IndefiniteQPError(str(exc)) from exc
         raise
     wall = time.perf_counter() - t0
+    res = _unscale_result(res, sigma)
     if print_level > 0:
         _print_trace("lp-ipm" if P is None else "qp-ipm", res)
 
