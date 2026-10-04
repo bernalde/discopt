@@ -58,6 +58,7 @@ from discopt.modeling.core import (
     VarType,
 )
 from discopt.solvers import SolveStatus
+from discopt.solvers.lp_backend import names_decomposition_route
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ def _partition_columns(model: Model, structure: DecompositionStructure) -> _Part
 # ── Solver ────────────────────────────────────────────────────
 
 
+@names_decomposition_route("benders: discopt Benders decomposition")
 def solve_benders(
     model: Model,
     *,

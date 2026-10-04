@@ -24,7 +24,9 @@ fallback — POUNCE is the QP engine.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable, TypeVar, cast
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _lp_pounce() -> Callable | None:
@@ -231,6 +233,32 @@ def get_milp_solver(prefer_pounce: bool = False, backend: str = "auto") -> Calla
         "  pip install pounce-solver   (POUNCE, via the self-hosted B&B)\n"
         "  pip install gurobipy        (Gurobi, requires a working license)"
     )
+
+
+def names_decomposition_route(label: str) -> Callable[[_F], _F]:
+    """Decorate a decomposition solver so its result names the route (#1614 D-14).
+
+    Fills ``algorithm_route`` only when the solver left it ``None`` (an inner
+    solver -- GBD under Benders -- names itself first). The masters are pinned to
+    the in-house simplex B&B (#986, ``get_milp_solver(backend="simplex")``), and
+    the route says so: an engine the caller did not pick must not answer
+    silently. Moving them to HiGHS is still open on #1614 (D-26/D-27); a first
+    attempt stalled ``test_benders.py::test_annotated_continuous_lp`` at
+    ``iteration_limit``.
+    """
+    import functools
+
+    def deco(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            res = fn(*args, **kwargs)
+            if getattr(res, "algorithm_route", "unset") is None:
+                res.algorithm_route = f"{label}; master MILP on the discopt simplex B&B"
+            return res
+
+        return cast(_F, wrapper)
+
+    return deco
 
 
 def available_lp_backends() -> list[str]:

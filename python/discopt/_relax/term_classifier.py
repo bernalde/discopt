@@ -1658,8 +1658,13 @@ def _classify_nonlinear_terms_python(model: Model) -> NonlinearTerms:
                 # would be silently dropped by the linear projection; flag it.
                 # If either side folds to a constant the product is just linear
                 # scaling, so only recurse (the existing behaviour).
-                left_const = _ratio_fold_const(expr.left) is not None
-                right_const = _ratio_fold_const(expr.right) is not None
+                # #1614 C1: a *variable-free* factor -- a literal constant OR a
+                # ``Parameter`` (fixed for the solve) -- is linear scaling, the same
+                # as a constant. ``_ratio_fold_const`` folds only literals, so
+                # ``p*(x+y)`` was flagged ``general_nl`` and its MILP left HiGHS for
+                # the native tree while the algebraically equal ``p*x+p*y`` did not.
+                left_const = _is_variable_free(expr.left, vf_memo)
+                right_const = _is_variable_free(expr.right, vf_memo)
                 if not left_const and not right_const:
                     result.general_nl.append(expr)
                 _classify_node(expr.left)

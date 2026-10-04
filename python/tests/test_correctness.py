@@ -944,7 +944,10 @@ class TestMINLP:
         """
         r = _build_simple_minlp().solve(solver="bb")
         assert r.status == "optimal"
-        assert r.algorithm_route is None, f"did not take B&B: {r.algorithm_route}"
+        # #1614: B&B routes name themselves; the convex auto-route must not answer.
+        assert (r.algorithm_route or "").startswith("nlp-bb:"), (
+            f"did not take B&B: {r.algorithm_route}"
+        )
         assert r.node_count >= 1, "MINLP should use branch-and-bound"
 
     def test_default_convex_route_reports_its_work(self) -> None:

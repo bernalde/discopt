@@ -44,6 +44,7 @@ from discopt.decomposition.structure import (
 )
 from discopt.modeling.core import Model, SolveResult, VarType
 from discopt.solvers import SolveStatus
+from discopt.solvers.lp_backend import names_decomposition_route
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class LagrangianConfig:
     lambda_max0: float = 1e4  # initial multiplier box; grows x10 when hit
 
 
+@names_decomposition_route("lagrangian: discopt Lagrangian decomposition")
 def solve_lagrangian(
     model: Model,
     *,

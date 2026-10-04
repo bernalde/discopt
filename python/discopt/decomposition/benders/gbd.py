@@ -119,6 +119,7 @@ from discopt.decomposition.structure import (
 )
 from discopt.modeling.core import Model, ObjectiveSense, SolveResult, VarType
 from discopt.solvers import SolveStatus
+from discopt.solvers.lp_backend import names_decomposition_route
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,7 @@ def _master_columns(model: Model, structure: DecompositionStructure):
     )
 
 
+@names_decomposition_route("benders/gbd: discopt generalized Benders decomposition")
 def solve_gbd(
     model: Model,
     *,
