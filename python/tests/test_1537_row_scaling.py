@@ -254,9 +254,11 @@ def test_row_scaled_flay03m_admits_no_infeasible_incumbent(monkeypatch):
     monkeypatch.delenv("DISCOPT_CONVEX_ROUTE_OA_MASTER", raising=False)
     res = _per_row_scaled("flay03m.nl", 6.0).solve(time_limit=30)
     trace = res.mip_nlp_trace or {}
-    assert trace.get("summary", {}).get("rejected_incumbent_count", 0) > 0, trace.get("summary")
     route = res.algorithm_route or ""
-    assert "fell back" not in route, route
+    # Everything a CI-only failure needs to be diagnosed from the log alone.
+    why = (res.status, res.gap_certified, res.bound, res.objective, route, trace.get("summary"))
+    assert trace.get("summary", {}).get("rejected_incumbent_count", 0) > 0, why
+    assert "fell back" not in route, why
     assert res.gap_certified, (res.status, res.bound, route)
     # minlplib.solu: flay03m =opt= 48.98979486 (minimize). Never above it.
     assert res.bound <= 48.98979486 + 1e-6, res.bound

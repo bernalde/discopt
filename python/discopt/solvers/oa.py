@@ -4822,6 +4822,8 @@ def _exit_verified_incumbent(
     x_flat: np.ndarray,
     obj: float,
     obj_sign: float,
+    *,
+    warn: bool = True,
 ) -> tuple[np.ndarray, float, Optional[str]]:
     """Verify the point OA is about to return; repair round-off or refuse to certify.
 
@@ -4877,7 +4879,11 @@ def _exit_verified_incumbent(
     than implied.
 
     Returns ``(x, objective, refusal_reason)``; ``refusal_reason`` is ``None``
-    when the returned point verifies.
+    when the returned point verifies. ``warn=False`` drops the refusal to a debug
+    record: the in-loop candidate screen (``verified_candidate``) asks the same
+    question of every fixed-NLP point and logs its own refusals, and a WARNING per
+    refused candidate is noise (7 per solve on ``flay03m`` rows scaled in 10^[-6,6]), not a
+    statement about what the solve returns.
     """
     from discopt.validation.feasibility import verify_point
 
@@ -4922,7 +4928,7 @@ def _exit_verified_incumbent(
                 repaired_obj = float(obj_sign * second.objective)
             return out, repaired_obj, None
 
-    logger.warning(
+    (logger.warning if warn else logger.debug)(
         "OA: the returned incumbent does not verify (%s) and %d near-bound "
         "repair(s) did not fix it. Reporting the point WITHOUT certification: "
         "its objective is not a proven upper bound. The master's dual bound is "
@@ -7981,7 +7987,7 @@ def solve_oa(
         fallback cold, and the solve lost the certificate it earns from that start.
         """
         nonlocal rejected_incumbents, best_refused
-        x_out, obj_out, refusal = _exit_verified_incumbent(model, x, obj, _obj_sign)
+        x_out, obj_out, refusal = _exit_verified_incumbent(model, x, obj, _obj_sign, warn=False)
         if refusal is not None:
             rejected_incumbents += 1
             logger.debug("OA: candidate incumbent %.12g refused: %s", obj, refusal)

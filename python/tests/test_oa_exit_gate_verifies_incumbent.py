@@ -152,7 +152,7 @@ def test_the_gate_repairs_without_moving_the_answer(monkeypatch):
 
     real = oa._exit_verified_incumbent
 
-    def _identity(model, x_flat, obj, obj_sign):
+    def _identity(model, x_flat, obj, obj_sign, *, warn=True):
         return np.asarray(x_flat, dtype=np.float64), obj, None
 
     reproduced = []
@@ -270,7 +270,7 @@ def test_a_refusal_downgrades_the_solve_result(monkeypatch):
 
     seen: dict = {}
 
-    def _always_refuse(model, x_flat, obj, obj_sign):
+    def _always_refuse(model, x_flat, obj, obj_sign, *, warn=True):
         # Record what the gate was handed, so the assertions below compare the
         # result against THIS run rather than against a float from one machine.
         seen["obj"] = obj
