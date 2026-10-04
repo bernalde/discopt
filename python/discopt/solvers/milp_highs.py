@@ -40,15 +40,33 @@ HiGHS reports no usable dual bound, ``bound`` is ``None``; it is never synthesiz
 
 from __future__ import annotations
 
+import logging
 import math
 import time
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import scipy.sparse as sp
 
 from discopt.solvers import MILPResult, SolveStatus
+from discopt.solvers.lp_milp_highs import MILP_PRESOLVE_RULE_OFF
 from discopt.solvers.milp_simplex import _INF, BoundList, _marshal_col_bounds
+
+logger = logging.getLogger(__name__)
+
+# #1634: every master solve here switches off the same HiGHS presolve rule the
+# pure-MILP route does (:data:`~discopt.solvers.lp_milp_highs.MILP_PRESOLVE_RULE_OFF`,
+# rule 13, ParallelRowsAndCols). Measured on the #1634 generator written with explicit
+# slacks (``A x + s = b``) plus a convex quadratic, so it takes the convex-MINLP route
+# with OA on this master: 35/1200 false certificates on main (seed 181 at cost scale
+# 1e-3 certified 0.02082 against an enumerated 0.00801). The same masters through this
+# backend directly: 35/1200 false bounds with HiGHS defaults, 1/1200 with rule 13 off.
+#: Row/bound slack the #1634 cross-check grants a point before it counts as verified,
+#: relative to ``max(1, |rhs|, |a| @ |x|)``. A verified point is only ever used to
+#: LOWER a bound, so a loose value errs toward a weaker bound, never a false one.
+_VERIFY_REL = 1e-6
+#: Integrality slack for the same check (CLAUDE.md: integrality 1e-5).
+_VERIFY_INT = 1e-5
 
 
 class HighsBackendUnavailable(ImportError):
@@ -336,8 +354,40 @@ def solve_milp(
     """Solve ``min c^T x  s.t.  A_ub x <= b_ub, A_eq x == b_eq`` with HiGHS.
 
     Signature-compatible with :func:`discopt.solvers.milp_simplex.solve_milp`, so
-    it drops into ``get_milp_solver``'s contract. ``bound`` is HiGHS's dual bound.
+    it drops into ``get_milp_solver``'s contract. ``bound`` is HiGHS's dual bound,
+    held against a second, presolve-free HiGHS solve (#1634,
+    :func:`_cross_check_presolve`) before it is returned.
     """
+    t0 = time.time()
+    kw: dict[str, Any] = dict(
+        c=c,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        bounds=bounds,
+        integrality=integrality,
+        gap_tolerance=gap_tolerance,
+        mip_start=mip_start,
+    )
+    primary = _solve_milp_once(time_limit=time_limit, presolve=True, **kw)
+    return _cross_check_presolve(primary, kw, time_limit, t0)
+
+
+def _solve_milp_once(
+    c: np.ndarray,
+    A_ub: Optional[Union[np.ndarray, sp.spmatrix]],
+    b_ub: Optional[np.ndarray],
+    A_eq: Optional[Union[np.ndarray, sp.spmatrix]],
+    b_eq: Optional[np.ndarray],
+    bounds: Optional[BoundList],
+    integrality: Optional[np.ndarray],
+    time_limit: Optional[float],
+    gap_tolerance: float,
+    mip_start: Optional[np.ndarray],
+    presolve: bool,
+) -> MILPResult:
+    """One HiGHS MILP solve; ``presolve=False`` is the #1634 cross-solve, not an option."""
     highspy = _require_highspy()
     t0 = time.time()
 
@@ -379,7 +429,12 @@ def solve_milp(
     opts: list[tuple[str, object]] = [
         ("output_flag", False),
         ("mip_rel_gap", float(gap_tolerance)),
+        # #1634: HiGHS's parallel-column presolve fixes integers on an absolute
+        # cost-tie test that bad coefficient ratios defeat; see the constant.
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),
     ]
+    if not presolve:
+        opts.append(("presolve", "off"))
     if time_limit is not None:
         opts.append(("time_limit", float(time_limit)))
     for key, val in opts:
@@ -439,6 +494,240 @@ def solve_milp(
         iterations=int(info.simplex_iteration_count),
         wall_time=wall,
     )
+
+
+def _verified_objective(kw: dict, x: Optional[np.ndarray]) -> Optional[float]:
+    """``c @ x`` when ``x`` satisfies the ORIGINAL master (rows, bounds, integrality).
+
+    #1634: the point is checked against the caller's arrays, not against the model
+    HiGHS was handed (which ``_stack_rows`` may have windowed), so a verified point is
+    a point of the master the caller asked about.
+    """
+    if x is None:
+        return None
+    c_arr = np.asarray(kw["c"], dtype=np.float64).ravel()
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = c_arr.shape[0]
+    if x.shape[0] != n or not np.all(np.isfinite(x)):
+        return None
+    lb, ub = _marshal_col_bounds(kw["bounds"], n)
+    lo_ok = (lb <= -_INF) | (x >= lb - _VERIFY_REL * np.maximum(1.0, np.abs(lb)))
+    hi_ok = (ub >= _INF) | (x <= ub + _VERIFY_REL * np.maximum(1.0, np.abs(ub)))
+    if not (np.all(lo_ok) and np.all(hi_ok)):
+        return None
+    if kw["integrality"] is not None:
+        mask = np.asarray(kw["integrality"]).ravel().astype(bool)
+        if np.any(np.abs(x[mask] - np.round(x[mask])) > _VERIFY_INT):
+            return None
+    for key_a, key_b, eq in (("A_ub", "b_ub", False), ("A_eq", "b_eq", True)):
+        a = kw[key_a]
+        if a is None:
+            continue
+        a = sp.csr_matrix(a)
+        if a.shape[0] == 0:
+            continue
+        rhs = np.asarray(kw[key_b], dtype=np.float64).ravel()
+        act = a @ x
+        scale = np.maximum(np.maximum(1.0, np.abs(rhs)), abs(a) @ np.abs(x))
+        viol = np.abs(act - rhs) if eq else act - rhs
+        if np.any(viol > _VERIFY_REL * scale):
+            return None
+    return float(c_arr @ x)
+
+
+def _cross_check_presolve(
+    primary: MILPResult, kw: dict, time_limit: Optional[float], t0: float
+) -> MILPResult:
+    """#1634: hold a HiGHS master's bound against a second, presolve-free HiGHS solve.
+
+    An OA / GDP master's ``bound`` becomes the global lower bound, so a master solve
+    that prunes its own optimum is a FALSE certificate on a convex MINLP. HiGHS's MIP
+    presolve and tree decide on ABSOLUTE tolerances that a badly scaled master
+    defeats. Rule 13 is off (:data:`~discopt.solvers.lp_milp_highs.MILP_PRESOLVE_RULE_OFF`),
+    but measured on the
+    #1634 slack panel through this backend that still leaves 1/1200 false bounds with
+    presolve on, and 6/1200 with presolve off entirely; the two configurations never
+    failed on the same instance. So:
+
+    * the published bound is ``min`` of the two configurations' bounds -- valid
+      whenever either one is -- and never above a VERIFIED point of either solve
+      (:func:`_verified_objective`): a verified point below a bound refutes it;
+    * the returned incumbent is the better verified point (the primary's own when
+      neither verifies, as before);
+    * ``infeasible`` stands only when the cross-solve agrees; a verified point
+      refutes it;
+    * a claim the cross-solve cannot confirm (no budget left, or no bound of its
+      own) is withdrawn -- ``bound=None`` -- rather than standing on the absence of
+      evidence (#1309).
+
+    ``OPTIMAL`` is kept only when both solves were optimal and the published bound
+    still closes the gap at ``gap_tolerance``; otherwise the result is an uncertified
+    ``ITERATION_LIMIT`` carrying the (valid) bound. Diagnostics are in
+    ``callback_stats["presolve_cross_check"]``.
+    """
+    infeasible = primary.status == SolveStatus.INFEASIBLE
+    if not infeasible and primary.bound is None:
+        return primary  # no claim to check
+    diag: dict[str, object] = {"ran": False, "primary_status": primary.status.value}
+    primary.callback_stats = {**(primary.callback_stats or {}), "presolve_cross_check": diag}
+
+    def _withdraw(why: str) -> MILPResult:
+        diag["withdrawn"] = why
+        logger.warning("HiGHS master: claim withdrawn: %s (#1634)", why)
+        primary.bound = None
+        primary.gap = None
+        if infeasible:
+            primary.status, primary.x, primary.objective = SolveStatus.ERROR, None, None
+        elif primary.status == SolveStatus.OPTIMAL:
+            primary.status = SolveStatus.ITERATION_LIMIT
+        return primary
+
+    remaining = None
+    if time_limit is not None:
+        remaining = float(time_limit) - (time.time() - t0)
+        if remaining <= 0.0:
+            return _withdraw("no time budget left for the presolve-free cross-solve")
+    cross = _solve_milp_once(time_limit=remaining, presolve=False, **kw)
+    diag.update(ran=True, cross_status=cross.status.value, cross_bound=cross.bound)
+    primary.node_count += cross.node_count
+    primary.iterations += cross.iterations
+    primary.wall_time = time.time() - t0
+
+    points = []
+    for r in (primary, cross):
+        obj = _verified_objective(kw, r.x)
+        if obj is not None:
+            points.append((obj, r.x))
+    best = min(points, key=lambda p: p[0]) if points else None
+    diag["verified_points"] = len(points)
+
+    if infeasible:
+        if cross.status == SolveStatus.INFEASIBLE:
+            return primary
+        if best is not None:
+            diag["refuted"] = f"infeasible, but a verified point of objective {best[0]:.12g}"
+            logger.warning("HiGHS master: infeasible refuted by a presolve-free solve (#1634)")
+            primary.status = SolveStatus.ITERATION_LIMIT
+            primary.objective, primary.x = best[0], np.asarray(best[1], dtype=np.float64)
+            primary.bound = primary.gap = None
+            return primary
+        return _withdraw(
+            f"the presolve-free cross-solve did not confirm infeasible ({cross.status.value})"
+        )
+
+    if cross.bound is None:
+        return _withdraw(f"the presolve-free cross-solve has no bound ({cross.status.value})")
+    assert primary.bound is not None
+    bound = min(float(primary.bound), float(cross.bound))
+    if best is not None and best[0] < bound:
+        diag["refuted"] = f"bound {bound:.12g} above a verified point's objective {best[0]:.12g}"
+        bound = best[0]
+    if bound < float(primary.bound):
+        diag["bound_lowered"] = float(primary.bound) - bound
+        logger.warning(
+            "HiGHS master: bound %.12g lowered to %.12g by the presolve-free cross-solve (#1634)",
+            primary.bound,
+            bound,
+        )
+    if best is not None:
+        primary.objective, primary.x = best[0], np.asarray(best[1], dtype=np.float64)
+    primary.bound = bound
+    if primary.objective is not None:
+        gap = max(0.0, primary.objective - bound)
+        denom = max(abs(primary.objective), abs(bound), 1e-10)
+        primary.gap = gap / denom
+        closed = gap <= 1e-9 or gap / denom <= float(kw["gap_tolerance"])
+    else:
+        closed = False
+    both_optimal = primary.status == SolveStatus.OPTIMAL and cross.status == SolveStatus.OPTIMAL
+    if primary.status == SolveStatus.OPTIMAL and not (both_optimal and closed):
+        primary.status = SolveStatus.ITERATION_LIMIT
+    return primary
+
+
+def _cross_check_lazy_master(
+    h,
+    highspy,
+    status: SolveStatus,
+    bound: Optional[float],
+    time_left: Optional[float],
+    objective: Optional[float] = None,
+) -> tuple[SolveStatus, Optional[float], dict]:
+    """#1634 for the lazy-cut master: re-solve its FINAL model with presolve off.
+
+    The cross-solve's incumbent is not separated, so it is never returned as the
+    master's point; only its verdict and bound are used, as in
+    :func:`_cross_check_presolve`: ``min`` of the two bounds, ``infeasible`` only if
+    both agree, and a claim the cross-solve cannot confirm is withdrawn.
+
+    ``OPTIMAL`` survives a lowered bound when the gap against ``objective`` (the
+    master's returned incumbent) is still closed at the master's ``mip_rel_gap``:
+    two B&B runs stopping at different points inside that gap is not a refutation.
+    """
+    infeasible = status == SolveStatus.INFEASIBLE
+    diag: dict[str, object] = {"ran": False, "primary_status": status.value}
+    if not infeasible and bound is None:
+        return status, bound, diag
+    if time_left is not None and time_left <= 0.0:
+        diag["withdrawn"] = "no time budget left for the presolve-free cross-solve"
+        if infeasible:
+            return SolveStatus.ERROR, None, diag
+        if status == SolveStatus.OPTIMAL:
+            status = SolveStatus.ITERATION_LIMIT
+        return status, None, diag
+    g = highspy.Highs()
+    st, rel_gap = h.getOptionValue("mip_rel_gap")
+    if st != highspy.HighsStatus.kOk:
+        raise RuntimeError(f"HiGHS would not report mip_rel_gap (status {st})")
+    opts: list[tuple[str, object]] = [
+        ("output_flag", False),
+        ("presolve", "off"),
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),
+        ("mip_rel_gap", float(rel_gap)),
+    ]
+    if time_left is not None:
+        opts.append(("time_limit", float(time_left)))
+    for key, val in opts:
+        if g.setOptionValue(key, val) != highspy.HighsStatus.kOk:
+            raise RuntimeError(f"HiGHS rejected option {key}={val!r}")
+    if g.passModel(h.getLp()) != highspy.HighsStatus.kOk:
+        raise RuntimeError("HiGHS rejected the master model for the #1634 cross-solve")
+    g.run()
+    cstatus = _status_map(highspy).get(g.getModelStatus(), SolveStatus.ERROR)
+    raw = float(g.getInfo().mip_dual_bound)
+    cbound = raw if np.isfinite(raw) else None
+    diag.update(ran=True, cross_status=cstatus.value, cross_bound=cbound)
+    if infeasible:
+        if cstatus == SolveStatus.INFEASIBLE:
+            return status, bound, diag
+        diag["withdrawn"] = f"cross-solve did not confirm infeasible ({cstatus.value})"
+        return SolveStatus.ERROR, None, diag
+    if cbound is None:
+        diag["withdrawn"] = f"cross-solve has no bound ({cstatus.value})"
+        if status == SolveStatus.OPTIMAL:
+            status = SolveStatus.ITERATION_LIMIT
+        return status, None, diag
+    assert bound is not None
+    if cbound < bound:
+        diag["bound_lowered"] = bound - cbound
+        logger.warning(
+            "HiGHS lazy master: bound %.12g lowered to %.12g by the presolve-free "
+            "cross-solve (#1634)",
+            bound,
+            cbound,
+        )
+        bound = cbound
+        if status == SolveStatus.OPTIMAL and not _gap_closed(objective, bound, float(rel_gap)):
+            status = SolveStatus.ITERATION_LIMIT
+    return status, bound, diag
+
+
+def _gap_closed(objective: Optional[float], bound: float, rel_gap: float) -> bool:
+    """Whether ``bound`` still closes the gap to ``objective`` at ``rel_gap`` (#1634)."""
+    if objective is None or not np.isfinite(objective):
+        return False
+    gap = max(0.0, float(objective) - float(bound))
+    return gap <= 1e-9 or gap / max(abs(float(objective)), abs(float(bound)), 1e-10) <= rel_gap
 
 
 def solve_milp_with_lazy_cuts(
@@ -570,7 +859,11 @@ def solve_milp_with_lazy_cuts(
             for f in int_mask
         ]
 
-    for key, val in [("output_flag", False), ("mip_rel_gap", float(gap_tolerance))]:
+    for key, val in [
+        ("output_flag", False),
+        ("mip_rel_gap", float(gap_tolerance)),
+        ("presolve_rule_off", int(MILP_PRESOLVE_RULE_OFF)),  # #1634
+    ]:
         if h.setOptionValue(key, val) != highspy.HighsStatus.kOk:
             raise RuntimeError(f"HiGHS rejected option {key}={val!r}")
     if h.passModel(lp) != highspy.HighsStatus.kOk:
@@ -758,6 +1051,13 @@ def solve_milp_with_lazy_cuts(
         # incumbent is not a bound.
         bound = obj_out
 
+    # #1634: the master's bound is the OA lower bound; hold it against a presolve-free
+    # solve of the final master before it leaves this function.
+    time_left = None if time_limit is None else float(time_limit) - (time.time() - t0)
+    status, bound, cross_diag = _cross_check_lazy_master(
+        h, highspy, status, bound, time_left, objective=obj_out
+    )
+
     return MILPResult(
         status=status,
         x=x_out,
@@ -766,5 +1066,10 @@ def solve_milp_with_lazy_cuts(
         node_count=nodes,
         iterations=iters,
         wall_time=time.time() - t0,
-        callback_stats={**counts, "terminated": terminated, "terminate_context": terminate_context},
+        callback_stats={
+            **counts,
+            "terminated": terminated,
+            "terminate_context": terminate_context,
+            "presolve_cross_check": cross_diag,
+        },
     )
