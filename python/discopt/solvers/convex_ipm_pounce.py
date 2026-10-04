@@ -567,8 +567,10 @@ def _verdict_status(
     if raw == "time_limit":
         return SolveStatus.TIME_LIMIT, ""
     if raw in ("iteration_limit", "optimal_inaccurate"):
-        # ``optimal_inaccurate`` met only the engine's relaxed tolerance; it is not
-        # reported as ``optimal`` (the matrix route would certify it).
+        # Reached for ``optimal_inaccurate`` only from :func:`solve_lp`: the LP matrix
+        # route publishes an ``optimal`` point's objective as its bound with no
+        # certificate of its own, so a point the engine could not converge to ``tol``
+        # is not handed to it. :func:`solve_qp` passes it on to its #1596 certificate.
         return SolveStatus.ITERATION_LIMIT, f"the engine reported {raw!r}"
     return SolveStatus.ERROR, f"the engine reported {raw!r}"
 
@@ -690,7 +692,19 @@ def solve_qp(
         Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options, solve_report
     )
     iters = int(res.iters)
-    if raw != "optimal":
+    # ``optimal_inaccurate`` is the engine's own ``optimal`` iterate re-judged on its
+    # normalized KKT measure (POUNCE gh#984) and found above ``tol`` -- a converged
+    # point, not an iteration cap. It goes to the caller as a candidate, exactly as
+    # ``optimal`` does: on this route the engine's label never certified anything.
+    # ``solver._solve_qp_matrix`` refuses it unless it is primal feasible and passes
+    # the #1384 stationarity guard, and publishes a bound only when the #1596
+    # certificate, which charges the unconverged complementarity, closes the gap;
+    # otherwise it is an uncertified ``feasible`` point. Mapping it to
+    # ``ITERATION_LIMIT`` dropped the point and named a cap the engine never hit:
+    # the 1e-6-scaled row of #1617 stopped after 17 iterations as
+    # ``optimal_inaccurate`` under pounce ``main`` and as ``optimal`` under the
+    # 0.12.0 wheel, with bit-identical iterates.
+    if raw not in ("optimal", "optimal_inaccurate"):
         assert A is not None and cl is not None and cu is not None
         status, why = _verdict_status(raw, c_arr, A, cl, cu, lb, ub, Q_arr)
         return QPResult(
@@ -713,4 +727,5 @@ def solve_qp(
         wall_time=wall,
         kkt_error=res.kkt_error,
         solve_report=report,
+        message="" if raw == "optimal" else f"the engine reported {raw!r}",
     )
