@@ -29,9 +29,12 @@ lazily so a default MINLP solve never loads it.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import logging
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Optional
@@ -1157,6 +1160,84 @@ def _ray(getter) -> Optional[np.ndarray]:
     return np.asarray(vals, dtype=np.float64) if has else None
 
 
+#: HiGHS options ``Model.solve(highs_options=...)`` may NOT set (#1620), with the
+#: reason. The route's certificates are built on these values (tolerances, gaps, the
+#: #1634 presolve rule), or they have a ``solve`` keyword of their own that the route
+#: already maps onto HiGHS, or setting them breaks later solves in the process
+#: (``threads``, see :func:`_new_highs`). Refused loudly rather than silently
+#: overridden. Name patterns are refused as a class in :func:`validate_user_options`.
+RESERVED_USER_OPTIONS: dict[str, str] = {
+    "mip_rel_gap": "use Model.solve(gap_tolerance=...)",
+    "mip_abs_gap": "use Model.solve(abs_gap_tolerance=...)",
+    "mip_max_nodes": "use Model.solve(max_nodes=...)",
+    "time_limit": "use Model.solve(time_limit=...)",
+    "presolve_rule_off": "the route pins it (#1634: an unsound presolve rule is disabled)",
+    "run_crossover": "the route's dual certificates need a crossover basis",
+    "small_matrix_value": "the route sets it to pass its standard form exactly",
+    "threads": "HiGHS's scheduler is process-wide; a nonzero value breaks later solves",
+    "random_seed": "the route pins it for reproducible certificates",
+}
+
+#: Substrings of option names refused as a class: tolerances, infinity/bound
+#: conventions and objective cut-offs change what the route certifies, and limits
+#: change which status HiGHS stops with.
+_RESERVED_USER_OPTION_PATTERNS = (
+    "tolerance",
+    "epsilon",
+    "infinite",
+    "objective_bound",
+    "objective_target",
+    "_limit",
+    "mip_max_",
+    "matrix_value",
+)
+
+_USER_OPTIONS: contextvars.ContextVar[tuple[tuple[str, Any], ...]] = contextvars.ContextVar(
+    "discopt_highs_user_options", default=()
+)
+
+
+def validate_user_options(options: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Check ``Model.solve(highs_options=...)`` and return it as ``(key, value)`` pairs.
+
+    Raises ``TypeError`` for a non-mapping or a non-string key and ``ValueError``
+    for a reserved option (:data:`RESERVED_USER_OPTIONS`, or a name matching a
+    reserved class). An option HiGHS itself does not know raises later, from
+    :func:`_set_options`, when the route builds its HiGHS instance.
+    """
+    if not isinstance(options, Mapping):
+        raise TypeError(
+            "highs_options must be a dict of HiGHS option name -> value, got "
+            f"{type(options).__name__}"
+        )
+    pairs = []
+    for key, val in options.items():
+        if not isinstance(key, str):
+            raise TypeError(f"highs_options keys must be HiGHS option names, got {key!r}")
+        why = RESERVED_USER_OPTIONS.get(key)
+        if why is None and any(pat in key for pat in _RESERVED_USER_OPTION_PATTERNS):
+            why = "it changes what the route's certificate means"
+        if why is not None:
+            raise ValueError(f"highs_options[{key!r}] cannot be set: {why} (#1620)")
+        pairs.append((key, val))
+    return tuple(pairs)
+
+
+@contextlib.contextmanager
+def user_options(pairs: tuple[tuple[str, Any], ...]) -> Iterator[None]:
+    """Apply validated user HiGHS options to every HiGHS instance built in the scope.
+
+    They are set after the route's base options (so ``output_flag=True`` turns the
+    HiGHS log on) and before each solve's own options, so a route option -- e.g. the
+    #1634 cross-check's ``presolve="off"`` -- always wins over a user one.
+    """
+    token = _USER_OPTIONS.set(tuple(pairs))
+    try:
+        yield
+    finally:
+        _USER_OPTIONS.reset(token)
+
+
 def _new_highs(highspy, opts: list[tuple[str, Any]]):
     h = highspy.Highs()
     # ``threads`` stays at HiGHS's default (0). HiGHS keeps one process-wide scheduler,
@@ -1165,6 +1246,8 @@ def _new_highs(highspy, opts: list[tuple[str, Any]]):
     # code run highspy with default options, so pinning a value here made every later
     # LP/MILP solve in the same process return ``error``.
     _set_options(h, highspy, [("output_flag", False), ("random_seed", 0)])
+    # #1620: ``Model.solve(highs_options=...)``, checked by validate_user_options.
+    _set_options(h, highspy, list(_USER_OPTIONS.get()))
     _set_options(h, highspy, opts)
     return h
 

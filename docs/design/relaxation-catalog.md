@@ -134,8 +134,8 @@ carries explicit lifted product variables and now produces the **exact multiline
 
 | Backend | File | What it does | Notes |
 |---|---|---|---|
-| **McCormick (NLP)** (default) | `mccormick.py`, `envelopes.py`, `relaxation_compiler.py` | compositional cv/cc envelopes (JAX) | midpoint or convex-NLP solve; **valid dual bound only for convex models** (see §6) |
-| **McCormick LP** | `mccormick_lp.py`, `milp_relaxation.py` | polyhedral **outer** approximation with **lifted bilinear aux columns**, solved as an LP | rigorous valid dual bound; tighter than the midpoint evaluator; default when the model has relaxable nonlinearity |
+| **McCormick (NLP)** | `mccormick.py`, `envelopes.py`, `relaxation_compiler.py` | compositional cv/cc envelopes (numpy) | opt-in via `mccormick_bounds="nlp"`; midpoint or convex-NLP solve; **valid dual bound only for convex models** (see §6); never selected by `"auto"` (which resolves to `"lp"` for nonconvex models, `"none"` for convex ones) |
+| **McCormick LP** | `mccormick_lp.py`, `milp_relaxation.py` | polyhedral **outer** approximation with **lifted bilinear aux columns**, solved as an LP | rigorous valid dual bound; tighter than the midpoint evaluator; default (`mccormick_bounds="auto"`) for a nonconvex model with relaxable nonlinearity |
 | **α-BB (rigorous)** | `alphabb.py` | `f ∓ Σαᵢ(xᵢ−lb)(ub−xᵢ)`, α from a **sound interval Hessian + interval-Gershgorin** bound | now auto-dispatched as a fallback and selectable via `arithmetic="alphabb"`; the rigorous α replaces the older sampling estimator |
 | **TM2014 multivariate** | `multivariate_mccormick.py` | tighter univariate composition | 11 ops |
 | **Piecewise McCormick** | `piecewise_mccormick.py` | partitioned envelopes (`partitions>0`) | bilinear, exp, log, sqrt, square, sin, cos, tan |

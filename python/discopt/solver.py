@@ -9,6 +9,7 @@ Connects:
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -9772,6 +9773,74 @@ def _scoped_determinism(fn: _F) -> _F:
     return cast(_F, wrapper)
 
 
+#: ``(validated highs_options pairs, {"used": bool})`` for the innermost
+#: ``solve_model`` call, or ``None`` when that call passed no ``highs_options``.
+#: Set by :func:`_scoped_highs_options`; read at the HiGHS LP/MILP route sites.
+_HIGHS_OPTIONS_REQUEST: contextvars.ContextVar[
+    Optional[tuple[tuple[tuple[str, Any], ...], dict]]
+] = contextvars.ContextVar("discopt_highs_options_request", default=None)
+
+
+def _scoped_highs_options(fn: _F) -> _F:
+    """Validate ``highs_options`` up front and warn when no HiGHS route used it (#1620).
+
+    The options are honoured by the verified HiGHS LP/MILP route only
+    (:func:`_highs_route_options`). Validation happens before any work, so a
+    reserved option is refused on every model, not only on the ones that reach
+    HiGHS. A solve that never took that route warns instead of returning as if
+    the options had been applied (CLAUDE.md §3). Nested solves get their own
+    scope: a solve that passed no ``highs_options`` sets the request to ``None``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        opts = kwargs.get("highs_options")
+        if opts is None:
+            if _HIGHS_OPTIONS_REQUEST.get() is None:
+                return fn(*args, **kwargs)
+            token = _HIGHS_OPTIONS_REQUEST.set(None)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _HIGHS_OPTIONS_REQUEST.reset(token)
+        from discopt.solvers.lp_milp_highs import validate_user_options
+
+        state = {"used": False}
+        token = _HIGHS_OPTIONS_REQUEST.set((validate_user_options(opts), state))
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _HIGHS_OPTIONS_REQUEST.reset(token)
+        if not state["used"] and opts:
+            import warnings
+
+            warnings.warn(
+                "highs_options was not used: it applies only to a pure LP or MILP "
+                "solved on the HiGHS route (milp_backend='highs', the default), and "
+                "this solve did not take that route.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return result
+
+    return cast(_F, wrapper)
+
+
+@contextlib.contextmanager
+def _highs_route_options():
+    """Apply the active ``highs_options`` to the HiGHS LP/MILP route and mark it used."""
+    req = _HIGHS_OPTIONS_REQUEST.get()
+    if req is None:
+        yield
+        return
+    from discopt.solvers.lp_milp_highs import user_options
+
+    pairs, state = req
+    state["used"] = True
+    with user_options(pairs):
+        yield
+
+
 def _scoped_role1_deadline(fn: _F) -> _F:
     """Scope :data:`_ROLE1_DEADLINE` to one ``solve_model`` call (#1371).
 
@@ -10422,6 +10491,7 @@ def _refusing_on_callback_failure(fn: _F) -> _F:
 @_scoped_tuning
 @_scoped_determinism
 @_scoped_role1_deadline
+@_scoped_highs_options
 @_debug_outermost_solve
 def solve_model(
     model: Model,
@@ -10485,6 +10555,8 @@ def solve_model(
     milp_backend: Optional[str] = None,
     milp_cuts: Optional[bool] = None,
     branching_rule: Optional[str] = None,
+    # #1620: HiGHS options for the HiGHS LP/MILP route; see ``_scoped_highs_options``.
+    highs_options: Optional[dict[str, Any]] = None,
     # #917: extra wall-clock seconds this solve may take *only if* it holds an
     # incumbent when ``time_limit`` expires. Set by ``Model.solve`` to the #844
     # fallback reserve it withheld, so a primary that found a primal reclaims the
@@ -10602,6 +10674,22 @@ def solve_model(
         probe LPs are counted in ``solver_stats["branching/strong_probe_lps"]``,
         not in ``node_count``). Changes only the order of the search, never a
         bound.
+    highs_options : dict, optional
+        HiGHS options (name -> value, HiGHS's own option names) for a pure LP or
+        MILP solved on the HiGHS route (#1620). ``{"output_flag": True}`` prints
+        the HiGHS log (off by default); search options such as ``presolve``,
+        ``mip_detect_symmetry``, ``mip_heuristic_effort`` or ``mip_pool_*`` pass
+        straight through. They apply to every HiGHS solve the route makes,
+        including its certificate cross-checks, but a route option always wins
+        (the #1634 cross-check still runs with presolve off). Options the
+        certificate depends on are refused with ``ValueError``: tolerances,
+        gaps, limits, infinity/objective cut-offs, ``threads``, ``random_seed``
+        and ``presolve_rule_off`` -- use ``gap_tolerance`` /
+        ``abs_gap_tolerance`` / ``time_limit`` / ``max_nodes`` instead. Every
+        certificate is still verified by discopt, so an option can change speed
+        and node count, never a reported bound's validity. On any other route
+        (a nonlinear model, ``milp_backend="native"``, a callback) the options
+        are not used and a ``UserWarning`` says so.
     ipopt_options : dict, optional
         Options passed to the NLP engine: POUNCE (the default ``nlp_solver``)
         or cyipopt (``nlp_solver="ipopt"``).
@@ -10659,10 +10747,13 @@ def solve_model(
         Falls back to standard McCormick for unsupported operations.
     mccormick_bounds : str, default "auto"
         McCormick relaxation lower-bounding strategy:
-        ``"auto"`` resolves to ``"none"`` — the McCormick ``"nlp"`` bound is
-        only valid for convex models (see below), and convex models already
-        get valid bounds from the NLP relaxation, so ``"auto"`` relies on the
-        NLP/alphaBB path in both cases,
+        ``"auto"`` resolves to ``"lp"`` for a **nonconvex** model with an
+        objective (the LP-form McCormick relaxation is a valid global dual
+        bound; when the model has nothing the LP relaxer can tighten or the
+        relaxer cannot be built, the setup falls back, ultimately to
+        ``"none"`` since the nonconvex-``"nlp"`` downgrade below applies), and
+        to ``"none"`` for a convex model or one with no objective,
+        since convex models already get valid bounds from the NLP relaxation,
         ``"nlp"`` solves an NLP over the McCormick objective relaxation.
         This is a valid lower bound **only for convex models**: the bound
         solver evaluates the relaxation at ``x_cv == x_cc`` where every
@@ -13844,7 +13935,8 @@ def solve_model(
                     stacklevel=2,
                 )
             if _lpm_backend == "highs":
-                return _solve_lp_highs(model, t_start, time_limit)
+                with _highs_route_options():
+                    return _solve_lp_highs(model, t_start, time_limit)
             _lp_res = _solve_lp(model, t_start, time_limit)
             if _lpm_backend == "native" and _lp_res.algorithm_route is None:
                 _lp_stats = _lp_res.solver_stats or {}
@@ -13897,15 +13989,16 @@ def solve_model(
                     and not lagrangian_bound
                     and not _observe_tree
                 ):
-                    _highs_res = _solve_milp_highs(
-                        model,
-                        time_limit,
-                        gap_tolerance,
-                        max_nodes,
-                        t_start,
-                        initial_point=initial_point,
-                        abs_gap_tolerance=abs_gap_tolerance,
-                    )
+                    with _highs_route_options():
+                        _highs_res = _solve_milp_highs(
+                            model,
+                            time_limit,
+                            gap_tolerance,
+                            max_nodes,
+                            t_start,
+                            initial_point=initial_point,
+                            abs_gap_tolerance=abs_gap_tolerance,
+                        )
                     if _highs_res is not None:
                         return _highs_res
                 # Warm-started-simplex engine: the whole MILP B&B runs in Rust
@@ -25379,8 +25472,12 @@ def _lp_qp_unpack_duals(
     ``A_ub`` rows first (multipliers ≥ 0), then ``A_eq`` rows (free).
     ``_decompose_eq_slack_form`` emits inequalities to ``A_ub`` in declared
     order, flipping the row sign for ``">="`` so HiGHS sees ``-body ≤ 0``;
-    we flip the multiplier back so the returned dual reflects the original
-    ``">="`` body (giving ``μ ≤ 0`` in the examiner convention).
+    composing that flip with HiGHS's ``∂obj/∂b`` sign leaves ``μ ≥ 0`` for a
+    binding ``">="`` row, exactly as for ``"<="`` -- the
+    ``SolveResult.constraint_duals`` convention (#1620): ``∇F + Σ_{≤} μ ∇body
+    − Σ_{≥} μ ∇body + Σ_{=} λ ∇(lhs − rhs) = 0`` with ``μ ≥ 0`` for both
+    inequality senses. (This docstring used to claim ``μ ≤ 0`` for ``">="``;
+    the code never did that -- ``min 2a + 3b`` s.t. ``a + b >= 4`` reports +2.)
 
     Reduced costs are split into lower- and upper-bound multipliers using the
     examiner's convention ``λ_lb = max(rc, 0)``, ``λ_ub = max(-rc, 0)``.
@@ -25399,9 +25496,9 @@ def _lp_qp_unpack_duals(
 
     constraint_duals: Optional[dict[str, np.ndarray]] = None
     if row_dual is not None and row_dual.size == n_ub + n_eq:
-        # HiGHS reports row duals as ∂obj/∂b. The examiner uses the Lagrangian
-        # convention μ s.t. ∇f + ∇body·μ = 0, with μ ≥ 0 for "<=" and μ ≤ 0
-        # for ">=", so we negate for "<=" and "==" rows. For ">=" the
+        # HiGHS reports row duals as ∂obj/∂b. The reported convention (see
+        # SolveResult.constraint_duals) is μ ≥ 0 for both "<=" and ">=" rows, so
+        # we negate for "<=" and "==" rows. For ">=" the
         # extractor already flipped the row to "-body ≤ const", which (after
         # composing the two negations) leaves the HiGHS row_dual unflipped.
         out: dict[str, np.ndarray] = {}

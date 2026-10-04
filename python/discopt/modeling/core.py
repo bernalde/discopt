@@ -4178,6 +4178,24 @@ class SolveResult:
         a certificate stated in problem units must be built from.
         ``barrier_parameter`` is the terminal interior-point ``mu``, forwarded by
         :meth:`solve`'s ``warm_start`` to seed the next solve.
+    constraint_duals : dict of str to numpy.ndarray, or None
+        KKT multipliers at the returned point, keyed by ``Constraint.name``
+        (one entry per row for a vector body), when the route exposes them.
+        Sign convention (#1620), for the objective ``F`` the solver
+        *minimized* -- ``F = f`` for MINIMIZE, ``F = -f`` for MAXIMIZE::
+
+            grad F + sum_{<=} mu_i grad(body_i) - sum_{>=} mu_i grad(body_i)
+                   + sum_{==} lam_k grad(lhs_k - rhs_k) = 0
+
+        so **both** inequality senses carry ``mu >= 0`` (positive when
+        binding), and an equality's ``lam`` is free, signed against
+        ``lhs - rhs``. Example: ``min 2a + 3b`` s.t. ``a + b >= 4`` reports
+        ``+2`` for that row; ``min x**2 + y**2`` s.t. ``x + y == 5`` reports
+        ``-5``. Dict order is **not** declaration order: inequality rows come
+        first, then equality rows.
+    bound_duals_lower, bound_duals_upper : dict of str to numpy.ndarray, or None
+        Multipliers of active variable bounds, keyed by ``Variable.name``,
+        ``>= 0`` in the same internal-minimization convention.
     solve_report : dict or None
         POUNCE's structured solve report for the one POUNCE call that produced
         this result -- the ``pounce.solve-report/v1`` document, the same data as
@@ -7082,6 +7100,20 @@ class Model:
         name : str, optional
             Base name for the constraint group.
 
+        Notes
+        -----
+        The indicator is lowered to a big-M row. ``M`` is the tightest valid
+        value discopt can derive for the body over the variable box (an LP bound
+        for a linear body, interval arithmetic otherwise) **times a 1.01 safety
+        factor** (``_relax/gdp_reformulate.py``); a body with no finite bound is
+        refused. So ``m.if_then(z, [x >= 500])`` with ``x`` in ``[0, 1000]``
+        becomes ``x - 500 >= -505 (1 - z)``, i.e. ``505 z - x <= 5``, not the
+        exact ``x >= 500 z``. Both are valid and agree at integral ``z``; the
+        1% margin only loosens the LP relaxation (here ``z <= 5/505`` rather
+        than ``z = 0`` at ``x = 0``), which can cost root bound and nodes on
+        models dominated by such rows. When that matters, write the exact
+        big-M row by hand (#1620).
+
         Examples
         --------
         >>> m.if_then(y[0], [x[0] >= 10, x[1] <= 50], name="unit0_active")
@@ -7998,10 +8030,14 @@ class Model:
             problems. When False (default), convex NLPs are solved with
             a single NLP call (no B&B), guaranteeing global optimality.
         nlp_bb : bool or None, default None
-            Nonlinear Branch & Bound mode. When ``None`` (default),
-            auto-selects NLP-BB for convex MINLPs and spatial B&B
-            otherwise. When ``True``, forces NLP-BB (heuristic mode if
-            nonconvex). When ``False``, forces spatial B&B.
+            Nonlinear Branch & Bound mode. When ``None`` (default), a MINLP
+            certified convex at the root is auto-routed to outer approximation
+            (``solver="mip-nlp"``, ``mip_nlp_method="oa"``; opt out with
+            ``DISCOPT_CONVEX_MINLP_ROUTE=0``); a convex MINLP the route refuses
+            (e.g. the caller set an option OA ignores) falls back to NLP-BB, and
+            everything else runs spatial B&B. When ``True``, forces NLP-BB
+            (heuristic mode if nonconvex) and suppresses the OA auto-route.
+            When ``False``, forces spatial B&B.
         lazy_constraints : callable, optional
             Lazy constraint callback. Called at integer-feasible nodes.
             Should accept ``(ctx, model)`` and return a list of
@@ -8095,6 +8131,13 @@ class Model:
             ``max_wall_time``, ``print_level`` (any positive value prints its
             iteration trace), ``tau`` and ``tau_max``; an NLP-engine option such
             as ``mu_strategy`` on an LP raises rather than being ignored.
+            The NLP engine does **not** run at Ipopt's defaults: discopt seeds
+            ``constr_viol_tol=1e-8`` and ``bound_relax_factor=0`` (iterates
+            and the returned point stay inside the declared box;
+            ``pounce_option_defaults`` / ``pounce_incumbent_options`` in
+            ``discopt.solvers``), and a ``pounce_options`` entry overrides
+            either (#1620). The same baseline applies wherever discopt returns
+            a POUNCE point as the solution.
 
             Use ``solver="amp"`` to select
             Adaptive Multivariate Partitioning. AMP-specific keyword

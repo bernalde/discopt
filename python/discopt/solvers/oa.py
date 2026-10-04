@@ -5700,7 +5700,9 @@ def solve_lp_nlp_bb(
         # cuts that were never generated -- on ``bchoco07`` it said "97 of 153
         # classified convex" for 97 rows that are all affine and all already in
         # the master.
-        logger.warning(
+        # INFO, not WARNING (#1620): a partial cut mask is the normal case
+        # (affine rows are already exact in the master), not a problem.
+        logger.info(
             "LP/NLP BB: generating OA cuts for %d of %d rows (%d convex; the rest are "
             "either nonconvex or already exact in the master)",
             sum(1 for eligible in decomp.oa_cut_mask if eligible),
@@ -7039,7 +7041,9 @@ def solve_oa(
         # cuts that were never generated -- on ``bchoco07`` it said "97 of 153
         # classified convex" for 97 rows that are all affine and all already in
         # the master.
-        logger.warning(
+        # INFO, not WARNING (#1620): a partial cut mask is the normal case
+        # (affine rows are already exact in the master), not a problem.
+        logger.info(
             "OA: generating OA cuts for %d of %d rows (%d convex; the rest are "
             "either nonconvex or already exact in the master)",
             sum(1 for eligible in decomp.oa_cut_mask if eligible),
