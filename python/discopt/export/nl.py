@@ -250,6 +250,42 @@ def nl_row_order(model: Model) -> np.ndarray:
     return np.asarray(writer._row_order, dtype=np.intp)
 
 
+def nl_column_order(model: Model) -> np.ndarray:
+    """The model flat column behind each column of ``model.to_nl()``'s output (#1620).
+
+    ``.nl`` orders variables by nonlinearity class and integrality
+    (:meth:`_NLWriter._reorder_vars_canonical`), so its columns are generally a
+    permutation of the model's. ``order[j]`` is the model's flat column index
+    (variables in declaration order, each expanded row-major -- the layout of
+    ``SolveResult.x`` flattened) written as ``.nl`` column ``j``. A reader's
+    per-column output -- a ``.sol`` primal vector, a tape evaluated in ``.nl``
+    order -- maps back with ``model_vals[order] = nl_vals``; the row analogue is
+    :func:`nl_row_order`.
+
+    The permutation is read off the Python writer, which is the one that exposes
+    it. Because :func:`to_nl` normally runs the Rust writer, the Python writer's
+    text is compared with what :func:`to_nl` writes for this model, and a
+    mismatch raises ``RuntimeError`` rather than return a map for a different
+    file (the #1578 lesson recorded in :func:`nl_row_order`).
+    """
+    refuse_non_algebraic_relations(model, ".nl")
+    model.validate(for_solve=False)
+    writer = _NLWriter(model)
+    text = writer.write()
+    rust = _rust_nl_text(model, None)
+    if rust is not None and rust != text:
+        raise RuntimeError(
+            "nl_column_order: the Rust and Python .nl writers disagree on this model, so "
+            "the Python writer's column permutation would not describe the file to_nl "
+            "writes. Set DISCOPT_RUST_NL=0 to export with the Python writer, whose order "
+            "this function then returns."
+        )
+    offsets = variable_flat_offsets(model)
+    return np.asarray(
+        [offsets[id(var)] + int(elem) for var, elem in writer._flat_vars], dtype=np.intp
+    )
+
+
 _RUST_NL_ENV = "DISCOPT_RUST_NL"
 
 _RUST_NL_LOG = logging.getLogger(__name__)

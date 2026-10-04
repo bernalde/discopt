@@ -29,9 +29,12 @@ lazily so a default MINLP solve never loads it.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import logging
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Optional
@@ -1227,6 +1230,107 @@ def _ray(getter) -> Optional[np.ndarray]:
     return np.asarray(vals, dtype=np.float64) if has else None
 
 
+#: HiGHS options ``Model.solve(highs_options=...)`` may set (#1620). An allowlist,
+#: not a denylist: HiGHS has hundreds of options, and one this route does not know
+#: about (``solver="pdlp"``, ``solve_relaxation``, ``user_objective_scale``,
+#: ``write_*_to_file``, a new release's additions) must be refused here rather than
+#: trusted to be caught by a downstream certificate check. Every entry changes only
+#: logging or the *search* -- never a tolerance, a limit, a gap, the problem HiGHS
+#: solves, or the process-wide thread scheduler (see :func:`_new_highs`) -- so the
+#: route's certificate means the same thing whatever value is passed. Extending it
+#: is a review decision: add the option with that argument.
+ALLOWED_USER_OPTIONS: frozenset[str] = frozenset(
+    {
+        # logging
+        "output_flag",
+        "log_to_console",
+        "log_file",
+        "log_dev_level",
+        "mip_report_level",
+        # search strategy
+        "presolve",
+        "mip_detect_symmetry",
+        "mip_allow_restart",
+        "mip_heuristic_effort",
+        "mip_heuristic_run_rins",
+        "mip_heuristic_run_rens",
+        "mip_heuristic_run_root_reduced_cost",
+        "mip_heuristic_run_zi_round",
+        "mip_heuristic_run_shifting",
+        "mip_lp_age_limit",
+        "mip_pool_age_limit",
+        "mip_pool_soft_limit",
+        "mip_pscost_minreliable",
+        "simplex_scale_strategy",
+        "simplex_dual_edge_weight_strategy",
+        "simplex_primal_edge_weight_strategy",
+        "simplex_price_strategy",
+    }
+)
+
+#: Why the options a user is most likely to reach for are refused; anything else
+#: outside :data:`ALLOWED_USER_OPTIONS` gets the generic message.
+RESERVED_USER_OPTIONS: dict[str, str] = {
+    "mip_rel_gap": "use Model.solve(gap_tolerance=...)",
+    "mip_abs_gap": "use Model.solve(abs_gap_tolerance=...)",
+    "mip_max_nodes": "use Model.solve(max_nodes=...)",
+    "time_limit": "use Model.solve(time_limit=...)",
+    "presolve_rule_off": "the route pins it (#1634: an unsound presolve rule is disabled)",
+    "run_crossover": "the route's dual certificates need a crossover basis",
+    "small_matrix_value": "the route sets it to pass its standard form exactly",
+    "threads": "HiGHS's scheduler is process-wide; a nonzero value breaks later solves",
+    "random_seed": "the route pins it for reproducible certificates",
+}
+
+_USER_OPTIONS: contextvars.ContextVar[tuple[tuple[str, Any], ...]] = contextvars.ContextVar(
+    "discopt_highs_user_options", default=()
+)
+
+
+def validate_user_options(options: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Check ``Model.solve(highs_options=...)`` and return it as ``(key, value)`` pairs.
+
+    Raises ``TypeError`` for a non-mapping or a non-string key and ``ValueError``
+    for any option not in :data:`ALLOWED_USER_OPTIONS` (with the reason from
+    :data:`RESERVED_USER_OPTIONS` when there is a specific one). A bad *value* for
+    an allowed option raises later, from :func:`_set_options`, when the route
+    builds its HiGHS instance.
+    """
+    if not isinstance(options, Mapping):
+        raise TypeError(
+            "highs_options must be a dict of HiGHS option name -> value, got "
+            f"{type(options).__name__}"
+        )
+    pairs = []
+    for key, val in options.items():
+        if not isinstance(key, str):
+            raise TypeError(f"highs_options keys must be HiGHS option names, got {key!r}")
+        if key not in ALLOWED_USER_OPTIONS:
+            why = RESERVED_USER_OPTIONS.get(
+                key,
+                "only logging and search-strategy options are passed through "
+                f"(allowed: {', '.join(sorted(ALLOWED_USER_OPTIONS))})",
+            )
+            raise ValueError(f"highs_options[{key!r}] cannot be set: {why} (#1620)")
+        pairs.append((key, val))
+    return tuple(pairs)
+
+
+@contextlib.contextmanager
+def user_options(pairs: tuple[tuple[str, Any], ...]) -> Iterator[None]:
+    """Apply validated user HiGHS options to every HiGHS instance built in the scope.
+
+    They are set after the route's base options (so ``output_flag=True`` turns the
+    HiGHS log on) and before each solve's own options, so a route option -- e.g. the
+    #1634 cross-check's ``presolve="off"`` -- always wins over a user one.
+    """
+    token = _USER_OPTIONS.set(tuple(pairs))
+    try:
+        yield
+    finally:
+        _USER_OPTIONS.reset(token)
+
+
 def _new_highs(highspy, opts: list[tuple[str, Any]]):
     h = highspy.Highs()
     # ``threads`` stays at HiGHS's default (0). HiGHS keeps one process-wide scheduler,
@@ -1235,6 +1339,8 @@ def _new_highs(highspy, opts: list[tuple[str, Any]]):
     # code run highspy with default options, so pinning a value here made every later
     # LP/MILP solve in the same process return ``error``.
     _set_options(h, highspy, [("output_flag", False), ("random_seed", 0)])
+    # #1620: ``Model.solve(highs_options=...)``, checked by validate_user_options.
+    _set_options(h, highspy, list(_USER_OPTIONS.get()))
     _set_options(h, highspy, opts)
     return h
 
