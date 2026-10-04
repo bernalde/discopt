@@ -291,3 +291,48 @@ def test_external_memo_never_caches_a_failure():
         call(np.array([0.0]))
     assert call(np.array([0.0]))[0] == 1.0
     assert n["k"] == 2
+
+
+def test_external_memo_does_not_leak_across_solves():
+    # A parameter sweep over a closed-over dict: the callable is a function of its
+    # input within each solve, but not across solves. With a builder-lifetime memo
+    # the second and third solves walked the same path and returned 1, 1, 1.
+    params = {"k": 1.0}
+
+    def f(x):
+        return np.array(params["k"] + (x[0] - 2.0) ** 2 + x[1] ** 2)
+
+    def jac(x):
+        return np.array([2.0 * (x[0] - 2.0), 2.0 * x[1]])
+
+    def hess(x):
+        return np.diag([2.0, 2.0])
+
+    sim = dm.external(f, jac=jac, hess=hess)
+    m = dm.Model("sweep")
+    x = m.continuous("x", shape=(2,), lb=-5, ub=5)
+    m.minimize(sim(x))
+    objs = []
+    for k in (1.0, 10.0, 100.0):
+        params["k"] = k
+        r = m.solve()
+        objs.append(r.objective)
+    assert objs == pytest.approx([1.0, 10.0, 100.0], abs=1e-6), objs
+
+
+def test_external_reset_clears_memo_and_recorded_failure():
+    from discopt.modeling.external import external_failure, external_reset
+
+    n = {"k": 0}
+
+    def f(x):
+        n["k"] += 1
+        return np.array(1.0)
+
+    sim = dm.external(f, jac=lambda x: np.zeros(2), hess=lambda x: np.zeros((2, 2)))
+    failures = sim._discopt_external_failures
+    failures.append(RuntimeError("stale"))
+    assert external_failure(sim) is not None
+    external_reset(sim)
+    assert external_failure(sim) is None
+    external_reset(object())  # non-external: a no-op, not an error

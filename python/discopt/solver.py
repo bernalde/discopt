@@ -10867,6 +10867,15 @@ def solve_model(
 
     require_all_relations_lowered(model, context="solve_model")
 
+    # --- #1619 B-13: dm.external memos and failure records are per solve ---
+    # A callable may read state the caller changed since the last solve (a
+    # parameter sweep), so a value cached by a previous solve is not this solve's.
+    if _model_contains_custom_call(model):
+        from discopt.modeling.external import external_reset
+
+        for _node in _model_custom_calls(model):
+            external_reset(getattr(_node, "fn", None))
+
     # --- #1243: the absolute half of the convergence criterion ---
     # Resolved once, here, so every route below reads the same number and an
     # invalid value is rejected before any work is done rather than at whichever

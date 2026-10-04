@@ -101,7 +101,13 @@ import numpy as np
 
 from discopt.modeling.core import custom
 
-__all__ = ["ExternalSpec", "external", "external_failure", "external_spec"]
+__all__ = [
+    "ExternalSpec",
+    "external",
+    "external_failure",
+    "external_reset",
+    "external_spec",
+]
 
 #: Points each external callable remembers (#1619 B-13). A handful covers the
 #: real access pattern -- every use of one point, then its Jacobian and Hessian,
@@ -195,7 +201,13 @@ def _checked(
     corrupt the cache. The memo is per callable and keeps the most recent
     :data:`_MEMO_SIZE` points. A raised error is never cached. This assumes the
     callable is a function of its input -- which every consumer (derivatives,
-    the NLP solver, the screen) already assumes.
+    the NLP solver, the screen) already assumes -- but only *within one solve*:
+    a callable that reads state the caller changes between solves (a parameter
+    sweep over a closed-over dict) is still a function of its input during each
+    solve. So the memo is scoped to one solve: ``solve_model`` clears it on entry
+    through :func:`external_reset`. Without that, a second solve along the same
+    path returned the first solve's values (measured: objectives 1, 1, 1 for a
+    sweep whose true optima are 1, 10, 100).
     """
     memo: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
@@ -249,6 +261,7 @@ def _checked(
             raise
 
     call.__name__ = f"{label}_{role}"
+    call._discopt_memo_clear = memo.clear  # type: ignore[attr-defined]
     return call
 
 
@@ -360,10 +373,32 @@ def external(
     body._discopt_external = spec  # type: ignore[attr-defined]
     body._discopt_external_failures = failures  # type: ignore[attr-defined]
 
+    def reset() -> None:
+        # Per-solve state: the memo (values are only stable within a solve) and
+        # the recorded failure (a previous solve's error is not this solve's).
+        for c in (f_call, j_call, h_call):
+            if c is not None:
+                c._discopt_memo_clear()  # type: ignore[attr-defined]
+        failures.clear()
+
+    body._discopt_external_reset = reset  # type: ignore[attr-defined]
+
     builder = custom(body, name=label)
     builder._discopt_external = spec  # type: ignore[attr-defined]
     builder._discopt_external_failures = failures  # type: ignore[attr-defined]
+    builder._discopt_external_reset = reset  # type: ignore[attr-defined]
     return builder
+
+
+def external_reset(fn: Any) -> None:
+    """Clear *fn*'s per-solve state (memo and recorded failure); no-op otherwise.
+
+    Called by ``solve_model`` on entry for every external block in the model, so
+    nothing a previous solve cached or recorded leaks into this one (#1619 B-13).
+    """
+    reset = getattr(fn, "_discopt_external_reset", None)
+    if callable(reset):
+        reset()
 
 
 def external_failure(fn: Any) -> Optional[BaseException]:
