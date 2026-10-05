@@ -13092,15 +13092,14 @@ def solve_model(
     # must fail the solve: the old ``except Exception`` + DEBUG log made a crashed
     # pass indistinguishable from 'nothing to linearize' (CLAUDE.md §3/§7).
     from discopt._relax.binary_multilinear_reform import has_binary_multilinear_work
-    from discopt._relax.problem_classifier import ProblemClass as _PC
-    from discopt._relax.problem_classifier import classify_problem as _classify_problem
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
     from discopt.transformations import get as _get_transformation
 
     # #1614 A-21: a product whose exact arena coefficient is zero (``0*x*y``) is
     # still a syntactic product, and the three product reforms below would lift
     # it into a big-M MILP and divert an already-linear model off the MILP route.
     # ``classify_problem`` reads the exact quadratic form, so it is the gate.
-    _already_linear = _classify_problem(model) in (_PC.LP, _PC.MILP)
+    _already_linear = classify_problem(model) in (ProblemClass.LP, ProblemClass.MILP)
 
     if (
         not _already_linear

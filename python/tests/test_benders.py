@@ -273,23 +273,26 @@ def _count_master_solves(model, **cfg_kw):
     import discopt.solvers.lp_backend as lpb
     from discopt.decomposition.benders.solver import BendersConfig
 
-    real = lpb.get_milp_solver
+    # Masters come from ``get_decomposition_master_solver`` (#1614 D-26/D-27).
+    real = lpb.get_decomposition_master_solver
     box = {"n": 0}
 
-    def counted(*a, **k):
-        solver = real(*a, **k)
+    def counted():
+        solver, engine = real()
 
         def w(*aa, **kk):
             box["n"] += 1
             return solver(*aa, **kk)
 
-        return w
+        return w, engine
 
-    lpb.get_milp_solver = counted
+    lpb.get_decomposition_master_solver = counted
     try:
         r = solve_benders(model, config=BendersConfig(time_limit=30, max_iterations=500, **cfg_kw))
     finally:
-        lpb.get_milp_solver = real
+        lpb.get_decomposition_master_solver = real
+    # Prove the counter fired: a zero here would make ``n_multi <= n_single`` vacuous.
+    assert box["n"] > 0, "no master solve was counted"
     return r, box["n"]
 
 

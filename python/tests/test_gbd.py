@@ -501,12 +501,14 @@ def test_gbd_master_satisfies_its_own_cuts_at_scale():
     """
     import discopt.solvers.lp_backend as lp_backend
 
-    real_get_milp_solver = lp_backend.get_milp_solver
+    # The master's engine comes from ``get_decomposition_master_solver`` (#1614
+    # D-26/D-27: HiGHS when installed, else the simplex B&B); both are exact-vertex.
+    real_master_solver = lp_backend.get_decomposition_master_solver
     worst = -np.inf
     rows_compared = 0
 
-    def instrumented(prefer_pounce=False, backend="auto"):
-        inner = real_get_milp_solver(prefer_pounce=prefer_pounce, backend=backend)
+    def instrumented():
+        inner, engine = real_master_solver()
 
         def wrapper(c, A_ub=None, b_ub=None, **kwargs):
             nonlocal worst, rows_compared
@@ -519,7 +521,7 @@ def test_gbd_master_satisfies_its_own_cuts_at_scale():
                 worst = max(worst, float((A @ x - b).max()))
             return res
 
-        return wrapper
+        return wrapper, engine
 
     # The instance is pinned by seed; drawing it the same way the soundness fuzz
     # does keeps it a member of the class the fuzz samples rather than a special case.
@@ -542,11 +544,11 @@ def test_gbd_master_satisfies_its_own_cuts_at_scale():
     sy = sum(y[i] for i in range(ny))
     m.subject_to(sum(x[j] for j in range(nx)) == float(rng.uniform(0, 3)) * sy)
 
-    lp_backend.get_milp_solver = instrumented
+    lp_backend.get_decomposition_master_solver = instrumented
     try:
         r = solve_benders(m, time_limit=30)
     finally:
-        lp_backend.get_milp_solver = real_get_milp_solver
+        lp_backend.get_decomposition_master_solver = real_master_solver
 
     # Prove the probe fired (CLAUDE.md measurement discipline): a silent zero-row
     # traversal would make the residual assertion below vacuously true.
