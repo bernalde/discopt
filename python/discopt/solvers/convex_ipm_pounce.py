@@ -431,6 +431,7 @@ def _solve(
     time_limit: Optional[float],
     options: Optional[dict],
     solve_report: bool = False,
+    x0: Optional[np.ndarray] = None,
 ) -> Tuple[
     str,
     Any,
@@ -485,6 +486,9 @@ def _solve(
             method="ipm",
             tau=opts.get("tau"),
             tau_max=opts.get("tau_max"),
+            # #1615 B-01b: a primal start seeds the IPM; it does not change the
+            # solution (the objective scale touches only the duals, not ``x``).
+            warm_start=None if x0 is None else {"x": np.asarray(x0, dtype=np.float64)},
         )
     except ValueError as exc:
         # POUNCE's PSD guard: the convex engine refuses an indefinite P before
@@ -661,12 +665,15 @@ def solve_qp(
     gap_tolerance: float = 1e-4,
     options: Optional[dict] = None,
     solve_report: bool = False,
+    warm_start: Optional[np.ndarray] = None,
 ) -> QPResult:
     """Solve ``min ½x'Qx + c'x`` s.t. linear rows with POUNCE's qp-ipm.
 
     ``bounds`` default to free variables (the shared QP contract).
     ``solve_report=True`` attaches the solve's ``pounce.solve-report/v1``
-    document as ``QPResult.solve_report`` (#1534).
+    document as ``QPResult.solve_report`` (#1534). ``warm_start`` is a primal
+    point of length ``n`` that seeds the interior-point iteration (#1615 B-01b);
+    it never changes the answer.
 
     Raises:
         IndefiniteQPError: ``Q`` is not PSD (POUNCE's own check).
@@ -688,8 +695,14 @@ def solve_qp(
             "convex QP IPM may not certify its answer."
         )
     lb, ub = _engine_box(bounds, n, default_lb=-np.inf)
+    x0 = None
+    if warm_start is not None:
+        x0 = np.asarray(warm_start, dtype=np.float64).ravel()
+        if x0.shape != (n,):
+            # POUNCE silently ignores a mismatched start; refuse it here instead.
+            raise ValueError(f"warm_start has {x0.size} entries for a QP with {n} variables")
     raw, res, wall, A, cl, cu, report = _solve(
-        Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options, solve_report
+        Q_arr, c_arr, A_ub, b_ub, A_eq, b_eq, lb, ub, time_limit, options, solve_report, x0
     )
     iters = int(res.iters)
     # ``optimal_inaccurate`` is the engine's own ``optimal`` iterate re-judged on its

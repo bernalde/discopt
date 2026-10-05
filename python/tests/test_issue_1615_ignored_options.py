@@ -14,8 +14,8 @@ Each option must either take effect or be refused/declared loudly. Covered here:
   hull cannot take) are declared with a warning.
 * C-10b -- the convex MINLP kernel (big-M only) is not attempted when the caller
   asked for another GDP reformulation.
-* B-01b -- ``initial_solution`` / ``warm_start`` on the convex ``pounce`` LP/QP
-  arm (a cold matrix solve) warns.
+* B-01b -- ``initial_solution`` / ``warm_start`` reach POUNCE's qp-ipm as its
+  ``warm_start``; the lp-ipm arm (still a cold solve) warns.
 * D-12 -- a looser relative ``gap_tolerance`` is honoured by the native kernel.
 * B-02a -- ``skip_convex_check`` is documented as what it does (one local NLP).
 """
@@ -296,11 +296,67 @@ def _small_qp():
     return m, x, y
 
 
-def test_pounce_qp_initial_solution_warns():
-    m, x, y = _small_qp()
-    with pytest.warns(UserWarning, match=r"ignores initial_solution .*qp-ipm"):
-        r = m.solve(solver="pounce", initial_solution={x: 0.5, y: 1.5})
+def _mpc_qp(n=30):
+    # A linear-MPC chain QP in the shape of the issue's I.14b repro: a start from
+    # the previous horizon cuts the qp-ipm iteration count.
+    m = dm.Model("mpc")
+    x0 = m.parameter("x0", 3.0)
+    x = [m.continuous(f"x[{k}]", lb=-50, ub=50) for k in range(n + 1)]
+    u = [m.continuous(f"u[{k}]", lb=-2, ub=2) for k in range(n)]
+    m.subject_to(x[0] == x0)
+    for k in range(n):
+        m.subject_to(x[k + 1] == 0.95 * x[k] + 0.1 * u[k])
+    m.minimize(sum(x[k] ** 2 for k in range(1, n + 1)) + 0.1 * sum(v**2 for v in u))
+    return m, x0, x + u
+
+
+def _pounce_starts(m, **kw):
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        r = m.solve(solver="pounce", **kw)
     assert r.algorithm_route == "pounce:qp-ipm"
+    return r, [str(w.message) for w in rec if "ignores" in str(w.message)]
+
+
+def test_pounce_qp_initial_solution_is_used(monkeypatch):
+    # B-01b: the start reaches POUNCE's qp-ipm as ``warm_start`` -- no warning,
+    # same answer, fewer iterations.
+    import pounce.qp as pq
+
+    seen: list = []
+    real = pq.solve_qp
+
+    def _spy(*a, **kw):
+        seen.append(kw.get("warm_start"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pq, "solve_qp", _spy)
+    m, x0, allv = _mpc_qp()
+    r0, _ = _pounce_starts(m)
+    x0.value = 3.1
+    cold, msgs_cold = _pounce_starts(m)
+    start = {v: r0.value(v) for v in allv}
+    warm, msgs_warm = _pounce_starts(m, initial_solution=start)
+    ws, msgs_ws = _pounce_starts(m, warm_start=r0)
+    assert msgs_cold == msgs_warm == msgs_ws == []
+    assert seen[:2] == [None, None]
+    assert seen[2] is not None and seen[3] is not None
+    assert warm.status == cold.status == ws.status == "optimal"
+    assert warm.objective == pytest.approx(cold.objective, rel=1e-8)
+    assert ws.objective == pytest.approx(cold.objective, rel=1e-8)
+    it = [int(r.solver_stats["pounce/iterations"]) for r in (cold, warm, ws)]
+    assert it[1] < it[0] and it[2] < it[0], it
+
+
+def test_pounce_lp_initial_solution_still_warns():
+    # lp-ipm remains a cold solve: the start is dropped, and declared.
+    m = dm.Model("lp")
+    x = m.continuous("x", lb=0, ub=10)
+    m.maximize(3 * x)
+    m.subject_to(x <= 4)
+    with pytest.warns(UserWarning, match=r"ignores initial_solution .*lp-ipm"):
+        r = m.solve(solver="pounce", initial_solution={x: 1.0})
+    assert r.algorithm_route == "pounce:lp-ipm"
 
 
 def test_pounce_qp_without_start_does_not_warn():

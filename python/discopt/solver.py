@@ -22939,16 +22939,26 @@ def _solve_pounce_route(
         from discopt.solvers import convex_ipm_pounce as _cvx
 
         is_lp = pclass == ProblemClass.LP
-        # #1615 B-01b: the convex lp-ipm/qp-ipm arm is a cold matrix solve; it does
-        # not thread a starting point through, so an ``initial_solution`` /
-        # ``warm_start`` the caller passed would be dropped without a word. The NLP
-        # arm below does use them, so this warning is specific to the convex arm.
-        # ``Model.solve`` turns a warm start's primal half into ``initial_point``
-        # too, so name the option the caller actually passed.
+        # #1615 B-01b: qp-ipm takes the caller's primal start (``Model.solve`` turns
+        # a warm start's primal half into ``initial_point`` too) as POUNCE's
+        # ``warm_start`` -- measured on the issue's linear-MPC QP, 15 -> 8
+        # iterations at N=100 and 16 -> 8 at N=400, same objective to 1e-10. The
+        # lp-ipm arm is still a cold solve, so a start passed there is dropped,
+        # and says so; name the option the caller actually passed.
+        n_flat = sum(v.size for v in model._variables)
+        qp_x0 = None
+        if not is_lp and initial_point is not None:
+            _ip = np.asarray(initial_point, dtype=np.float64).ravel()
+            if _ip.size == n_flat and np.all(np.isfinite(_ip)):
+                qp_x0 = _ip
         _dropped_starts = (
-            ["warm_start"]
-            if warm_start is not None
-            else (["initial_solution"] if initial_point is not None else [])
+            []
+            if qp_x0 is not None
+            else (
+                ["warm_start"]
+                if warm_start is not None
+                else (["initial_solution"] if initial_point is not None else [])
+            )
         )
         # Options are validated against the engine that actually runs (#1585). An
         # LP is always the convex engine, so refuse before solving. A QP is routed
@@ -22996,6 +23006,7 @@ def _solve_pounce_route(
                     strict=True,
                     relaxes_huge_bounds=True,
                     reject_reason=reject_reason,
+                    x0=qp_x0,
                 )
         except _cvx.IndefiniteQPError as exc:
             logger.info("solver='pounce': %s Solving locally with the NLP IPM.", exc)
@@ -28181,6 +28192,7 @@ def _solve_qp_matrix(
     strict: bool = False,
     relaxes_huge_bounds: bool = False,
     reject_reason: list[str] | None = None,
+    x0: np.ndarray | None = None,
 ) -> SolveResult | None:
     """Solve a QP/MIQP through a matrix-form ``solve_qp`` backend.
 
@@ -28201,6 +28213,10 @@ def _solve_qp_matrix(
     returned point was refused by the feasibility or stationarity guard. The
     caller uses it to populate ``SolveResult.error`` on the terminal path, so the
     only record of *why* a QP came back ``error`` is not a log line (#1384).
+
+    ``x0``, a primal point over the model's flattened variables, is forwarded as
+    ``warm_start=`` -- only to a backend that takes one (POUNCE qp-ipm, #1615
+    B-01b); the caller passes it only then.
     """
     from discopt._relax.problem_classifier import extract_qp_data
     from discopt.modeling.core import ObjectiveSense
@@ -28246,6 +28262,9 @@ def _solve_qp_matrix(
     Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
     c_orig = np.asarray(qp_data.c[:n_orig])
 
+    start_kw: dict[str, Any] = {}
+    if x0 is not None:
+        start_kw["warm_start"] = np.asarray(x0, dtype=np.float64).ravel()[:n_orig]
     try:
         result = solve_qp_fn(
             Q=Q_orig,
@@ -28258,6 +28277,7 @@ def _solve_qp_matrix(
             integrality=integrality,
             time_limit=time_limit,
             gap_tolerance=gap_tolerance,
+            **start_kw,
         )
     except Exception as e:
         if strict:
