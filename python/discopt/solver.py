@@ -23008,9 +23008,45 @@ def _solve_pounce_route(
                     x0=qp_x0,
                 )
         except _cvx.IndefiniteQPError as exc:
-            logger.info("solver='pounce': %s Solving locally with the NLP IPM.", exc)
+            # #1616 A-18: an objective that is structurally a positive-weighted sum
+            # of squares of affine forms is convex whatever its expanded Hessian
+            # rounds to; a rank-deficient one (a penalty ``(g.x)**2``, least squares
+            # with fewer residuals than unknowns) fails the exact PSD test only
+            # because ``2 A' diag(w) A`` is formed in floats. Re-solve it lifted,
+            # where the Hessian is diagonal and PSD exactly. Any other indefinite
+            # Hessian still falls to the local NLP arm.
             outcome = None
-            pclass = ProblemClass.NLP  # fall to the NLP arm below
+            lift = _pounce_sos_lift(model)
+            if lift is not None:
+                logger.info(
+                    "solver='pounce': %s The objective is a weighted sum of %d affine "
+                    "squares; solving its exact lift with qp-ipm (#1616 A-18).",
+                    exc,
+                    lift[0].size,
+                )
+                reject_reason.clear()
+                outcome = _solve_qp_matrix(
+                    model,
+                    t_start,
+                    _remaining(),
+                    solve_fn,
+                    "POUNCE qp-ipm",
+                    strict=True,
+                    relaxes_huge_bounds=True,
+                    reject_reason=reject_reason,
+                    x0=qp_x0,
+                    sos_lift=lift,
+                )
+            else:
+                warnings.warn(
+                    f"solver='pounce': {exc} The convex QP route (qp-ipm) does not "
+                    "apply, so this solve uses the local NLP interior-point arm and "
+                    "its result certifies only local optimality. A globally "
+                    "certified answer needs the default solver (#1616).",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                pclass = ProblemClass.NLP  # fall to the NLP arm below
         if pclass != ProblemClass.NLP:
             if _dropped_starts:
                 warnings.warn(
@@ -28181,6 +28217,24 @@ def _qp_convex_certificate(
     return cert
 
 
+def _pounce_sos_lift(model: Model) -> Optional[tuple]:
+    """The objective's exact sum-of-squares decomposition for ``_solve_qp_matrix``.
+
+    Minimization sense (a maximized objective is negated). ``None`` when the
+    objective is not structurally ``sum_k w_k (a_k.x + b_k)**2 + affine`` with
+    every ``w_k > 0``, or the model has integer variables (#1616 A-18).
+    """
+    from discopt._relax.convexity.patterns import weighted_affine_square_decomposition
+    from discopt.modeling.core import ObjectiveSense
+
+    if model._objective is None or any(
+        v.var_type in (VarType.BINARY, VarType.INTEGER) for v in model._variables
+    ):
+        return None
+    sign = -1.0 if model._objective.sense == ObjectiveSense.MAXIMIZE else 1.0
+    return weighted_affine_square_decomposition(model._objective.expression, model, sign)
+
+
 def _solve_qp_matrix(
     model: Model,
     t_start: float,
@@ -28192,6 +28246,7 @@ def _solve_qp_matrix(
     relaxes_huge_bounds: bool = False,
     reject_reason: list[str] | None = None,
     x0: np.ndarray | None = None,
+    sos_lift: tuple | None = None,
 ) -> SolveResult | None:
     """Solve a QP/MIQP through a matrix-form ``solve_qp`` backend.
 
@@ -28216,6 +28271,19 @@ def _solve_qp_matrix(
     ``x0``, a primal point over the model's flattened variables, is forwarded as
     ``warm_start=`` -- only to a backend that takes one (POUNCE qp-ipm, #1615
     B-01b); the caller passes it only then.
+
+    ``sos_lift`` is a continuous objective's
+    :func:`~discopt._relax.convexity.patterns.weighted_affine_square_decomposition`
+    in minimization sense, ``(w, A, b, l, c0)``. The backend then solves the lifted
+    QP over ``(x, d)``: ``min sum_k w_k d_k**2 + l.x + c0`` subject to the model's
+    rows and ``A x - d = -b``. It is the same problem (``d`` is defined by its row),
+    but its Hessian is ``diag(0, 2w)`` -- PSD exactly -- where the expanded
+    ``2 A' diag(w) A`` of a rank-deficient ``A`` can round to indefinite and be
+    refused by the exact PSD test (#1616 A-18). The point and the multipliers of
+    the model's own rows are mapped back, and every check after the solve (the
+    feasibility guard, the objective re-evaluation, the #1596 certificate, the
+    named duals) runs on the original problem; only the backend's own KKT
+    residual is judged on the system it solved.
     """
     from discopt._relax.problem_classifier import extract_qp_data
     from discopt.modeling.core import ObjectiveSense
@@ -28264,15 +28332,43 @@ def _solve_qp_matrix(
     start_kw: dict[str, Any] = {}
     if x0 is not None:
         start_kw["warm_start"] = np.asarray(x0, dtype=np.float64).ravel()[:n_orig]
+    Q_s, c_s, A_ub_s, A_eq_s, b_eq_s, bounds_s = Q_orig, c_orig, A_ub, A_eq, b_eq, bounds
+    obj_const_s = float(qp_data.obj_const)
+    n_lift = 0
+    if sos_lift is not None:
+        if integrality is not None:
+            raise ValueError("sos_lift is for a continuous QP only")
+        w_l, A_l, b_l, l_l, c0_l = sos_lift
+        A_l = A_l.tocsr()[:, :n_orig].toarray()
+        n_lift = int(w_l.size)
+        n_s = n_orig + n_lift
+        Q_s = np.zeros((n_s, n_s), dtype=np.float64)
+        Q_s[n_orig:, n_orig:] = np.diag(2.0 * np.asarray(w_l, dtype=np.float64))
+        c_s = np.concatenate([np.asarray(l_l, dtype=np.float64)[:n_orig], np.zeros(n_lift)])
+        obj_const_s = float(c0_l)
+        if A_ub is not None and A_ub.shape[0] > 0:
+            A_ub_s = np.hstack([_dense_A(A_ub), np.zeros((A_ub.shape[0], n_lift))])
+        lift_rows = np.hstack([A_l, -np.eye(n_lift)])
+        if A_eq is not None and A_eq.shape[0] > 0:
+            A_eq_s = np.vstack(
+                [np.hstack([_dense_A(A_eq), np.zeros((A_eq.shape[0], n_lift))]), lift_rows]
+            )
+            b_eq_s = np.concatenate([np.asarray(b_eq, dtype=np.float64).ravel(), -b_l])
+        else:
+            A_eq_s, b_eq_s = lift_rows, -np.asarray(b_l, dtype=np.float64)
+        bounds_s = bounds + [(-np.inf, np.inf)] * n_lift
+        if "warm_start" in start_kw:
+            ws = start_kw["warm_start"]
+            start_kw["warm_start"] = np.concatenate([ws, A_l @ ws + b_l])
     try:
         result = solve_qp_fn(
-            Q=Q_orig,
-            c=c_orig,
-            A_ub=A_ub,
+            Q=Q_s,
+            c=c_s,
+            A_ub=A_ub_s,
             b_ub=b_ub,
-            A_eq=A_eq,
-            b_eq=b_eq,
-            bounds=bounds,
+            A_eq=A_eq_s,
+            b_eq=b_eq_s,
+            bounds=bounds_s,
             integrality=integrality,
             time_limit=time_limit,
             gap_tolerance=gap_tolerance,
@@ -28290,14 +28386,50 @@ def _solve_qp_matrix(
 
     objective = None
     if result.objective is not None:
-        objective = float(result.objective) + float(qp_data.obj_const)
+        objective = float(result.objective) + obj_const_s
         if sense == ObjectiveSense.MAXIMIZE:
             objective = -objective
 
     result_bound = getattr(result, "bound", None)
-    bound = _engine_bound_in_model_sense(
-        result.status, result_bound, objective, float(qp_data.obj_const), sense
-    )
+    bound = _engine_bound_in_model_sense(result.status, result_bound, objective, obj_const_s, sense)
+
+    if result.status == SolveStatus.OPTIMAL and n_lift:
+        # The backend's KKT residual is about the lifted system; judge it there,
+        # then hand the rest of this function the original problem (``sos_lift``).
+        assert result.x is not None and result.objective is not None
+        kkt_scale = _qp_stationarity_scale(
+            Q_s, c_s, result.x, result.dual_values, result.reduced_costs
+        )
+        if result.kkt_error is not None and result.kkt_error > _QP_KKT_RESIDUAL_TOL * kkt_scale:
+            reason = (
+                f"{engine} QP (sum-of-squares lift) reported a non-stationary 'optimal' "
+                f"(KKT residual {result.kkt_error:.2e} > {_QP_KKT_RESIDUAL_TOL:.0e} x "
+                f"stationarity scale {kkt_scale:.3g}); the point was refused."
+            )
+            logger.warning("%s", reason)
+            if reject_reason is not None:
+                reject_reason.append(reason)
+            return None
+        x_o = np.asarray(result.x, dtype=np.float64)[:n_orig]
+        n_rows_o = (A_ub.shape[0] if A_ub is not None else 0) + (
+            A_eq.shape[0] if A_eq is not None else 0
+        )
+        f_o = float(0.5 * x_o @ (Q_orig @ x_o) + np.asarray(c_orig) @ x_o)
+        result = dataclasses.replace(
+            result,
+            x=x_o,
+            objective=f_o,
+            dual_values=(
+                None if result.dual_values is None else np.asarray(result.dual_values)[:n_rows_o]
+            ),
+            reduced_costs=(
+                None if result.reduced_costs is None else np.asarray(result.reduced_costs)[:n_orig]
+            ),
+            kkt_error=None,
+        )
+        objective = f_o + float(qp_data.obj_const)
+        if sense == ObjectiveSense.MAXIMIZE:
+            objective = -objective
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and result.objective is not None
