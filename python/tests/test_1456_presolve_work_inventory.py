@@ -207,6 +207,12 @@ def _resolve_registry_target(nm: str, call: ast.Call) -> tuple[str, str]:
     return module, attr
 
 
+# Solver-local helpers that run pre-solve passes for ``solve_model``. Their bodies
+# are scanned as part of the region. ``_convexity_rewrites`` (#1616 A-01) holds the
+# entropy and objective-epigraph rewrites so ``Model.convexity()`` shares them.
+_FOLLOWED_HELPERS = ("_convexity_rewrites",)
+
+
 def _scan() -> tuple[int, int, set[tuple[str, str]]]:
     """Return ``(start, end, {(module, callee)})`` for ``solve_model``'s pre-solve
     region.
@@ -234,6 +240,26 @@ def _scan() -> tuple[int, int, set[tuple[str, str]]]:
     )
     end = min(ends)
 
+    found: set[tuple[str, str]] = set()
+    # The region itself, then each solver-local helper it calls that runs passes
+    # on its behalf (``_FOLLOWED_HELPERS``). A pass moved into such a helper is
+    # still a pre-solve pass; not following it would read as the call being gone.
+    bodies: list[tuple[ast.FunctionDef, int]] = [(fn, end)]
+    region_calls = {
+        _called_name(n) for n in ast.walk(fn) if isinstance(n, ast.Call) and n.lineno < end
+    }
+    for helper in _FOLLOWED_HELPERS:
+        if helper not in region_calls:
+            continue  # test_followed_helpers_are_called guards the real source
+        hfn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == helper)
+        bodies.append((hfn, hfn.end_lineno + 1))
+    for body, stop in bodies:
+        found |= _collect(body, stop)
+    return fn.lineno, end, found
+
+
+def _collect(fn: ast.FunctionDef, end: int) -> set[tuple[str, str]]:
+    """``{(module, callee)}`` for the discopt calls in ``fn`` before line ``end``."""
     origin: dict[str, str] = {}
     # The name as *imported*, before any ``as`` alias. The registry entry points
     # are imported under an alias at every call site
@@ -263,7 +289,7 @@ def _scan() -> tuple[int, int, set[tuple[str, str]]]:
                     found.add(_resolve_registry_target(nm, n))
                 else:
                     found.add((origin[nm], nm))
-    return fn.lineno, end, found
+    return found
 
 
 # Deterministic work budgets a ``bounded`` row may name. Keyed by the symbol as
@@ -561,6 +587,24 @@ def test_a_computed_transformation_key_is_refused(tmp_path, monkeypatch):
     monkeypatch.setitem(globals(), "_SOLVER", fake)
     with pytest.raises(AssertionError, match="non-literal"):
         _scan()
+
+
+def test_followed_helpers_are_called():
+    """A followed helper the region no longer calls would be followed for nothing,
+    and a pass that moved out of it would read as still inventoried."""
+    tree = ast.parse(_SOLVER.read_text())
+    fn = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "solve_model"
+    )
+    _start, end, _found = _scan()
+    calls = {_called_name(n) for n in ast.walk(fn) if isinstance(n, ast.Call) and n.lineno < end}
+    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    checked = 0
+    for helper in _FOLLOWED_HELPERS:
+        assert helper in defined, f"{helper} is not defined in solver.py"
+        assert helper in calls, f"{helper} is not called in solve_model's pre-solve region"
+        checked += 1
+    assert checked == len(_FOLLOWED_HELPERS) > 0
 
 
 def test_recorded_passes_still_exist():
