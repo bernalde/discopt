@@ -482,3 +482,16 @@ def test_order1_sensitivity_skips_the_jax_kkt_jacobian(monkeypatch):
     np.testing.assert_allclose(s.dx_dp, ref[:n], rtol=1e-9, atol=1e-11)
     np.testing.assert_allclose(s.dlambda_dp, ref[n:], rtol=1e-9, atol=1e-11)
     assert np.abs(s.dx_dp).max() > 1e-3
+
+
+@pytest.mark.parametrize("key", ["qp_crossover", "qp_presolve", "qp_reg", "qp_hsde"])
+def test_pounce_cli_only_qp_option_names_the_cli_route(key):
+    # A-17/A-24: pounce.qp.solve_qp exposes none of these, so they stay refused,
+    # but the refusal now says they are CLI options and how to reach them,
+    # instead of filing them with NLP-engine options.
+    m = dm.Model("l")
+    x = m.continuous("x", lb=0, ub=10)
+    m.maximize(3 * x)
+    m.subject_to(x <= 4)
+    with pytest.raises(ValueError, match=rf"\['{key}'\].*command line.*m\.to_nl"):
+        m.solve(solver="pounce", pounce_options={key: "yes"})

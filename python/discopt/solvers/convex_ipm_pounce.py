@@ -262,6 +262,21 @@ def convex_engine_options(options: Optional[dict]) -> dict:
     """
     opts = dict(options or {})
     unknown = sorted(k for k in opts if k not in CONVEX_OPTION_KEYS)
+    # #1615 A-17/A-24: the convex engine's own knobs (``qp_crossover``,
+    # ``qp_presolve``, ``qp_hsde``, ...) are POUNCE options file / CLI options that
+    # ``pounce.qp.solve_qp`` exposes no argument for, so no discopt call can set
+    # them. Say where they do work rather than lump them in with NLP options.
+    cli_only = [k for k in unknown if k.startswith("qp_")]
+    if cli_only:
+        raise ValueError(
+            f"pounce_options {cli_only} are options of POUNCE's convex QP engine "
+            f"that only its command line / options file reaches: pounce.qp.solve_qp, "
+            f"which solver='pounce' calls for this model, takes no such argument, so "
+            f"the setting cannot be applied from discopt. Refused rather than "
+            f"ignored. To use it, export the model and run the CLI: "
+            f"m.to_nl('model.nl'), then `pounce model.nl {cli_only[0]}=...`. From "
+            f"discopt that engine accepts {sorted(CONVEX_OPTION_KEYS)}."
+        )
     if unknown:
         raise ValueError(
             f"pounce_options {unknown} are not options of POUNCE's convex LP/QP "
