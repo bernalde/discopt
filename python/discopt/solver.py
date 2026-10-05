@@ -1909,7 +1909,29 @@ def _try_native_spatial_kernel(
     # safe direction, but a caller who asked for 1e6 and got 1e-4 explored
     # the same 45 nodes as with no tolerance at all and was told nothing
     # (#1330). #1323's rule is honoured-or-declared; this is the declaration.
-    _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
+    _relative_requested = float(gap_tolerance) > _DEFAULT_REL_GAP_TOL
+    if not _relative_requested:
+        _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
+    # #1615 D-12: a ``gap_tolerance`` ABOVE the default is an explicit request to
+    # stop on the documented RELATIVE gap. The absolute ``gap_tol`` arm, conjoined
+    # in ``gap_closed``, made that request a no-op (Haverly 3: 13 nodes at 0.2,
+    # root gap 6.7%). Lifting the absolute arm to ``inf`` leaves exactly the
+    # Python tree's disjunction -- ``abs_gap_tol`` OR relative ``gap_tolerance``
+    # -- which ``_refuse_unclosed_published_pair`` re-checks on the published
+    # pair. The #1243 hazard (a default relative arm loosening a caller's
+    # absolute TIGHTENING) cannot arise: this arm is entered only when the
+    # caller loosened the relative tolerance itself, and a default or tighter
+    # ``gap_tolerance`` hands the kernel exactly the inputs it had before.
+    # In this arm ``abs_gap_tol`` below is the caller's own value too, so a
+    # looser ``abs_gap_tolerance`` is honoured and ``_warn_abs_gap_not_loosened``
+    # (above) correctly stays quiet.
+    #
+    # 1e300, NOT ``inf``: ``gap_closed`` reads ``bound >= inc - gap_tol``, and with
+    # ``inf`` a bound-less ``-inf`` passes it (``-inf >= -inf``) and the relative
+    # arm then passes too (``inf <= inf``) -- measured: Haverly ``optimal`` at
+    # node 0 with no bound. A finite lift keeps ``-inf`` failing the first clause.
+    if _relative_requested:
+        _kernel_abs_tol = 1e300
     solve_kwargs = dict(
         max_nodes=int(max_nodes),
         gap_tol=_kernel_abs_tol,
@@ -6856,34 +6878,6 @@ def _warn_abs_gap_not_loosened(abs_gap_tolerance: Optional[float], gap_tolerance
 #: ``solve_model``'s ``gap_tolerance`` default; a larger value is an explicit request
 #: to stop earlier on the relative gap.
 _DEFAULT_REL_GAP_TOL = 1e-4
-
-
-def _warn_kernel_gap_tolerance_absolute(gap_tolerance: float) -> None:
-    """Say so when the native kernel did not honour a LOOSER relative gap (#1615 D-12).
-
-    The kernel fathoms only when ``bound >= incumbent - gap_tolerance`` (absolute)
-    AND the abs-or-relative test holds, so a relative ``gap_tolerance`` above the
-    default never stops it early the way the documented relative criterion -- and
-    the Python engine -- would (Haverly 3: 13 nodes at 0.2 against a root gap of
-    6.7%). Giving the kernel a relative arm is a certificate-semantics change for
-    every kernel solve and needs its own panel, so this declares the drop rather
-    than changing it. Tightening below the default is honoured (the absolute arm
-    is then the stricter one) and is not reported.
-    """
-    if float(gap_tolerance) <= _DEFAULT_REL_GAP_TOL:
-        return
-    import warnings
-
-    warnings.warn(
-        f"The native spatial kernel applied gap_tolerance={gap_tolerance!r} as an "
-        "ABSOLUTE tolerance (it stops only when bound and incumbent are within "
-        f"{gap_tolerance!r} in objective units), not as the relative gap it is "
-        "documented as, so the looser relative tolerance did not stop the search "
-        "early. Set DISCOPT_NATIVE_SPATIAL_KERNEL=0 to run the Python engine, which "
-        "applies gap_tolerance relatively.",
-        UserWarning,
-        stacklevel=2,
-    )
 
 
 def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
@@ -15103,7 +15097,6 @@ def solve_model(
             _native_result.algorithm_route = (
                 "native-spatial: discopt Rust spatial branch-and-bound kernel"
             )
-        _warn_kernel_gap_tolerance_absolute(gap_tolerance)
         return _native_result
     # #1614: everything past this point is the Python spatial tree.
     _declare_route(

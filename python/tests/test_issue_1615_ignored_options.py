@@ -15,6 +15,7 @@ Each option must either take effect or be refused/declared loudly. Covered here:
   asked for another GDP reformulation.
 * B-01b -- ``initial_solution`` / ``warm_start`` on the convex ``pounce`` LP/QP
   arm (a cold matrix solve) warns.
+* D-12 -- a looser relative ``gap_tolerance`` is honoured by the native kernel.
 * B-02a -- ``skip_convex_check`` is documented as what it does (one local NLP).
 """
 
@@ -205,23 +206,40 @@ def test_skip_convex_check_docstring_states_local_solve():
     assert "local" in section and "no spatial branch-and-bound" in section
 
 
-def _kernel_gap_warnings(rec):
-    return [w for w in rec if "applied gap_tolerance" in str(w.message)]
-
-
-def test_kernel_loose_relative_gap_is_declared(monkeypatch):
-    """D-12: the kernel applies gap_tolerance absolutely; a looser one must be declared."""
+def _kernel_gap_solve(monkeypatch, **kw):
     monkeypatch.setenv("DISCOPT_NATIVE_SPATIAL_KERNEL", "1")
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        r = _haverly().solve(time_limit=60, gap_tolerance=0.2)
-    assert len(_kernel_gap_warnings(rec)) == 1
-    assert r.objective == pytest.approx(400.0, rel=0.2)
+        r = _haverly().solve(time_limit=60, **kw)
+    assert r.algorithm_route.startswith("native-spatial"), r.algorithm_route
+    return r, [w for w in rec if "gap_tolerance" in str(w.message)]
+
+
+def test_kernel_loose_relative_gap_is_honoured(monkeypatch):
+    """D-12: a gap_tolerance looser than the default stops the kernel on the RELATIVE gap.
+
+    It used to be applied absolutely, so 0.2 explored the same 233 nodes as 1e-4.
+    """
+    tight, _ = _kernel_gap_solve(monkeypatch)
+    loose, warned = _kernel_gap_solve(monkeypatch, gap_tolerance=0.2)
+    assert warned == []
+    assert loose.node_count < tight.node_count, (loose.node_count, tight.node_count)
+    # Haverly maximizes: the bound sits above the incumbent, by at most 20%.
+    assert loose.status == "optimal" and loose.gap_certified
+    assert loose.bound is not None and loose.objective is not None
+    assert loose.bound >= 400.0 - 1e-6  # still a valid bound on the optimum 400
+    gap = (loose.bound - loose.objective) / max(abs(loose.bound), abs(loose.objective))
+    assert 0.0 <= gap <= 0.2
+    assert loose.solver_stats["gap_criterion"] == "relative"
+
+
+def test_kernel_loose_gap_never_closes_without_a_bound(monkeypatch):
+    """The lifted absolute arm must stay finite: ``inf`` closed at node 0 with no bound."""
+    r, _ = _kernel_gap_solve(monkeypatch, gap_tolerance=0.5)
+    assert r.bound is not None and r.node_count > 0
 
 
 def test_kernel_default_gap_is_silent(monkeypatch):
-    monkeypatch.setenv("DISCOPT_NATIVE_SPATIAL_KERNEL", "1")
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        _haverly().solve(time_limit=60)
-    assert _kernel_gap_warnings(rec) == []
+    r, warned = _kernel_gap_solve(monkeypatch)
+    assert warned == []
+    assert r.status == "optimal" and r.solver_stats["gap_criterion"] == "absolute"
