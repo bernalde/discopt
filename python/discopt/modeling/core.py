@@ -9896,19 +9896,39 @@ class Model:
             # exclude the pole anyway (``x**2 >= 1``).
             from discopt._relax.poles import describe_poles
 
-            _logging.getLogger("discopt.solver").warning(
-                "No valid dual bound was produced for model %r (status=%s): its "
-                "objective has a pole inside the variable box -- %s. The objective "
-                "diverges near the pole, so no relaxation can bound it on a box "
-                "that contains the pole and the result carries no optimality claim "
-                "(the problem itself is unbounded if it diverges in the optimizing "
-                "direction at feasible points near the pole). If the pole is not "
-                "meant to be reachable, bound the denominator away from zero (e.g. "
-                "a strictly positive lower bound) or split the model by its sign.",
-                self.name,
-                result.status,
-                describe_poles(_poles),
-            )
+            if all(p.excluded_by_constraints for p in _poles):
+                # #1616 A-04: the box allows the denominator to vanish but the
+                # linear rows do not, so "a pole inside the box" mis-states the
+                # cause. The relaxation bounds each term over the variable box and
+                # never sees the implied range; a variable carrying that range does.
+                _logging.getLogger("discopt.solver").warning(
+                    "No valid dual bound was produced for model %r (status=%s): its "
+                    "objective divides by an expression that the variable bounds "
+                    "allow to reach 0, although the linear constraints keep it away "
+                    "from 0 -- %s. The relaxation bounds each term over the variable "
+                    "box, where the quotient is unbounded, so it does not use that "
+                    "implied range. To give it the range, introduce a variable for the "
+                    "denominator with the implied bound, e.g. "
+                    "`d = m.continuous('d', lb=<implied lower bound>)` with "
+                    "`m.subject_to(d == <denominator>)`, and divide by `d`.",
+                    self.name,
+                    result.status,
+                    describe_poles(_poles),
+                )
+            else:
+                _logging.getLogger("discopt.solver").warning(
+                    "No valid dual bound was produced for model %r (status=%s): its "
+                    "objective has a pole inside the variable box -- %s. The objective "
+                    "diverges near the pole, so no relaxation can bound it on a box "
+                    "that contains the pole and the result carries no optimality claim "
+                    "(the problem itself is unbounded if it diverges in the optimizing "
+                    "direction at feasible points near the pole). If the pole is not "
+                    "meant to be reachable, bound the denominator away from zero (e.g. "
+                    "a strictly positive lower bound) or split the model by its sign.",
+                    self.name,
+                    result.status,
+                    describe_poles(_poles),
+                )
         elif (
             isinstance(result, SolveResult)
             and result.bound is None
