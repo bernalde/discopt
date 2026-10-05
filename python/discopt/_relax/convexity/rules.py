@@ -1719,6 +1719,21 @@ def classify_model(
     :func:`_run_with_deep_recursion`) so deep expression graphs classify instead
     of demoting to convexity-unknown (issue #266).
     """
+    obj_convex, mask = classify_model_parts(
+        model, use_certificate=use_certificate, deadline=deadline
+    )
+    return obj_convex and all(mask), mask
+
+
+def classify_model_parts(
+    model: Model, *, use_certificate: bool = False, deadline: float | None = None
+) -> tuple[bool, list[bool]]:
+    """:func:`classify_model`, returning ``(objective_convex, constraint_mask)``.
+
+    The one walk behind :func:`classify_model`, kept separate so a caller that
+    reports *which* part failed (``Model.convexity()``, #1616 A-01) reads the same
+    verdicts the solver dispatches on instead of re-deriving them.
+    """
     return _run_with_deep_recursion(
         lambda: _classify_model_inner(model, use_certificate=use_certificate, deadline=deadline),
         depth_need=_recursion_headroom_need(model),
@@ -1811,7 +1826,6 @@ def _classify_model_inner(
     )
 
     constraint_mask: list[bool] = []
-    all_convex = obj_convex
     for c in model._constraints:
         if deadline is not None and _time.perf_counter() > deadline:
             raise ConvexityBudgetExceeded(
@@ -1819,15 +1833,13 @@ def _classify_model_inner(
                 f"{len(constraint_mask)}/{len(model._constraints)} constraints"
             )
         if isinstance(c, Constraint):
-            is_cvx = classify_constraint(c, model, cache, use_certificate=use_certificate)
-            constraint_mask.append(is_cvx)
-            if not is_cvx:
-                all_convex = False
+            constraint_mask.append(
+                classify_constraint(c, model, cache, use_certificate=use_certificate)
+            )
         else:
             constraint_mask.append(False)
-            all_convex = False
 
-    return all_convex, constraint_mask
+    return obj_convex, constraint_mask
 
 
 @dataclass(frozen=True)

@@ -10207,6 +10207,22 @@ class Model:
 
         return compute_iis(self, include_bounds=include_bounds, time_limit=time_limit)
 
+    def convexity(self, *, time_limit: float | None = 15.0):
+        """Report whether the solver can prove this model convex.
+
+        Returns a :class:`~discopt.convexity_report.ConvexityReport`. It runs the
+        same exact rewrites (``x*log(x)`` -> ``entropy(x)``, objective epigraph)
+        and the same classifier :meth:`solve` dispatches its convex fast path on,
+        so the two cannot disagree (#1616). ``is_convex=False`` means *not
+        proven*; the classifier is sound but incomplete.
+
+        >>> rep = m.convexity()
+        >>> rep.is_convex, rep.rewrites, rep.nonconvex_constraints()
+        """
+        from discopt.convexity_report import convexity
+
+        return convexity(self, time_limit=time_limit)
+
     # ── Validation ──
 
     def _iter_owned_leaves(self):

@@ -7710,6 +7710,41 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
     return False
 
 
+def _convexity_rewrites(
+    model: Model, *, entropy: bool = True, epigraph: bool = True
+) -> tuple[Model, tuple[str, ...]]:
+    """Apply the exact rewrites ``solve_model`` runs before classifying convexity.
+
+    Returns ``(model, applied)``: the rewritten model (never the caller's model
+    mutated -- both passes return a new model or the same one unchanged) and the
+    names of the passes that changed something, in order.
+
+    * ``"entropy"`` -- ``x*log(x)`` -> ``entropy(x)`` and ``x*log(x/y)`` ->
+      ``centropy(x, y)`` (:func:`~discopt._relax.factorable_reform.canonicalize_entropy`).
+    * ``"objective_epigraph"`` -- ``min z`` with ``z == g(x)`` relaxed to
+      ``z >= g(x)`` (:func:`~discopt._relax.objective_epigraph.relax_objective_defining_equality`).
+
+    Both are exact at the optimum. They are the reason the solve can prove a model
+    convex that the bare classifier does not, so this is the single definition
+    shared by the solve and by :meth:`discopt.modeling.core.Model.convexity`.
+    """
+    applied: list[str] = []
+    if entropy:
+        from discopt._relax.factorable_reform import canonicalize_entropy
+
+        new = canonicalize_entropy(model)
+        if new is not model:
+            applied.append("entropy")
+            model = new
+    if epigraph:
+        from discopt._relax.objective_epigraph import relax_objective_defining_equality
+
+        model, changed = relax_objective_defining_equality(model)
+        if changed:
+            applied.append("objective_epigraph")
+    return model, tuple(applied)
+
+
 def _classify_model_convexity(
     model: Model,
     *,
@@ -12927,10 +12962,7 @@ def solve_model(
 
     _presolve_deadline = PresolveDeadline(_deadline_exhausted)
 
-    from discopt._relax.factorable_reform import canonicalize_entropy
-
-    if _presolve_deadline.afford("canonicalize_entropy"):
-        model = canonicalize_entropy(model)
+    _entropy_ok = _presolve_deadline.afford("canonicalize_entropy")
 
     # --- Objective-defining-equality relaxation (the SUSPECT "objective
     # constraint"). When the model is `min/max z` with z a free scalar that
@@ -12944,12 +12976,15 @@ def solve_model(
     # The transform is structurally gated and abstains conservatively, so it is
     # general and never alters the optimum. Skipped when streaming B&B callbacks
     # are attached so node/incumbent indices stay aligned with the user's model.
-    if not _has_bb_callbacks:
-        from discopt._relax.objective_epigraph import relax_objective_defining_equality
-
-        model, _epi_changed = relax_objective_defining_equality(model)
-        if _epi_changed:
-            logger.debug("relaxed objective-defining equality to binding inequality")
+    #
+    # Both rewrites live in :func:`_convexity_rewrites`, which ``Model.convexity()``
+    # also calls, so the public verdict and the one dispatch uses cannot drift
+    # apart (#1616 A-01).
+    model, _rewrites = _convexity_rewrites(
+        model, entropy=_entropy_ok, epigraph=not _has_bb_callbacks
+    )
+    if "objective_epigraph" in _rewrites:
+        logger.debug("relaxed objective-defining equality to binding inequality")
 
     # --- Factorable reformulation: clear sign-definite denominators and lift
     # mixed repeated-factor products (e.g. x*x*y) into bilinear form via
