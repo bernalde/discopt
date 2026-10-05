@@ -47,6 +47,16 @@ def _install_fake_rust_classifier(monkeypatch, problem_kind: str) -> None:
         def is_constraint_quadratic(self, _idx):
             return problem_kind in linear_constraint_kinds | quadratic_constraint_kinds
 
+        # #1614 A-21: the classifier reads the exact quadratic forms to tell a
+        # genuine degree-2 term from a zero-coefficient one; every kind the fake
+        # answers "quadratic" for carries a real (nonzero) term. Shape:
+        # (q_rows, q_cols, q_vals, lin_idx, lin_vals, const).
+        def objective_quadratic_form(self):
+            return ([0], [0], [1.0], [], [], 0.0)
+
+        def constraint_quadratic_form(self, _idx):
+            return ([0], [0], [1.0], [], [], 0.0)
+
     fake_rust = types.SimpleNamespace(
         PyTreeManager=object,
         model_to_repr=lambda _model, _builder=None: _FakeRepr(),
