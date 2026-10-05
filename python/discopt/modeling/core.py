@@ -7780,7 +7780,11 @@ class Model:
 
         Exactly one disjunct is **selected**: this maps to indicator
         constraints (``if_then``) and an ``exactly(1, ...)`` selector, i.e.
-        :attr:`DisjunctionSemantics.SELECT_ONE`.
+        :attr:`DisjunctionSemantics.SELECT_ONE`. The rows are tagged with their
+        disjunction, so ``solve(gdp_method="hull")`` lowers the block by the
+        convex hull with the Disjunct indicators as its selectors (the same
+        relaxation ``either_or`` gets); other methods use big-M. A block with an
+        empty disjunct has no row carrying that indicator and stays on big-M.
 
         Because each block owns a *named* indicator, the select-one reading is
         directly observable here, and it is the one users most often misread:
@@ -7815,8 +7819,25 @@ class Model:
         # same predicate that pass uses, not on which member it was handed.
         resolved = _coerce_disjunction_semantics(semantics)
         _require_semantics_supported(resolved, _SELECT_ONE_ROWS, "add_disjunction()")
-        for d in disjuncts:
+        # #1615 C-10a: a per-call key tags each emitted indicator row with its
+        # disjunction and disjunct index, so ``gdp_method="hull"`` can find the
+        # block again. Counted over keys already present so a cloned or
+        # deserialized model cannot collide.
+        taken = {
+            c.disjunction[0]
+            for c in self._constraints
+            if isinstance(c, _IndicatorConstraint) and c.disjunction is not None
+        }
+        n_keys = len(taken)
+        key = f"add_disjunction:{name or ''}:{n_keys}"
+        while key in taken:
+            n_keys += 1
+            key = f"add_disjunction:{name or ''}:{n_keys}"
+        for k, d in enumerate(disjuncts):
+            n_before = len(self._constraints)
             self.if_then(d.indicator.variable, d._constraints, name=d.name)
+            for row in self._constraints[n_before:]:
+                row.disjunction = (key, k, len(disjuncts))
             # #1430: the block's rows are now in ``_constraints``; record that so
             # ``validate`` does not report it as forgotten. Set per disjunct rather
             # than for the call, so a list that raises part-way through leaves an
@@ -10932,6 +10953,11 @@ class _IndicatorConstraint:
     constraint: Constraint
     active_value: int = 1
     name: Optional[str] = None
+    # #1615 C-10a: set by ``Model.add_disjunction`` to ``(key, k, n)`` -- this row
+    # belongs to disjunct ``k`` of the ``n``-way disjunction ``key`` -- so the GDP
+    # pass can lower the block by hull with the user's indicators as selectors
+    # when ``gdp_method="hull"``. ``None`` for a plain ``if_then`` row.
+    disjunction: Optional[tuple[str, int, int]] = None
 
 
 @dataclass

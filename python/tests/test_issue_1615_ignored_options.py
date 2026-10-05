@@ -9,8 +9,9 @@ Each option must either take effect or be refused/declared loudly. Covered here:
   (``rlt``, ``partitions``, ``strategy``, ``presolve``,
   ``in_tree_presolve_stride``, ``obbt_at_root``) now route to the Python engine.
 * B-08 -- an explicit ``mu_init`` is honoured under ``warm_start=``.
-* C-10a -- ``gdp_method="hull"`` on indicator constraints (``add_disjunction``
-  blocks) is declared with a warning instead of silently lowered by big-M.
+* C-10a -- ``gdp_method="hull"`` lowers ``add_disjunction`` blocks by hull, with
+  the Disjunct indicators as selectors; plain ``if_then`` rows (and a block the
+  hull cannot take) are declared with a warning.
 * C-10b -- the convex MINLP kernel (big-M only) is not attempted when the caller
   asked for another GDP reformulation.
 * B-01b -- ``initial_solution`` / ``warm_start`` on the convex ``pounce`` LP/QP
@@ -143,10 +144,121 @@ def _twobox(api):
     return m
 
 
-def test_hull_on_add_disjunction_warns():
-    with pytest.warns(UserWarning, match=r"gdp_method='hull' does not apply .* indicator"):
-        r = _twobox("make_disjunct").solve(gdp_method="hull")
+def _gdp_warnings(fn):
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        r = fn()
+    return r, [str(w.message) for w in rec if "gdp_method" in str(w.message)]
+
+
+def test_hull_on_add_disjunction_is_honoured():
+    # C-10a: the Disjunct blocks take the hull -- the same root bound as either_or
+    # (9.00), not big-M's 6.30 -- and nothing warns.
+    r, msgs = _gdp_warnings(lambda: _twobox("make_disjunct").solve(gdp_method="hull"))
+    assert msgs == []
+    assert r.status == "optimal"
     assert r.objective == pytest.approx(9.0, abs=1e-6)
+    assert r.root_bound == pytest.approx(9.0, abs=1e-4)
+
+
+def test_bigm_on_add_disjunction_is_unchanged():
+    # Control: big-M on the same blocks keeps its weaker root bound.
+    r = _twobox("make_disjunct").solve(gdp_method="big-m")
+    assert r.objective == pytest.approx(9.0, abs=1e-6)
+    assert r.root_bound == pytest.approx(6.3, abs=1e-4)
+
+
+def test_hull_on_add_disjunction_uses_the_user_indicators():
+    # The hull's selectors ARE the Disjunct indicators, so a constraint on an
+    # indicator still binds: forbidding box B forces box A (min x+y = 10).
+    from discopt._relax.gdp_reformulate import reformulate_gdp
+
+    m = dm.Model("twobox_fix")
+    x = m.continuous("x", lb=0, ub=10)
+    y = m.continuous("y", lb=0, ub=10)
+    dA, dB = m.make_disjunct("A"), m.make_disjunct("B")
+    for c in [x >= 4, x <= 5, y >= 6, y <= 7]:
+        dA.subject_to(c)
+    for c in [x >= 7, x <= 8, y >= 2, y <= 3]:
+        dB.subject_to(c)
+    m.add_disjunction([dA, dB])
+    m.subject_to(dB.indicator.variable <= 0)
+    m.minimize(x + y)
+    lowered = reformulate_gdp(m, method="hull")
+    assert not any(v.name.startswith("_gdp_aux_hull") for v in lowered._variables)
+    assert any(v.name.startswith("_hull_") for v in lowered._variables)
+    r = m.solve(gdp_method="hull")
+    assert r.objective == pytest.approx(10.0, abs=1e-6)
+
+
+def test_hull_on_nonlinear_add_disjunction_matches_either_or_hull():
+    # Perspective rows on the user's indicators: the same lowering, hence the same
+    # solve, as the either_or hull of the same disjunction. (Compared against the
+    # either_or hull rather than the true optimum: both currently accept a point
+    # 5.9e-5 infeasible on the exp row -- pre-existing, tracked in #1659.)
+    def build(api):
+        m = dm.Model("nl_disj")
+        x = m.continuous("x", lb=0, ub=4)
+        y = m.continuous("y", lb=0, ub=20)
+        A = [y >= dm.exp(x) - 1, x <= 1]
+        B = [y >= x**2 + 3, x >= 2]
+        if api == "either_or":
+            m.either_or([A, B])
+        else:
+            d1, d2 = m.make_disjunct("lo"), m.make_disjunct("hi")
+            for c in A:
+                d1.subject_to(c)
+            for c in B:
+                d2.subject_to(c)
+            m.add_disjunction([d1, d2])
+        m.minimize(y - 2 * x)
+        return m
+
+    re = build("either_or").solve(gdp_method="hull")
+    rh, msgs = _gdp_warnings(lambda: build("make_disjunct").solve(gdp_method="hull"))
+    assert msgs == []
+    assert rh.status == re.status == "optimal"
+    assert rh.objective == pytest.approx(re.objective, abs=1e-8)
+
+
+def test_hull_on_plain_if_then_still_warns():
+    m = dm.Model("ifthen")
+    x = m.continuous("x", lb=0, ub=10)
+    z = m.binary("z")
+    m.if_then(z, [x >= 5])
+    m.subject_to(z >= 1)
+    m.minimize(x)
+    with pytest.warns(UserWarning, match=r"gdp_method='hull' does not apply to the 1 indicator"):
+        r = m.solve(gdp_method="hull")
+    assert r.objective == pytest.approx(5.0, abs=1e-6)
+
+
+def test_hull_on_add_disjunction_with_empty_disjunct_warns():
+    # An empty disjunct leaves no row carrying its indicator, so the hull has no
+    # selector for it; the block stays on big-M and says so.
+    m = dm.Model("empty_disj")
+    x = m.continuous("x", lb=0, ub=10)
+    dA, dB = m.make_disjunct("A"), m.make_disjunct("B")
+    dA.subject_to(x >= 5)
+    m.add_disjunction([dA, dB])
+    m.minimize(-x)
+    with pytest.warns(UserWarning, match=r"does not apply to the 1 indicator"):
+        r = m.solve(gdp_method="hull")
+    assert r.objective == pytest.approx(-10.0, abs=1e-6)
+
+
+def test_add_disjunction_tag_survives_copy_and_serialization():
+    from discopt import serialize
+    from discopt.modeling.core import _IndicatorConstraint
+
+    m = _twobox("make_disjunct")
+
+    def tags(model):
+        return [c.disjunction for c in model._constraints if isinstance(c, _IndicatorConstraint)]
+
+    assert all(t is not None for t in tags(m)) and len(tags(m)) == 8
+    assert tags(m.clone()) == tags(m)
+    assert tags(serialize.loads(serialize.dumps(m))) == tags(m)
 
 
 def test_hull_on_either_or_is_silent_and_takes_effect():
