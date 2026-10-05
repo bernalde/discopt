@@ -732,6 +732,11 @@ def solve_gp(model: Model, **solve_kwargs) -> Optional[SolveResult]:
         # status propagated but the reason did not (#1061).
         incumbent_verification_failed=log_result.incumbent_verification_failed,
         _model=model,
+        # #1614 D-14: the GP route rebuilds the result in x-space, so name it and
+        # carry the engine that solved the log-space program.
+        algorithm_route=(
+            f"gp: log-space convex reformulation (inner: {log_result.algorithm_route})"
+        ),
     )
     return result
 
@@ -1117,6 +1122,7 @@ def solve_gp_minlp(
         convex_fast_path=False,
         gap_certified=certified,
         _model=model,
+        algorithm_route="gp-minlp: discopt integer branch and bound over log-space GP relaxations",
     )
 
 

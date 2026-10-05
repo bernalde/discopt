@@ -5268,16 +5268,21 @@ def solve_feasibility_pump(
     fp_main_norm: Optional[str] = None,
     fp_norm_constraint: bool = False,
     fp_norm_constraint_coef: float = 1.0,
+    milp_solver: str = "auto",
     **kwargs,
 ) -> SolveResult:
-    """Run the MIP-NLP feasibility pump as a standalone heuristic method."""
+    """Run the MIP-NLP feasibility pump as a standalone heuristic method.
+
+    ``milp_solver`` selects the engine of the integer-projection MILPs, as on
+    every other MIP-NLP method (#1614 E-01(d): it used to be rejected here).
+    """
     if kwargs:
         raise ValueError(
             "Unsupported feasibility-pump option(s): "
             + ", ".join(sorted(kwargs))
             + ". Supported FP options are: "
             + ", ".join(sorted(FP_OPTION_KEYS))
-            + ", add_no_good_cuts, feasibility_norm."
+            + ", add_no_good_cuts, feasibility_norm, milp_solver."
         )
     t_start = time.perf_counter()
     fp_config = _normalize_fp_config(
@@ -5347,6 +5352,7 @@ def solve_feasibility_pump(
         fp_mipgap=fp_config.mipgap,
         fp_discrete_only=fp_config.discrete_only,
         fp_projzerotol=fp_config.projzerotol,
+        milp_solver=milp_solver,
     )
     wall_time = time.perf_counter() - t_start
     if fp.best_x is not None and fp.best_obj is not None:
@@ -6651,7 +6657,11 @@ def solve_goa(
 
     oa_convexity = classify_oa_cut_convexity(model)
     if oa_convexity.objective_is_convex and all(oa_convexity.constraint_mask):
-        ignored_amp_options = sorted(provided_option_keys.intersection(GOA_AMP_ONLY_OPTION_KEYS))
+        # #1614 E-01(d): ``milp_solver`` is not AMP-only -- the OA masters run on
+        # it -- so it is forwarded, never listed as ignored.
+        ignored_amp_options = sorted(
+            provided_option_keys.intersection(GOA_AMP_ONLY_OPTION_KEYS) - {"milp_solver"}
+        )
         if ignored_amp_options:
             warnings.warn(
                 "GOA routed a convexity-certified model to OA; AMP-only GOA "
@@ -6671,6 +6681,7 @@ def solve_goa(
             initial_point=initial_point,
             add_no_good_cuts=bool(add_no_good_cuts),
             feasibility_norm=feasibility_norm,
+            milp_solver=amp_kwargs["milp_solver"],
             **fp_kwargs,
         )
         result.wall_time += elapsed
@@ -6710,6 +6721,7 @@ def solve_goa(
                 fp_mipgap=fp_config.mipgap,
                 fp_discrete_only=fp_config.discrete_only,
                 fp_projzerotol=fp_config.projzerotol,
+                milp_solver=amp_kwargs["milp_solver"],
             )
             pre_amp_mip_count += fp_result.mip_count
             if fp_result.best_x is not None:

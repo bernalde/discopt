@@ -13098,9 +13098,21 @@ def solve_model(
     # must fail the solve: the old ``except Exception`` + DEBUG log made a crashed
     # pass indistinguishable from 'nothing to linearize' (CLAUDE.md §3/§7).
     from discopt._relax.binary_multilinear_reform import has_binary_multilinear_work
+    from discopt._relax.problem_classifier import ProblemClass as _PC
+    from discopt._relax.problem_classifier import classify_problem as _classify_problem
     from discopt.transformations import get as _get_transformation
 
-    if _presolve_deadline.afford("binary_multilinear") and has_binary_multilinear_work(model):
+    # #1614 A-21: a product whose exact arena coefficient is zero (``0*x*y``) is
+    # still a syntactic product, and the three product reforms below would lift
+    # it into a big-M MILP and divert an already-linear model off the MILP route.
+    # ``classify_problem`` reads the exact quadratic form, so it is the gate.
+    _already_linear = _classify_problem(model) in (_PC.LP, _PC.MILP)
+
+    if (
+        not _already_linear
+        and _presolve_deadline.afford("binary_multilinear")
+        and has_binary_multilinear_work(model)
+    ):
         _bml = _get_transformation("binary.multilinear").apply(model)
         if _bml is not model:
             from discopt._relax.problem_classifier import ProblemClass, classify_problem
@@ -13283,7 +13295,7 @@ def solve_model(
     # ``expand_integer_products``, which returns ``model`` unchanged -- the
     # ``_iml is not model`` test below. Every other exception is a defect and
     # propagates instead of being logged at DEBUG and skipped.
-    if _tuning().integer_multilinear_reform:
+    if _tuning().integer_multilinear_reform and not _already_linear:
         from discopt._relax.integer_product_reform import (
             extend_initial_point as _iml_extend,
         )
@@ -13466,6 +13478,7 @@ def solve_model(
     # the reformulated path both stay fast.
     if (
         not _did_multilinear_reform
+        and not _already_linear
         and _presolve_deadline.afford("integer_bilinear")
         and has_nonconvex_integer_bilinear(model)
     ):
@@ -14580,6 +14593,9 @@ def solve_model(
         and not _callbacks_force_bb  # #1500: see the entry-route note above
     ):
         logger.info("Convex NLP detected — solving with single NLP (global optimality guaranteed)")
+        _declare_route(
+            f"convex-nlp: single {nlp_solver} NLP solve (continuous model proved convex)"
+        )
         result = _solve_continuous(
             model,
             time_limit,
@@ -31182,6 +31198,14 @@ def _milp_is_exactly_linear(model: Model) -> bool:
     """
     from discopt._relax.term_classifier import classify_nonlinear_terms
 
+    _degree_linear, _zero_q_linear = _repr_linearity(model)
+    if not _degree_linear:
+        # #1614 A-21: not linear by degree, but every degree-2 piece has an exactly
+        # empty Q on the arena walk (``0*x*y``, ``0.0*(x+y)**2``). The walk is exact,
+        # so the linear projection IS the model; the syntactic term classifier
+        # below would count the zero-coefficient product as bilinear.
+        return _zero_q_linear
+
     _nl = classify_nonlinear_terms(model)
     if (
         _nl.bilinear
@@ -31206,20 +31230,37 @@ def _milp_is_exactly_linear(model: Model) -> bool:
     # linear in its objective and every constraint. For models that reach here
     # through the normal MILP route this is a no-op (the router already proved
     # linearity); it only guards direct calls, future re-routing, and any
-    # router/extractor representation discrepancy.
+    # router/extractor representation discrepancy. (Computed by
+    # ``_repr_linearity`` above, before the term classifier.)
+    return _degree_linear
+
+
+def _repr_linearity(model: Model) -> tuple[bool, bool]:
+    """``(degree_linear, zero_q_linear)`` from the Rust model repr.
+
+    ``degree_linear``: the objective and every constraint are linear by the degree
+    analysis. ``zero_q_linear``: additionally accepting a degree-2 body whose exact
+    arena quadratic form has no nonzero Q entry (#1614 A-21). Both False when the
+    repr cannot be built.
+    """
     try:
+        from discopt._relax.problem_classifier import _quadratic_form_is_linear
         from discopt._rust import model_to_repr
 
         _repr = model_to_repr(model, getattr(model, "_builder", None))
-        _fully_linear = bool(_repr.is_objective_linear()) and all(
-            _repr.is_constraint_linear(i) for i in range(_repr.n_constraints)
-        )
+        _obj_lin = bool(_repr.is_objective_linear())
+        _rows = [i for i in range(_repr.n_constraints) if not _repr.is_constraint_linear(i)]
     except Exception as exc:  # noqa: BLE001 - see below
         # #1520: kept as a sound fallback, like the solve's own repr (#1516):
         # "not provably linear" defers to the general path.
         _warn_fallback_once("Rust model repr (MILP linearity check)", exc, "deferring")
-        _fully_linear = False
-    return _fully_linear
+        return False, False
+    if _obj_lin and not _rows:
+        return True, True
+    zero_q = (_obj_lin or _quadratic_form_is_linear(_repr.objective_quadratic_form())) and all(
+        _quadratic_form_is_linear(_repr.constraint_quadratic_form(i)) for i in _rows
+    )
+    return False, zero_q
 
 
 def _highs_std_form(model: Model):

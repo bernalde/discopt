@@ -63,6 +63,9 @@ _FP_OPTION_KEYS = frozenset(
         "add_no_good_cuts",
         "feasibility_norm",
         "init_strategy",
+        # #1614 E-01(d): the pump's projection MILPs take the engine like every
+        # other method's masters do.
+        "milp_solver",
         *FP_OPTION_KEYS,
     }
 )
@@ -1022,6 +1025,7 @@ def solve_mip_nlp(
                 fp_main_norm=options.get("fp_main_norm"),
                 fp_norm_constraint=options.get("fp_norm_constraint", False),
                 fp_norm_constraint_coef=options.get("fp_norm_constraint_coef", 1.0),
+                milp_solver=options.get("milp_solver", "auto"),
             )
             ensure_mip_nlp_trace(
                 result,

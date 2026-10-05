@@ -473,7 +473,14 @@ def _solve_milp_once(
     # incumbent. `mip_dual_bound` is +/-inf before the root LP finishes.
     bound = None
     raw_bound = float(info.mip_dual_bound)
-    if np.isfinite(raw_bound):
+    # #1614 D-26: with no integer column HiGHS runs its LP solver, never the MIP
+    # one, and ``mip_dual_bound`` keeps a stale FINITE 0.0. Read as a bound it
+    # capped an optimal LP's bound at 0 (a continuous Benders master then never
+    # closed) and, on an LP stopped by a limit, would have claimed 0 as a lower
+    # bound on an LP whose optimum is below it. An LP's bound is its optimum,
+    # which the OPTIMAL arm below supplies; otherwise there is none.
+    has_integer = integrality is not None and bool(np.any(np.asarray(integrality).ravel()))
+    if has_integer and np.isfinite(raw_bound):
         bound = raw_bound
     if status == SolveStatus.OPTIMAL and objective is not None:
         # HiGHS may report a dual bound a hair above the incumbent at its own
@@ -624,7 +631,11 @@ def _cross_check_presolve(
         bound = best[0]
     if bound < float(primary.bound):
         diag["bound_lowered"] = float(primary.bound) - bound
-        logger.warning(
+        # An ulp-level lowering is still applied, but at WARNING it fired on nearly
+        # every master once the decomposition masters moved to HiGHS (#1614 D-26).
+        material = float(primary.bound) - bound > 1e-9 * max(1.0, abs(bound))
+        logger.log(
+            logging.WARNING if material else logging.DEBUG,
             "HiGHS master: bound %.12g lowered to %.12g by the presolve-free cross-solve (#1634)",
             primary.bound,
             bound,
