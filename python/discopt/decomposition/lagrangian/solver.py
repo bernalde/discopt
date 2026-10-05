@@ -106,7 +106,11 @@ def solve_lagrangian(
         ``bound`` is the rigorous Lagrangian dual lower bound; ``objective`` is
         the best feasible value found by the recovery heuristic (if any).
     """
-    from discopt.solvers.lp_backend import get_lp_solver, get_milp_solver, get_qp_solver
+    from discopt.solvers.lp_backend import (
+        get_decomposition_master_solver,
+        get_lp_solver,
+        get_qp_solver,
+    )
 
     cfg = config or LagrangianConfig(
         time_limit=time_limit,
@@ -131,7 +135,8 @@ def solve_lagrangian(
     # ill-conditioned LP (#145), and here that value *is* the certificate.
     # ``get_milp_solver`` still falls back to POUNCE when the Rust simplex binding
     # is unavailable, so POUNCE-only installs keep working.
-    milp = get_milp_solver(backend="simplex")
+    # #1614 D-27: HiGHS when available (an exact-vertex engine, as #986 requires).
+    milp, _ = get_decomposition_master_solver()
     # ``lp`` only picks the next multiplier iterate (the Kelley/bundle master over
     # λ) and recovers a primal incumbent; the dual bound at that λ is always
     # recomputed by ``_subproblem``, so this seam is not certificate-producing and

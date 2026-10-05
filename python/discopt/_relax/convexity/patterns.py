@@ -795,6 +795,97 @@ def _affine_square_sum_matrix(
     return np.asarray(rows, dtype=np.float64), np.asarray(consts, dtype=np.float64)
 
 
+def weighted_affine_square_decomposition(
+    expr: Expression, model: Model, sign: float = 1.0
+) -> Optional[tuple[np.ndarray, _sp.csr_matrix, np.ndarray, np.ndarray, float]]:
+    """Decompose ``sign * expr`` as ``sum_k w_k (a_k . x + b_k)**2 + l . x + c0``, ``w_k > 0``.
+
+    Returns ``(w, A, b, l, c0)`` -- rows of ``A`` are the ``a_k`` over every scalar
+    variable of the model, sparse -- or ``None`` when the expression does not have that
+    shape *structurally*. The top level is a signed sum (``+``, ``-``, negation,
+    ``dm.sum``); each summand, after peeling a product of scalar constants, is
+    either a square of a scalar affine form (``s**2`` or ``s * s`` with the same
+    ``s``) carrying a strictly positive weight, or affine. A square with a
+    non-positive weight abstains: that is curvature this proof does not cover.
+
+    The point is that convexity here is a fact about the *expression*, not about a
+    floating-point Hessian: ``Q = 2 A' diag(w) A`` assembled in floats can be
+    indefinite in exact arithmetic for a rank-deficient ``A`` (#1616 A-18), and an
+    exact PSD test then correctly refuses it. Lifting ``d_k = a_k . x + b_k`` turns
+    the objective into ``sum_k w_k d_k**2 + l . x + c0``, whose Hessian is
+    diagonal with entries ``2 w_k > 0`` -- PSD exactly, with no rounding to argue.
+    """
+    from discopt._relax.problem_classifier import (
+        _extract_linear_coefficients_sparse,
+        _NotLinearError,
+    )
+
+    n_total = _total_scalar_variables(model)
+    terms: list[tuple[float, Expression]] = []
+    _flatten_sum_terms(expr, float(sign), terms)
+
+    weights: list[float] = []
+    r_idx: list[int] = []
+    c_idx: list[int] = []
+    vals: list[float] = []
+    consts: list[float] = []
+    lin = np.zeros(n_total, dtype=np.float64)
+    c0 = 0.0
+    for scale, term in terms:
+        node = term
+        while isinstance(node, BinaryOp) and node.op == "*":
+            if isinstance(node.left, Constant) and node.left.value.ndim == 0:
+                scale *= float(node.left.value)
+                node = node.right
+            elif isinstance(node.right, Constant) and node.right.value.ndim == 0:
+                scale *= float(node.right.value)
+                node = node.left
+            else:
+                break
+        if not np.isfinite(scale):
+            return None
+        base: Optional[Expression] = None
+        if (
+            isinstance(node, BinaryOp)
+            and node.op == "**"
+            and isinstance(node.right, Constant)
+            and node.right.value.ndim == 0
+            and float(node.right.value) == 2.0
+        ):
+            base = node.left
+        elif isinstance(node, BinaryOp) and node.op == "*" and _same_expr(node.left, node.right):
+            base = node.left
+        try:
+            if base is not None:
+                if scale == 0.0:
+                    continue
+                if scale < 0.0:
+                    return None
+                row, const = _extract_linear_coefficients_sparse(base, model, n_total)
+                for j, v in row.items():
+                    r_idx.append(len(weights))
+                    c_idx.append(j)
+                    vals.append(float(v))
+                weights.append(scale)
+                consts.append(float(const))
+            else:
+                row, const = _extract_linear_coefficients_sparse(node, model, n_total)
+                for j, v in row.items():
+                    lin[j] += scale * float(v)
+                c0 += scale * float(const)
+        except _NotLinearError:
+            return None
+    if not weights:
+        return None
+    return (
+        np.asarray(weights, dtype=np.float64),
+        _sp.csr_matrix((vals, (r_idx, c_idx)), shape=(len(weights), n_total)),
+        np.asarray(consts, dtype=np.float64),
+        lin,
+        float(c0),
+    )
+
+
 def _peel_nonneg_scale(term: Expression) -> tuple[Optional[float], Expression]:
     """Peel a product of nonnegative constant factors off ``term``.
 

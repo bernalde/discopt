@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from typing import Optional
 
 import numpy as np
 
@@ -209,20 +210,37 @@ def reformulate_gdp(
         new_model._variables.append(var)
         return var
 
-    # #1615 C-10a: indicator constraints -- ``Model.if_then`` and the blocks
-    # ``Model.add_disjunction`` lowers to ``if_then`` + ``exactly(1)`` -- are always
-    # lowered by big-M (or multiple big-M); the hull / simplex reformulations
-    # apply only to ``either_or`` disjunctions. Say so rather than let a caller
-    # believe ``gdp_method="hull"`` reached them.
+    # #1615 C-10a: under ``gdp_method="hull"`` the Disjunct blocks of
+    # ``Model.add_disjunction`` (indicator rows tagged with their disjunction) are
+    # lowered by hull, with the user's indicators as the selectors -- the model
+    # already carries their ``exactly(1)`` row. ``_hull_groups`` maps a group key
+    # to its rebuilt ``_DisjunctiveConstraint`` and selectors; ``None`` when no
+    # group qualifies.
+    _hull_groups = _collect_indicator_hull_groups(model) if method == "hull" else {}
+
+    # Every other indicator row -- a plain ``Model.if_then``, any block under
+    # ``"simplex"`` -- is lowered by big-M (or multiple big-M). Say so rather than
+    # let a caller believe ``gdp_method`` reached it.
     if method in ("hull", "simplex"):
-        _n_ind = sum(1 for c in model._constraints if isinstance(c, _IndicatorConstraint))
+        _n_ind = sum(
+            1
+            for c in model._constraints
+            if isinstance(c, _IndicatorConstraint)
+            and (c.disjunction is None or c.disjunction[0] not in _hull_groups)
+        )
         if _n_ind:
+            _which = (
+                "Model.if_then rows, and add_disjunction blocks the hull cannot "
+                "take (an empty disjunct or a shared indicator)"
+                if method == "hull"
+                else "Model.if_then, and the Disjunct blocks of Model.add_disjunction"
+            )
             warnings.warn(
                 f"gdp_method={method!r} does not apply to the {_n_ind} indicator "
-                "constraint(s) in this model (Model.if_then, and the Disjunct blocks "
-                "of Model.add_disjunction, which lower to if_then): they are "
-                "reformulated by big-M. Only Model.either_or disjunctions take the "
-                f"{method!r} reformulation.",
+                f"constraint(s) in this model ({_which}): they are reformulated by "
+                f"big-M. Model.either_or disjunctions take the {method!r} "
+                "reformulation"
+                + (", as do complete add_disjunction blocks." if method == "hull" else "."),
                 UserWarning,
                 stacklevel=2,
             )
@@ -242,8 +260,22 @@ def reformulate_gdp(
     if method == "mbigm" or "mbigm" in auto_advice.values():
         lp_data = _precompute_lp_relaxation(model)
 
+    _hull_emitted: set[str] = set()
     for ci, c in enumerate(model._constraints):
-        if isinstance(c, _IndicatorConstraint):
+        if (
+            isinstance(c, _IndicatorConstraint)
+            and c.disjunction is not None
+            and c.disjunction[0] in _hull_groups
+        ):
+            key = c.disjunction[0]
+            if key not in _hull_emitted:
+                _hull_emitted.add(key)
+                dc, sels = _hull_groups[key]
+                new_vars, new_cons = _reformulate_disjunction_hull(
+                    dc, new_model, _add_aux_binary, selectors=sels
+                )
+                new_model._constraints.extend(new_cons)
+        elif isinstance(c, _IndicatorConstraint):
             new_cons = _reformulate_indicator(c, new_model, lp_data=lp_data)
             new_model._constraints.extend(new_cons)
         elif isinstance(c, _DisjunctiveConstraint):
@@ -287,6 +319,53 @@ def reformulate_gdp(
     carry_validation_guards(model, new_model)  # #1498
 
     return new_model
+
+
+def _collect_indicator_hull_groups(
+    model: Model,
+) -> dict[str, tuple[_DisjunctiveConstraint, list[Variable]]]:
+    """Rebuild the ``Model.add_disjunction`` blocks the hull can lower (#1615 C-10a).
+
+    ``add_disjunction`` lowers each Disjunct to ``if_then`` rows tagged
+    ``(key, k, n)``. A group qualifies when every disjunct ``0..n-1`` has at
+    least one row, each disjunct's rows share one indicator with
+    ``active_value == 1``, and the ``n`` indicators are distinct. An empty
+    disjunct leaves its indicator unrecorded, and the hull needs every selector,
+    so such a group stays on big-M (and is counted in the caller's warning).
+    """
+    rows: dict[str, dict[int, list[_IndicatorConstraint]]] = {}
+    sizes: dict[str, int] = {}
+    for c in model._constraints:
+        if isinstance(c, _IndicatorConstraint) and c.disjunction is not None:
+            key, k, n = c.disjunction
+            rows.setdefault(key, {}).setdefault(k, []).append(c)
+            if sizes.setdefault(key, n) != n:
+                sizes[key] = -1  # inconsistent tag: leave the group on big-M
+    groups: dict[str, tuple[_DisjunctiveConstraint, list[Variable]]] = {}
+    for key, by_k in rows.items():
+        n = sizes[key]
+        if n < 1 or sorted(by_k) != list(range(n)):
+            continue
+        sels: list[Variable] = []
+        ok = True
+        for k in range(n):
+            inds = {id(r.indicator) for r in by_k[k]}
+            if len(inds) != 1 or any(r.active_value != 1 for r in by_k[k]):
+                ok = False
+                break
+            ind = by_k[k][0].indicator
+            if not isinstance(ind, Variable):
+                ok = False
+                break
+            sels.append(ind)
+        if not ok or len({id(v) for v in sels}) != n:
+            continue
+        dc = _DisjunctiveConstraint(
+            disjuncts=[[r.constraint for r in by_k[k]] for k in range(n)],
+            name=key.replace(":", "_"),
+        )
+        groups[key] = (dc, sels)
+    return groups
 
 
 def _compute_big_m(
@@ -1437,6 +1516,7 @@ def _reformulate_disjunction_hull(
     model: Model,
     add_aux_binary,
     eps: float = 1e-8,
+    selectors: Optional[list[Variable]] = None,
 ) -> tuple[list[Variable], list[Constraint]]:
     """Reformulate a disjunction via convex hull relaxation.
 
@@ -1459,6 +1539,11 @@ def _reformulate_disjunction_hull(
         Factory for creating auxiliary binary variables.
     eps : float
         Small positive constant for clamping y_k in perspective functions.
+    selectors : list of Variable, optional
+        Existing binaries to use as ``y_k`` (one per disjunct) instead of new
+        auxiliaries. The caller owns their select-one row, so none is emitted
+        (#1615 C-10a: the indicators of a ``Model.add_disjunction`` block, whose
+        ``exactly(1)`` row the model already carries).
 
     Returns
     -------
@@ -1472,28 +1557,33 @@ def _reformulate_disjunction_hull(
     new_cons: list[Constraint] = []
     prefix = dc.name or "anon"
 
-    # --- Selector binaries y_k with sum == 1 ---
-    selectors: list[Variable] = []
-    for k in range(n_disjuncts):
-        y_k = add_aux_binary(f"hull_{prefix}_{k}")
-        selectors.append(y_k)
-        new_vars.append(y_k)
-
-    if n_disjuncts == 1:
-        sum_sel = selectors[0]
+    if selectors is not None:
+        if len(selectors) != n_disjuncts:
+            raise ValueError(
+                f"hull of disjunction {prefix!r}: {len(selectors)} selectors for "
+                f"{n_disjuncts} disjuncts."
+            )
+        selectors = list(selectors)
     else:
+        # --- Selector binaries y_k with sum == 1 ---
+        selectors = []
+        for k in range(n_disjuncts):
+            y_k = add_aux_binary(f"hull_{prefix}_{k}")
+            selectors.append(y_k)
+            new_vars.append(y_k)
+
         sum_sel = selectors[0]
         for k in range(1, n_disjuncts):
             sum_sel = sum_sel + selectors[k]
 
-    new_cons.append(
-        Constraint(
-            body=sum_sel - _wrap(1.0),
-            sense="==",
-            rhs=0.0,
-            name=f"_hull_select_{prefix}",
+        new_cons.append(
+            Constraint(
+                body=sum_sel - _wrap(1.0),
+                sense="==",
+                rhs=0.0,
+                name=f"_hull_select_{prefix}",
+            )
         )
-    )
 
     # Refuse before doing any work if any body hides a variable from the
     # collector everything below is keyed on (checked per body -- see the

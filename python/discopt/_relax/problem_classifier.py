@@ -105,13 +105,21 @@ def classify_problem(model: Model) -> ProblemClass:
 
     obj_linear = repr.is_objective_linear()
     obj_quadratic = repr.is_objective_quadratic()
-    all_constraints_linear = all(repr.is_constraint_linear(i) for i in range(repr.n_constraints))
+    # #1614 A-21: the degree analysis is syntactic, so ``0.0*(x+y)**2`` reads as
+    # degree 2 and an LP left for the QP route. The exact arena walk already sums
+    # the literal coefficients; a quadratic form whose Q has no entries is linear.
+    if obj_quadratic and not obj_linear:
+        obj_linear = _quadratic_form_is_linear(repr.objective_quadratic_form())
+    nonlinear_rows = [i for i in range(repr.n_constraints) if not repr.is_constraint_linear(i)]
     if hasattr(repr, "is_constraint_quadratic"):
-        all_constraints_quadratic = all(
-            repr.is_constraint_quadratic(i) for i in range(repr.n_constraints)
-        )
+        all_constraints_quadratic = all(repr.is_constraint_quadratic(i) for i in nonlinear_rows)
     else:
-        all_constraints_quadratic = all_constraints_linear
+        all_constraints_quadratic = not nonlinear_rows
+    # Same for constraint rows. Short-circuits on the first row with a genuine
+    # quadratic term, so a real QCP pays for at most one extra walk here.
+    all_constraints_linear = all_constraints_quadratic and all(
+        _quadratic_form_is_linear(repr.constraint_quadratic_form(i)) for i in nonlinear_rows
+    )
 
     if all_constraints_linear:
         if obj_linear:
@@ -126,6 +134,19 @@ def classify_problem(model: Model) -> ProblemClass:
             return ProblemClass.MIQCQP if has_integer else ProblemClass.QCQP
 
     return ProblemClass.MINLP if has_integer else ProblemClass.NLP
+
+
+def _quadratic_form_is_linear(form) -> bool:
+    """True iff an arena quadratic form (``ModelRepr.*_quadratic_form``) has no
+    nonzero second-degree coefficient.
+
+    Exact, not a tolerance: the walk sums literal coefficients without
+    differencing, so ``0.0*x**2`` and ``(x-x)**2`` come back with an empty Q while
+    ``1e-300*x**2`` keeps its term. ``None`` (the walk declined) is not linear.
+    """
+    if form is None:
+        return False
+    return not any(v != 0.0 for v in form[2])
 
 
 # Dense-Q budget for QP extraction (#863). Above this the extractor emits a sparse

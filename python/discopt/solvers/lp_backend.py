@@ -235,16 +235,37 @@ def get_milp_solver(prefer_pounce: bool = False, backend: str = "auto") -> Calla
     )
 
 
+def _highspy_available() -> bool:
+    try:
+        import highspy  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def get_decomposition_master_solver() -> tuple[Callable, str]:
+    """``(solve_milp, engine_name)`` for a decomposition MASTER (#1614 D-26/D-27).
+
+    The Benders / GBD / Lagrangian masters are linear MILPs whose objective is the
+    reported dual bound, so they need an exact-vertex engine (#986: not the POUNCE
+    IPM B&B). HiGHS is one, and on MIP masters it is the measurably stronger one
+    (#1060: rsyn0840m's OA master closes 86.1% of the root gap on HiGHS vs 0% on
+    the in-house tree). It is a core dependency, so it is the default here;
+    the in-house simplex B&B remains the fallback for an install without
+    ``highspy`` and is then named in the route.
+    """
+    if _highspy_available():
+        return _milp_highs(), "HiGHS"  # type: ignore[return-value]
+    return get_milp_solver(backend="simplex"), "the discopt simplex B&B"
+
+
 def names_decomposition_route(label: str) -> Callable[[_F], _F]:
     """Decorate a decomposition solver so its result names the route (#1614 D-14).
 
     Fills ``algorithm_route`` only when the solver left it ``None`` (an inner
-    solver -- GBD under Benders -- names itself first). The masters are pinned to
-    the in-house simplex B&B (#986, ``get_milp_solver(backend="simplex")``), and
-    the route says so: an engine the caller did not pick must not answer
-    silently. Moving them to HiGHS is still open on #1614 (D-26/D-27); a first
-    attempt stalled ``test_benders.py::test_annotated_continuous_lp`` at
-    ``iteration_limit``.
+    solver -- GBD under Benders -- names itself first). The route names the master
+    engine :func:`get_decomposition_master_solver` picks, so a fallback to the
+    in-house B&B on a HiGHS-less install is never silent.
     """
     import functools
 
@@ -253,7 +274,8 @@ def names_decomposition_route(label: str) -> Callable[[_F], _F]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             res = fn(*args, **kwargs)
             if getattr(res, "algorithm_route", "unset") is None:
-                res.algorithm_route = f"{label}; master MILP on the discopt simplex B&B"
+                _, engine = get_decomposition_master_solver()
+                res.algorithm_route = f"{label}; master MILP on {engine}"
             return res
 
         return cast(_F, wrapper)

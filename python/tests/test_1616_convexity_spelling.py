@@ -184,3 +184,87 @@ def test_inline_perspective_is_convex():
 def test_inline_perspective_with_nonpositive_denominator_is_not_convex(offset):
     # (1-eps)*z - eps reaches -eps at z=0; (1-eps)*z reaches 0: no proof.
     assert classify_model(_perspective(offset))[0] is False
+
+
+# -- A-18: rank-deficient sums of squares stay on qp-ipm ---------------------
+
+
+def _rank_one_penalty():
+    rng = np.random.default_rng(0)
+    n = 6
+    g, c = rng.normal(size=n), rng.normal(size=n)
+    m = dm.Model("r1")
+    x = m.continuous("x", shape=(n,), lb=-5, ub=5)
+    gx = dm.sum([float(g[i]) * x[i] for i in range(n)])
+    m.maximize(dm.sum([float(c[i]) * x[i] for i in range(n)]) - 500 * gx**2)
+    return m
+
+
+def _underdetermined_nnls():
+    rng = np.random.default_rng(0)
+    rng.normal(size=12)  # keep the stream of the original repro
+    A, b = rng.normal(size=(8, 12)), rng.normal(size=8)
+    m = dm.Model("nnls")
+    x = m.continuous("x", shape=(12,), lb=0, ub=100)
+    m.minimize(
+        dm.sum(
+            [
+                (dm.sum([float(A[i, j]) * x[j] for j in range(12)]) - float(b[i])) ** 2
+                for i in range(8)
+            ]
+        )
+    )
+    return m
+
+
+@pytest.mark.parametrize("build", [_rank_one_penalty, _underdetermined_nnls])
+def test_rank_deficient_sum_of_squares_is_solved_on_qp_ipm(build):
+    # 2 A' diag(w) A rounds to an exactly-indefinite matrix, so the exact PSD test
+    # refuses it; the structural lift has Hessian diag(0, 2w) and must certify.
+    r = build().solve(solver="pounce")
+    ref = build().solve()
+    assert r.algorithm_route == "pounce:qp-ipm"
+    assert r.status == "optimal" and r.gap_certified
+    assert r.objective == pytest.approx(ref.objective, rel=1e-6, abs=1e-8)
+
+
+def test_lifted_qp_maps_duals_and_rows_back():
+    rng = np.random.default_rng(3)
+    g = rng.normal(size=5)
+    m = dm.Model("rows")
+    x = m.continuous("x", shape=(5,), lb=-3, ub=3)
+    m.subject_to(dm.sum([x[i] for i in range(5)]) <= 1)
+    m.subject_to(x[0] - x[1] == 0.5)
+    gx = dm.sum([float(g[i]) * x[i] for i in range(5)])
+    m.maximize(x[2] + 2 * x[3] - 7 * gx**2 + 3)
+    r = m.solve(solver="pounce")
+    ref = m.solve()
+    assert r.algorithm_route == "pounce:qp-ipm" and r.status == "optimal"
+    assert r.objective == pytest.approx(ref.objective, rel=1e-6)
+    xv = np.asarray(r.x["x"])
+    assert xv.shape == (5,)
+    assert xv.sum() <= 1 + 1e-7 and xv[0] - xv[1] == pytest.approx(0.5, abs=1e-7)
+    assert set(r.constraint_duals) == set(ref.constraint_duals)
+    for k in ref.constraint_duals:
+        assert float(r.constraint_duals[k]) == pytest.approx(
+            float(ref.constraint_duals[k]), rel=1e-4, abs=1e-6
+        )
+
+
+@pytest.mark.parametrize(
+    "spell",
+    [
+        lambda x, y: x**2 - y**2 + 0.1 * x,  # a negative square
+        lambda x, y: -1e-11 * x**2 + y**2,  # #1660's witness: tiny negative weight
+        lambda x, y: x * y + x**2,  # a bilinear term is not a square
+    ],
+)
+def test_indefinite_qp_is_not_lifted_and_warns(spell):
+    m = dm.Model("ind")
+    x = m.continuous("x", lb=-1, ub=1)
+    y = m.continuous("y", lb=-1, ub=1)
+    m.minimize(spell(x, y))
+    with pytest.warns(UserWarning, match="convex QP route"):
+        r = m.solve(solver="pounce")
+    assert r.algorithm_route == "pounce:nlp"
+    assert not (r.status == "optimal" and r.gap_certified)

@@ -192,9 +192,9 @@ def solve_benders(
         With a rigorous lower ``bound`` (the master objective) on convergence.
     """
     from discopt.solvers.lp_backend import (
+        get_decomposition_master_solver,
         get_exact_dual_lp_solver,
         get_lp_solver,
-        get_milp_solver,
     )
 
     cfg = config or BendersConfig(
@@ -235,7 +235,8 @@ def solve_benders(
     # certifies. Same conflation and same fix as the GBD master (#977, ``gbd.py``);
     # ``get_milp_solver`` still falls back to POUNCE when the Rust simplex binding
     # is unavailable, so POUNCE-only installs keep working.
-    milp = get_milp_solver(backend="simplex")
+    # #1614 D-26: HiGHS when available (an exact-vertex engine, as #986 requires).
+    milp, _ = get_decomposition_master_solver()
 
     if structure is None:
         structure = detect_decomposition(model)

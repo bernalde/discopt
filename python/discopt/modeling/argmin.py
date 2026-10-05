@@ -241,6 +241,7 @@ class _ArgminLayer:
         params_tuple: Callable,
         objective_fn: Callable,
         state: dict,
+        kkt_residual: Callable,
     ) -> None:
         self._fn = fn
         self._state = state
@@ -252,6 +253,9 @@ class _ArgminLayer:
         self.params_tuple = params_tuple
         #: The inner objective in the internal MINIMIZATION form, ``fn(x, params)``.
         self.objective_fn = objective_fn
+        #: ``kkt_residual(z, p, x*, active, at_bound)`` -- the active-set KKT
+        #: residual ``phi`` linearizes, with the identification held fixed.
+        self.kkt_residual = kkt_residual
 
     def __call__(self, p):
         return self._fn(p)
@@ -686,6 +690,37 @@ def _build_layer(
             vals[slot] = jnp.reshape(p[k], ())
         return tuple(vals)
 
+    def kkt_residual(z, p, x_star, active, at_bound):
+        """The active-set KKT residual at ``z = (x, λ)`` for parameter values ``p``.
+
+        ``x_star``/``active``/``at_bound`` come from :func:`_identify_host` and are
+        held fixed.  Shared by ``phi`` (whose ``custom_root`` linearizes it) and by
+        the order-1 sensitivity path, which needs only its ``p``-derivative.
+        """
+        pt = _params_tuple(jnp.reshape(jnp.asarray(p, dtype=jnp.float64), (n_params,)))
+        # Variables sitting on a bound are held at their solution value: under
+        # strict complementarity the active set is locally constant, so their
+        # sensitivity is zero and their stationarity row is absorbed by the
+        # bound multiplier.  Their row below is replaced by ``x_i - x_i*``,
+        # which keeps the system square without needing bound duals.
+        x = jnp.where(at_bound > 0, x_star, z[:n])
+        lam = z[n:]
+        lam_active = lam * active
+        # One reverse pass for the whole stationarity row: grad(f + λ_A·c) is
+        # ∇f + J_Aᵀλ_A without ever forming J.
+        stat = jax.grad(
+            lambda xx: jnp.reshape(obj_fn(xx, pt), ()) + jnp.dot(lam_active, _cons_vec(xx, pt))
+        )(x)
+        stat = jnp.where(at_bound > 0, z[:n] - x_star, stat)
+        # Inactive rows contribute nothing and pin their multiplier to 0,
+        # which keeps the system square with the active set held fixed.
+        rows = (
+            jnp.where(active > 0, _cons_vec(x, pt) - row_target, lam)
+            if m
+            else jnp.zeros(0, dtype=stat.dtype)
+        )
+        return jnp.concatenate([stat, rows])
+
     def phi(p):
         p = jnp.reshape(jnp.asarray(p, dtype=jnp.float64), (n_params,))
         x_star, lam_star, active, at_bound = _identify(p)
@@ -693,31 +728,9 @@ def _build_layer(
         at_bound = jax.lax.stop_gradient(at_bound)
         x_star = jax.lax.stop_gradient(x_star)
         lam_star = jax.lax.stop_gradient(lam_star)
-        pt = _params_tuple(p)
 
         def kkt(z):
-            # Variables sitting on a bound are held at their solution value: under
-            # strict complementarity the active set is locally constant, so their
-            # sensitivity is zero and their stationarity row is absorbed by the
-            # bound multiplier.  Their row below is replaced by ``x_i - x_i*``,
-            # which keeps the system square without needing bound duals.
-            x = jnp.where(at_bound > 0, x_star, z[:n])
-            lam = z[n:]
-            lam_active = lam * active
-            # One reverse pass for the whole stationarity row: grad(f + λ_A·c) is
-            # ∇f + J_Aᵀλ_A without ever forming J.
-            stat = jax.grad(
-                lambda xx: jnp.reshape(obj_fn(xx, pt), ()) + jnp.dot(lam_active, _cons_vec(xx, pt))
-            )(x)
-            stat = jnp.where(at_bound > 0, z[:n] - x_star, stat)
-            # Inactive rows contribute nothing and pin their multiplier to 0,
-            # which keeps the system square with the active set held fixed.
-            rows = (
-                jnp.where(active > 0, _cons_vec(x, pt) - row_target, lam)
-                if m
-                else jnp.zeros(0, dtype=stat.dtype)
-            )
-            return jnp.concatenate([stat, rows])
+            return kkt_residual(z, p, x_star, active, at_bound)
 
         z0 = jnp.concatenate([x_star, lam_star])
 
@@ -740,6 +753,7 @@ def _build_layer(
         params_tuple=_params_tuple,
         objective_fn=obj_fn,
         state=state,
+        kkt_residual=kkt_residual,
     )
 
 

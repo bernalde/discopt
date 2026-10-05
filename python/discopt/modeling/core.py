@@ -7780,7 +7780,11 @@ class Model:
 
         Exactly one disjunct is **selected**: this maps to indicator
         constraints (``if_then``) and an ``exactly(1, ...)`` selector, i.e.
-        :attr:`DisjunctionSemantics.SELECT_ONE`.
+        :attr:`DisjunctionSemantics.SELECT_ONE`. The rows are tagged with their
+        disjunction, so ``solve(gdp_method="hull")`` lowers the block by the
+        convex hull with the Disjunct indicators as its selectors (the same
+        relaxation ``either_or`` gets); other methods use big-M. A block with an
+        empty disjunct has no row carrying that indicator and stays on big-M.
 
         Because each block owns a *named* indicator, the select-one reading is
         directly observable here, and it is the one users most often misread:
@@ -7815,8 +7819,25 @@ class Model:
         # same predicate that pass uses, not on which member it was handed.
         resolved = _coerce_disjunction_semantics(semantics)
         _require_semantics_supported(resolved, _SELECT_ONE_ROWS, "add_disjunction()")
-        for d in disjuncts:
+        # #1615 C-10a: a per-call key tags each emitted indicator row with its
+        # disjunction and disjunct index, so ``gdp_method="hull"`` can find the
+        # block again. Counted over keys already present so a cloned or
+        # deserialized model cannot collide.
+        taken = {
+            c.disjunction[0]
+            for c in self._constraints
+            if isinstance(c, _IndicatorConstraint) and c.disjunction is not None
+        }
+        n_keys = len(taken)
+        key = f"add_disjunction:{name or ''}:{n_keys}"
+        while key in taken:
+            n_keys += 1
+            key = f"add_disjunction:{name or ''}:{n_keys}"
+        for k, d in enumerate(disjuncts):
+            n_before = len(self._constraints)
             self.if_then(d.indicator.variable, d._constraints, name=d.name)
+            for row in self._constraints[n_before:]:
+                row.disjunction = (key, k, len(disjuncts))
             # #1430: the block's rows are now in ``_constraints``; record that so
             # ``validate`` does not report it as forgotten. Set per disjunct rather
             # than for the call, so a list that raises part-way through leaves an
@@ -9875,19 +9896,39 @@ class Model:
             # exclude the pole anyway (``x**2 >= 1``).
             from discopt._relax.poles import describe_poles
 
-            _logging.getLogger("discopt.solver").warning(
-                "No valid dual bound was produced for model %r (status=%s): its "
-                "objective has a pole inside the variable box -- %s. The objective "
-                "diverges near the pole, so no relaxation can bound it on a box "
-                "that contains the pole and the result carries no optimality claim "
-                "(the problem itself is unbounded if it diverges in the optimizing "
-                "direction at feasible points near the pole). If the pole is not "
-                "meant to be reachable, bound the denominator away from zero (e.g. "
-                "a strictly positive lower bound) or split the model by its sign.",
-                self.name,
-                result.status,
-                describe_poles(_poles),
-            )
+            if all(p.excluded_by_constraints for p in _poles):
+                # #1616 A-04: the box allows the denominator to vanish but the
+                # linear rows do not, so "a pole inside the box" mis-states the
+                # cause. The relaxation bounds each term over the variable box and
+                # never sees the implied range; a variable carrying that range does.
+                _logging.getLogger("discopt.solver").warning(
+                    "No valid dual bound was produced for model %r (status=%s): its "
+                    "objective divides by an expression that the variable bounds "
+                    "allow to reach 0, although the linear constraints keep it away "
+                    "from 0 -- %s. The relaxation bounds each term over the variable "
+                    "box, where the quotient is unbounded, so it does not use that "
+                    "implied range. To give it the range, introduce a variable for the "
+                    "denominator with the implied bound, e.g. "
+                    "`d = m.continuous('d', lb=<implied lower bound>)` with "
+                    "`m.subject_to(d == <denominator>)`, and divide by `d`.",
+                    self.name,
+                    result.status,
+                    describe_poles(_poles),
+                )
+            else:
+                _logging.getLogger("discopt.solver").warning(
+                    "No valid dual bound was produced for model %r (status=%s): its "
+                    "objective has a pole inside the variable box -- %s. The objective "
+                    "diverges near the pole, so no relaxation can bound it on a box "
+                    "that contains the pole and the result carries no optimality claim "
+                    "(the problem itself is unbounded if it diverges in the optimizing "
+                    "direction at feasible points near the pole). If the pole is not "
+                    "meant to be reachable, bound the denominator away from zero (e.g. "
+                    "a strictly positive lower bound) or split the model by its sign.",
+                    self.name,
+                    result.status,
+                    describe_poles(_poles),
+                )
         elif (
             isinstance(result, SolveResult)
             and result.bound is None
@@ -10185,6 +10226,22 @@ class Model:
         from discopt.infeasibility import compute_iis
 
         return compute_iis(self, include_bounds=include_bounds, time_limit=time_limit)
+
+    def convexity(self, *, time_limit: float | None = 15.0):
+        """Report whether the solver can prove this model convex.
+
+        Returns a :class:`~discopt.convexity_report.ConvexityReport`. It runs the
+        same exact rewrites (``x*log(x)`` -> ``entropy(x)``, objective epigraph)
+        and the same classifier :meth:`solve` dispatches its convex fast path on,
+        so the two cannot disagree (#1616). ``is_convex=False`` means *not
+        proven*; the classifier is sound but incomplete.
+
+        >>> rep = m.convexity()
+        >>> rep.is_convex, rep.rewrites, rep.nonconvex_constraints()
+        """
+        from discopt.convexity_report import convexity
+
+        return convexity(self, time_limit=time_limit)
 
     # ── Validation ──
 
@@ -10932,6 +10989,11 @@ class _IndicatorConstraint:
     constraint: Constraint
     active_value: int = 1
     name: Optional[str] = None
+    # #1615 C-10a: set by ``Model.add_disjunction`` to ``(key, k, n)`` -- this row
+    # belongs to disjunct ``k`` of the ``n``-way disjunction ``key`` -- so the GDP
+    # pass can lower the block by hull with the user's indicators as selectors
+    # when ``gdp_method="hull"``. ``None`` for a plain ``if_then`` row.
+    disjunction: Optional[tuple[str, int, int]] = None
 
 
 @dataclass

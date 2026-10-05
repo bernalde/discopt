@@ -119,10 +119,11 @@ class LagrangianNodeBounder:
                 integrality[off : off + v.size] = 1
             off += v.size
 
-        from discopt.solvers.lp_backend import get_milp_solver
+        from discopt.solvers.lp_backend import get_decomposition_master_solver
 
         try:
-            milp = get_milp_solver(backend="simplex")
+            # #1614 D-27: HiGHS when available (exact-vertex, as #986 requires).
+            milp, _ = get_decomposition_master_solver()
         except ImportError:
             return None
         return cls(lin.c, lin.c_offset, A_c, r_c, A_b, r_b, integrality, milp)

@@ -590,10 +590,15 @@ def _compute_sensitivity_at_solution(
     Returns:
         1-D array of sensitivities d(obj*)/dp for all parameters.
     """
-    from discopt._relax.nlp_evaluator import NLPEvaluator
+    from discopt._tape_nlp_evaluator import make_evaluator
     from discopt.solvers import SolveStatus
 
-    evaluator = NLPEvaluator(model)
+    # #1615 B-01a: the canonical evaluator (the POUNCE tape when the model is
+    # representable, the JAX one otherwise), not a fresh JAX ``NLPEvaluator``.
+    # Building and tracing the JAX Hessian for this one warm-started re-solve
+    # cost ~9 s on the issue's N=100 MPC QP, against a 0.2 s solve; on the tape
+    # the gradient is the same to 8e-12 and the call takes 0.24 s.
+    evaluator = make_evaluator(model)
     opts = dict(solver_options or {})
     opts.setdefault("print_level", 0)
 

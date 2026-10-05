@@ -127,16 +127,27 @@ def _enumerated_optimum(model):
 
 
 def _record_milp_selection(monkeypatch):
-    """Record every ``get_milp_solver`` selection the solvers make."""
+    """Record every master-engine selection the solvers make.
+
+    Since #1614 D-26/D-27 the masters select through
+    :func:`~discopt.solvers.lp_backend.get_decomposition_master_solver`, which
+    returns HiGHS when it is installed and the in-house simplex B&B otherwise --
+    both exact-vertex engines. What #986 forbids is the POUNCE IPM, so the spy
+    records the engine name and the tests assert it is one of the two.
+    """
     selections: list[dict] = []
-    original = lp_backend.get_milp_solver
+    original = lp_backend.get_decomposition_master_solver
 
-    def spy(prefer_pounce: bool = False, backend: str = "auto"):
-        selections.append({"prefer_pounce": prefer_pounce, "backend": backend})
-        return original(prefer_pounce=prefer_pounce, backend=backend)
+    def spy():
+        milp, engine = original()
+        selections.append({"engine": engine})
+        return milp, engine
 
-    monkeypatch.setattr(lp_backend, "get_milp_solver", spy)
+    monkeypatch.setattr(lp_backend, "get_decomposition_master_solver", spy)
     return selections
+
+
+_EXACT_ENGINES = ("HiGHS", "the discopt simplex B&B")
 
 
 def test_benders_master_is_not_routed_by_nlp_solver(monkeypatch):
@@ -147,11 +158,10 @@ def test_benders_master_is_not_routed_by_nlp_solver(monkeypatch):
 
     assert selections, "no MILP engine was selected; the test measured nothing"
     for sel in selections:
-        assert sel["backend"] == "simplex", (
-            f"the Benders master asked for backend={sel['backend']!r}; a linear "
+        assert sel["engine"] in _EXACT_ENGINES, (
+            f"the Benders master ran on {sel['engine']!r}; a linear "
             "master must be pinned to the exact-vertex engine (#986)"
         )
-        assert not sel["prefer_pounce"], "the master is still routed by nlp_solver (#986)"
 
 
 def test_lagrangian_master_is_not_routed_by_nlp_solver(monkeypatch):
@@ -163,11 +173,10 @@ def test_lagrangian_master_is_not_routed_by_nlp_solver(monkeypatch):
 
     assert selections, "no MILP engine was selected; the test measured nothing"
     for sel in selections:
-        assert sel["backend"] == "simplex", (
-            f"the Lagrangian subproblem asked for backend={sel['backend']!r}; its "
+        assert sel["engine"] in _EXACT_ENGINES, (
+            f"the Lagrangian subproblem ran on {sel['engine']!r}; its "
             "bound is the reported certificate and must come from the exact engine"
         )
-        assert not sel["prefer_pounce"]
 
 
 def test_lagrangian_node_bounder_is_not_routed_by_nlp_solver(monkeypatch):
@@ -181,11 +190,10 @@ def test_lagrangian_node_bounder_is_not_routed_by_nlp_solver(monkeypatch):
 
     assert selections, "no MILP engine was selected; the test measured nothing"
     for sel in selections:
-        assert sel["backend"] == "simplex", (
-            f"the node bounder asked for backend={sel['backend']!r}; its objective "
+        assert sel["engine"] in _EXACT_ENGINES, (
+            f"the node bounder ran on {sel['engine']!r}; its objective "
             "is a node lower bound and must come from the exact engine"
         )
-        assert not sel["prefer_pounce"]
 
 
 # ── and the certificate the exact master now reports is sound ──

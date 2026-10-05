@@ -273,7 +273,7 @@ def solve_gbd(
     from discopt._relax.gdp_reformulate import _extract_body_coeffs, _is_linear
     from discopt._tape_nlp_evaluator import make_evaluator
     from discopt.modeling.core import Constraint
-    from discopt.solvers.lp_backend import get_milp_solver
+    from discopt.solvers.lp_backend import get_decomposition_master_solver
     from discopt.solvers.nlp_ipopt import _infer_constraint_bounds
 
     t0 = time.time()
@@ -308,7 +308,8 @@ def solve_gbd(
     # INFEASIBLE at a feasible point. #986 clamps the master point to its bounds
     # and takes the recourse duals from the exact oracle. All four masters now
     # run on the exact-vertex engine.
-    milp = get_milp_solver(backend="simplex")
+    # #1614 D-26: HiGHS when available (an exact-vertex engine, as #986 requires).
+    milp, _ = get_decomposition_master_solver()
 
     if structure is None:
         structure = detect_decomposition(model)

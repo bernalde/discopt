@@ -120,6 +120,9 @@ from discopt.callbacks import (
 from discopt.callbacks import (
     CutResult as CutResult,
 )
+from discopt.convexity_report import (
+    ConvexityReport as ConvexityReport,
+)
 from discopt.decomposition import (
     DecompositionStructure as DecompositionStructure,
 )

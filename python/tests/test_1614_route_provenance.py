@@ -194,3 +194,146 @@ def test_e01c_auto_route_engine_failure_warns(monkeypatch):
     # z0=0 (x0=1, cost .25), z1=1 (x1=2.5, cost 1), z2=1 (x2=3.5, cost 1)
     assert r.objective == pytest.approx(2.25, abs=1e-4)
     assert "fell back" in _route(r)
+
+
+# ── A-21: a quadratic form whose Q is exactly zero is linear ──
+
+
+def _zero_q_model(form: str, where: str, integer: bool):
+    m = dm.Model("zq")
+    make = m.integer if integer else m.continuous
+    x = make("x", lb=0, ub=10)
+    y = make("y", lb=0, ub=10)
+    q = {
+        "zero_sum_sq": 0.0 * (x + y) ** 2,
+        "zero_bilinear": 0 * x * y,
+        "cancelled_sq": (x - x) ** 2,
+        "tiny_sq": 1e-300 * x**2,
+    }[form]
+    if where == "objective":
+        m.maximize(3 * x + 2 * y - q)
+        m.subject_to(x + y <= 4)
+    else:
+        m.maximize(3 * x + 2 * y)
+        m.subject_to(x + y + q <= 4)
+    return m
+
+
+@pytest.mark.parametrize("where", ["objective", "constraint"])
+@pytest.mark.parametrize("form", ["zero_sum_sq", "zero_bilinear", "cancelled_sq"])
+@pytest.mark.parametrize("integer", [False, True])
+def test_a21_zero_quadratic_coefficient_is_linear(form, where, integer):
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
+
+    m = _zero_q_model(form, where, integer)
+    assert classify_problem(m) == (ProblemClass.MILP if integer else ProblemClass.LP)
+    r = m.solve(time_limit=30)
+    assert r.status == "optimal"
+    assert r.objective == pytest.approx(12.0, abs=1e-6)  # x=4, y=0
+    assert _route(r).startswith("highs-milp" if integer else "highs-lp"), r.algorithm_route
+
+
+@pytest.mark.parametrize("where", ["objective", "constraint"])
+def test_a21_tiny_nonzero_coefficient_stays_quadratic(where):
+    """Only an EXACT zero is dropped: 1e-300 is a (tiny) quadratic term."""
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
+
+    m = _zero_q_model("tiny_sq", where, integer=False)
+    assert classify_problem(m) not in (ProblemClass.LP, ProblemClass.MILP)
+
+
+# ── D-14 leftovers: convex-NLP and GP routes name themselves ──
+
+
+def test_d14_convex_nlp_default_solve_names_route():
+    m = dm.Model("cnlp")
+    x = m.continuous("x", lb=0.1, ub=10)
+    y = m.continuous("y", lb=0, ub=10)
+    m.minimize(dm.exp(x) + (y - 2) ** 2)
+    m.subject_to(x + y >= 3)
+    r = m.solve(time_limit=30)
+    assert r.status == "optimal"
+    # x+y>=3 binds and lb=0.1 is slack: stationarity gives e^x = 2(y-2) = 2(1-x).
+    import math
+
+    xs = r.x["x"]
+    assert math.exp(xs) == pytest.approx(2 * (1 - xs), abs=1e-4)
+    assert r.objective == pytest.approx(math.exp(xs) + (1 - xs) ** 2, abs=1e-5)
+    assert _route(r)
+
+
+# ── D-26/D-27: decomposition masters on HiGHS, and an LP master's bound ──
+
+
+def test_d26_benders_master_runs_on_highs():
+    r = _two_stage_milp().solve(decomposition="benders", time_limit=60)
+    assert r.status == "optimal"
+    assert r.objective == pytest.approx(5.0, abs=1e-5)
+    assert _route(r).endswith("master MILP on HiGHS"), r.algorithm_route
+
+
+def test_d26_lagrangian_master_runs_on_highs(monkeypatch):
+    import discopt.solvers.lp_backend as lpb
+
+    engines = []
+    original = lpb.get_decomposition_master_solver
+
+    def spy():
+        milp, engine = original()
+        engines.append(engine)
+        return milp, engine
+
+    monkeypatch.setattr(lpb, "get_decomposition_master_solver", spy)
+    r = _coupled_knapsack().solve(decomposition="lagrangian", time_limit=60)
+    assert engines and set(engines) == {"HiGHS"}, engines
+    assert r.bound is not None and r.bound <= -9.0 + 1e-6
+
+
+def test_d26_highs_lp_master_bound_is_its_optimum():
+    """With no integer column, HiGHS's ``mip_dual_bound`` is a stale 0.0.
+
+    Read as the bound it capped this LP's bound at 0 < 4 (the optimum), so a
+    continuous Benders master never closed its gap and stalled at
+    ``iteration_limit``.
+    """
+    import numpy as np
+    from discopt.solvers import SolveStatus
+    from discopt.solvers.milp_highs import solve_milp
+
+    r = solve_milp(
+        c=np.array([1.0, 1.0]),
+        A_ub=np.array([[-2.0, -1.0], [0.0, -1.0]]),
+        b_ub=np.array([-8.0, 0.0]),
+        bounds=[(0.0, 10.0), (-1e12, 1e20)],
+    )
+    assert r.status == SolveStatus.OPTIMAL
+    assert r.objective == pytest.approx(4.0, abs=1e-9)
+    assert r.bound == pytest.approx(4.0, abs=1e-9)
+
+
+# ── E-01(d): every MIP-NLP method takes milp_solver, and honours it ──
+
+
+@pytest.mark.parametrize("method", ["fp", "goa"])
+def test_e01d_mip_nlp_method_honours_milp_solver(method, monkeypatch):
+    import warnings
+
+    import discopt.solvers.lp_backend as lpb
+
+    seen = []
+    original = lpb.get_milp_solver
+
+    def spy(prefer_pounce=False, backend="auto"):
+        seen.append(backend)
+        return original(prefer_pounce=prefer_pounce, backend=backend)
+
+    monkeypatch.setattr(lpb, "get_milp_solver", spy)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*ignored.*milp_solver.*")
+        r = _convex_minlp().solve(
+            solver="mip-nlp", mip_nlp_method=method, milp_solver="highs", time_limit=60
+        )
+    assert seen, "no MILP was solved; the test measured nothing"
+    assert set(seen) == {"highs"}, seen
+    assert r.status in ("optimal", "feasible")
+    assert r.objective == pytest.approx(2.25, abs=1e-4)

@@ -1909,7 +1909,29 @@ def _try_native_spatial_kernel(
     # safe direction, but a caller who asked for 1e6 and got 1e-4 explored
     # the same 45 nodes as with no tolerance at all and was told nothing
     # (#1330). #1323's rule is honoured-or-declared; this is the declaration.
-    _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
+    _relative_requested = float(gap_tolerance) > _DEFAULT_REL_GAP_TOL
+    if not _relative_requested:
+        _warn_abs_gap_not_loosened(abs_gap_tolerance, gap_tolerance)
+    # #1615 D-12: a ``gap_tolerance`` ABOVE the default is an explicit request to
+    # stop on the documented RELATIVE gap. The absolute ``gap_tol`` arm, conjoined
+    # in ``gap_closed``, made that request a no-op (Haverly 3: 13 nodes at 0.2,
+    # root gap 6.7%). Lifting the absolute arm to ``inf`` leaves exactly the
+    # Python tree's disjunction -- ``abs_gap_tol`` OR relative ``gap_tolerance``
+    # -- which ``_refuse_unclosed_published_pair`` re-checks on the published
+    # pair. The #1243 hazard (a default relative arm loosening a caller's
+    # absolute TIGHTENING) cannot arise: this arm is entered only when the
+    # caller loosened the relative tolerance itself, and a default or tighter
+    # ``gap_tolerance`` hands the kernel exactly the inputs it had before.
+    # In this arm ``abs_gap_tol`` below is the caller's own value too, so a
+    # looser ``abs_gap_tolerance`` is honoured and ``_warn_abs_gap_not_loosened``
+    # (above) correctly stays quiet.
+    #
+    # 1e300, NOT ``inf``: ``gap_closed`` reads ``bound >= inc - gap_tol``, and with
+    # ``inf`` a bound-less ``-inf`` passes it (``-inf >= -inf``) and the relative
+    # arm then passes too (``inf <= inf``) -- measured: Haverly ``optimal`` at
+    # node 0 with no bound. A finite lift keeps ``-inf`` failing the first clause.
+    if _relative_requested:
+        _kernel_abs_tol = 1e300
     solve_kwargs = dict(
         max_nodes=int(max_nodes),
         gap_tol=_kernel_abs_tol,
@@ -6858,34 +6880,6 @@ def _warn_abs_gap_not_loosened(abs_gap_tolerance: Optional[float], gap_tolerance
 _DEFAULT_REL_GAP_TOL = 1e-4
 
 
-def _warn_kernel_gap_tolerance_absolute(gap_tolerance: float) -> None:
-    """Say so when the native kernel did not honour a LOOSER relative gap (#1615 D-12).
-
-    The kernel fathoms only when ``bound >= incumbent - gap_tolerance`` (absolute)
-    AND the abs-or-relative test holds, so a relative ``gap_tolerance`` above the
-    default never stops it early the way the documented relative criterion -- and
-    the Python engine -- would (Haverly 3: 13 nodes at 0.2 against a root gap of
-    6.7%). Giving the kernel a relative arm is a certificate-semantics change for
-    every kernel solve and needs its own panel, so this declares the drop rather
-    than changing it. Tightening below the default is honoured (the absolute arm
-    is then the stricter one) and is not reported.
-    """
-    if float(gap_tolerance) <= _DEFAULT_REL_GAP_TOL:
-        return
-    import warnings
-
-    warnings.warn(
-        f"The native spatial kernel applied gap_tolerance={gap_tolerance!r} as an "
-        "ABSOLUTE tolerance (it stops only when bound and incumbent are within "
-        f"{gap_tolerance!r} in objective units), not as the relative gap it is "
-        "documented as, so the looser relative tolerance did not stop the search "
-        "early. Set DISCOPT_NATIVE_SPATIAL_KERNEL=0 to run the Python engine, which "
-        "applies gap_tolerance relatively.",
-        UserWarning,
-        stacklevel=2,
-    )
-
-
 def _resolve_abs_gap_tolerance(abs_gap_tolerance: Optional[float]) -> float:
     """The absolute gap tolerance a solve runs at, validated.
 
@@ -7714,6 +7708,41 @@ def _model_contains_nonsmooth_node(model: Model) -> bool:
         if body is not None and _walk(body):
             return True
     return False
+
+
+def _convexity_rewrites(
+    model: Model, *, entropy: bool = True, epigraph: bool = True
+) -> tuple[Model, tuple[str, ...]]:
+    """Apply the exact rewrites ``solve_model`` runs before classifying convexity.
+
+    Returns ``(model, applied)``: the rewritten model (never the caller's model
+    mutated -- both passes return a new model or the same one unchanged) and the
+    names of the passes that changed something, in order.
+
+    * ``"entropy"`` -- ``x*log(x)`` -> ``entropy(x)`` and ``x*log(x/y)`` ->
+      ``centropy(x, y)`` (:func:`~discopt._relax.factorable_reform.canonicalize_entropy`).
+    * ``"objective_epigraph"`` -- ``min z`` with ``z == g(x)`` relaxed to
+      ``z >= g(x)`` (:func:`~discopt._relax.objective_epigraph.relax_objective_defining_equality`).
+
+    Both are exact at the optimum. They are the reason the solve can prove a model
+    convex that the bare classifier does not, so this is the single definition
+    shared by the solve and by :meth:`discopt.modeling.core.Model.convexity`.
+    """
+    applied: list[str] = []
+    if entropy:
+        from discopt._relax.factorable_reform import canonicalize_entropy
+
+        new = canonicalize_entropy(model)
+        if new is not model:
+            applied.append("entropy")
+            model = new
+    if epigraph:
+        from discopt._relax.objective_epigraph import relax_objective_defining_equality
+
+        model, changed = relax_objective_defining_equality(model)
+        if changed:
+            applied.append("objective_epigraph")
+    return model, tuple(applied)
 
 
 def _classify_model_convexity(
@@ -12933,10 +12962,7 @@ def solve_model(
 
     _presolve_deadline = PresolveDeadline(_deadline_exhausted)
 
-    from discopt._relax.factorable_reform import canonicalize_entropy
-
-    if _presolve_deadline.afford("canonicalize_entropy"):
-        model = canonicalize_entropy(model)
+    _entropy_ok = _presolve_deadline.afford("canonicalize_entropy")
 
     # --- Objective-defining-equality relaxation (the SUSPECT "objective
     # constraint"). When the model is `min/max z` with z a free scalar that
@@ -12950,12 +12976,15 @@ def solve_model(
     # The transform is structurally gated and abstains conservatively, so it is
     # general and never alters the optimum. Skipped when streaming B&B callbacks
     # are attached so node/incumbent indices stay aligned with the user's model.
-    if not _has_bb_callbacks:
-        from discopt._relax.objective_epigraph import relax_objective_defining_equality
-
-        model, _epi_changed = relax_objective_defining_equality(model)
-        if _epi_changed:
-            logger.debug("relaxed objective-defining equality to binding inequality")
+    #
+    # Both rewrites live in :func:`_convexity_rewrites`, which ``Model.convexity()``
+    # also calls, so the public verdict and the one dispatch uses cannot drift
+    # apart (#1616 A-01).
+    model, _rewrites = _convexity_rewrites(
+        model, entropy=_entropy_ok, epigraph=not _has_bb_callbacks
+    )
+    if "objective_epigraph" in _rewrites:
+        logger.debug("relaxed objective-defining equality to binding inequality")
 
     # --- Factorable reformulation: clear sign-definite denominators and lift
     # mixed repeated-factor products (e.g. x*x*y) into bilinear form via
@@ -13098,9 +13127,20 @@ def solve_model(
     # must fail the solve: the old ``except Exception`` + DEBUG log made a crashed
     # pass indistinguishable from 'nothing to linearize' (CLAUDE.md §3/§7).
     from discopt._relax.binary_multilinear_reform import has_binary_multilinear_work
+    from discopt._relax.problem_classifier import ProblemClass, classify_problem
     from discopt.transformations import get as _get_transformation
 
-    if _presolve_deadline.afford("binary_multilinear") and has_binary_multilinear_work(model):
+    # #1614 A-21: a product whose exact arena coefficient is zero (``0*x*y``) is
+    # still a syntactic product, and the three product reforms below would lift
+    # it into a big-M MILP and divert an already-linear model off the MILP route.
+    # ``classify_problem`` reads the exact quadratic form, so it is the gate.
+    _already_linear = classify_problem(model) in (ProblemClass.LP, ProblemClass.MILP)
+
+    if (
+        not _already_linear
+        and _presolve_deadline.afford("binary_multilinear")
+        and has_binary_multilinear_work(model)
+    ):
         _bml = _get_transformation("binary.multilinear").apply(model)
         if _bml is not model:
             from discopt._relax.problem_classifier import ProblemClass, classify_problem
@@ -13283,7 +13323,7 @@ def solve_model(
     # ``expand_integer_products``, which returns ``model`` unchanged -- the
     # ``_iml is not model`` test below. Every other exception is a defect and
     # propagates instead of being logged at DEBUG and skipped.
-    if _tuning().integer_multilinear_reform:
+    if _tuning().integer_multilinear_reform and not _already_linear:
         from discopt._relax.integer_product_reform import (
             extend_initial_point as _iml_extend,
         )
@@ -13466,6 +13506,7 @@ def solve_model(
     # the reformulated path both stay fast.
     if (
         not _did_multilinear_reform
+        and not _already_linear
         and _presolve_deadline.afford("integer_bilinear")
         and has_nonconvex_integer_bilinear(model)
     ):
@@ -14580,6 +14621,9 @@ def solve_model(
         and not _callbacks_force_bb  # #1500: see the entry-route note above
     ):
         logger.info("Convex NLP detected — solving with single NLP (global optimality guaranteed)")
+        _declare_route(
+            f"convex-nlp: single {nlp_solver} NLP solve (continuous model proved convex)"
+        )
         result = _solve_continuous(
             model,
             time_limit,
@@ -15087,7 +15131,6 @@ def solve_model(
             _native_result.algorithm_route = (
                 "native-spatial: discopt Rust spatial branch-and-bound kernel"
             )
-        _warn_kernel_gap_tolerance_absolute(gap_tolerance)
         return _native_result
     # #1614: everything past this point is the Python spatial tree.
     _declare_route(
@@ -22930,16 +22973,26 @@ def _solve_pounce_route(
         from discopt.solvers import convex_ipm_pounce as _cvx
 
         is_lp = pclass == ProblemClass.LP
-        # #1615 B-01b: the convex lp-ipm/qp-ipm arm is a cold matrix solve; it does
-        # not thread a starting point through, so an ``initial_solution`` /
-        # ``warm_start`` the caller passed would be dropped without a word. The NLP
-        # arm below does use them, so this warning is specific to the convex arm.
-        # ``Model.solve`` turns a warm start's primal half into ``initial_point``
-        # too, so name the option the caller actually passed.
+        # #1615 B-01b: qp-ipm takes the caller's primal start (``Model.solve`` turns
+        # a warm start's primal half into ``initial_point`` too) as POUNCE's
+        # ``warm_start`` -- measured on the issue's linear-MPC QP, 15 -> 8
+        # iterations at N=100 and 16 -> 8 at N=400, same objective to 1e-10. The
+        # lp-ipm arm is still a cold solve, so a start passed there is dropped,
+        # and says so; name the option the caller actually passed.
+        n_flat = sum(v.size for v in model._variables)
+        qp_x0 = None
+        if not is_lp and initial_point is not None:
+            _ip = np.asarray(initial_point, dtype=np.float64).ravel()
+            if _ip.size == n_flat and np.all(np.isfinite(_ip)):
+                qp_x0 = _ip
         _dropped_starts = (
-            ["warm_start"]
-            if warm_start is not None
-            else (["initial_solution"] if initial_point is not None else [])
+            []
+            if qp_x0 is not None
+            else (
+                ["warm_start"]
+                if warm_start is not None
+                else (["initial_solution"] if initial_point is not None else [])
+            )
         )
         # Options are validated against the engine that actually runs (#1585). An
         # LP is always the convex engine, so refuse before solving. A QP is routed
@@ -22987,11 +23040,48 @@ def _solve_pounce_route(
                     strict=True,
                     relaxes_huge_bounds=True,
                     reject_reason=reject_reason,
+                    x0=qp_x0,
                 )
         except _cvx.IndefiniteQPError as exc:
-            logger.info("solver='pounce': %s Solving locally with the NLP IPM.", exc)
+            # #1616 A-18: an objective that is structurally a positive-weighted sum
+            # of squares of affine forms is convex whatever its expanded Hessian
+            # rounds to; a rank-deficient one (a penalty ``(g.x)**2``, least squares
+            # with fewer residuals than unknowns) fails the exact PSD test only
+            # because ``2 A' diag(w) A`` is formed in floats. Re-solve it lifted,
+            # where the Hessian is diagonal and PSD exactly. Any other indefinite
+            # Hessian still falls to the local NLP arm.
             outcome = None
-            pclass = ProblemClass.NLP  # fall to the NLP arm below
+            lift = _pounce_sos_lift(model)
+            if lift is not None:
+                logger.info(
+                    "solver='pounce': %s The objective is a weighted sum of %d affine "
+                    "squares; solving its exact lift with qp-ipm (#1616 A-18).",
+                    exc,
+                    lift[0].size,
+                )
+                reject_reason.clear()
+                outcome = _solve_qp_matrix(
+                    model,
+                    t_start,
+                    _remaining(),
+                    solve_fn,
+                    "POUNCE qp-ipm",
+                    strict=True,
+                    relaxes_huge_bounds=True,
+                    reject_reason=reject_reason,
+                    x0=qp_x0,
+                    sos_lift=lift,
+                )
+            else:
+                warnings.warn(
+                    f"solver='pounce': {exc} The convex QP route (qp-ipm) does not "
+                    "apply, so this solve uses the local NLP interior-point arm and "
+                    "its result certifies only local optimality. A globally "
+                    "certified answer needs the default solver (#1616).",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                pclass = ProblemClass.NLP  # fall to the NLP arm below
         if pclass != ProblemClass.NLP:
             if _dropped_starts:
                 warnings.warn(
@@ -28162,6 +28252,24 @@ def _qp_convex_certificate(
     return cert
 
 
+def _pounce_sos_lift(model: Model) -> Optional[tuple]:
+    """The objective's exact sum-of-squares decomposition for ``_solve_qp_matrix``.
+
+    Minimization sense (a maximized objective is negated). ``None`` when the
+    objective is not structurally ``sum_k w_k (a_k.x + b_k)**2 + affine`` with
+    every ``w_k > 0``, or the model has integer variables (#1616 A-18).
+    """
+    from discopt._relax.convexity.patterns import weighted_affine_square_decomposition
+    from discopt.modeling.core import ObjectiveSense
+
+    if model._objective is None or any(
+        v.var_type in (VarType.BINARY, VarType.INTEGER) for v in model._variables
+    ):
+        return None
+    sign = -1.0 if model._objective.sense == ObjectiveSense.MAXIMIZE else 1.0
+    return weighted_affine_square_decomposition(model._objective.expression, model, sign)
+
+
 def _solve_qp_matrix(
     model: Model,
     t_start: float,
@@ -28172,6 +28280,8 @@ def _solve_qp_matrix(
     strict: bool = False,
     relaxes_huge_bounds: bool = False,
     reject_reason: list[str] | None = None,
+    x0: np.ndarray | None = None,
+    sos_lift: tuple | None = None,
 ) -> SolveResult | None:
     """Solve a QP/MIQP through a matrix-form ``solve_qp`` backend.
 
@@ -28192,6 +28302,23 @@ def _solve_qp_matrix(
     returned point was refused by the feasibility or stationarity guard. The
     caller uses it to populate ``SolveResult.error`` on the terminal path, so the
     only record of *why* a QP came back ``error`` is not a log line (#1384).
+
+    ``x0``, a primal point over the model's flattened variables, is forwarded as
+    ``warm_start=`` -- only to a backend that takes one (POUNCE qp-ipm, #1615
+    B-01b); the caller passes it only then.
+
+    ``sos_lift`` is a continuous objective's
+    :func:`~discopt._relax.convexity.patterns.weighted_affine_square_decomposition`
+    in minimization sense, ``(w, A, b, l, c0)``. The backend then solves the lifted
+    QP over ``(x, d)``: ``min sum_k w_k d_k**2 + l.x + c0`` subject to the model's
+    rows and ``A x - d = -b``. It is the same problem (``d`` is defined by its row),
+    but its Hessian is ``diag(0, 2w)`` -- PSD exactly -- where the expanded
+    ``2 A' diag(w) A`` of a rank-deficient ``A`` can round to indefinite and be
+    refused by the exact PSD test (#1616 A-18). The point and the multipliers of
+    the model's own rows are mapped back, and every check after the solve (the
+    feasibility guard, the objective re-evaluation, the #1596 certificate, the
+    named duals) runs on the original problem; only the backend's own KKT
+    residual is judged on the system it solved.
     """
     from discopt._relax.problem_classifier import extract_qp_data
     from discopt.modeling.core import ObjectiveSense
@@ -28237,18 +28364,50 @@ def _solve_qp_matrix(
     Q_orig = _dense_Q(qp_data.Q)[:n_orig, :n_orig]
     c_orig = np.asarray(qp_data.c[:n_orig])
 
+    start_kw: dict[str, Any] = {}
+    if x0 is not None:
+        start_kw["warm_start"] = np.asarray(x0, dtype=np.float64).ravel()[:n_orig]
+    Q_s, c_s, A_ub_s, A_eq_s, b_eq_s, bounds_s = Q_orig, c_orig, A_ub, A_eq, b_eq, bounds
+    obj_const_s = float(qp_data.obj_const)
+    n_lift = 0
+    if sos_lift is not None:
+        if integrality is not None:
+            raise ValueError("sos_lift is for a continuous QP only")
+        w_l, A_l, b_l, l_l, c0_l = sos_lift
+        A_l = A_l.tocsr()[:, :n_orig].toarray()
+        n_lift = int(w_l.size)
+        n_s = n_orig + n_lift
+        Q_s = np.zeros((n_s, n_s), dtype=np.float64)
+        Q_s[n_orig:, n_orig:] = np.diag(2.0 * np.asarray(w_l, dtype=np.float64))
+        c_s = np.concatenate([np.asarray(l_l, dtype=np.float64)[:n_orig], np.zeros(n_lift)])
+        obj_const_s = float(c0_l)
+        if A_ub is not None and A_ub.shape[0] > 0:
+            A_ub_s = np.hstack([_dense_A(A_ub), np.zeros((A_ub.shape[0], n_lift))])
+        lift_rows = np.hstack([A_l, -np.eye(n_lift)])
+        if A_eq is not None and A_eq.shape[0] > 0:
+            A_eq_s = np.vstack(
+                [np.hstack([_dense_A(A_eq), np.zeros((A_eq.shape[0], n_lift))]), lift_rows]
+            )
+            b_eq_s = np.concatenate([np.asarray(b_eq, dtype=np.float64).ravel(), -b_l])
+        else:
+            A_eq_s, b_eq_s = lift_rows, -np.asarray(b_l, dtype=np.float64)
+        bounds_s = bounds + [(-np.inf, np.inf)] * n_lift
+        if "warm_start" in start_kw:
+            ws = start_kw["warm_start"]
+            start_kw["warm_start"] = np.concatenate([ws, A_l @ ws + b_l])
     try:
         result = solve_qp_fn(
-            Q=Q_orig,
-            c=c_orig,
-            A_ub=A_ub,
+            Q=Q_s,
+            c=c_s,
+            A_ub=A_ub_s,
             b_ub=b_ub,
-            A_eq=A_eq,
-            b_eq=b_eq,
-            bounds=bounds,
+            A_eq=A_eq_s,
+            b_eq=b_eq_s,
+            bounds=bounds_s,
             integrality=integrality,
             time_limit=time_limit,
             gap_tolerance=gap_tolerance,
+            **start_kw,
         )
     except Exception as e:
         if strict:
@@ -28262,14 +28421,50 @@ def _solve_qp_matrix(
 
     objective = None
     if result.objective is not None:
-        objective = float(result.objective) + float(qp_data.obj_const)
+        objective = float(result.objective) + obj_const_s
         if sense == ObjectiveSense.MAXIMIZE:
             objective = -objective
 
     result_bound = getattr(result, "bound", None)
-    bound = _engine_bound_in_model_sense(
-        result.status, result_bound, objective, float(qp_data.obj_const), sense
-    )
+    bound = _engine_bound_in_model_sense(result.status, result_bound, objective, obj_const_s, sense)
+
+    if result.status == SolveStatus.OPTIMAL and n_lift:
+        # The backend's KKT residual is about the lifted system; judge it there,
+        # then hand the rest of this function the original problem (``sos_lift``).
+        assert result.x is not None and result.objective is not None
+        kkt_scale = _qp_stationarity_scale(
+            Q_s, c_s, result.x, result.dual_values, result.reduced_costs
+        )
+        if result.kkt_error is not None and result.kkt_error > _QP_KKT_RESIDUAL_TOL * kkt_scale:
+            reason = (
+                f"{engine} QP (sum-of-squares lift) reported a non-stationary 'optimal' "
+                f"(KKT residual {result.kkt_error:.2e} > {_QP_KKT_RESIDUAL_TOL:.0e} x "
+                f"stationarity scale {kkt_scale:.3g}); the point was refused."
+            )
+            logger.warning("%s", reason)
+            if reject_reason is not None:
+                reject_reason.append(reason)
+            return None
+        x_o = np.asarray(result.x, dtype=np.float64)[:n_orig]
+        n_rows_o = (A_ub.shape[0] if A_ub is not None else 0) + (
+            A_eq.shape[0] if A_eq is not None else 0
+        )
+        f_o = float(0.5 * x_o @ (Q_orig @ x_o) + np.asarray(c_orig) @ x_o)
+        result = dataclasses.replace(
+            result,
+            x=x_o,
+            objective=f_o,
+            dual_values=(
+                None if result.dual_values is None else np.asarray(result.dual_values)[:n_rows_o]
+            ),
+            reduced_costs=(
+                None if result.reduced_costs is None else np.asarray(result.reduced_costs)[:n_orig]
+            ),
+            kkt_error=None,
+        )
+        objective = f_o + float(qp_data.obj_const)
+        if sense == ObjectiveSense.MAXIMIZE:
+            objective = -objective
 
     if result.status == SolveStatus.OPTIMAL:
         assert result.x is not None and result.objective is not None
@@ -31182,6 +31377,14 @@ def _milp_is_exactly_linear(model: Model) -> bool:
     """
     from discopt._relax.term_classifier import classify_nonlinear_terms
 
+    _degree_linear, _zero_q_linear = _repr_linearity(model)
+    if not _degree_linear:
+        # #1614 A-21: not linear by degree, but every degree-2 piece has an exactly
+        # empty Q on the arena walk (``0*x*y``, ``0.0*(x+y)**2``). The walk is exact,
+        # so the linear projection IS the model; the syntactic term classifier
+        # below would count the zero-coefficient product as bilinear.
+        return _zero_q_linear
+
     _nl = classify_nonlinear_terms(model)
     if (
         _nl.bilinear
@@ -31206,20 +31409,37 @@ def _milp_is_exactly_linear(model: Model) -> bool:
     # linear in its objective and every constraint. For models that reach here
     # through the normal MILP route this is a no-op (the router already proved
     # linearity); it only guards direct calls, future re-routing, and any
-    # router/extractor representation discrepancy.
+    # router/extractor representation discrepancy. (Computed by
+    # ``_repr_linearity`` above, before the term classifier.)
+    return _degree_linear
+
+
+def _repr_linearity(model: Model) -> tuple[bool, bool]:
+    """``(degree_linear, zero_q_linear)`` from the Rust model repr.
+
+    ``degree_linear``: the objective and every constraint are linear by the degree
+    analysis. ``zero_q_linear``: additionally accepting a degree-2 body whose exact
+    arena quadratic form has no nonzero Q entry (#1614 A-21). Both False when the
+    repr cannot be built.
+    """
     try:
+        from discopt._relax.problem_classifier import _quadratic_form_is_linear
         from discopt._rust import model_to_repr
 
         _repr = model_to_repr(model, getattr(model, "_builder", None))
-        _fully_linear = bool(_repr.is_objective_linear()) and all(
-            _repr.is_constraint_linear(i) for i in range(_repr.n_constraints)
-        )
+        _obj_lin = bool(_repr.is_objective_linear())
+        _rows = [i for i in range(_repr.n_constraints) if not _repr.is_constraint_linear(i)]
     except Exception as exc:  # noqa: BLE001 - see below
         # #1520: kept as a sound fallback, like the solve's own repr (#1516):
         # "not provably linear" defers to the general path.
         _warn_fallback_once("Rust model repr (MILP linearity check)", exc, "deferring")
-        _fully_linear = False
-    return _fully_linear
+        return False, False
+    if _obj_lin and not _rows:
+        return True, True
+    zero_q = (_obj_lin or _quadratic_form_is_linear(_repr.objective_quadratic_form())) and all(
+        _quadratic_form_is_linear(_repr.constraint_quadratic_form(i)) for i in _rows
+    )
+    return False, zero_q
 
 
 def _highs_std_form(model: Model):

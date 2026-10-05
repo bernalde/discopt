@@ -475,6 +475,14 @@ KNOWN: tuple[tuple[str, str, str], ...] = (
         "model._solve_deadline = time.perf_counter() + float(time_limit)",
         "contract",
     ),
+    # #1616 A-01: ``Model.convexity(time_limit=...)`` classifies under the caller's
+    # own budget and, when it is spent, reports ``is_convex=None`` (unknown) --
+    # never a verdict from a half-finished walk. ``contract`` role, like #1624.
+    (
+        "convexity_report.py",
+        "deadline = None if time_limit is None else time.perf_counter() + float(time_limit)",
+        "contract",
+    ),
     (
         "_daemon_core.py",
         "if self.max_lifetime > 0 and time.monotonic() - started >= self.max_lifetime:",

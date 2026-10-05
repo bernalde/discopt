@@ -909,6 +909,7 @@ def _enc_rows(model: Model, table: _NodeTable) -> list[dict]:
                     "constraint": _enc_constraint(con.constraint, table),
                     "active_value": int(con.active_value),
                     "name": con.name,
+                    "disjunction": (None if con.disjunction is None else list(con.disjunction)),
                 }
             )
         elif t is _SOSConstraint:
@@ -958,6 +959,16 @@ def _dec_rows(docs: list[dict], nodes: list) -> list:
                     constraint=_dec_constraint(d["constraint"], nodes),
                     active_value=d["active_value"],
                     name=d["name"],
+                    # Absent in files written before #1615 C-10a.
+                    disjunction=(
+                        None
+                        if d.get("disjunction") is None
+                        else (
+                            str(d["disjunction"][0]),
+                            int(d["disjunction"][1]),
+                            int(d["disjunction"][2]),
+                        )
+                    ),
                 )
             )
         elif kind == "sos":

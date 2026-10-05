@@ -53,7 +53,12 @@ def test_level_bundle_bound_matches_kelley():
 
 
 def test_requested_lagrangian_is_not_replaced_by_bnb_fallback():
-    r = _gap().solve(decomposition="lagrangian", lagrangian_method="kelley", max_nodes=60)
+    # max_nodes caps the Kelley iterations. 100, not 60: the masters moved to HiGHS
+    # (#1614 D-27), which breaks ties between optimal subproblem vertices differently
+    # from the in-house simplex, so Kelley's trajectory changes. Measured: both
+    # engines converge to 331.6; HiGHS reaches it between 60 and 70 iterations
+    # (330.40 at 60), the simplex by 60.
+    r = _gap().solve(decomposition="lagrangian", lagrangian_method="kelley", max_nodes=100)
     # Pre-fix: status "optimal", bound_source "bnb_tree", node_count 484 > max_nodes.
     assert r.bound_source != "bnb_tree"
     assert r.status != "optimal" or r.gap_certified

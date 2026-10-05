@@ -75,11 +75,11 @@ def test_limit_hit_master_incumbent_is_never_kept_as_bound(monkeypatch):
     import discopt.solvers.lp_backend as lpb
     from discopt.solvers import MILPResult, SolveStatus
 
-    real_get = lpb.get_milp_solver
+    real_get = lpb.get_decomposition_master_solver
     calls = {"master": 0, "limited": 0}
 
-    def get_milp_solver(*a, **k):
-        real = real_get(*a, **k)
+    def get_decomposition_master_solver():
+        real, engine = real_get()
 
         def milp(c, **kw):
             res = real(c, **kw)
@@ -95,9 +95,9 @@ def test_limit_hit_master_incumbent_is_never_kept_as_bound(monkeypatch):
                     )
             return res
 
-        return milp
+        return milp, engine
 
-    monkeypatch.setattr(lpb, "get_milp_solver", get_milp_solver)
+    monkeypatch.setattr(lpb, "get_decomposition_master_solver", get_decomposition_master_solver)
     m, y, _ = build_monolithic("s")
     m.first_stage(y)
     r = solve_benders(m, config=BendersConfig(multicut=False))
