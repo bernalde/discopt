@@ -295,11 +295,27 @@ def pounce_sensitivity(
         )
 
     if method == "exact":
-        jac = np.asarray(jax.jacobian(phi)(jnp.asarray(p0)))
-        dx_dp = jac[:n]
-        dlambda_dp = jac[n:] if m_cons else np.zeros((0, len(params)))
         d2x_dp2 = None
-        if order == 2:
+        if order == 1:
+            # #1615 B-01a: the KKT matrix comes from the tape evaluator's exact
+            # Hessian/Jacobian and only the right-hand side -- one forward pass per
+            # parameter -- goes through JAX.  ``jax.jacobian(phi)`` assembles the
+            # same matrix by an (n+m)-row JAX Jacobian of the residual inside
+            # ``custom_root``, which was ~94% of a 100-step MPC's sensitivity time.
+            kkt = _kkt_matrix(model, n, m_cons, x_star, lambda_star, active, at_bound)
+            z0 = jnp.asarray(np.concatenate([x_star, lambda_star]))
+            act_j, bnd_j = jnp.asarray(active), jnp.asarray(at_bound)
+            x_j0 = jnp.asarray(x_star)
+            d_res = np.asarray(
+                jax.jacfwd(lambda pp: phi.kkt_residual(z0, pp, x_j0, act_j, bnd_j))(jnp.asarray(p0))
+            ).reshape(n + m_cons, len(params))
+            sol = np.linalg.solve(kkt, -d_res)
+            dx_dp = sol[:n]
+            dlambda_dp = sol[n:] if m_cons else np.zeros((0, len(params)))
+        else:
+            jac = np.asarray(jax.jacobian(phi)(jnp.asarray(p0)))
+            dx_dp = jac[:n]
+            dlambda_dp = jac[n:] if m_cons else np.zeros((0, len(params)))
             hess = np.asarray(jax.jacfwd(jax.jacobian(phi))(jnp.asarray(p0)))
             d2x_dp2 = hess[:n]
     else:
@@ -333,6 +349,31 @@ def pounce_sensitivity(
     )
 
 
+def _kkt_matrix(model, n, m_cons, x_star, lambda_star, active, at_bound):
+    """The active-set KKT matrix at ``(x*, λ*)``, from the tape evaluator.
+
+    The same square system ``phi``'s ``custom_root`` linearizes: rows for variables
+    at a bound become ``dx_i/dp = 0`` and rows for inactive constraints become
+    ``dλ_j/dp = 0``, so only the right-hand side depends on how ``p`` enters.
+    """
+    free = ~np.asarray(at_bound, dtype=bool)
+    act = np.asarray(active, dtype=bool)
+    ev = make_evaluator(model)
+    W = np.asarray(ev.evaluate_lagrangian_hessian(x_star, 1.0, lambda_star * active))
+    J = np.asarray(ev.evaluate_jacobian(x_star)) if m_cons else np.zeros((0, n))
+    top = np.where(free[:, None], W, np.eye(n))
+    if not m_cons:
+        return top
+    top = np.hstack([top, np.where(free[:, None], (J * active[:, None]).T, 0.0)])
+    bottom = np.hstack(
+        [
+            np.where(act[:, None], J, 0.0) * free[None, :],
+            np.diag((~act).astype(float)),
+        ]
+    )
+    return np.vstack([top, bottom])
+
+
 def _fd_sensitivity(model, params, phi, p0, x_star, lambda_star, active, at_bound, eps):
     """Central-difference right-hand side on the SAME active-set system.
 
@@ -349,24 +390,7 @@ def _fd_sensitivity(model, params, phi, p0, x_star, lambda_star, active, at_boun
     free = ~np.asarray(at_bound, dtype=bool)
     act = np.asarray(active, dtype=bool)
 
-    ev = make_evaluator(model)
-    W = np.asarray(ev.evaluate_lagrangian_hessian(x_star, 1.0, lambda_star * active))
-    J = np.asarray(ev.evaluate_jacobian(x_star)) if m_cons else np.zeros((0, n))
-
-    # Rows for variables at a bound become ``dx_i/dp = 0``; rows for inactive
-    # constraints become ``dλ_j/dp = 0``.
-    top = np.where(free[:, None], W, np.eye(n))
-    if m_cons:
-        top = np.hstack([top, np.where(free[:, None], (J * active[:, None]).T, 0.0)])
-        bottom = np.hstack(
-            [
-                np.where(act[:, None], J, 0.0) * free[None, :],
-                np.diag((~act).astype(float)),
-            ]
-        )
-        kkt = np.vstack([top, bottom])
-    else:
-        kkt = top
+    kkt = _kkt_matrix(model, n, m_cons, x_star, lambda_star, active, at_bound)
 
     dx_dp = np.zeros((n, n_params))
     dlambda_dp = np.zeros((m_cons, n_params))

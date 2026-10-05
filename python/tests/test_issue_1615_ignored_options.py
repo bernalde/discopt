@@ -411,3 +411,74 @@ def test_kernel_default_gap_is_silent(monkeypatch):
     r, warned = _kernel_gap_solve(monkeypatch)
     assert warned == []
     assert r.status == "optimal" and r.solver_stats["gap_criterion"] == "absolute"
+
+
+# --- B-01a: sensitivity/gradient off the JAX path ---------------------------
+
+
+def _param_qp():
+    # Bounds and a one-sided row that are active at the optimum, so the KKT system
+    # exercises the at-bound and inactive-row eliminations as well as equalities.
+    m = dm.Model("pqp")
+    a = m.parameter("a", 1.5)
+    b = m.parameter("b", 0.7)
+    x = [m.continuous(f"x{i}", lb=-1.0, ub=2.0) for i in range(4)]
+    m.subject_to(x[0] + x[1] + x[2] == a)
+    m.subject_to(x[0] - x[3] <= b)
+    m.subject_to(x[1] + x[3] >= -5.0)
+    m.minimize(
+        (x[0] - 3.0) ** 2 + (x[1] + a) ** 2 + 0.5 * x[2] ** 2 + (x[3] - b * a) ** 2 + x[0] * x[2]
+    )
+    return m, a, b
+
+
+def test_gradient_uses_the_tape_evaluator(monkeypatch):
+    # ``SolveResult.gradient()``'s envelope re-solve used to build a fresh JAX
+    # ``NLPEvaluator`` (~9 s on the issue's 100-step MPC against a 0.2 s solve).
+    import discopt._relax.nlp_evaluator as ne
+
+    m, a, b = _param_qp()
+    r = m.solve()
+    expected = (float(r.gradient(a)), float(r.gradient(b)))
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("gradient() built a JAX NLPEvaluator")
+
+    monkeypatch.setattr(ne, "NLPEvaluator", _refuse)
+    r2 = m.solve()
+    got = (float(r2.gradient(a)), float(r2.gradient(b)))
+    assert got == pytest.approx(expected, rel=1e-6, abs=1e-8)
+    assert all(abs(g) > 1e-3 for g in got), got
+
+
+def test_order1_sensitivity_skips_the_jax_kkt_jacobian(monkeypatch):
+    # Order-1 exact sensitivity assembles the KKT matrix from the tape evaluator;
+    # only the p-derivative of the residual goes through JAX (forward mode). It
+    # must agree with differentiating ``phi`` through ``custom_root``.
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from discopt.modeling.argmin import _build_layer
+    from discopt.solvers.sipopt import pounce_sensitivity
+
+    m, a, b = _param_qp()
+    phi = _build_layer(m, [a, b], verify_minimizer=False, require_min=False, full=True)
+    ref = np.asarray(jax.jacobian(phi)(jnp.asarray([1.5, 0.7])))
+    n = phi.n_variables
+    _, _, active, at_bound = phi.identify(np.array([1.5, 0.7]))
+    # The instance must exercise every elimination, or the comparison is partial.
+    assert at_bound.any() and active.any() and not active.all()
+
+    calls = {"n": 0}
+    real = jax.jacobian
+
+    def _counted(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(jax, "jacobian", _counted)
+    s = pounce_sensitivity(m, [a, b])
+    assert calls["n"] == 0
+    np.testing.assert_allclose(s.dx_dp, ref[:n], rtol=1e-9, atol=1e-11)
+    np.testing.assert_allclose(s.dlambda_dp, ref[n:], rtol=1e-9, atol=1e-11)
+    assert np.abs(s.dx_dp).max() > 1e-3
